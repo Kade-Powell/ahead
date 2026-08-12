@@ -10,20 +10,84 @@ Implementation is optional and normally belongs in a linked product-change or in
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    F["1. Frame decision<br/>Human"] --> C["2. Define criteria and constraints"]
-    C --> R["3. Research<br/>AI-assisted"]
-    R --> Q["4. Review questions and unknowns"]
-    Q -->|"material gap"| R
-    Q --> HOPT["5. Human initial option"]
-    HOPT --> AOPT["6. AI expands and challenges options"]
-    AOPT --> CMP["7. Compare tradeoffs and consequences"]
-    CMP --> D{"8. Human decision gate"}
-    D -->|"reframe or seek evidence"| F
-    D --> V["9. Validate consequences and dissent"]
-    V --> PUB["10. Publish decision,<br/>review trigger, and linked work"]
-    PUB --> O{"11. Human outcome gate"}
+```text
+┌──────────────────────────────────────────────┐
+│ 1. FRAME DECISION                            │
+│                                              │
+│ HUMAN                                        │
+│ • State the choice to be made                │
+│ • Name accountable decider/stakeholders      │
+│ • Define scope and deadline                  │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 2. DEFINE CRITERIA                           │
+│                                              │
+│ HUMAN                                        │
+│ • Goals • constraints • criteria             │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Expose hidden criteria and tensions        │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 3. RESEARCH AND QUESTIONS                    │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Gather cited evidence                      │
+│ • Find contradictions and missing questions  │
+│                                              │
+│ HUMAN                                        │
+│ • Read, evaluate, and accept unknowns        │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ EVIDENCE      │
+                │ SUFFICIENT?   │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+              ↺ RESEARCH    │
+                            ▼
+┌──────────────────────────────────────────────┐
+│ 4. HUMAN INITIAL OPTION                      │
+│ • Propose at least one viable course         │
+│ • Explain the initial reasoning              │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 5. EXPAND AND CHALLENGE OPTIONS              │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Add alternatives • compare • challenge     │
+│ • Surface consequences and risks             │
+│ • Analyze reversibility                      │
+│                                              │
+│ HUMAN                                        │
+│ • Evaluate and refine the option set         │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 6. HUMAN DECISION GATE                       │
+│ • Select the course                          │
+│ • Accept tradeoffs and uncertainty           │
+│ • Record rationale and dissent               │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 7. VALIDATE AND PUBLISH                      │
+│                                              │
+│ HUMAN                                        │
+│ • Validate consequences                      │
+│ • Set reversibility and review trigger       │
+│ • Link resulting work                        │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Challenge consistency and missing effects  │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                 HUMAN OUTCOME
+
+Reframe or seek evidence ─────────↺ FRAME / RESEARCH
 ```
 
 ## Minimal phases
@@ -40,16 +104,29 @@ flowchart LR
 
 ## Decision evidence chain
 
-```mermaid
-flowchart LR
-    FRAME["Decision frame"] --> CRIT["Criteria and constraints"]
-    CRIT --> EVID["Evidence and unknowns"]
-    EVID --> H["Human initial option"]
-    H --> OPTIONS["Expanded option set"]
-    OPTIONS --> TRADE["Tradeoffs and consequences"]
-    TRADE --> DEC["Human decision and rationale"]
-    DEC --> REVIEW["Reversibility and review trigger"]
-    REVIEW --> LINKS["Linked implementation or investigation"]
+```text
+HUMAN DECISION FRAME / CRITERIA
+              │
+              ▼
+AI-ASSISTED EVIDENCE / HUMAN-ACCEPTED UNKNOWNS
+              │
+              ▼
+HUMAN INITIAL OPTION
+              │
+              ▼
+AI-EXPANDED / HUMAN-EVALUATED OPTION SET
+              │
+              ▼
+TRADEOFFS / CONSEQUENCES
+              │
+              ▼
+HUMAN DECISION / RATIONALE / DISSENT
+              │
+              ▼
+HUMAN-OWNED REVERSIBILITY / REVIEW TRIGGER
+              │
+              ▼
+LINKED IMPLEMENTATION OR INVESTIGATION
 ```
 
 ## Non-waivable pilot rules

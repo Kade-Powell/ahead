@@ -10,22 +10,101 @@ Use product change when externally meaningful behavior is intentionally changing
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    INV["1. Define behavioral invariants<br/>Human"] --> BASE["2. Establish baseline and evidence"]
-    BASE --> TARGET["3. Define target quality and measure"]
-    TARGET --> OPT["4. Human option first;<br/>AI expands and challenges"]
-    OPT --> D{"5. Human decision gate"}
-    D --> P["6. Human first-pass plan"]
-    P --> I["7. Implement improvement"]
-    I --> AR["8. AI review"]
-    AR -->|"changes required"| I
-    AR --> HR{"9. Human review gate"}
-    HR -->|"changes required"| I
-    HR --> V["10. Verify invariants and<br/>measure improvement"]
-    V -->|"invariant fails"| I
-    V -->|"target not improved"| D
-    V --> O{"11. Human outcome gate"}
+```text
+┌──────────────────────────────────────────────┐
+│ 1. DEFINE INVARIANTS                         │
+│                                              │
+│ HUMAN                                        │
+│ • Define behavior that must not change       │
+│ • Define scope and non-goals                 │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Identify overlooked contracts/consumers    │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 2. BASELINE AND TARGET                       │
+│                                              │
+│ HUMAN                                        │
+│ • Accept current evidence and measurement    │
+│ • Define target quality                      │
+│ • Define success threshold                   │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Gather metrics • find measurement gaps     │
+│ • Suggest unintended effects to watch        │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 3. OPTIONS                                   │
+│                                              │
+│ HUMAN — FIRST PASS                           │
+│ • Propose at least one improvement approach  │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Expand alternatives • expose coupling      │
+│ • Challenge complexity and assumptions       │
+│                                              │
+│ HUMAN                                        │
+│ • Evaluate and refine options                │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 4. HUMAN DECISION GATE                       │
+│ • Select approach and accept tradeoffs       │
+│ • Record rationale                           │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 5. PLAN                                      │
+│                                              │
+│ HUMAN — FIRST PASS                           │
+│ • Sequence change, checks, and rollback      │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Find affected boundaries and missing tests │
+│                                              │
+│ HUMAN finalizes and approves                 │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 6. IMPLEMENT                                 │
+│ ENGINEER owns and understands the change     │
+│ AI — ASSIST with bounded contributions       │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 7. AI REVIEW                                 │
+│ • Hidden behavior changes • complexity       │
+│ • Tests • coupling • plan compliance         │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 8. HUMAN REVIEW GATE                         │
+│ • Final judgment on preservation/improvement │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 9. VERIFY                                    │
+│                                              │
+│ HUMAN                                        │
+│ • Verify invariants                          │
+│ • Compare before/after target evidence       │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Analyze measurements / suggest checks      │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ PRESERVED AND │
+                │ IMPROVED?     │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+         ↺ DECIDE / WORK    │
+                            ▼
+                   HUMAN OUTCOME GATE
+
+Review changes requested ─────────────↺ IMPLEMENT
 ```
 
 ## Minimal phases
@@ -38,22 +117,37 @@ flowchart LR
 | Options and decision | Initial approach, selection, and risk | Expand alternatives, expose coupling, and challenge abstraction | Options, decision, and rationale | Human approves the approach |
 | Plan | First-pass sequence, verification, and rollback | Find affected boundaries, migration needs, and missing tests | Plan and invariant checks | Human approves the final plan |
 | Implement | Engineering change and scope control | Bounded refactoring, explanation, tests, and mechanical assistance | Linked changeset and deviations | Change is ready for review |
-| Review | Final judgment about simplicity, coupling, risk, and preservation | Review for hidden behavior changes and incidental complexity | AI findings and current human review | Human accepts the current change |
+| AI review | Disposition of valid findings | Review for hidden behavior changes, incidental complexity, tests, and plan alignment | AI findings and dispositions | Blocking findings are resolved or rejected with rationale |
+| Human review | Final judgment about simplicity, coupling, risk, and preservation | Answer targeted questions and retrieve evidence | Current human review | Human accepts the current change |
 | Verify | Invariant preservation and target-quality comparison | Analyze measurements and suggest negative checks | Before/after evidence and invariant results | Preservation and improvement are demonstrated or failure is accepted |
 | Outcome | Acceptance, rollback, partial result, or new work | Summarize learning | Outcome, remaining debt, and follow-ups | Human accepts closure |
 
 ## Preservation and improvement chain
 
-```mermaid
-flowchart LR
-    CONTRACT["Behavioral invariants and non-goals"] --> BASE["Before baseline"]
-    BASE --> TARGET["Target quality and measure"]
-    TARGET --> DEC["Approach and rationale"]
-    DEC --> CHANGE["Plan and changeset"]
-    CHANGE --> REV["AI and human review"]
-    REV --> INV["Invariant verification"]
-    INV --> COMP["Before/after comparison"]
-    COMP --> OUT["Human outcome and remaining debt"]
+```text
+HUMAN-OWNED INVARIANTS / NON-GOALS
+               │
+               ▼
+HUMAN-ACCEPTED BASELINE / TARGET
+               │
+               ▼
+HUMAN OPTION + AI-EXPANDED ALTERNATIVES
+               │
+               ▼
+HUMAN DECISION / FIRST-PASS PLAN
+               │
+               ▼
+ENGINEER-OWNED CHANGESET
+               │
+               ▼
+AI REVIEW + HUMAN REVIEW GATE
+               │
+               ▼
+HUMAN-ACCEPTED INVARIANT VERIFICATION
+AND BEFORE / AFTER COMPARISON
+               │
+               ▼
+HUMAN OUTCOME / REMAINING DEBT
 ```
 
 ## Non-waivable pilot rules

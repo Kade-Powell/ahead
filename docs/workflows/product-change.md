@@ -10,23 +10,125 @@ Do not use it when the main task is explaining an observed failure, restoring a 
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    D["1. Define problem<br/>Human"] --> R["2. Research<br/>AI-assisted"]
-    R --> Q["3. Review research and questions<br/>Human understanding"]
-    Q -->|"important question remains"| R
-    Q --> O["4. Options<br/>Human option first; AI expands"]
-    O --> DEC{"5. Human decision gate"}
-    DEC -->|"reframe"| D
-    DEC --> P["6. Plan<br/>Human first pass; AI challenges"]
-    P --> IMP["7. Implement<br/>Engineer with bounded AI help"]
-    IMP --> AR["8. AI review"]
-    AR -->|"changes required"| IMP
-    AR --> HR{"9. Human review gate"}
-    HR -->|"changes required"| IMP
-    HR --> V["10. Verify and observe"]
-    V -->|"outcome not demonstrated"| IMP
-    V --> OUT{"11. Human outcome gate"}
+```text
+┌──────────────────────────────────────────────┐
+│ 1. DEFINE PROBLEM                            │
+│                                              │
+│ HUMAN                                        │
+│ • Define desired outcome and users           │
+│ • Define constraints and scope               │
+│ • Define success signals                     │
+│ • Define initial questions                   │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 2. RESEARCH                                  │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Search authorized sources                  │
+│ • Compile and cite evidence                  │
+│ • Answer known questions                     │
+│ • Identify contradictions and gaps           │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 3. RESEARCH REVIEW                           │
+│                                              │
+│ HUMAN                                        │
+│ • Read and understand the research           │
+│ • Ask follow-up questions                    │
+│ • Challenge findings                         │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Identify questions humans missed           │
+│ • Research unanswered questions              │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ RESEARCH      │
+                │ COMPLETE?     │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+                      │     │
+             ↺ RESEARCH     ↓
+┌──────────────────────────────────────────────┐
+│ 4. OPTIONS                                   │
+│                                              │
+│ HUMAN — FIRST PASS                           │
+│ • Propose at least one viable approach       │
+│ • Explain initial reasoning                  │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Research and challenge the human option    │
+│ • Identify additional approaches             │
+│ • Compare tradeoffs and risks                │
+│                                              │
+│ HUMAN                                        │
+│ • Evaluate, refine, add, or remove options   │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 5. DECISION                                  │
+│                                              │
+│ HUMAN GATE                                   │
+│ • Select approach                            │
+│ • Accept tradeoffs and unknowns              │
+│ • Record rationale and reversibility         │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 6. PLAN                                      │
+│                                              │
+│ HUMAN — FIRST PASS                           │
+│ • Define implementation steps and systems    │
+│ • Define testing, rollout, and recovery       │
+│                                              │
+│ AI — OPTIONAL ASSISTANCE                     │
+│ • Find gaps, dependencies, risks, edge cases │
+│ • Challenge assumptions                      │
+│                                              │
+│ HUMAN                                        │
+│ • Finalize and approve the plan              │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 7. IMPLEMENT                                 │
+│                                              │
+│ ENGINEER                                     │
+│ • Own and understand the implementation      │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Bounded code, tests, and explanation       │
+│ • Debugging and refactoring suggestions      │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 8. AI REVIEW                                 │
+│ • Correctness • security • tests             │
+│ • Architecture • plan compliance             │
+│ • Maintainability                            │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 9. HUMAN REVIEW                              │
+│ • Final engineering judgment                 │
+│ • Approve or request changes                 │
+└──────────────────────┬───────────────────────┘
+                       ↓
+             10. DEPLOY / RELEASE
+                       ↓
+               11. VERIFY / OBSERVE
+                       ↓
+                  12. AI AUDIT
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 13. HUMAN OUTCOME                            │
+│ • Accept, roll back, follow up, or abandon   │
+│ • Record learning                            │
+└──────────────────────────────────────────────┘
+
+Review changes requested ─────────↺ IMPLEMENT
+Outcome not demonstrated ─────────↺ PLAN / IMPLEMENT
 ```
 
 ## Minimal phases
@@ -42,21 +144,39 @@ flowchart LR
 | Implement | Code and engineering changes | Bounded generation, explanation, tests, debugging, and refactoring assistance | Linked changeset and plan deviations | Work is ready for independent review and checks pass |
 | AI review | Resolution of valid findings | Review behavior, security, tests, architecture, and plan alignment | Findings and dispositions | Blocking findings are resolved or rejected with rationale |
 | Human review | Final engineering judgment | Answer targeted questions and retrieve evidence | Current human review | Human reviewer accepts the current change |
+| Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended version reaches the target environment or deployment is explicitly not applicable |
 | Verify and observe | Evaluation against intended behavior | Suggest checks and analyze authorized observations | Test, deployment, and user-visible evidence | Intended outcome is demonstrated or failure is recorded |
+| AI audit | Disposition of findings and any required response | Compare the result with the problem, decision, plan, reviews, and observed behavior; identify divergence, weak evidence, and missed learning | Audit findings and dispositions | Human has reviewed material findings |
 | Outcome | Acceptance, rollback, follow-up, or abandonment | Summarize learning | Result, uncertainty, follow-ups | Human accepts closure or routes more work |
 
 ## Artifact and evidence chain
 
-```mermaid
-flowchart LR
-    P["Problem and success signals"] --> RES["Research and questions"]
-    RES --> OPT["Human option plus alternatives"]
-    OPT --> D["Decision and rationale"]
-    D --> PL["Human first-pass and final plan"]
-    PL --> C["Changeset and tests"]
-    C --> REV["AI review and human review"]
-    REV --> VER["Verification and observations"]
-    VER --> OUT["Outcome and learning"]
+```text
+PROBLEM / SUCCESS SIGNALS
+            │
+            ▼
+RESEARCH / QUESTIONS
+            │
+            ▼
+HUMAN OPTION / ALTERNATIVES
+            │
+            ▼
+HUMAN DECISION / RATIONALE
+            │
+            ▼
+HUMAN FIRST-PASS / FINAL PLAN
+            │
+            ▼
+CHANGESET / TESTS / DEPLOYMENT
+            │
+            ▼
+AI REVIEW / HUMAN REVIEW GATE / AI AUDIT
+            │
+            ▼
+VERIFICATION / OBSERVATIONS
+            │
+            ▼
+HUMAN OUTCOME / LEARNING
 ```
 
 ## Non-waivable pilot rules

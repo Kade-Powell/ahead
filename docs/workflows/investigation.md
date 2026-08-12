@@ -10,19 +10,92 @@ An investigation may end with no action, insufficient evidence, several viable i
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    Q["1. Frame question<br/>Human"] --> B["2. Bound scope, confidence,<br/>and stopping conditions"]
-    B --> G["3. Gather facts and prior evidence<br/>AI-assisted"]
-    G --> M["4. Build or update model<br/>Human-owned"]
-    M --> H["5. Hypotheses or exploration paths"]
-    H --> T["6. Human-selected test, analysis,<br/>or disposable prototype"]
-    T -->|"new evidence or question"| M
-    T --> S["7. Synthesize evidence and limits"]
-    S --> C{"8. Human conclusion gate"}
-    C -->|"more evidence justified"| G
-    C --> R["9. Recommendations or linked runs"]
-    R --> O{"10. Human outcome gate"}
+```text
+┌──────────────────────────────────────────────┐
+│ 1. FRAME QUESTION                            │
+│                                              │
+│ HUMAN                                        │
+│ • State the question and why it matters      │
+│ • Record initial understanding               │
+│ • Name audience or dependent decision        │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 2. BOUND INVESTIGATION                       │
+│                                              │
+│ HUMAN                                        │
+│ • Define scope, exclusions, confidence need  │
+│ • Set time/evidence budget and stopping rule │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Challenge whether it is answerable         │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 3. GATHER EVIDENCE                           │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Locate, summarize, compare, and cite       │
+│ • Expose conflicting or missing evidence     │
+│                                              │
+│ HUMAN                                        │
+│ • Evaluate source quality and relevance      │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 4. HUMAN MODEL                               │
+│ • Build/update the explanation of the domain │
+│ • Record assumptions and unknowns            │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 5. EXPLORATION PATHS                         │
+│                                              │
+│ HUMAN                                        │
+│ • Contribute/select what is worth exploring  │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Generate hypotheses and alternatives       │
+│ • Suggest analyses, tests, or prototypes     │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 6. HUMAN SELECTS AND AUTHORIZES              │
+│ • Test / analysis / disposable prototype     │
+│ • Prediction, safety, scope, and disposal    │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 7. EXECUTE EXPLORATION                       │
+│                                              │
+│ HUMAN / ENGINEER OWNS THE EXPERIMENT         │
+│ AI — ASSIST                                  │
+│ • May fully generate an isolated throwaway   │
+│   prototype under prototype policy           │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ ENOUGH TO     │
+                │ CONCLUDE?     │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+           ↺ MODEL / PATHS  │
+                            ▼
+┌──────────────────────────────────────────────┐
+│ 8. SYNTHESIZE                                │
+│                                              │
+│ HUMAN                                        │
+│ • Interpret evidence, contradictions, limits │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Organize findings and challenge overclaims │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 9. HUMAN CONCLUSION / OUTCOME GATE           │
+│ • State conclusion, confidence, and unknowns │
+│ • Recommend no action or link another flow   │
+└──────────────────────────────────────────────┘
 ```
 
 Full vibe coding is permitted for an isolated, explicitly disposable prototype when its purpose is learning. The learning is retained; prototype code is discarded or deliberately re-enters the appropriate production workflow.
@@ -40,15 +113,31 @@ Full vibe coding is permitted for an isolated, explicitly disposable prototype w
 
 ## Knowledge chain
 
-```mermaid
-flowchart LR
-    Q["Question and relevance"] --> SCOPE["Scope and stopping rule"]
-    SCOPE --> E["Evidence and source quality"]
-    E --> MODEL["Model and assumptions"]
-    MODEL --> EXP["Hypotheses, analyses,<br/>tests, or prototypes"]
-    EXP --> RESULT["Results and contradictions"]
-    RESULT --> CONC["Human conclusion,<br/>confidence, and limits"]
-    CONC --> ROUTE["Recommendation or linked run"]
+```text
+HUMAN QUESTION / RELEVANCE
+           │
+           ▼
+HUMAN SCOPE / STOPPING RULE
+           │
+           ▼
+AI-ASSISTED EVIDENCE GATHERING
+HUMAN SOURCE EVALUATION
+           │
+           ▼
+HUMAN MODEL / ASSUMPTIONS
+           │
+           ▼
+AI-EXPANDED EXPLORATION PATHS
+HUMAN-SELECTED TEST / ANALYSIS / PROTOTYPE
+           │
+           ▼
+RESULTS / CONTRADICTIONS
+           │
+           ▼
+HUMAN CONCLUSION / CONFIDENCE / LIMITS
+           │
+           ▼
+HUMAN RECOMMENDATION / LINKED RUN
 ```
 
 ## Non-waivable pilot rules

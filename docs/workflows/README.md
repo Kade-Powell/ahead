@@ -68,17 +68,53 @@ The body records only the sections required by the selected flow. Evidence may r
 
 ## Shared human–AI rhythm
 
-```mermaid
-flowchart LR
-    H1["Human frames the work"] --> A1["AI researches, expands, or challenges"]
-    A1 --> H2{"Human understands and decides"}
-    H2 --> H3["Human plans or authorizes action"]
-    H3 --> W["Engineer performs the work with bounded AI assistance"]
-    W --> A2["AI adds review or analysis"]
-    A2 --> H4{"Human reviews and accepts the outcome"}
-    H4 --> L["Record evidence and learning"]
-    H2 -->|"questions remain"| A1
-    H4 -->|"not accepted"| W
+Diagram language is normative for the pilot:
+
+- `HUMAN` or `ENGINEER` means the person owns the reasoning, decision, action, or artifact.
+- `AI — ASSIST` means AI may research, organize, propose, explain, generate bounded material, or challenge; it does not own or approve the phase.
+- `AI REVIEW` is an additional review and never satisfies a human-review gate.
+- Every decision, test selection, risk acceptance, consequential-action authorization, final review, and outcome gate is human.
+- If a diagram and prose appear to disagree, the [AHEAD Constitution](../../CONSTITUTION.md) controls: humans lead and remain accountable; AI assists.
+
+```text
+┌──────────────────────────────────────────────┐
+│ HUMAN FRAMES THE WORK                        │
+│ • Outcome, question, failure, or invariant   │
+│ • Initial understanding                      │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ AI — ASSISTS, AMPLIFIES, AND CHALLENGES      │
+│ • Research • alternatives • hypotheses       │
+│ • Gaps • contradictions • risks              │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ HUMAN UNDERSTANDS AND DECIDES                │
+│ • Evaluate evidence • accept tradeoffs       │
+│ • Resolve or accept important unknowns       │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ HUMAN PLANS OR AUTHORIZES ACTION             │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ ENGINEER ACTS WITH BOUNDED AI ASSISTANCE     │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ AI REVIEW / ANALYSIS                         │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ HUMAN REVIEWS AND ACCEPTS THE OUTCOME        │
+└──────────────────────┬───────────────────────┘
+                       ↓
+              RECORD EVIDENCE AND LEARNING
+
+Questions remain ───────────────↺ AI assistance
+Outcome not accepted ───────────↺ Work / investigation
 ```
 
 ## Pilot feedback

@@ -10,22 +10,107 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    D["1. Detect or declare"] --> A["2. Assess impact, scope,<br/>desired vs. actual state"]
-    A --> MODE{"Incident or emergency overlay?"}
-    MODE --> FORK["3. Parallel work"]
-    FORK --> INV["Investigate<br/>evidence, model, hypotheses"]
-    FORK --> STAB["Stabilize<br/>contain, mitigate, recover"]
-    INV --> FORK
-    STAB --> AG{"4. Human action gate<br/>for consequential intervention"}
-    AG --> ACT["5. Execute and observe intervention"]
-    ACT -->|"not converged"| FORK
-    ACT --> REC["6. Verify recovery and convergence"]
-    REC --> MON["7. Monitor recurrence"]
-    MON -->|"recurs"| FORK
-    MON --> O{"8. Human outcome gate"}
-    O --> FU["9. Link corrective, investigation,<br/>decision, or improvement work"]
+```text
+             LIVE SYSTEM OUTSIDE
+           ACCEPTABLE OPERATING STATE
+                       │
+                       ▼
+┌──────────────────────────────────────────────┐
+│ 1. ASSESS                                    │
+│                                              │
+│ HUMAN                                        │
+│ • Assess impact, urgency, and scope          │
+│ • Define desired versus actual state         │
+│ • Assign accountable ownership               │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Correlate authorized signals               │
+│ • Identify missing information               │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ HUMAN SELECTS │
+                │ RESPONSE MODE │
+                │ Normal /      │
+                │ incident /    │
+                │ emergency     │
+                └───────┬───────┘
+                        ↓
+        ┌────────────── PARALLEL ──────────────┐
+        │                                      │
+        ▼                                      ▼
+┌──────────────────────┐          ┌──────────────────────┐
+│ 2A. INVESTIGATE      │          │ 2B. STABILIZE        │
+│                      │          │                      │
+│ HUMAN LEADS          │          │ HUMAN LEADS          │
+│ • Model system       │          │ • Set priorities     │
+│ • Select tests       │          │ • Select candidate   │
+│ • Interpret evidence│          │   intervention       │
+│                      │          │ • Assess risk        │
+│ AI — ASSIST          │          │                      │
+│ • Organize telemetry│          │ AI — ASSIST          │
+│ • Suggest hypotheses│          │ • Compare actions    │
+│ • Find conflicts     │          │ • Find side effects  │
+└──────────┬───────────┘          └──────────┬───────────┘
+           │                                 │
+           └────────────────┬────────────────┘
+                            ↓
+              ┌─────────────────────────┐
+              │ 3. HUMAN ACTION GATE    │
+              │                         │
+              │ • Authorize actor/scope │
+              │ • Blast radius          │
+              │ • Rollback/containment  │
+              │ • Accepted uncertainty  │
+              └────────────┬────────────┘
+                           ↓
+┌──────────────────────────────────────────────┐
+│ 4. EXECUTE AND OBSERVE                       │
+│                                              │
+│ HUMAN / PREAUTHORIZED AUTOMATION             │
+│ • Performs the operational action            │
+│                                              │
+│ AI — ASSIST                                  │
+│ • May act only through separate, scoped,     │
+│   human-authorized operational permission    │
+│ • Workflow phase grants no production access │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ CONVERGING?   │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+          ↺ INVESTIGATE     │
+            / STABILIZE     ▼
+┌──────────────────────────────────────────────┐
+│ 5. VERIFY RECOVERY                           │
+│                                              │
+│ HUMAN                                        │
+│ • Verify convergence and user-visible state │
+│                                              │
+│ AI — ASSIST                                  │
+│ • Analyze authorized recovery indicators     │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 6. MONITOR RECURRENCE                        │
+│ HUMAN selects duration and signals           │
+│ AI — ASSIST                                  │
+│ • Summarize authorized telemetry             │
+└──────────────────────┬───────────────────────┘
+                       ↓
+                ┌───────────────┐
+                │ STABLE?       │
+                └───────┬───────┘
+                   NO ↙   ↘ YES
+          ↺ INVESTIGATE     │
+            / STABILIZE     ▼
+┌──────────────────────────────────────────────┐
+│ 7. HUMAN OUTCOME                             │
+│ • Accept closure and remaining risk          │
+│ • Link corrective, investigation, decision, │
+│   or improvement follow-up runs              │
+└──────────────────────────────────────────────┘
 ```
 
 Investigation and stabilization may proceed concurrently. Service restoration must not wait for a complete causal explanation when a human authorizes a proportionate intervention.
@@ -44,18 +129,35 @@ Investigation and stabilization may proceed concurrently. Service restoration mu
 
 ## Parallel evidence and action chains
 
-```mermaid
-flowchart TB
-    OBS["Observed operating condition"] --> IMP["Impact, scope, desired state"]
-    IMP --> E["Evidence and timeline"]
-    E --> MODEL["System and control-loop model"]
-    MODEL --> H["Hypotheses and tests"]
-    IMP --> CAND["Containment or recovery options"]
-    H --> CAND
-    CAND --> AUTH{"Human authorization"}
-    AUTH --> ACTION["Action plus observed result"]
-    ACTION --> REC["Recovery, convergence,<br/>and user-visible verification"]
-    REC --> FOLLOW["Causal confidence, remaining risk,<br/>and linked follow-up runs"]
+```text
+OBSERVED OPERATING CONDITION
+              │
+              ▼
+HUMAN-OWNED IMPACT / SCOPE / DESIRED STATE
+              │
+       ┌──────┴────────┐
+       ▼               ▼
+EVIDENCE / MODEL   STABILIZATION OPTIONS
+       │               │
+       ▼               │
+HUMAN-SELECTED         │
+HYPOTHESES / TESTS     │
+       │               │
+       └──────┬────────┘
+              ▼
+       HUMAN AUTHORIZATION
+              │
+              ▼
+ACTION / OBSERVED RESULT
+              │
+              ▼
+HUMAN-ACCEPTED RECOVERY / CONVERGENCE
+              │
+              ▼
+REMAINING RISK / LINKED FOLLOW-UP RUNS
+
+AI assists evidence gathering, option generation,
+hypothesis generation, and analysis; it owns no gate.
 ```
 
 ## Incident and emergency overlay
