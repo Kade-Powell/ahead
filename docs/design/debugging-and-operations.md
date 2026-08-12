@@ -45,8 +45,11 @@ Observe → Reproduce or establish
 → Characterize
 → Human-led investigation loop
 → Human accepts diagnosis or uncertainty
-→ Choose fix → Plan → Implement → Validate
-→ AI review → Human review → Verify outcome
+→ Choose fix → Plan → Implement → Validate locally
+→ AI review → Independent human review
+→ Human-authorized deploy or release when applicable
+→ Verify the original failure and observe the outcome
+→ Audit assumptions → Human outcome
 ```
 
 Reproduction is valuable but not universally required. A failure may be intermittent, historical, production-only, environment-specific, or already mitigated.

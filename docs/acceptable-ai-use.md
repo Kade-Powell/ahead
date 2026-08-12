@@ -1,6 +1,12 @@
 # Acceptable AI Use in AHEAD
 
-Status: proposed policy
+Status: binding pilot policy v0.1
+
+## Authority
+
+This policy is binding for AHEAD pilot workflows. The [AHEAD Constitution](../CONSTITUTION.md) is the highest authority; this policy interprets its human-ownership boundaries; workflow profiles apply both and may narrow AI permissions for a phase. A workflow phase, diagram, tool permission, or local convenience cannot broaden AI authority beyond this policy. Organization and repository policies may impose stricter controls.
+
+If two rules appear to conflict, apply the more protective rule and record the ambiguity for correction. No exception may transfer human authorship, judgment, approval, accountability, or unscoped consequential authority to AI.
 
 ## Purpose
 
@@ -72,6 +78,8 @@ Research has found that LLM support can increase generated tests and defect dete
 AI may perform an additional early review for likely defects, security concerns, missing tests, plan divergence, unclear code, and relevant edge cases.
 
 AI review never constitutes final approval. Findings are hypotheses until a human validates them. Human review remains required because empirical work links substantive review participation and expertise with quality, while current LLM reviewers exhibit systematic false-positive and conformance-judgment failures.
+
+For a lasting engineering change, independent human review means review by a person other than the implementer. The implementer and reviewer must both understand the behavior, risks, and evidence relevant to their responsibilities. Implementer self-review and AI review do not satisfy this gate. An emergency policy may defer independent review to restore service, but the gate remains unsatisfied until a named human reviewer completes it after stabilization.
 
 ### Refactoring proposals
 

@@ -92,7 +92,7 @@ Basis: direct empirical debugging and incident-response studies, plus *The Pragm
 
 ## 11. Review independently and communicate honestly
 
-Review is a reasoning activity, not an approval button. Review the current artifact against intended behavior, architecture, risks, tests, operations, and maintainability. Automated and AI review add coverage; they do not replace accountable human judgment.
+Review is a reasoning activity, not an approval button. Review the current artifact against intended behavior, architecture, risks, tests, operations, and maintainability. Automated and AI review add coverage; they do not replace accountable human judgment. A lasting engineering change requires review by a person other than the implementer; implementer self-review is still necessary, but it does not satisfy that independent gate.
 
 Technical communication should be clear, audience-aware, and grounded in the author's understanding. State observed fact, interpretation, uncertainty, decision, and request distinctly. Do not polish weak understanding into false confidence.
 
@@ -126,7 +126,7 @@ Before accepting AI-assisted work:
 - Are claims, sources, dependencies, and commands verified?
 - Did AI-generated tests inherit the implementation's assumptions?
 - Was sensitive context authorized for the selected tool?
-- Is there independent human review proportionate to risk?
+- Has a person other than the implementer independently reviewed every lasting engineering change, with additional specialist review proportionate to risk?
 
 Before merge or delivery:
 

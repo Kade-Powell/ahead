@@ -43,7 +43,9 @@ Implementation is optional and normally belongs in a linked product-change or in
                        ↓
                 ┌───────────────┐
                 │ EVIDENCE      │
-                │ SUFFICIENT?   │
+                │ REVIEWED AND  │
+                │ UNCERTAINTY   │
+                │ DISPOSED?     │
                 └───────┬───────┘
                    NO ↙   ↘ YES
               ↺ RESEARCH    │
@@ -90,13 +92,15 @@ Implementation is optional and normally belongs in a linked product-change or in
 Reframe or seek evidence ─────────↺ FRAME / RESEARCH
 ```
 
+“Disposed” means the uncertainty is answered or the accountable human explicitly accepts it. AI does not introduce solution alternatives during research; option expansion begins only after the human initial option is recorded.
+
 ## Minimal phases
 
 | Phase | Human owns | AI may | Minimum record | Advance when |
 |---|---|---|---|---|
 | Frame | Decision to be made, accountable decider, scope, deadline, and stakeholders | Clarify ambiguity and identify missing stakeholders | Decision statement and owner | Human accepts the frame |
 | Criteria | Goals, constraints, evaluation criteria, and relative importance | Challenge hidden criteria and identify tensions | Criteria and non-negotiable constraints | Criteria are sufficient for comparison |
-| Research and questions | Evaluation of evidence and disposition of uncertainty | Gather cited evidence, find alternatives, contradictions, and missing questions | Sources, findings, unknowns, and limits | Material evidence is reviewed or uncertainty accepted |
+| Research and questions | Evaluation of evidence and disposition of uncertainty | Gather cited evidence and find contradictions or missing questions; do not introduce solution alternatives yet | Sources, findings, unknowns, and limits | Material evidence is reviewed and uncertainty is answered or explicitly accepted |
 | Options | At least one human-originated option | Expand, combine, challenge, and propose alternatives | Options with provenance | Plausible option space is understood |
 | Compare | Interpretation of tradeoffs | Structure comparison and sensitivity analysis | Benefits, costs, risks, consequences, reversibility | Decision is ready for accountable judgment |
 | Decide | Selection, rationale, accepted tradeoffs, and dissent | Test rationale for inconsistency or missing consequence | Decision and rejected alternatives | Accountable human approves a specific revision |

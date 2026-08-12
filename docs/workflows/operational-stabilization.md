@@ -36,9 +36,9 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
                 │ emergency     │
                 └───────┬───────┘
                         ↓
-        ┌────────────── PARALLEL ──────────────┐
-        │                                      │
-        ▼                                      ▼
+        ┌──────── PARALLEL — NO JOIN BARRIER ────────┐
+        │                                            │
+        ▼                                            ▼
 ┌──────────────────────┐          ┌──────────────────────┐
 │ 2A. INVESTIGATE      │          │ 2B. STABILIZE        │
 │                      │          │                      │
@@ -52,18 +52,17 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
 │ • Suggest hypotheses│          │ • Compare actions    │
 │ • Find conflicts     │          │ • Find side effects  │
 └──────────┬───────────┘          └──────────┬───────────┘
-           │                                 │
-           └────────────────┬────────────────┘
-                            ↓
-              ┌─────────────────────────┐
-              │ 3. HUMAN ACTION GATE    │
-              │                         │
-              │ • Authorize actor/scope │
-              │ • Blast radius          │
-              │ • Rollback/containment  │
-              │ • Accepted uncertainty  │
-              └────────────┬────────────┘
-                           ↓
+           │ CONTINUES                         │
+           │ WHILE NEEDED                      ▼
+           │                      ┌─────────────────────────┐
+           │                      │ 3. HUMAN ACTION GATE    │
+           │ MAY INFORM           │                         │
+           ├─ - - - - - - - - - ►│ • Authorize actor/scope │
+           │   NO BARRIER         │ • Blast radius          │
+           │                      │ • Rollback/containment  │
+           │                      │ • Accepted uncertainty  │
+           │                      └────────────┬────────────┘
+           │                                   ↓
 ┌──────────────────────────────────────────────┐
 │ 4. EXECUTE AND OBSERVE                       │
 │                                              │
@@ -113,7 +112,7 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
 └──────────────────────────────────────────────┘
 ```
 
-Investigation and stabilization may proceed concurrently. Service restoration must not wait for a complete causal explanation when a human authorizes a proportionate intervention.
+Investigation and stabilization proceed independently: there is no join gate. Investigation may inform an intervention and continue after it, but service restoration does not wait for a complete causal explanation when a human authorizes a proportionate intervention.
 
 ## Minimal phases
 
@@ -138,26 +137,24 @@ HUMAN-OWNED IMPACT / SCOPE / DESIRED STATE
        ┌──────┴────────┐
        ▼               ▼
 EVIDENCE / MODEL   STABILIZATION OPTIONS
-       │               │
-       ▼               │
-HUMAN-SELECTED         │
-HYPOTHESES / TESTS     │
-       │               │
-       └──────┬────────┘
-              ▼
-       HUMAN AUTHORIZATION
-              │
-              ▼
-ACTION / OBSERVED RESULT
-              │
-              ▼
-HUMAN-ACCEPTED RECOVERY / CONVERGENCE
-              │
-              ▼
+       │ CONTINUES         │
+       ▼                   ▼
+HUMAN-SELECTED      HUMAN AUTHORIZATION
+HYPOTHESES / TESTS         │
+       │ MAY INFORM        ▼
+       ├─ - - - - - ► ACTION / OBSERVED RESULT
+       │                   │
+       └──── updates ◄─────┘
+                           │
+                           ▼
+            HUMAN-ACCEPTED RECOVERY / CONVERGENCE
+                           │
+                           ▼
 REMAINING RISK / LINKED FOLLOW-UP RUNS
 
-AI assists evidence gathering, option generation,
-hypothesis generation, and analysis; it owns no gate.
+The investigation chain has no join barrier. AI assists
+evidence gathering, option generation, hypothesis
+generation, and analysis; it owns no gate.
 ```
 
 ## Incident and emergency overlay
@@ -174,6 +171,7 @@ During incident or emergency mode, maintain at minimum:
 
 - Workflow permission is not production authorization.
 - A live intervention requires an accountable human unless existing automation was previously authorized for that action.
+- Any lasting engineering change produced during stabilization still requires a human first-pass plan and independent human review, either in this record or a linked change run; emergency policy may defer but not erase those gates.
 - Kubernetes readiness, controller status, or a successful command is not automatically user-visible recovery.
 - The conclusion may include mechanism, trigger, enabling conditions, and detection or containment gaps rather than one root cause.
 - Closure does not require every follow-up to remain inside the operational run.

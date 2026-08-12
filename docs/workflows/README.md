@@ -17,6 +17,17 @@ The profiles are:
 
 Choose the flow by its dominant outcome, not by the issue label. Incident, emergency, security, regulatory, and other concerns are overlays or modifiers.
 
+## Rule hierarchy
+
+The pilot applies rules in this order:
+
+1. [AHEAD Constitution](../../CONSTITUTION.md)
+2. [Acceptable AI Use](../acceptable-ai-use.md)
+3. The selected workflow profile and applicable overlays
+4. Organization and repository guidance, which may narrow but not broaden AI authority
+
+Phase permission is not a waiver of higher-level policy. When rules appear to conflict, apply the more protective rule and record the ambiguity for correction.
+
 ## Shared pilot contract
 
 Every pilot run has:
@@ -42,10 +53,10 @@ Phases may loop or reopen. A workflow is not invalid merely because learning cha
 | Decision accepted | A course or intervention is selected | Chosen option, rationale, tradeoffs, unknowns, and accountable human |
 | Plan accepted | Before a lasting implementation | Human first-pass plan plus accepted AI challenges or additions |
 | Action authorized | Before a consequential, risky, destructive, or production action | Actor, purpose, scope, blast radius, rollback or containment, and authorization |
-| Human review accepted | Before accepting a lasting engineering change | Review of the current changeset and material evidence |
+| Independent human review accepted | Before accepting a lasting engineering change | Review of the current changeset and material evidence by a person other than the implementer; both implementer and reviewer understand their responsibilities |
 | Outcome accepted | Before closure | Verification against the original outcome plus remaining uncertainty and follow-ups |
 
-Emergency policy may defer nonessential documentation, but it does not remove authorization or accountability. Deferred reasoning is reconstructed after stabilization.
+Emergency policy may defer nonessential documentation and, where explicitly allowed, independent review needed to restore service. It does not remove authorization or accountability, and any deferred review gate remains open until a named human completes it after stabilization. Deferred reasoning is reconstructed after stabilization.
 
 ## Minimal run record
 
@@ -74,7 +85,7 @@ Diagram language is normative for the pilot:
 - `AI — ASSIST` means AI may research, organize, propose, explain, generate bounded material, or challenge; it does not own or approve the phase.
 - `AI REVIEW` is an additional review and never satisfies a human-review gate.
 - Every decision, test selection, risk acceptance, consequential-action authorization, final review, and outcome gate is human.
-- If a diagram and prose appear to disagree, the [AHEAD Constitution](../../CONSTITUTION.md) controls: humans lead and remain accountable; AI assists.
+- All diagram permissions remain bounded by the rule hierarchy above. Humans lead and remain accountable; AI assists.
 
 ```text
 ┌──────────────────────────────────────────────┐

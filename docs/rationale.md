@@ -63,7 +63,7 @@ AHEAD asks the human to contribute first where independent judgment matters:
 - select debugging hypotheses and tests;
 - choose the decision and accept its tradeoffs;
 - write the first-pass implementation or remediation plan;
-- own the implementation and final review.
+- own the implementation; for lasting changes, a different human performs the final engineering review.
 
 The first human contribution does not need to be polished or complete. Its purpose is to make the person's current mental model visible before AI influences it. AI can then do what it is particularly good at: broaden the search, find contradictions, identify omissions, generate counterarguments, and expose assumptions.
 
@@ -115,7 +115,7 @@ AI can consistently compare a large changeset against requirements, plans, commo
 
 Human reviewers understand organizational context, implicit architectural boundaries, operational history, product consequences, and whether the implementation is one the team is willing and able to own. They also carry accountability that an AI system cannot.
 
-AHEAD uses AI review before final human review. The AI broadens scrutiny; the human makes the final engineering judgment.
+AHEAD uses AI review before final human review. For a lasting engineering change, that final review is performed by a person other than the implementer. The AI broadens scrutiny; the independent human reviewer makes the final engineering judgment. In an emergency, review may be deferred to restore service, but it remains due after stabilization.
 
 ## The failure modes AHEAD is designed to prevent
 

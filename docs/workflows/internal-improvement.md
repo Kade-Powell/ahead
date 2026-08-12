@@ -80,12 +80,16 @@ Use product change when externally meaningful behavior is intentionally changing
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 8. HUMAN REVIEW GATE                         │
+│ 8. INDEPENDENT HUMAN REVIEW                  │
+│ • Reviewer is not the implementer            │
 │ • Final judgment on preservation/improvement │
 └──────────────────────┬───────────────────────┘
                        ↓
+       9. HUMAN AUTHORIZES DEPLOY / RELEASE
+                    WHEN APPLICABLE
+                       ↓
 ┌──────────────────────────────────────────────┐
-│ 9. VERIFY                                    │
+│ 10. VERIFY                                   │
 │                                              │
 │ HUMAN                                        │
 │ • Verify invariants                          │
@@ -95,17 +99,43 @@ Use product change when externally meaningful behavior is intentionally changing
 │ • Analyze measurements / suggest checks      │
 └──────────────────────┬───────────────────────┘
                        ↓
+┌──────────────────────────────────────────────┐
+│ 11. AI AUDIT                                 │
+│ • Compare invariants, target, plan, reviews, │
+│   deployment, and observed evidence          │
+│ HUMAN disposes material findings             │
+└──────────────────────┬───────────────────────┘
+                       ↓
                 ┌───────────────┐
-                │ PRESERVED AND │
-                │ IMPROVED?     │
+                │ INVARIANTS    │
+                │ PRESERVED?    │
                 └───────┬───────┘
                    NO ↙   ↘ YES
-         ↺ DECIDE / WORK    │
-                            ▼
-                   HUMAN OUTCOME GATE
+                     │     │
+                     │     ▼
+                     │  ┌────────────────┐
+                     │  │ TARGET QUALITY │
+                     │  │ IMPROVED?      │
+                     │  └───────┬────────┘
+                     │     NO ↙   ↘ YES
+                     │       │      └────► HUMAN OUTCOME GATE
+                     │       ▼
+                     │  HUMAN CHOOSES
+                     │  ├─ Rework ─────────────↺ IMPLEMENT
+                     │  ├─ Roll back ─────────► HUMAN OUTCOME
+                     │  └─ Accept partial/no improvement
+                     │     with rationale ─────► HUMAN OUTCOME
+                     ▼
+              HUMAN CHOOSES
+              ├─ Rework ──────────────────────↺ IMPLEMENT
+              ├─ Roll back ──────────────────► HUMAN OUTCOME
+              └─ Reclassify ─────────────────► NEW PRODUCT CHANGE RUN
+                                                + HUMAN OUTCOME
 
 Review changes requested ─────────────↺ IMPLEMENT
 ```
+
+Preservation and improvement are separate judgments. A failed invariant cannot be accepted as an internal improvement: the team must roll back, rework, or deliberately reclassify the work as a product change. If invariants hold but the target quality does not improve, a human may stop and record a partial or unsuccessful result rather than manufacture success.
 
 ## Minimal phases
 
@@ -118,8 +148,10 @@ Review changes requested ─────────────↺ IMPLEMENT
 | Plan | First-pass sequence, verification, and rollback | Find affected boundaries, migration needs, and missing tests | Plan and invariant checks | Human approves the final plan |
 | Implement | Engineering change and scope control | Bounded refactoring, explanation, tests, and mechanical assistance | Linked changeset and deviations | Change is ready for review |
 | AI review | Disposition of valid findings | Review for hidden behavior changes, incidental complexity, tests, and plan alignment | AI findings and dispositions | Blocking findings are resolved or rejected with rationale |
-| Human review | Final judgment about simplicity, coupling, risk, and preservation | Answer targeted questions and retrieve evidence | Current human review | Human accepts the current change |
-| Verify | Invariant preservation and target-quality comparison | Analyze measurements and suggest negative checks | Before/after evidence and invariant results | Preservation and improvement are demonstrated or failure is accepted |
+| Human review | Independent final judgment by someone other than the implementer about simplicity, coupling, risk, and preservation | Answer targeted questions and retrieve evidence | Current independent human review | Independent human reviewer accepts the current change |
+| Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended version reaches the target environment or deployment is explicitly not applicable |
+| Verify | Invariant preservation and target-quality comparison | Analyze measurements and suggest negative checks | Before/after and deployed-outcome evidence when applicable, plus invariant results | Invariants are evaluated and target-quality results are measured; an invariant failure routes to rollback, rework, or product-change reclassification |
+| AI audit | Disposition of findings and required response | Compare invariants, target, plan, reviews, deployment, and observed evidence; identify divergence or weak proof | Audit findings and dispositions | Human has reviewed material findings |
 | Outcome | Acceptance, rollback, partial result, or new work | Summarize learning | Outcome, remaining debt, and follow-ups | Human accepts closure |
 
 ## Preservation and improvement chain
@@ -140,11 +172,17 @@ HUMAN DECISION / FIRST-PASS PLAN
 ENGINEER-OWNED CHANGESET
                │
                ▼
-AI REVIEW + HUMAN REVIEW GATE
+AI REVIEW + INDEPENDENT HUMAN REVIEW
+               │
+               ▼
+HUMAN-AUTHORIZED DEPLOYMENT WHEN APPLICABLE
                │
                ▼
 HUMAN-ACCEPTED INVARIANT VERIFICATION
 AND BEFORE / AFTER COMPARISON
+               │
+               ▼
+AI AUDIT / HUMAN DISPOSITION
                │
                ▼
 HUMAN OUTCOME / REMAINING DEBT
@@ -157,6 +195,9 @@ HUMAN OUTCOME / REMAINING DEBT
 - AI may propose a refactor; humans decide whether it reduces conceptual complexity.
 - File movement or abstraction count is not itself an improvement.
 - The outcome compares before and after evidence against the declared target.
+- An invariant failure cannot close as a successful internal improvement.
+- AI review and implementer self-review do not satisfy independent human review.
+- Implementation completion is not deployment or outcome verification.
 
 ## Pilot questions
 

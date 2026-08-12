@@ -75,8 +75,9 @@ An investigation may end with no action, insufficient evidence, several viable i
 └──────────────────────┬───────────────────────┘
                        ↓
                 ┌───────────────┐
-                │ ENOUGH TO     │
-                │ CONCLUDE?     │
+                │ STOPPING      │
+                │ CONDITION     │
+                │ REACHED?      │
                 └───────┬───────┘
                    NO ↙   ↘ YES
            ↺ MODEL / PATHS  │
@@ -99,6 +100,8 @@ An investigation may end with no action, insufficient evidence, several viable i
 ```
 
 Full vibe coding is permitted for an isolated, explicitly disposable prototype when its purpose is learning. The learning is retained; prototype code is discarded or deliberately re-enters the appropriate production workflow.
+
+Stopping conditions may be satisfied by enough evidence for a conclusion, exhaustion of the agreed time or evidence budget, discovery that the question is not currently answerable, or another human-approved boundary. Therefore “insufficient evidence” can advance to synthesis and an honest conclusion rather than forcing an endless loop.
 
 ## Minimal phases
 

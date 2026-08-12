@@ -80,14 +80,14 @@ Use operational stabilization instead when a live system is unhealthy and restor
                       │
                       ▼
                 ┌──────────────┐
-                │ SUPPORTED    │
-                │ ENOUGH?      │
+                │ HUMAN READY  │
+                │ TO CHOOSE?   │
                 └──────┬───────┘
                    NO ↙  ↘ YES
                      │    │
                      │    ▼
-        ↺ HUMAN MODEL     HUMAN DIAGNOSIS
-                          OR ACCEPTED UNCERTAINTY
+        ↺ HUMAN MODEL     HUMAN ACCEPTS DIAGNOSIS
+                          OR UNKNOWN CAUSE / RISK
                                   │
                                   ▼
                          HUMAN FIX APPROACH
@@ -102,10 +102,20 @@ Use operational stabilization instead when a live system is unhealthy and restor
                               AI REVIEW
                                   │
                                   ▼
-                            HUMAN REVIEW
+                    INDEPENDENT HUMAN REVIEW
                                   │
                                   ▼
-                HUMAN VERIFIES ORIGINAL FAILURE
+                  HUMAN AUTHORIZES DEPLOY / RELEASE
+                           WHEN APPLICABLE
+                                  │
+                                  ▼
+          HUMAN VERIFIES CORRECTION OF ORIGINAL FAILURE
+                                  │
+                                  ▼
+                 HUMAN OBSERVES DEPLOYED OUTCOME
+                                  │
+                                  ▼
+                              AI AUDIT
                                   │
                                   ▼
                          HUMAN OUTCOME GATE
@@ -114,6 +124,8 @@ Not corrected ───────────────────↺ HUMAN
 ```
 
 Reproduction is useful but not a universal gate. Historical, intermittent, production-only, or already mitigated failures may proceed when the limitation is recorded.
+
+“Ready to choose” means either the evidence sufficiently supports a human-accepted diagnosis or the accountable human explicitly accepts that the cause remains unknown and records the risk of proceeding. Unsupported hypotheses alone do not satisfy the gate.
 
 ## Minimal phases
 
@@ -126,8 +138,11 @@ Reproduction is useful but not a universal gate. Historical, intermittent, produ
 | Plan | First-pass correction and verification plan | Find missing cases, risks, regression tests, and rollout concerns | Plan and rollback or containment needs | Human approves the plan |
 | Implement | Code and engineering changes | Bounded implementation and debugging assistance | Linked changeset and regression evidence | Change is ready for review |
 | AI review | Disposition of valid findings | Review correction, tests, risks, and plan alignment | AI findings and dispositions | Blocking findings are resolved or rejected with rationale |
-| Human review | Final engineering judgment | Answer targeted questions and retrieve evidence | Current human review | Human accepts the current change |
-| Verify outcome | Original failure, regression protection, deployed behavior when applicable | Suggest checks and analyze authorized evidence | Pre-change comparison, fix validation, and observed outcome | Human accepts correction or reopens investigation |
+| Human review | Independent final engineering judgment by someone other than the implementer | Answer targeted questions and retrieve evidence | Current independent human review | Independent human reviewer accepts the current change |
+| Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended correction reaches the target environment or deployment is explicitly not applicable |
+| Verify and observe | Original failure, regression protection, and deployed behavior when applicable | Suggest checks and analyze authorized evidence | Pre-change comparison, fix validation, deployment evidence, and observed outcome | The original failure and user-visible outcome are evaluated |
+| AI audit | Disposition of findings and required response | Compare the result with the failure, diagnosis or accepted uncertainty, correction, plan, reviews, and observed behavior | Audit findings and dispositions | Human has reviewed material findings |
+| Outcome | Acceptance, rollback, continued investigation, follow-up, or abandonment | Summarize learning | Result, causal confidence, uncertainty, and follow-ups | Human accepts closure or reopens/routes work |
 
 ## Evidence chain
 
@@ -152,13 +167,22 @@ FACTS / EVIDENCE ──► HUMAN MENTAL MODEL
              HUMAN CORRECTION DECISION / PLAN
                             │
                             ▼
-         ENGINEER CHANGE / AI REVIEW / HUMAN REVIEW
+     ENGINEER CHANGE / AI REVIEW / INDEPENDENT REVIEW
                             │
                             ▼
-           HUMAN-ACCEPTED FAILURE VERIFICATION
+                HUMAN-AUTHORIZED DEPLOYMENT
                             │
                             ▼
-             HUMAN-ACCEPTED DEPLOYED OUTCOME
+              CORRECTION VERIFICATION EVIDENCE
+                            │
+                            ▼
+                DEPLOYED OUTCOME EVIDENCE
+                            │
+                            ▼
+               AI AUDIT / HUMAN DISPOSITION
+                            │
+                            ▼
+                    HUMAN OUTCOME
 ```
 
 ## Non-waivable pilot rules
@@ -168,6 +192,8 @@ FACTS / EVIDENCE ──► HUMAN MENTAL MODEL
 - The human chooses or authorizes tests and interprets their results.
 - A plausible cause is not treated as proven.
 - Fix validation and post-deployment outcome verification are distinct when deployment applies.
+- AI review and implementer self-review do not satisfy independent human review.
+- Implementation completion is not deployment, recovery, or outcome verification.
 
 ## Pilot questions
 
