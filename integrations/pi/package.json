@@ -1,6 +1,6 @@
 {
   "name": "ahead-pi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AHEAD workflow enforcement and context for Pi",
   "license": "MIT",
   "type": "module",

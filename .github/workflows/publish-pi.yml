@@ -59,8 +59,24 @@ jobs:
       - name: Publish with provenance
         working-directory: integrations/pi
         run: npm publish --access public --provenance --tag "${{ steps.release.outputs.dist_tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify registry version
-        run: npm view "${{ steps.release.outputs.package_name }}@${{ steps.release.outputs.version }}" version
+        env:
+          PACKAGE_NAME: ${{ steps.release.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          for attempt in {1..10}; do
+            actual_version="$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version 2>/dev/null || true)"
+            if [[ "${actual_version}" == "${PACKAGE_VERSION}" ]]; then
+              echo "Verified ${PACKAGE_NAME}@${PACKAGE_VERSION}"
+              exit 0
+            fi
+
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} is not visible yet (attempt ${attempt}/10)"
+            if [[ "${attempt}" -lt 10 ]]; then
+              sleep 6
+            fi
+          done
+
+          echo "${PACKAGE_NAME}@${PACKAGE_VERSION} did not become visible in time" >&2
+          exit 1

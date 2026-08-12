@@ -48,7 +48,7 @@ The workflow has `id-token: write` and publishes with `--provenance`. Before tru
 
 ## Move to tokenless trusted publishing
 
-After the first package exists, open the `ahead-pi` package settings on npm and configure this trusted publisher:
+The `ahead-pi` package uses this trusted publisher:
 
 | npm field | Value |
 |---|---|
@@ -59,7 +59,7 @@ After the first package exists, open the `ahead-pi` package settings on npm and 
 | Environment | `npm` |
 | Allowed action | `npm publish` |
 
-Publish the next version and verify that OIDC authentication and automatic provenance succeed. Then remove the `NPM_TOKEN` environment secret, revoke the bootstrap token, and configure npm publishing access to require 2FA while disallowing traditional tokens. Keep the trusted publisher.
+The GitHub `npm` environment must not contain an `NPM_TOKEN` secret. npm publishing access requires 2FA, disallows bypass-2FA tokens, and keeps the trusted publisher. Each release verifies tokenless OIDC authentication and automatic provenance.
 
 ## Publish and verify
 
