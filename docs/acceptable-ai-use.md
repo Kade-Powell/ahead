@@ -43,7 +43,7 @@ The engineer checks local conventions, error handling, dependencies, security po
 
 ### Disposable prototypes and full vibe coding
 
-Full “vibe coding”—prompting AI to produce most or all of an implementation without first understanding every detail—is acceptable for a disposable prototype whose purpose is to learn quickly whether an idea is feasible or how an experience might turn out.
+Full “vibe coding”-prompting AI to produce most or all of an implementation without first understanding every detail-is acceptable for a disposable prototype whose purpose is to learn quickly whether an idea is feasible or how an experience might turn out.
 
 This exception applies only when all of these boundaries are explicit:
 
