@@ -110,8 +110,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   implement: {
     objective: "Produce a change the engineer understands and can defend.",
-    human: "Own the implementation, understand every lasting change, run the planned checks, and record deviations.",
-    ai: "Assist within the approved plan, explain changes, run authorized checks, and surface reasons to revisit earlier phases.",
+    human: "Make the first attempt, ask questions freely, own the implementation, understand every lasting change, run the planned checks, and record deviations.",
+    ai: "Coach, explain, help diagnose, and suggest bounded next steps within the approved plan. Do not turn a question into taking over the implementation.",
     artifactPrompts: {
       changeset: [
         "What exact commit, branch, pull request, or diff identifies the current change?",
@@ -252,7 +252,9 @@ export function nextAction(state: RunState, workflow: WorkflowDefinition): Guide
         ? "ai"
         : "human";
     if (actor === "human") {
-      const label = state.phase.id === "human-review"
+      const label = state.phase.id === "implement" && artifact.kind === "changeset"
+        ? "Implement first, then record the exact changeset"
+        : state.phase.id === "human-review"
         ? "Independent reviewer records the current human review"
         : `Write ${artifact.title}`;
       return { actor, label, artifactKind: artifact.kind };
@@ -323,7 +325,7 @@ export function buildWidgetLines(run: Run, state: RunState, workflow: WorkflowDe
     `AI: ${guide.ai}`,
     `Required: ${checklist}`,
     `Next (${action.actor === "human" ? "you" : "AI"}): ${action.label}`,
-    "Run /ahead for the guided action.",
+    "Run /ahead for the guided action · /ahead-guide for framework docs.",
   ];
 }
 

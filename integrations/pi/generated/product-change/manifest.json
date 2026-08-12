@@ -17,8 +17,8 @@
     "outcome.md"
   ],
   "sources": [
-    "pec/workflows/product-change-v0.1.json",
-    "olicy/common.md",
+    "spec/workflows/product-change-v0.1.json",
+    "policy/common.md",
     "policy/product-change/<phase>.md"
   ]
 }

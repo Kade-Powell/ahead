@@ -14,6 +14,13 @@ import {
   phaseGuide,
   phasePosition,
 } from "./guidance.js";
+import {
+  findReference,
+  loadReferenceIndex,
+  readReference,
+  relevantReferences,
+} from "./reference.js";
+import { showReferenceViewer } from "./reference-viewer.js";
 import { humanActor, projectRoot, RunStore } from "./storage.js";
 import type { Actor, Capability, EventAction, Run, RunState } from "./types.js";
 
@@ -38,12 +45,22 @@ const RecordArtifactParams = Type.Object({
   kind: Type.String({ description: "Artifact kind permitted for AI in the active phase" }),
   content: Type.String({ description: "Complete Markdown artifact content", maxLength: 100_000 }),
 });
+const ReferenceParams = Type.Object({
+  topic: Type.Optional(Type.String({ description: "Reference id, path, or title; omit to list phase-relevant references" })),
+});
 
 export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ahead", {
     description: "Enter or continue the guided AHEAD mode",
     handler: async (args, ctx) => command(ctx, async () => {
       await openAheadMode(pi, args, ctx);
+    }),
+  });
+
+  pi.registerCommand("ahead-guide", {
+    description: "Read the AHEAD framework guidance relevant to the active phase",
+    handler: async (args, ctx) => command(ctx, async () => {
+      await showAheadGuide(ctx, args);
     }),
   });
 
@@ -137,6 +154,7 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(
         [
           "/ahead [title] — enter, resume, or act in guided AHEAD mode",
+          "/ahead-guide [topic] — read the applicable AHEAD framework Markdown",
           "",
           "Once started, the repository run remains in AHEAD mode until an accountable human closes the outcome.",
           "Use normal conversation to think and work with AI. Run /ahead whenever you want the next valid action.",
@@ -161,6 +179,34 @@ export default function aheadExtension(pi: ExtensionAPI): void {
         const run = await requireRun(ctx);
         const state = (await enginePromise).deriveState(run);
         return { run, state };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "ahead_get_reference",
+    label: "AHEAD framework reference",
+    description: "List or read packaged AHEAD Constitution, philosophy, acceptable-use, engineering-practice, workflow, and evidence Markdown.",
+    promptSnippet: "Retrieve relevant AHEAD framework guidance when the phase or policy is unclear.",
+    parameters: ReferenceParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return toolResult(async () => {
+        const run = await storeFor(ctx).loadCurrent();
+        const phase = run && !(await enginePromise).deriveState(run).closed
+          ? (await enginePromise).deriveState(run).phase.id
+          : undefined;
+        if (!params.topic?.trim()) {
+          const index = await loadReferenceIndex();
+          return {
+            phase: phase ?? null,
+            recommended: await relevantReferences(phase),
+            available: index.references.map(({ id, title, path }) => ({ id, title, path })),
+            instruction: "Request one reference by id, path, or title. Load only what is relevant.",
+          };
+        }
+        const entry = await findReference(params.topic);
+        if (!entry) throw new Error(`No packaged AHEAD reference matches ${params.topic}`);
+        return { reference: entry, content: await readReference(entry) };
       });
     },
   });
@@ -277,6 +323,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       "- Never author a human-owned artifact, make a human decision, accept a gate, transition the run, approve a change, or claim accountability.",
       "- When required AI-owned work is ready, record it with ahead_record_artifact and explain what the human must validate or decide.",
       "- Treat AI review findings as hypotheses. Independent human review remains required for lasting engineering changes.",
+      "- Humans may ask questions at any phase. During implementation, help them understand or solve the problem without taking over; if their first attempt or current model is missing, ask for it.",
+      "- When AHEAD policy or rationale is unclear, use ahead_get_reference to retrieve only the applicable packaged Markdown.",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${phaseInstructions}\n\n${liveContext}\n` };
   });
@@ -378,10 +426,18 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
     state.allowed_ai_capabilities.length > 0
     && action.actor !== "ai"
     && !missingRequired.some((artifact) => artifact.actor === "ai")
+    && state.phase.id !== "implement"
   ) {
     actions.push({
       label: `Ask AI to assist · ${state.phase.title}`,
       run: async () => requestAiAssistance(pi, state),
+    });
+  }
+
+  if (state.phase.id === "implement") {
+    actions.push({
+      label: "Ask AI for help understanding or solving a problem",
+      run: async () => askImplementationQuestion(pi, ctx, state),
     });
   }
 
@@ -391,6 +447,11 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
       run: async () => returnToEarlierPhase(ctx, ""),
     });
   }
+
+  actions.push({
+    label: "Read AHEAD framework guidance for this phase",
+    run: async () => showAheadGuide(ctx, ""),
+  });
 
   actions.push({
     label: "Explain this phase and its expectations",
@@ -414,6 +475,73 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
   );
   const chosen = actions.find((candidate) => candidate.label === selected);
   if (chosen) await chosen.run();
+}
+
+async function askImplementationQuestion(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  state: RunState,
+): Promise<void> {
+  if (!ctx.hasUI) throw new Error("Implementation coaching requires interactive or RPC UI support");
+  const question = await ctx.ui.editor(
+    "AHEAD implementation help · human first",
+    [
+      "## What are you trying to understand or solve?",
+      "",
+      "",
+      "## What do you currently think is happening or should happen?",
+      "",
+      "",
+      "## What have you tried or inspected so far?",
+      "",
+      "",
+      "## What kind of help would be useful?",
+      "",
+      "<!-- Ask for explanation, a hint, competing approaches, debugging help, or a bounded suggestion. -->",
+      "",
+    ].join("\n"),
+  );
+  if (!question?.trim()) return;
+  pi.sendUserMessage([
+    `AHEAD mode: help me with this ${state.phase.title} question while I remain the implementer.`,
+    "Use my current model and first attempt below. Help me understand or solve the problem with questions, explanation, evidence, hints, and bounded next steps.",
+    "Do not convert this question into autonomous implementation or author my human-owned records. If I later request a bounded mechanical edit, explain it so I can inspect and own it.",
+    "",
+    question.trim(),
+  ].join("\n"));
+}
+
+async function showAheadGuide(ctx: ExtensionCommandContext, requestedTopic: string): Promise<void> {
+  if (!ctx.hasUI) throw new Error("Reading AHEAD framework guidance requires interactive or RPC UI support");
+  const run = await storeFor(ctx).loadCurrent();
+  const phase = run && !(await enginePromise).deriveState(run).closed
+    ? (await enginePromise).deriveState(run).phase.id
+    : undefined;
+  const index = await loadReferenceIndex();
+  let entry = requestedTopic.trim() && requestedTopic.trim().toLowerCase() !== "all"
+    ? await findReference(requestedTopic)
+    : undefined;
+
+  if (requestedTopic.trim() && requestedTopic.trim().toLowerCase() !== "all" && !entry) {
+    throw new Error(`No packaged AHEAD reference matches ${requestedTopic.trim()}`);
+  }
+
+  if (!entry) {
+    const recommended = requestedTopic.trim().toLowerCase() === "all"
+      ? index.references
+      : await relevantReferences(phase);
+    const browseAll = "Browse all packaged AHEAD Markdown";
+    const selected = await ctx.ui.select(
+      phase ? `AHEAD guidance · ${phase}` : "AHEAD framework guidance",
+      [...recommended.map((candidate) => candidate.title), ...(recommended.length < index.references.length ? [browseAll] : [])],
+    );
+    if (!selected) return;
+    if (selected === browseAll) return showAheadGuide(ctx, "all");
+    entry = recommended.find((candidate) => candidate.title === selected);
+  }
+  if (!entry) return;
+
+  await showReferenceViewer(ctx, `AHEAD reference · ${entry.title}`, await readReference(entry));
 }
 
 async function startRun(ctx: ExtensionCommandContext, requestedTitle: string): Promise<Run | undefined> {

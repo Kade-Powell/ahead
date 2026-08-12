@@ -120,6 +120,23 @@ test("AI review is explicitly bound in guidance to the current changeset", () =>
   assert.match(action.label, /exact current changeset/);
 });
 
+test("implementation guidance keeps the engineer first while making help explicit", () => {
+  const current = state(
+    "implement",
+    [artifact("changeset", "Linked changeset", "human", true)],
+    { allowed_ai_capabilities: ["inspect", "analyze", "modify", "execute"] },
+  );
+  const action = nextAction(current, workflow);
+  assert.deepEqual(action, {
+    actor: "human",
+    artifactKind: "changeset",
+    label: "Implement first, then record the exact changeset",
+  });
+  const widget = buildWidgetLines(run, current, workflow).join("\n");
+  assert.match(widget, /Make the first attempt, ask questions freely/);
+  assert.match(widget, /Do not turn a question into taking over/);
+});
+
 test("human-review widget makes the independent handoff and authority boundary visible", () => {
   const current = state(
     "human-review",

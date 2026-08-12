@@ -1,0 +1,180 @@
+{
+  "generated_from": [
+    "CONSTITUTION.md",
+    "docs/acceptable-ai-use.md",
+    "docs/design/debugging-and-operations.md",
+    "docs/design/executable-workflows.md",
+    "docs/design/process-taxonomy.md",
+    "docs/engineering-practice.md",
+    "docs/evidence/evidence-standard.md",
+    "docs/evidence/research-map.md",
+    "docs/rationale.md",
+    "docs/references/pragmatic-programmer-page-index.md",
+    "docs/references/submitted-engineering-notes.md",
+    "docs/releasing-pi.md",
+    "docs/workflows/README.md",
+    "docs/workflows/corrective-debugging.md",
+    "docs/workflows/decision.md",
+    "docs/workflows/internal-improvement.md",
+    "docs/workflows/investigation.md",
+    "docs/workflows/operational-stabilization.md",
+    "docs/workflows/product-change.md"
+  ],
+  "references": [
+    {
+      "id": "constitution",
+      "path": "CONSTITUTION.md",
+      "title": "AHEAD Constitution",
+      "summary": "This constitution records the durable principles of **Assisted Human Engineering and Development**. Workflows and tools may evolve. These principles define what makes them AHEAD.",
+      "phases": [
+        "*"
+      ]
+    },
+    {
+      "id": "acceptable-ai-use",
+      "path": "docs/acceptable-ai-use.md",
+      "title": "Acceptable AI Use in AHEAD",
+      "summary": "This policy is binding for AHEAD pilot workflows. The [AHEAD Constitution](../CONSTITUTION.md) is the highest authority; this policy interprets its human-ownership boundaries; workflow profiles apply both and may narrow AI permissions for a",
+      "phases": [
+        "*"
+      ]
+    },
+    {
+      "id": "design:debugging-and-operations",
+      "path": "docs/design/debugging-and-operations.md",
+      "title": "Debugging and Operational Investigation",
+      "summary": "The minimal [corrective-debugging](../workflows/corrective-debugging.md) and [operational-stabilization](../workflows/operational-stabilization.md) profiles translate this discussion into pilotable flows. This document retains the reasoning",
+      "phases": []
+    },
+    {
+      "id": "design:executable-workflows",
+      "path": "docs/design/executable-workflows.md",
+      "title": "Executable AHEAD Workflows",
+      "summary": "The executable layer makes AHEAD workflow state durable and makes selected human/AI boundaries enforceable across integrations. It does not turn judgment into a checklist or make workflow artifacts proof of understanding.",
+      "phases": [
+        "*"
+      ]
+    },
+    {
+      "id": "design:process-taxonomy",
+      "path": "docs/design/process-taxonomy.md",
+      "title": "AHEAD Process Taxonomy",
+      "summary": "AHEAD should not create a workflow for every issue label. “Security,” “performance,” “data,” “incident,” and “technical debt” often describe risk, domain, urgency, or cause—not the kind of reasoning needed to complete the work.",
+      "phases": []
+    },
+    {
+      "id": "engineering-practice",
+      "path": "docs/engineering-practice.md",
+      "title": "AHEAD Engineering Practice",
+      "summary": "AHEAD is not only a sequence of AI gates. It is a way of practicing engineering. This guide distills general habits from the submitted starting list into a smaller set of principles that can be remembered, applied, and evaluated.",
+      "phases": [
+        "*"
+      ]
+    },
+    {
+      "id": "evidence:evidence-standard",
+      "path": "docs/evidence/evidence-standard.md",
+      "title": "AHEAD Evidence Standard",
+      "summary": "AHEAD should be supported by the best available evidence without claiming more certainty than software-engineering research can provide. A credible methodology must distinguish evidence for a descriptive claim from evidence that a particula",
+      "phases": [
+        "research",
+        "questions",
+        "decision",
+        "plan",
+        "ai-review",
+        "human-review",
+        "verify",
+        "ai-audit",
+        "outcome"
+      ]
+    },
+    {
+      "id": "evidence:research-map",
+      "path": "docs/evidence/research-map.md",
+      "title": "AHEAD Research Map",
+      "summary": "This document maps current AHEAD design claims to available evidence. It is not a bibliography of everything related to software engineering. It focuses on claims that materially shape the methodology.",
+      "phases": []
+    },
+    {
+      "id": "rationale",
+      "path": "docs/rationale.md",
+      "title": "Why AHEAD",
+      "summary": "AI can make software engineering faster. It can search broadly, synthesize information, identify omissions, generate alternatives, produce routine code, explain unfamiliar systems, and review more material than a person can inspect unaided.",
+      "phases": [
+        "*"
+      ]
+    },
+    {
+      "id": "references:pragmatic-programmer-page-index",
+      "path": "docs/references/pragmatic-programmer-page-index.md",
+      "title": "*The Pragmatic Programmer* Page Index",
+      "summary": "This index preserves the page-level provenance from the original AHEAD engineering-practice notes for:",
+      "phases": []
+    },
+    {
+      "id": "references:submitted-engineering-notes",
+      "path": "docs/references/submitted-engineering-notes.md",
+      "title": "Submitted Engineering Notes",
+      "summary": "This document preserves submitted engineering tips, checklists, and practices that are intentionally condensed in the [AHEAD Engineering Practice](../engineering-practice.md) guide. It is a source record, not a claim that every item is an e",
+      "phases": []
+    },
+    {
+      "id": "releasing-pi",
+      "path": "docs/releasing-pi.md",
+      "title": "Releasing the Pi Extension",
+      "summary": "- npm package: `ahead-pi` - package source: `integrations/pi` - release workflow: `.github/workflows/publish-pi.yml` - release tag: `pi-v<package-version>` - stable npm dist-tag: `latest` - prerelease npm dist-tag: `next` - registry: `https",
+      "phases": []
+    },
+    {
+      "id": "workflows:readme",
+      "path": "docs/workflows/README.md",
+      "title": "AHEAD Pilot Workflows",
+      "summary": "These six minimal workflow profiles are meant to be used on real engineering work before AHEAD builds a workflow engine, editor extension, or CI enforcement. They are deliberately small. The pilot should reveal which phases, gates, and reco",
+      "phases": []
+    },
+    {
+      "id": "workflows:corrective-debugging",
+      "path": "docs/workflows/corrective-debugging.md",
+      "title": "Corrective Debugging Workflow",
+      "summary": "Use this flow when observed behavior conflicts with intended behavior and the dominant work is causal diagnosis plus correction. It ends with a verified correction or an explicit human acceptance of remaining uncertainty.",
+      "phases": []
+    },
+    {
+      "id": "workflows:decision",
+      "path": "docs/workflows/decision.md",
+      "title": "Decision Workflow",
+      "summary": "Use this flow when the deliverable is an accountable human choice among alternatives: architecture, buy versus build, technology selection, platform direction, policy, or another consequential course.",
+      "phases": []
+    },
+    {
+      "id": "workflows:internal-improvement",
+      "path": "docs/workflows/internal-improvement.md",
+      "title": "Internal Improvement Workflow",
+      "summary": "Use this flow when externally required behavior should remain invariant while an internal quality improves: maintainability, comprehensibility, performance, reliability margin, operability, testability, cost, or preventive risk reduction.",
+      "phases": []
+    },
+    {
+      "id": "workflows:investigation",
+      "path": "docs/workflows/investigation.md",
+      "title": "Investigation Workflow",
+      "summary": "Use this flow when the primary deliverable is knowledge or reduced uncertainty and no intervention has yet been selected. It may answer feasibility, causal, capacity, vendor, architectural, or technical questions.",
+      "phases": []
+    },
+    {
+      "id": "workflows:operational-stabilization",
+      "path": "docs/workflows/operational-stabilization.md",
+      "title": "Operational Stabilization Workflow",
+      "summary": "Use this flow when a live system is outside an acceptable operating state and the immediate outcome is restoration, stabilization, or demonstrated convergence. It covers code and non-code causes such as reconciliation storms, configuration ",
+      "phases": []
+    },
+    {
+      "id": "workflows:product-change",
+      "path": "docs/workflows/product-change.md",
+      "title": "Product Change Workflow",
+      "summary": "Use this flow when the dominant outcome is new, changed, adapted, migrated, or retired externally meaningful behavior. It ends with verified intended behavior and an accountable human outcome decision.",
+      "phases": [
+        "*"
+      ]
+    }
+  ]
+}
