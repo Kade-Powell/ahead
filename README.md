@@ -18,6 +18,7 @@ AHEAD is being designed for several kinds of engineering work, including feature
 - [Constitution](CONSTITUTION.md) records its non-negotiable principles.
 - [Acceptable AI use](docs/acceptable-ai-use.md) defines appropriate, conditional, and prohibited uses of AI in engineering work.
 - [Engineering practice](docs/engineering-practice.md) distills the general habits AHEAD expects engineers to cultivate.
+- [Pragmatic Programmer page index](docs/references/pragmatic-programmer-page-index.md) preserves the edition-specific page references behind the submitted practice notes.
 - [Process taxonomy](docs/design/process-taxonomy.md) defines the six proposed workflow families and the test for adding another.
 - [Debugging and operational investigation](docs/design/debugging-and-operations.md) captures the current design discussion; it is not yet a final workflow specification.
 - [Evidence standard](docs/evidence/evidence-standard.md) defines what AHEAD means by evidence-backed.

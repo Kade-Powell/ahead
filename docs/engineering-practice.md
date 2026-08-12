@@ -8,11 +8,13 @@ AHEAD is not only a sequence of AI gates. It is a way of practicing engineering.
 
 Many of these ideas come from practitioner literature rather than controlled experiments. The source type matters: a useful craft principle can guide work without being misrepresented as science.
 
+The submitted notes include page-level references to *The Pragmatic Programmer*. Those locators are preserved in the [edition-specific page index](references/pragmatic-programmer-page-index.md) and grouped below so the distillation remains traceable to its source.
+
 ## 1. Care about the craft and own the result
 
 Engineering quality begins with attention, pride, and accountability. Treat code, documentation, tests, operations, and communication as parts of one professional result. Do not submit work merely because a tool produced it or a check passed.
 
-Basis: practitioner guidance in *The Pragmatic Programmer*, Toyota's human-centered improvement philosophy, and AHEAD's constitution.
+Basis: *The Pragmatic Programmer* tips 1 (p. xlx as submitted) and 70 (p. 258), Toyota's human-centered improvement philosophy, and AHEAD's constitution.
 
 ## 2. Think deliberately
 
@@ -20,7 +22,7 @@ Stay aware of what you are doing and why. Critique assumptions, inspect evidence
 
 When a tool proposes an answer, ask what would disprove it and what information it could not see.
 
-Basis: practitioner guidance plus direct debugging research on mental models and hypothesis testing.
+Basis: *The Pragmatic Programmer* tips 2 (p. xlx as submitted), 9 (p. 16), 27 (p. 97), and 44 (p. 175), plus direct debugging research on mental models and hypothesis testing.
 
 ## 3. Start from users, domain, and real constraints
 
@@ -28,7 +30,7 @@ Requirements are discovered and refined, not merely received. Work with users an
 
 Quality is contextual. Reliability, latency, accessibility, security, cost, maintainability, and delivery time do not have one universal ordering; accountable humans decide what the work requires.
 
-Basis: requirements and traceability research, ISO/IEC/IEEE life-cycle standards, and *The Pragmatic Programmer*.
+Basis: requirements and traceability research, ISO/IEC/IEEE life-cycle standards, and *The Pragmatic Programmer* tips 7 (p. 11), 17 (p. 58), 51 (p. 202), 52 (p. 204), 54 (p. 210), and 55 (p. 213).
 
 ## 4. Make reasoning visible
 
@@ -36,7 +38,7 @@ Record important assumptions, options, decisions, tradeoffs, evidence, uncertain
 
 Traceability should help future engineers understand why and where—not become compliance theater.
 
-Basis: controlled evidence that requirements-to-code traceability can improve maintenance-task performance, plus AHEAD's evidence standard.
+Basis: controlled evidence that requirements-to-code traceability can improve maintenance-task performance, AHEAD's evidence standard, and *The Pragmatic Programmer* tips 10 (p. 21), 18 (p. 64), 19 (p. 69), 20 (p. 74), and 23 (p. 88).
 
 ## 5. Prefer simple, local reasoning
 
@@ -44,7 +46,7 @@ Choose designs that minimize the number of concepts a person must hold simultane
 
 Modularity is not automatically simplicity: separate modules can remain tightly coupled through hidden assumptions, timing, shared state, or required call order.
 
-Basis: Rich Hickey's *Simple Made Easy* and practitioner design guidance. These are design heuristics, not universal experimental laws.
+Basis: Rich Hickey's *Simple Made Easy* and *The Pragmatic Programmer* tips 11 (p. 27), 13 (p. 35), 36 (p. 140), 41 (p. 156), and 42 (p. 161). These are design heuristics, not universal experimental laws.
 
 ## 6. Design for change without speculative machinery
 
@@ -52,7 +54,7 @@ Decisions can be revised, so record their rationale, reversibility, and review t
 
 Use a “rule of three” only as a prompt for judgment, not a mechanical law. Duplication of knowledge is more dangerous than superficially similar code; premature abstraction can couple cases that should evolve separately.
 
-Basis: practitioner guidance. The precise abstraction threshold is context-dependent.
+Basis: *The Pragmatic Programmer* tips 4 (p. 5), 12 (p. 33), 14 (p. 46), 47 (p. 186), and 53 (p. 209). The precise abstraction threshold is context-dependent.
 
 ## 7. Prototype to learn
 
@@ -62,7 +64,7 @@ This is a legitimate place for full “vibe coding”: AI may rapidly generate t
 
 Prototype code does not silently become production code. Preserve the learning, then discard the implementation. If any code is retained, it leaves the prototype exception and enters the normal human-understanding, design, implementation, test, security, and review process.
 
-Basis: empirical software-prototyping research, practitioner guidance, and AHEAD's Investigation process hypothesis. The evidence supports prototyping as a learning practice; the permission for full AI generation inside strict boundaries is AHEAD policy.
+Basis: empirical software-prototyping research, *The Pragmatic Programmer* tips 15 (p. 49) and 16 (p. 54), its prototyping checklist (p. 53), and AHEAD's Investigation process hypothesis. The evidence supports prototyping as a learning practice; the permission for full AI generation inside strict boundaries is AHEAD policy.
 
 ## 8. Automate repeatable mechanics
 
@@ -70,7 +72,7 @@ Use source control, shells, scripts, formatters, generators, CI, and other autom
 
 Do not automate a process you cannot evaluate. Judge tools by the long-lived artifacts and operational behavior they produce, not only authoring convenience or initial speed.
 
-Basis: *The Pragmatic Programmer*, NIST secure-development guidance, and AHEAD's Toyota analogy.
+Basis: *The Pragmatic Programmer* tips 21 (p. 80), 22 (p. 85), 28 (p. 100), 29 (p. 103), and 61 (p. 231), NIST secure-development guidance, and AHEAD's Toyota analogy.
 
 ## 9. Design for testing and failure
 
@@ -78,7 +80,7 @@ Think about verification before implementation. Define observable behavior, inva
 
 Coverage is evidence about execution, not proof of correctness. Test the tests through mutation, fault injection, or known negative cases where proportionate. When a defect is fixed, preserve a regression check when one can reliably express the failure.
 
-Basis: software-testing research and consensus practice. Evidence for specific methods such as strict test-driven development is mixed and context-dependent; AHEAD does not mandate one universal test-writing order.
+Basis: software-testing research and *The Pragmatic Programmer* tips 30–35 (pp. 107–129), 48–50 (pp. 192–199), and 62–66 (pp. 237–247). Evidence for specific methods such as strict test-driven development is mixed and context-dependent; AHEAD does not mandate one universal test-writing order.
 
 ## 10. Debug with evidence, not confidence or blame
 
@@ -86,7 +88,7 @@ Do not panic, guess from the loudest log, or assume the platform is broken. Esta
 
 Treat application code, dependencies, infrastructure, configuration, data, operator actions, and external systems as candidates whose likelihood changes with evidence. Focus on restoring and improving the system rather than protecting or assigning personal blame.
 
-Basis: direct empirical debugging and incident-response studies.
+Basis: direct empirical debugging and incident-response studies, plus *The Pragmatic Programmer* tips 24–27 (pp. 91–97) and debugging checklist (p. 98).
 
 ## 11. Review independently and communicate honestly
 
@@ -94,7 +96,7 @@ Review is a reasoning activity, not an approval button. Review the current artif
 
 Technical communication should be clear, audience-aware, and grounded in the author's understanding. State observed fact, interpretation, uncertainty, decision, and request distinctly. Do not polish weak understanding into false confidence.
 
-Basis: empirical code-review research, NIST generative-AI risk guidance, and practitioner communication guidance.
+Basis: empirical code-review research, NIST generative-AI risk guidance, and *The Pragmatic Programmer* tips 3 (p. 3), 10 (p. 21), and 67–70 (pp. 248–258).
 
 ## 12. Learn continuously and measure the tools
 
@@ -102,7 +104,7 @@ Build breadth by learning new languages, paradigms, ecosystems, tools, and opera
 
 Do not infer learning or productivity from ease, enjoyment, or generated volume. Measure relevant outcomes. AI studies currently show both productivity gains and losses in different settings, and emerging evidence shows that full delegation can reduce skill formation.
 
-Basis: randomized AI/developer studies, professional learning guidance, and the Toyota principle that human skill and automation should improve together.
+Basis: randomized AI/developer studies, *The Pragmatic Programmer* tips 8 (p. 14), 9 (p. 16), 58 (p. 220), and 59 (p. 222), and the Toyota principle that human skill and automation should improve together.
 
 ## Compact working checklist
 
@@ -140,6 +142,7 @@ Before merge or delivery:
 These are recommended practitioner sources, not scientific proof of AHEAD:
 
 - David Thomas and Andrew Hunt, [*The Pragmatic Programmer: Your Journey to Mastery*, 20th Anniversary Edition](https://pragprog.com/titles/tpp20/the-pragmatic-programmer-20th-anniversary-edition/), ISBN 9780135957059.
+  - AHEAD preserves the submitted print-page locators in its [Pragmatic Programmer page index](references/pragmatic-programmer-page-index.md).
 - Luca Palmieri, [*Zero To Production In Rust*](https://www.zero2prod.com/), ISBN 9798847211437. This is a concrete production-backend learning path rather than a general philosophy source.
 - Richard Hamming, [*The Art of Doing Science and Engineering: Learning to Learn*](https://press.stripe.com/the-art-of-doing-science-and-engineering), ISBN 9781732265172.
 - Rich Hickey, [*Simple Made Easy*](https://www.youtube.com/watch?v=SxdOUGdseq4), Strange Loop 2011.
