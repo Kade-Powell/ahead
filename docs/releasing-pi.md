@@ -20,7 +20,7 @@ Publishing is triggered only by publishing a GitHub Release whose tag starts wit
 
 The job uses the GitHub `npm` environment. Configure that environment with a required reviewer if releases need an explicit second confirmation.
 
-Before the first public release, make and record a deliberate repository/package license decision. AHEAD currently has no license file or package license declaration; the publishing machinery does not silently choose one.
+AHEAD is released under the MIT License. The repository license file and each published package must declare the same license.
 
 ## Prepare a version
 
