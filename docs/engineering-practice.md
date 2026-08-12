@@ -8,7 +8,7 @@ AHEAD is not only a sequence of AI gates. It is a way of practicing engineering.
 
 Many of these ideas come from practitioner literature rather than controlled experiments. The source type matters: a useful craft principle can guide work without being misrepresented as science.
 
-The submitted notes include page-level references to *The Pragmatic Programmer*. Those locators are preserved in the [edition-specific page index](references/pragmatic-programmer-page-index.md) and grouped below so the distillation remains traceable to its source.
+The submitted notes include page-level references to *The Pragmatic Programmer*. Those locators are preserved in the [edition-specific page index](references/pragmatic-programmer-page-index.md) and grouped below so the distillation remains traceable to its source. Additional submitted tips, complete checklists, and practices are retained in the [submitted engineering notes](references/submitted-engineering-notes.md); the practice guide condenses them without replacing that source record.
 
 ## 1. Care about the craft and own the result
 

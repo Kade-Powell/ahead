@@ -106,6 +106,8 @@ Two submitted locators look like transcription errors but are intentionally pres
 
 The submitted “Aspects of Testing” checklist did not include a page locator, so this index does not invent one.
 
+The complete submitted checklist bodies and the additional post-Pragmatic tips and practices are retained in the [submitted engineering notes](submitted-engineering-notes.md).
+
 ## Maintenance rule
 
 When AHEAD guidance derived from these notes is reorganized or condensed, retain the page-level reference either at the point of use or through a link to this index. If a locator is corrected against the referenced print edition, record the correction in the commit rather than silently replacing the submitted value.
