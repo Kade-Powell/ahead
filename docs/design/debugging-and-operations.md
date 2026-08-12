@@ -102,3 +102,13 @@ Mitigation and recovery must not be blocked on completing a full diagnosis. Risk
 - Which incident records must be produced during response, and which may be reconstructed afterward?
 - How should follow-up work remain linked without keeping the incident itself permanently open?
 
+## Evidence basis
+
+The current reasoning loop is supported by direct empirical software-engineering research, though the exact AHEAD recording requirements are not yet validated:
+
+- [Li and Coblenz, *A Grounded Theory of Debugging in Professional Software Engineering Practice*](https://arxiv.org/abs/2602.11435) observed professional developers and describes debugging as iterative mental-model construction that guides information gathering.
+- [Alaboudi and LaToza, *Using Hypotheses as a Debugging Aid*](https://doi.org/10.1109/VL/HCC50065.2020.9127273) found that early correct hypotheses predicted success and that supplying potential hypotheses helped more than supplying fault locations in their controlled experiment.
+- [Sillito and Kutomi, *Failures and Fixes*](https://doi.org/10.1109/ICSME46990.2020.00027) analyzed 30 incidents and identified distinct investigative and mitigative strategies.
+- [Ghosh et al., *How to Fight Production Incidents?*](https://doi.org/10.1145/3542929.3563482) studied hundreds of high-severity cloud incidents, including non-code causes, across detection, diagnosis, and mitigation.
+
+These studies support the shape of the process. They do not prove that requiring engineers to record every fact, hypothesis, or test improves results. AHEAD must test the minimum useful structure and remove requirements that interrupt investigation without improving reasoning, handoff, or learning.

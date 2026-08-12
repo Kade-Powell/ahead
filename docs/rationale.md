@@ -170,3 +170,10 @@ The human supplies intent, context, judgment, and responsibility. AI supplies re
 
 That is why AHEAD means **Assisted Human Engineering and Development**. The adjective is “assisted.” The subject is human engineering.
 
+## Evidence posture
+
+AHEAD is evidence-informed; it is not yet an experimentally validated methodology. No single study establishes that the complete AHEAD sequence is optimal. Some principles have direct support from empirical software-engineering research, some draw on adjacent cognitive research or consensus standards, and some—especially the exact “human first” sequencing—remain design hypotheses that AHEAD must test.
+
+The existing evidence also resists simplistic claims about AI. A randomized field study across 4,867 developers found increased completed tasks with access to an AI coding assistant, while a smaller randomized study of experienced open-source developers working in familiar repositories found that the available AI tools increased completion time. The responsible conclusion is that AI's effect depends on the people, task, system, tool, and outcome being measured—not that AI is inherently productive or unproductive.
+
+AHEAD will maintain a [research map](evidence/research-map.md) that records the evidence and limitations behind each important process choice. Its [evidence standard](evidence/evidence-standard.md) defines how claims are classified and how the methodology should be revised when better evidence appears.
