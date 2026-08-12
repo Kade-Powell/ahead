@@ -170,6 +170,37 @@ The human supplies intent, context, judgment, and responsibility. AI supplies re
 
 That is why AHEAD means **Assisted Human Engineering and Development**. The adjective is “assisted.” The subject is human engineering.
 
+## How AHEAD expects engineers to work
+
+AHEAD's philosophy applies beyond explicit workflow gates. Engineers should:
+
+- care about the quality and consequences of their work;
+- think deliberately rather than operate on autopilot;
+- understand the user, domain, constraints, and system before optimizing a solution;
+- make assumptions, evidence, decisions, and uncertainty visible;
+- prefer simple, local, independently changeable parts over convenient but entangled designs;
+- prototype to learn without quietly turning exploratory code into production code;
+- automate repeatable mechanics while retaining mastery of the work being automated;
+- design for testing, failure, diagnosis, and recovery;
+- use version control, traceable decisions, and durable engineering records;
+- fix problems without turning investigation into blame;
+- communicate from genuine understanding and state uncertainty honestly;
+- keep learning, including learning when a favored tool or practice does not improve outcomes.
+
+The detailed [engineering-practice guide](engineering-practice.md) traces these recommendations to empirical research, standards, and practitioner sources. Not every useful craft principle has experimental support; AHEAD labels the source and strength instead of presenting all advice as settled science.
+
+## Acceptable use of AI
+
+AI use is appropriate when it expands human reach without replacing the human reasoning, knowledge, or accountability the work requires. Typical uses include research, bounded boilerplate, candidate tests after a human defines expected behavior, examples and fixtures, explanations, proposed refactorings, documentation drafts based on supplied facts, structured meeting notes, additional design options, debugging hypotheses, and first-pass review.
+
+Full vibe coding is also appropriate for explicitly disposable, isolated prototypes built to answer a learning question quickly. The prototype may demonstrate feasibility or reveal how an idea feels, but it is not production evidence. Useful learning is preserved; prototype code is discarded. Anything retained must re-enter the ordinary human-led engineering workflow.
+
+AI use is not acceptable when it defines business behavior, substitutes for learning or codebase knowledge, makes a consequential decision, produces core business logic on the engineer's behalf, hides uncertainty, invents evidence, impersonates human authorship, performs final approval, uses unauthorized sensitive context, or produces code the responsible engineer cannot explain, test, maintain, debug, and change.
+
+The boundary depends on risk. AI may assist with security, authorization, cryptography, data migrations, infrastructure, CI/CD, or production operations, but such work requires explicit human design, authorization, and independent verification. Workflow permission never grants operational permission.
+
+The full [acceptable-use policy](acceptable-ai-use.md) records the conditions, heightened-review areas, prohibited uses, and evidence behind these boundaries.
+
 ## Evidence posture
 
 AHEAD is evidence-informed; it is not yet an experimentally validated methodology. No single study establishes that the complete AHEAD sequence is optimal. Some principles have direct support from empirical software-engineering research, some draw on adjacent cognitive research or consensus standards, and some—especially the exact “human first” sequencing—remain design hypotheses that AHEAD must test.
