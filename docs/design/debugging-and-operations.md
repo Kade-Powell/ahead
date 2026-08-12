@@ -2,6 +2,8 @@
 
 Status: design discussion, not an approved workflow specification
 
+The minimal [corrective-debugging](../workflows/corrective-debugging.md) and [operational-stabilization](../workflows/operational-stabilization.md) profiles translate this discussion into pilotable flows. This document retains the reasoning and unresolved questions behind them.
+
 ## Human ownership
 
 Debugging is human-owned. AI may help collect and organize evidence, suggest hypotheses and tests, identify contradictions, explain systems, and challenge conclusions. The human chooses what to investigate, performs or authorizes tests, interprets the evidence, selects interventions, and accepts the conclusion or remaining uncertainty.

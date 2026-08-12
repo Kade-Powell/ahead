@@ -19,6 +19,7 @@ AHEAD is being designed for several kinds of engineering work, including feature
 - [Acceptable AI use](docs/acceptable-ai-use.md) defines appropriate, conditional, and prohibited uses of AI in engineering work.
 - [Engineering practice](docs/engineering-practice.md) distills the general habits AHEAD expects engineers to cultivate.
 - [Pragmatic Programmer page index](docs/references/pragmatic-programmer-page-index.md) preserves the edition-specific page references behind the submitted practice notes.
+- [Pilot workflows](docs/workflows/README.md) provide minimal, diagrammed flows for product change, corrective debugging, operational stabilization, decision, investigation, and internal improvement.
 - [Process taxonomy](docs/design/process-taxonomy.md) defines the six proposed workflow families and the test for adding another.
 - [Debugging and operational investigation](docs/design/debugging-and-operations.md) captures the current design discussion; it is not yet a final workflow specification.
 - [Evidence standard](docs/evidence/evidence-standard.md) defines what AHEAD means by evidence-backed.
@@ -26,7 +27,7 @@ AHEAD is being designed for several kinds of engineering work, including feature
 
 ## Status
 
-AHEAD is in the methodology-design stage. The current priority is to understand the human engineering processes worth supporting before designing the workflow engine, editor extension, or CI gates.
+AHEAD is in the methodology-design stage. Six minimal workflow profiles are ready for manual pilot use. The current priority is to apply them to real work and refine their phases, gates, and records before designing the workflow engine, editor extension, or CI enforcement.
 
 No complete AHEAD workflow has yet been experimentally validated. The methodology distinguishes direct empirical support, adjacent evidence, standards, established practice, and AHEAD design hypotheses rather than presenting them as equally certain.
 

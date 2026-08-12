@@ -9,18 +9,18 @@ AHEAD should not create a workflow for every issue label. “Security,” “per
 
 The primary workflow should be selected by the **dominant outcome** the human is trying to produce. Variants and overlays then adapt that workflow to context.
 
-This gives AHEAD six proposed process families. Three are already under active design; three are additions worth developing.
+This gives AHEAD six proposed process families. All six now have minimal [pilot workflow profiles](../workflows/README.md) for use and evaluation; that does not yet validate the taxonomy or justify automated enforcement.
 
 ## The six process families
 
 | Process family | Dominant question | Terminal outcome | Examples | Status |
 |---|---|---|---|---|
-| 1. Product change | What behavior or capability should exist, and how should we deliver it? | Verified intended behavior | Feature, API change, integration, migration, dependency adaptation, decommission | Current |
-| 2. Corrective debugging | Why does observed behavior differ from intended behavior, and how should we correct it? | Verified correction or explicitly accepted uncertainty | Deterministic bug, flaky failure, regression, incorrect data processing | Current |
-| 3. Operational stabilization | Why is a live system outside an acceptable operating state, and how do we restore and stabilize it? | Demonstrated recovery/convergence and follow-up disposition | Reconciliation storm, capacity exhaustion, configuration drift, dependency outage | Current |
-| 4. Decision | Which course should humans choose, given goals, evidence, constraints, and tradeoffs? | Approved decision and rationale | Architecture decision, buy/build, technology selection, policy or platform choice | Proposed addition |
-| 5. Investigation | What is true, feasible, or likely when no intervention has yet been selected? | Bounded conclusion, confidence, evidence, and remaining unknowns | Technical spike, feasibility study, causal follow-up, capacity study, vendor evaluation | Proposed addition |
-| 6. Internal improvement | How can we improve system qualities while preserving an explicit behavioral contract? | Verified invariants plus improved target qualities | Refactor, preventive maintenance, maintainability debt, performance optimization without semantic change | Proposed addition |
+| 1. [Product change](../workflows/product-change.md) | What behavior or capability should exist, and how should we deliver it? | Verified intended behavior | Feature, API change, integration, migration, dependency adaptation, decommission | Pilot v0.1 |
+| 2. [Corrective debugging](../workflows/corrective-debugging.md) | Why does observed behavior differ from intended behavior, and how should we correct it? | Verified correction or explicitly accepted uncertainty | Deterministic bug, flaky failure, regression, incorrect data processing | Pilot v0.1 |
+| 3. [Operational stabilization](../workflows/operational-stabilization.md) | Why is a live system outside an acceptable operating state, and how do we restore and stabilize it? | Demonstrated recovery/convergence and follow-up disposition | Reconciliation storm, capacity exhaustion, configuration drift, dependency outage | Pilot v0.1 |
+| 4. [Decision](../workflows/decision.md) | Which course should humans choose, given goals, evidence, constraints, and tradeoffs? | Approved decision and rationale | Architecture decision, buy/build, technology selection, policy or platform choice | Pilot v0.1 |
+| 5. [Investigation](../workflows/investigation.md) | What is true, feasible, or likely when no intervention has yet been selected? | Bounded conclusion, confidence, evidence, and remaining unknowns | Technical spike, feasibility study, causal follow-up, capacity study, vendor evaluation | Pilot v0.1 |
+| 6. [Internal improvement](../workflows/internal-improvement.md) | How can we improve system qualities while preserving an explicit behavioral contract? | Verified invariants plus improved target qualities | Refactor, preventive maintenance, maintainability debt, performance optimization without semantic change | Pilot v0.1 |
 
 Six is a working taxonomy, not a sacred number. The threshold for adding a seventh family is deliberately high.
 
@@ -141,4 +141,4 @@ A new primary process family should be added only when all of these are true:
 
 Empirical debugging research supports a mental-model and hypothesis-testing process distinct from planned change. Empirical production-incident research distinguishes code and non-code causes and separates detection, investigation, and mitigation. Those findings support keeping corrective debugging and operational stabilization separate.
 
-The proposed six-family classification itself remains an AHEAD design hypothesis. It should be tested against a diverse sample of real engineering work by asking whether teams can route work consistently, whether important states or gates differ, and whether any family is rarely used or routinely misclassified.
+The proposed six-family classification itself remains an AHEAD design hypothesis. The pilot profiles should be tested against a diverse sample of real engineering work by asking whether teams can route work consistently, whether important states or gates differ, which records improve reasoning or handoff, and whether any family is rarely used or routinely misclassified.
