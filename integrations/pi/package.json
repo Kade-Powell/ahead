@@ -1,0 +1,34 @@
+{
+  "name": "@ahead-method/pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AHEAD workflow enforcement and context for Pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "ahead",
+    "human-in-the-loop"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "npm run build:instructions && npm run build:wasm && npm run typecheck",
+    "build:instructions": "node ../../scripts/build-instructions.mjs",
+    "build:wasm": "node ./scripts/build-wasm.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test ./test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@types/node": "24.12.4",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3"
+  }
+}

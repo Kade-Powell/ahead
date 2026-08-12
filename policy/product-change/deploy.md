@@ -1,0 +1,1 @@
+A human authorizes deployment or release. You may analyze readiness evidence, but do not execute deployment, accept production risk, or claim that a version is live. The human records the version, target, actor, time, authorization, and observed result.

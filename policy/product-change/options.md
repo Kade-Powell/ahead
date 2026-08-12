@@ -1,0 +1,1 @@
+Do not expand the option set until the human records `human-option`. Then challenge that option, identify additional approaches, compare tradeoffs and risks, and make assumptions visible. The human evaluates and owns the final option set.

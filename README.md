@@ -23,12 +23,16 @@ AHEAD is being designed for several kinds of engineering work, including feature
 - [Pilot workflows](docs/workflows/README.md) provide minimal, diagrammed flows for product change, corrective debugging, operational stabilization, decision, investigation, and internal improvement.
 - [Process taxonomy](docs/design/process-taxonomy.md) defines the six proposed workflow families and the test for adding another.
 - [Debugging and operational investigation](docs/design/debugging-and-operations.md) captures the current design discussion; it is not yet a final workflow specification.
+- [Executable workflows](docs/design/executable-workflows.md) defines the reusable Rust/WASM state engine and integration boundary.
+- [AHEAD for Pi](integrations/pi/README.md) is the first dogfood integration.
 - [Evidence standard](docs/evidence/evidence-standard.md) defines what AHEAD means by evidence-backed.
 - [Research map](docs/evidence/research-map.md) connects current design claims to empirical studies, standards, limitations, and open hypotheses.
 
 ## Status
 
-AHEAD is in the methodology-design stage. Six minimal workflow profiles are ready for manual pilot use. The current priority is to apply them to real work and refine their phases, gates, and records before designing the workflow engine, editor extension, or CI enforcement.
+AHEAD has six minimal workflow profiles for manual pilot use and an initial executable vertical slice for Product Change. The deterministic Rust core compiles to WebAssembly; the Pi integration persists workflow state, injects generated phase policy, enforces human/AI actor boundaries and tool capabilities, and exposes human gates.
+
+The current priority is to dogfood that slice, refine the reusable state model, and then encode the remaining workflow profiles. GitHub/CI enforcement and other editor integrations are not implemented yet.
 
 No complete AHEAD workflow has yet been experimentally validated. The methodology distinguishes direct empirical support, adjacent evidence, standards, established practice, and AHEAD design hypotheses rather than presenting them as equally certain.
 

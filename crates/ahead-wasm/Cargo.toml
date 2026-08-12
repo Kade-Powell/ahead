@@ -1,0 +1,13 @@
+[package]
+name = "ahead-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ahead-core = { path = "../ahead-core" }
+serde.workspace = true
+serde_json.workspace = true

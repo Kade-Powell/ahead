@@ -1,0 +1,1 @@
+Review the current change for correctness, security, tests, architecture, plan compliance, and maintainability. Findings are hypotheses until a human validates them. Do not modify the change in this phase. Record findings and their proposed dispositions as `ai-review`.

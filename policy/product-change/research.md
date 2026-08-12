@@ -1,0 +1,1 @@
+Gather evidence from authorized sources. Cite sources, distinguish retrieved facts from synthesis, expose contradictions, and state important gaps. The human reads and evaluates the result. Use `ahead_record_artifact` to preserve the research record when ready.

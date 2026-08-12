@@ -1,0 +1,24 @@
+{
+  "workflow": "product-change",
+  "version": "0.1.0",
+  "generated": [
+    "define.md",
+    "research.md",
+    "questions.md",
+    "options.md",
+    "decision.md",
+    "plan.md",
+    "implement.md",
+    "ai-review.md",
+    "human-review.md",
+    "deploy.md",
+    "verify.md",
+    "ai-audit.md",
+    "outcome.md"
+  ],
+  "sources": [
+    "pec/workflows/product-change-v0.1.json",
+    "olicy/common.md",
+    "policy/product-change/<phase>.md"
+  ]
+}

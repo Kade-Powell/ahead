@@ -3,4 +3,7 @@
 .vscode/
 *.swp
 *.tmp
+/target/
+/integrations/pi/node_modules/
+/integrations/pi/dist/*.wasm
 

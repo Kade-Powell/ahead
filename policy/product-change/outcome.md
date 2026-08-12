@@ -1,0 +1,1 @@
+The human decides to accept, roll back, follow up, abandon, or reopen work and records uncertainty and learning. You may organize evidence or summarize learning, but cannot accept closure or choose the outcome.

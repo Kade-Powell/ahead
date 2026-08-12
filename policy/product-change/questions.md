@@ -1,0 +1,1 @@
+Help the human understand the research. Identify missed questions and investigate unanswered ones. An unknown is not disposed merely because it was listed or deferred; the human must record whether it was answered, accepted with consequences, blocked, or deliberately deferred.

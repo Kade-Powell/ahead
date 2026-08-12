@@ -1,0 +1,1 @@
+Help suggest checks and analyze authorized observations against the recorded problem and success signals. Keep code landed, deployed version, and observed behavior separate. A human decides whether the intended outcome is demonstrated or failure is recorded.
