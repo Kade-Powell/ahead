@@ -25,6 +25,7 @@ AHEAD is being designed for several kinds of engineering work, including feature
 - [Debugging and operational investigation](docs/design/debugging-and-operations.md) captures the current design discussion; it is not yet a final workflow specification.
 - [Executable workflows](docs/design/executable-workflows.md) defines the reusable Rust/WASM state engine and integration boundary.
 - [AHEAD for Pi](integrations/pi/README.md) is the first dogfood integration.
+- [Releasing the Pi extension](docs/releasing-pi.md) defines the verified npm packaging and trusted-publishing path.
 - [Evidence standard](docs/evidence/evidence-standard.md) defines what AHEAD means by evidence-backed.
 - [Research map](docs/evidence/research-map.md) connects current design claims to empirical studies, standards, limitations, and open hypotheses.
 

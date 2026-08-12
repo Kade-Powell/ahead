@@ -1,9 +1,30 @@
 {
-  "name": "@ahead-method/pi-extension",
+  "name": "ahead-pi",
   "version": "0.1.0",
-  "private": true,
   "description": "AHEAD workflow enforcement and context for Pi",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kade-Powell/ahead.git",
+    "directory": "integrations/pi"
+  },
+  "homepage": "https://github.com/Kade-Powell/ahead/tree/main/integrations/pi#readme",
+  "bugs": {
+    "url": "https://github.com/Kade-Powell/ahead/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "dist/ahead_wasm.wasm",
+    "generated/",
+    "src/"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "keywords": [
     "pi-package",
     "ahead",
@@ -18,8 +39,12 @@
     "build": "npm run build:instructions && npm run build:wasm && npm run typecheck",
     "build:instructions": "node ../../scripts/build-instructions.mjs",
     "build:wasm": "node ./scripts/build-wasm.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run verify",
+    "pack:verify": "node ./scripts/verify-package.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test ./test/*.test.mjs"
+    "verify": "npm run build && node --test ./test/*.test.mjs",
+    "test": "npm run verify && npm run pack:verify"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

@@ -1,0 +1,66 @@
+name: Publish Pi extension
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: publish-pi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'pi-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Require a release commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Validate release version
+        id: release
+        working-directory: integrations/pi
+        run: node ./scripts/check-release.mjs "$RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+      - name: Install exact dependencies
+        working-directory: integrations/pi
+        run: npm ci
+
+      - name: Build, test, and verify packed installation
+        working-directory: integrations/pi
+        run: npm test
+
+      - name: Publish with provenance
+        working-directory: integrations/pi
+        run: npm publish --access public --provenance --tag "${{ steps.release.outputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify registry version
+        run: npm view "${{ steps.release.outputs.package_name }}@${{ steps.release.outputs.version }}" version

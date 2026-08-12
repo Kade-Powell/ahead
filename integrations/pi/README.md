@@ -6,6 +6,26 @@ The Pi integration runs the Rust AHEAD state machine as WebAssembly, injects gen
 
 It does not own model authentication. Use whichever provider Pi already supports and your organization permits, including an existing GitHub Copilot configuration. AHEAD never receives the model credential.
 
+## Install from npm
+
+After the first public release, install the current version globally in Pi:
+
+```sh
+pi install npm:ahead-pi
+```
+
+Pin an exact version for a team or project:
+
+```sh
+pi install -l npm:ahead-pi@0.1.0
+```
+
+Or try it for one session without changing settings:
+
+```sh
+pi -e npm:ahead-pi
+```
+
 ## Build from this repository
 
 Requirements: Rust with `wasm32-unknown-unknown`, Node 22 or newer, npm, and Pi 0.80.6 or a compatible release.
@@ -81,4 +101,12 @@ Human identity is resolved from `AHEAD_HUMAN_IDENTITY`, Git `user.email`, Git `u
 AHEAD_HUMAN_IDENTITY=reviewer@example.com pi -e ./integrations/pi/src/index.ts
 ```
 
-This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements only Product Change, and has no GitHub/CI enforcement yet. See [Executable AHEAD workflows](../../docs/design/executable-workflows.md) for the architecture and trust boundaries.
+This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements only Product Change, and has no GitHub/CI workflow enforcement yet. See [Executable AHEAD workflows](https://github.com/Kade-Powell/ahead/blob/main/docs/design/executable-workflows.md) for the architecture and trust boundaries.
+
+## Package and release verification
+
+`npm test` builds the Rust core for `wasm32-unknown-unknown`, regenerates instructions, runs Rust/WASM-facing tests, creates the exact npm tarball, verifies its allowlisted contents, loads the extracted package through the real Pi binary, and confirms that `/ahead-start` persists a valid run.
+
+The npm package contains only its README, package metadata, TypeScript runtime, generated phase instructions, and compiled WASM engine. Build scripts, tests, source specs, development dependencies, and repository files are excluded.
+
+See [Releasing the Pi extension](https://github.com/Kade-Powell/ahead/blob/main/docs/releasing-pi.md) for versioning, first-publish authentication, trusted publishing, and rollback rules.
