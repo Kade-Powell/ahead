@@ -1,0 +1,89 @@
+{
+  "id": "investigation",
+  "version": "0.1.0",
+  "title": "Investigation",
+  "initial_phase": "frame",
+  "phases": [
+    {
+      "id": "frame",
+      "title": "Frame the Question",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "question", "title": "Question, motivation, owner, intended use, and what would count as an answer", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "question-framed", "title": "Human confirms the investigation question is clear" },
+      "next": "bound",
+      "returns_to": [],
+      "ai_unlock_artifacts": ["question"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "bound",
+      "title": "Bound the Investigation",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "bounds", "title": "Scope, non-goals, evidence standard, time or cost box, risks, and stop conditions", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "bounds-accepted", "title": "Human accepts the investigation boundaries" },
+      "next": "gather",
+      "returns_to": ["frame"],
+      "ai_unlock_artifacts": ["bounds"],
+      "ai_capabilities": ["inspect", "search", "analyze"]
+    },
+    {
+      "id": "gather",
+      "title": "Gather Evidence",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "evidence", "title": "Sources, observations, measurements, contradictions, provenance, and gaps", "actor": "any", "required": true }
+      ],
+      "gate": { "id": "evidence-reviewed", "title": "Human confirms sufficient evidence exists to explore explanations" },
+      "next": "explore",
+      "returns_to": ["frame", "bound"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "explore",
+      "title": "Explore Explanations",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-model", "title": "Human first-pass model, explanation, or investigative path", "actor": "human", "required": true },
+        { "kind": "ai-paths", "title": "AI challenges, alternate explanations, and proposed tests", "actor": "ai", "required": false },
+        { "kind": "exploration-ledger", "title": "Models, predictions, tests or prototypes, results, contradictions, and confidence", "actor": "any", "required": true },
+        { "kind": "prototype-disposition", "title": "Human prototype disposition or explicit no-prototype record", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "exploration-reviewed", "title": "Human confirms material explanations were tested or explicitly left unresolved" },
+      "next": "synthesize",
+      "returns_to": ["frame", "bound", "gather"],
+      "ai_unlock_artifacts": ["human-model"],
+      "ai_capabilities": ["inspect", "search", "analyze", "modify", "execute", "record"]
+    },
+    {
+      "id": "synthesize",
+      "title": "Synthesize Findings",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "synthesis", "title": "Human synthesis of findings, evidence strength, contradictions, limitations, and confidence", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "synthesis-accepted", "title": "Human confirms the synthesis distinguishes evidence from inference" },
+      "next": "conclude",
+      "returns_to": ["gather", "explore"],
+      "ai_unlock_artifacts": ["synthesis"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "conclude",
+      "title": "Conclude or Route",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "conclusion", "title": "Answer or non-answer, confidence, unresolved questions, reusable evidence, and explicit route to Decision when consequential choice remains", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "investigation-closed", "title": "Human accepts the conclusion and owns any routed work" },
+      "next": null,
+      "returns_to": ["frame", "bound", "gather", "explore", "synthesize"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    }
+  ]
+}

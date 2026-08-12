@@ -26,7 +26,9 @@ async function loadEngine() {
       return JSON.parse(new TextDecoder().decode(output));
     } finally {
       wasm.ahead_dealloc(inputPointer, request.length);
-      if (outputPointer && outputLength) wasm.ahead_dealloc(outputPointer, outputLength);
+      if (outputPointer && outputLength) {
+        wasm.ahead_dealloc(outputPointer, outputLength);
+      }
     }
   };
   return { wasm, call };
@@ -42,6 +44,34 @@ test("raw JSON ABI exports a valid Product Change workflow", async () => {
   assert.equal(response.ok, true);
   assert.equal(response.result.phases.length, 13);
   assert.equal(response.result.phases[0].id, "define");
+});
+
+test("raw JSON ABI lists all six executable AHEAD workflows", async () => {
+  const { call } = await loadEngine();
+  const response = call("list_workflows", {});
+  assert.equal(response.ok, true);
+  assert.deepEqual(
+    response.result.map((workflow) => workflow.id),
+    [
+      "product-change",
+      "corrective-debugging",
+      "operational-stabilization",
+      "decision",
+      "investigation",
+      "internal-improvement",
+    ],
+  );
+});
+
+test("operational stabilization never grants AI authority to execute the intervention", async () => {
+  const { call } = await loadEngine();
+  const response = call("get_workflow", { workflow_id: "operational-stabilization" });
+  assert.equal(response.ok, true);
+  const respond = response.result.phases.find((phase) => phase.id === "respond");
+  const execute = response.result.phases.find((phase) => phase.id === "execute-observe");
+  assert.ok(!respond.ai_capabilities.includes("execute"));
+  assert.ok(!execute.ai_capabilities.includes("execute"));
+  assert.equal(execute.artifacts[0].actor, "human");
 });
 
 test("WASM boundary enforces human ownership, gates, and capabilities", async () => {

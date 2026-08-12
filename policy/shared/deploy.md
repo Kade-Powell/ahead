@@ -1,0 +1,1 @@
+Keep authorization, attempted action, and observed result distinct. A human records the exact version, target, actor, time, authorization, and result, or explains why deployment is not applicable. Do not treat merged code as deployed code or execute a release without separate authority.

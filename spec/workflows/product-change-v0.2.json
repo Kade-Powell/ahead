@@ -1,0 +1,186 @@
+{
+  "id": "product-change",
+  "version": "0.2.0",
+  "title": "Product Change",
+  "initial_phase": "define",
+  "phases": [
+    {
+      "id": "define",
+      "title": "Define Problem",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "problem", "title": "Problem and success signals", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "framing-accepted", "title": "Human accepts the framing" },
+      "next": "research",
+      "returns_to": [],
+      "ai_unlock_artifacts": ["problem"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "research",
+      "title": "Research",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "research", "title": "Evidence, findings, contradictions, and gaps", "actor": "any", "required": true }
+      ],
+      "gate": { "id": "research-reviewed", "title": "Human confirms material evidence is available" },
+      "next": "questions",
+      "returns_to": [],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "questions",
+      "title": "Research Review and Questions",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "unknowns", "title": "Disposition of important unknowns", "actor": "human", "required": true },
+        { "kind": "question-research", "title": "Follow-up research", "actor": "any", "required": false }
+      ],
+      "gate": { "id": "unknowns-disposed", "title": "Human confirms important unknowns are answered or explicitly accepted" },
+      "next": "options",
+      "returns_to": ["research"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "options",
+      "title": "Options",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-option", "title": "Human first-pass option and reasoning", "actor": "human", "required": true },
+        { "kind": "ai-challenge", "title": "AI challenges and additional alternatives", "actor": "ai", "required": false },
+        { "kind": "options", "title": "Human-evaluated options and tradeoffs", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "options-understood", "title": "Human confirms viable options and tradeoffs are understood" },
+      "next": "decision",
+      "returns_to": ["research", "questions"],
+      "ai_unlock_artifacts": ["human-option"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "decision",
+      "title": "Decision",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "decision", "title": "Decision, rationale, tradeoffs, unknowns, and reversibility", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "decision-approved", "title": "Accountable human approves the decision" },
+      "next": "plan",
+      "returns_to": ["research", "questions", "options"],
+      "ai_unlock_artifacts": ["decision"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "plan",
+      "title": "Plan",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "first-pass-plan", "title": "Human first-pass implementation plan", "actor": "human", "required": true },
+        { "kind": "ai-plan-review", "title": "AI plan challenge", "actor": "ai", "required": false },
+        { "kind": "plan", "title": "Human-approved sequenced plan, tests, rollout, recovery, and deviations policy", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "plan-approved", "title": "Human approves the final plan" },
+      "next": "implement",
+      "returns_to": ["options", "decision"],
+      "ai_unlock_artifacts": ["first-pass-plan"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "implement",
+      "title": "Implement",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "changeset", "title": "Linked changeset", "actor": "human", "required": true },
+        { "kind": "tests", "title": "Test and check evidence", "actor": "human", "required": true },
+        { "kind": "plan-deviations", "title": "Plan deviations and rationale, including none", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "implementation-ready", "title": "Human confirms work is ready for review and checks pass" },
+      "next": "ai-review",
+      "returns_to": ["plan"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "modify", "execute"]
+    },
+    {
+      "id": "ai-review",
+      "title": "AI Review",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "ai-review", "title": "AI review findings bound to the current changeset", "actor": "ai", "required": true },
+        { "kind": "review-disposition", "title": "Implementing-human disposition of every material AI finding", "actor": "human", "required": true, "same_as": "changeset" }
+      ],
+      "gate": { "id": "ai-review-disposed", "title": "Implementing human disposes blocking AI findings", "accepted_by_artifact": "review-disposition" },
+      "next": "human-review",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute", "record"]
+    },
+    {
+      "id": "human-review",
+      "title": "Independent Human Review",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-review", "title": "Independent human review", "actor": "human", "required": true, "independent_of": "changeset" }
+      ],
+      "gate": { "id": "human-review-accepted", "title": "Independent human reviewer accepts the current change", "accepted_by_artifact": "human-review" },
+      "next": "deploy",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "deploy",
+      "title": "Deploy or Release",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "deployment", "title": "Version, environment, actor, time, authorization, and result", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "deployment-confirmed", "title": "Human confirms the intended version reached the target or deployment is not applicable" },
+      "next": "verify",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "verify",
+      "title": "Verify and Observe",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "verification", "title": "Test, deployment, observation, and user-visible outcome evidence", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "outcome-demonstrated", "title": "Human confirms the intended outcome is demonstrated or failure is recorded" },
+      "next": "ai-audit",
+      "returns_to": ["plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute"]
+    },
+    {
+      "id": "ai-audit",
+      "title": "AI Audit",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "ai-audit", "title": "AI audit findings", "actor": "ai", "required": true },
+        { "kind": "audit-disposition", "title": "Human disposition of material AI audit findings", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "audit-disposed", "title": "Human reviews and disposes material audit findings", "accepted_by_artifact": "audit-disposition" },
+      "next": "outcome",
+      "returns_to": ["plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze", "record"]
+    },
+    {
+      "id": "outcome",
+      "title": "Human Outcome",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "outcome", "title": "Acceptance, rollback, follow-up, abandonment, uncertainty, and learning", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "outcome-accepted", "title": "Human accepts closure" },
+      "next": null,
+      "returns_to": ["plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "workflow": "operational-stabilization",
+  "version": "0.1.0",
+  "generated": [
+    "assess.md",
+    "respond.md",
+    "execute-observe.md",
+    "verify-recovery.md",
+    "monitor.md",
+    "outcome.md"
+  ],
+  "sources": [
+    "spec/workflows/operational-stabilization-v0.1.json",
+    "policy/common.md",
+    "policy/operational-stabilization/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/research-evidence.md"
+  ]
+}

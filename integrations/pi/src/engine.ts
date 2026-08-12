@@ -40,17 +40,19 @@ export class AheadEngine {
   static async load(path: string): Promise<AheadEngine> {
     const bytes = await readFile(path);
     const instantiated = await WebAssembly.instantiate(bytes, {});
-    const wasm = instantiated.instance.exports as WasmExports;
-    for (const name of ["memory", "ahead_alloc", "ahead_dealloc", "ahead_dispatch"]) {
-      if (!(name in wasm)) {
-        throw new Error(`AHEAD WebAssembly module is missing export: ${name}`);
-      }
+    const wasm = instantiated.instance.exports;
+    if (!isWasmExports(wasm)) {
+      throw new Error("AHEAD WebAssembly module does not expose the required engine ABI");
     }
     return new AheadEngine(wasm);
   }
 
   getWorkflow(workflowId = "product-change"): WorkflowDefinition {
     return this.call("get_workflow", { workflow_id: workflowId });
+  }
+
+  listWorkflows(): WorkflowDefinition[] {
+    return this.call("list_workflows", {});
   }
 
   createRun(input: {
@@ -78,10 +80,14 @@ export class AheadEngine {
     });
   }
 
-  toolAllowed(run: Run, capability: Capability): { allowed: boolean; reason: string; capability: Capability } {
+  toolAllowed(
+    run: Run,
+    capability: Capability,
+  ): { allowed: boolean; reason: string; capability: Capability } {
     return this.call("tool_allowed", { run, capability });
   }
 
+  // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- the operation selects the Rust response type
   private call<T>(operation: string, input: unknown): T {
     const request = new TextEncoder().encode(
       JSON.stringify({ api_version: ENGINE_API_VERSION, operation, input }),
@@ -96,9 +102,13 @@ export class AheadEngine {
       outputPointer = Number(packed >> 32n);
       outputLength = Number(packed & 0xffff_ffffn);
       const output = new Uint8Array(this.wasm.memory.buffer, outputPointer, outputLength).slice();
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the versioned Rust ABI owns this response envelope
       const response = JSON.parse(new TextDecoder().decode(output)) as EngineResponse<T>;
       if (!response.ok || response.result === undefined) {
-        const error = response.error ?? { code: "unknown_engine_error", message: "AHEAD engine call failed" };
+        const error = response.error ?? {
+          code: "unknown_engine_error",
+          message: "AHEAD engine call failed",
+        };
         throw new AheadEngineError(error.code, error.message);
       }
       return response.result;
@@ -109,4 +119,13 @@ export class AheadEngine {
       }
     }
   }
+}
+
+function isWasmExports(exports: WebAssembly.Exports): exports is WasmExports {
+  return (
+    exports.memory instanceof WebAssembly.Memory &&
+    typeof exports.ahead_alloc === "function" &&
+    typeof exports.ahead_dealloc === "function" &&
+    typeof exports.ahead_dispatch === "function"
+  );
 }

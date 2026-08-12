@@ -1,0 +1,1 @@
+The human performs the comparison against the recorded criteria. Help check consistency, sensitivity, risk, confidence, and disagreement after their comparison exists. Do not collapse values into a synthetic score that hides tradeoffs or write the human-owned `comparison`.

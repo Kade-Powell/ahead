@@ -13,6 +13,7 @@ export interface ArtifactDefinition {
   actor: ActorRule;
   required: boolean;
   independent_of?: string;
+  same_as?: string;
 }
 
 export interface PhaseDefinition {

@@ -1,13 +1,5 @@
-import {
-  getMarkdownTheme,
-  type ExtensionCommandContext,
-} from "@earendil-works/pi-coding-agent";
-import {
-  Markdown,
-  matchesKey,
-  truncateToWidth,
-  visibleWidth,
-} from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export async function showReferenceViewer(
   ctx: ExtensionCommandContext,
@@ -41,7 +33,9 @@ export async function showReferenceViewer(
           `${border("│")}${pad(` ${theme.fg("accent", theme.bold(title))}`)}${border("│")}`,
           `${border("│")}${pad(theme.fg("dim", ` ↑ ${scrollOffset} lines · ↓ ${remaining} lines`))}${border("│")}`,
         ];
-        for (const line of visible) lines.push(`${border("│")}${pad(` ${line}`)}${border("│")}`);
+        for (const line of visible) {
+          lines.push(`${border("│")}${pad(` ${line}`)}${border("│")}`);
+        }
         for (let index = visible.length; index < pageSize; index += 1) {
           lines.push(`${border("│")}${pad("")}${border("│")}`);
         }
@@ -56,13 +50,21 @@ export async function showReferenceViewer(
       },
       handleInput(data: string): void {
         const maxOffset = Math.max(0, totalLines - pageSize);
-        if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) done();
-        else if (matchesKey(data, "up")) scrollOffset = Math.max(0, scrollOffset - 1);
-        else if (matchesKey(data, "down")) scrollOffset = Math.min(maxOffset, scrollOffset + 1);
-        else if (matchesKey(data, "pageUp")) scrollOffset = Math.max(0, scrollOffset - pageSize);
-        else if (matchesKey(data, "pageDown")) scrollOffset = Math.min(maxOffset, scrollOffset + pageSize);
-        else if (matchesKey(data, "home")) scrollOffset = 0;
-        else if (matchesKey(data, "end")) scrollOffset = maxOffset;
+        if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+          done();
+        } else if (matchesKey(data, "up")) {
+          scrollOffset = Math.max(0, scrollOffset - 1);
+        } else if (matchesKey(data, "down")) {
+          scrollOffset = Math.min(maxOffset, scrollOffset + 1);
+        } else if (matchesKey(data, "pageUp")) {
+          scrollOffset = Math.max(0, scrollOffset - pageSize);
+        } else if (matchesKey(data, "pageDown")) {
+          scrollOffset = Math.min(maxOffset, scrollOffset + pageSize);
+        } else if (matchesKey(data, "home")) {
+          scrollOffset = 0;
+        } else if (matchesKey(data, "end")) {
+          scrollOffset = maxOffset;
+        }
         tui.requestRender();
       },
     };

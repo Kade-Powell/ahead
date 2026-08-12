@@ -1,0 +1,24 @@
+{
+  "api_version": "ahead.recommended-skills/v0.1",
+  "reviewed_at": "2026-08-12",
+  "skills": [
+    {
+      "id": "ponytail",
+      "title": "Ponytail",
+      "summary": "A persistent problem-solving loop for difficult implementation, debugging, and investigation work.",
+      "source": "DietrichGebert/ponytail",
+      "skill": "skills/ponytail",
+      "reviewed_ref": "2ed6c52c9d7e5e56942508591085fd45dea277d3",
+      "reviewed_url": "https://github.com/DietrichGebert/ponytail/tree/2ed6c52c9d7e5e56942508591085fd45dea277d3/skills/ponytail",
+      "license": "MIT",
+      "install": "npx skills add https://github.com/DietrichGebert/ponytail/tree/2ed6c52c9d7e5e56942508591085fd45dea277d3/skills/ponytail --agent pi",
+      "workflows": ["corrective-debugging", "investigation", "product-change", "internal-improvement"],
+      "phases": ["investigate", "explore", "implement"],
+      "compatibility": [
+        "AHEAD remains authoritative for human ownership, required artifacts, and gates.",
+        "Persistence never permits skipping human understanding, decisions, plans, tests, or review.",
+        "Treat suggestions to ship a quick or lazy version as experiments unless the active AHEAD flow has approved production implementation."
+      ]
+    }
+  ]
+}

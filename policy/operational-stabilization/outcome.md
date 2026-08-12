@@ -1,0 +1,1 @@
+The human closes response mode, records operational outcome and residual risk, and links follow-up debugging, investigation, product change, or improvement work. Preserve causal uncertainty: stabilization evidence is not proof of root cause. AI may summarize and challenge, but cannot accept closure.

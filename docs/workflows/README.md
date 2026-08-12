@@ -1,10 +1,10 @@
 # AHEAD Pilot Workflows
 
-Status: pilot v0.1
+Status: executable dogfood v0.1
 
 ## Purpose
 
-These six minimal workflow profiles are meant to be used on real engineering work before AHEAD builds a workflow engine, editor extension, or CI enforcement. They are deliberately small. The pilot should reveal which phases, gates, and records improve reasoning and which create process burden.
+These six minimal workflow profiles are meant to be used on real engineering work through the Pi adapter or a manual record. Their canonical executable contracts live in `spec/workflows`, while these documents explain the same boundaries and show the human/AI rhythm. Dogfooding should reveal which phases, gates, and records improve reasoning and which create process burden.
 
 The profiles are:
 
@@ -83,7 +83,7 @@ Diagram language is normative for the pilot:
 
 - `HUMAN` or `ENGINEER` means the person owns the reasoning, decision, action, or artifact.
 - `AI — ASSIST` means AI may research, organize, propose, explain, generate bounded material, or challenge; it does not own or approve the phase.
-- `AI REVIEW` is an additional review and never satisfies a human-review gate.
+- `AI REVIEW` produces snapshot-bound hypotheses. The implementing human separately dispositions every material finding, and neither action satisfies the independent human-review gate.
 - Every decision, test selection, risk acceptance, consequential-action authorization, final review, and outcome gate is human.
 - All diagram permissions remain bounded by the rule hierarchy above. Humans lead and remain accountable; AI assists.
 

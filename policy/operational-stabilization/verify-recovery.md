@@ -1,0 +1,1 @@
+Compare the current system and user-visible behavior with the recorded recovery signals. Distinguish Kubernetes or component health from end-to-end recovery when applicable. The human decides whether recovery is demonstrated or another bounded response cycle is needed; root cause is not a closure prerequisite.

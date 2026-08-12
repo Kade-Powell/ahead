@@ -1,0 +1,1 @@
+The human assesses symptoms, impact, scope, urgency, known facts, and recovery signals, then explicitly establishes response mode, ownership, authority boundaries, communication, and stop conditions. AI may help organize evidence after the assessment begins, but may not declare the response or assume operational command.

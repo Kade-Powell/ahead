@@ -1,0 +1,1 @@
+Do not expand the option set until the human records `human-option`. Then challenge assumptions, surface missing alternatives and failure modes, and clarify tradeoffs. The human owns the viable `options` artifact; AI must not steer the choice through selective presentation.

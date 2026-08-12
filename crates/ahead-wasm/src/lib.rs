@@ -1,80 +1,109 @@
+//! Minimal JSON-over-memory WebAssembly ABI for the AHEAD workflow engine.
+//!
+//! Hosts allocate request memory, dispatch a versioned JSON operation, decode the packed output
+//! pointer and length, and return both allocations through [`ahead_dealloc`].
+
 use ahead_core::{
     ApplyInput, Capability, CreateRunInput, ENGINE_API_VERSION, Run, apply, create_run,
-    derive_state, tool_allowed, validate_run, workflow,
+    derive_state, tool_allowed, validate_run, workflow, workflows,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Versioned operation request received from a WebAssembly host.
 #[derive(Debug, Deserialize)]
 struct Request {
+    /// Requested engine protocol version.
     api_version: String,
+    /// Operation identifier to dispatch.
     operation: String,
+    /// Operation-specific JSON input.
     #[serde(default)]
     input: Value,
 }
 
+/// JSON response envelope returned to a WebAssembly host.
 #[derive(Debug, Serialize)]
-struct Response<T: Serialize> {
+struct Response<T> {
+    /// Whether the operation completed successfully.
     ok: bool,
+    /// Successful operation result, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<T>,
+    /// Structured engine error, when the operation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ahead_core::AheadError>,
 }
 
+/// Input for the `get_workflow` operation.
 #[derive(Debug, Deserialize)]
 struct WorkflowInput {
+    /// Workflow identifier to load.
     workflow_id: String,
 }
 
+/// Input shared by operations that inspect an existing run.
 #[derive(Debug, Deserialize)]
 struct RunInput {
+    /// Run to validate or derive.
     run: Run,
 }
 
+/// Input for the `apply_event` operation.
 #[derive(Debug, Deserialize)]
 struct ApplyOperationInput {
+    /// Existing run to which the event will be appended.
     run: Run,
+    /// Attributed event input to append.
     event: ApplyInput,
 }
 
+/// Input for the `tool_allowed` operation.
 #[derive(Debug, Deserialize)]
 struct ToolInput {
+    /// Run whose active phase controls the capability.
     run: Run,
+    /// AI capability to evaluate.
     capability: Capability,
 }
 
+/// Allocates WebAssembly memory for a host-written request.
+///
+/// The host must initialize all `length` bytes before passing the returned pointer to
+/// [`ahead_dispatch`], then release the allocation with [`ahead_dealloc`].
 #[unsafe(no_mangle)]
 pub extern "C" fn ahead_alloc(length: usize) -> *mut u8 {
-    let mut bytes = Vec::<u8>::with_capacity(length);
+    let mut bytes = vec![0_u8; length].into_boxed_slice();
     let pointer = bytes.as_mut_ptr();
     std::mem::forget(bytes);
     pointer
 }
 
-#[unsafe(no_mangle)]
 /// Releases a buffer previously returned by this module.
 ///
 /// # Safety
 ///
 /// `pointer` and `length` must describe a live allocation returned by `ahead_alloc`
 /// or `ahead_dispatch`, and the allocation must not be released more than once.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ahead_dealloc(pointer: *mut u8, length: usize) {
     if !pointer.is_null() && length > 0 {
         // SAFETY: callers must pass pointers and lengths returned by this module's ABI.
         unsafe {
-            drop(Vec::from_raw_parts(pointer, length, length));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                pointer, length,
+            )));
         }
     }
 }
 
-#[unsafe(no_mangle)]
 /// Dispatches one UTF-8 JSON request and returns a packed output pointer and length.
 ///
 /// # Safety
 ///
 /// `pointer` must refer to at least `length` initialized, readable bytes in this
 /// module's linear memory for the duration of the call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ahead_dispatch(pointer: *const u8, length: usize) -> u64 {
     let output = if pointer.is_null() || length == 0 {
         error_json("invalid_request", "request body cannot be empty")
@@ -89,6 +118,7 @@ pub unsafe extern "C" fn ahead_dispatch(pointer: *const u8, length: usize) -> u6
     leak_output(output)
 }
 
+/// Decodes, validates, and dispatches one JSON request.
 fn dispatch_json(json: &str) -> Vec<u8> {
     let request = match serde_json::from_str::<Request>(json) {
         Ok(request) => request,
@@ -102,6 +132,7 @@ fn dispatch_json(json: &str) -> Vec<u8> {
     }
 
     let result = match request.operation.as_str() {
+        "list_workflows" => workflows().and_then(to_value),
         "get_workflow" => decode::<WorkflowInput>(request.input)
             .and_then(|input| workflow(&input.workflow_id))
             .and_then(to_value),
@@ -147,6 +178,7 @@ fn dispatch_json(json: &str) -> Vec<u8> {
     }
 }
 
+/// Deserializes one operation's input or returns a structured engine error.
 fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> ahead_core::Result<T> {
     serde_json::from_value(value).map_err(|error| ahead_core::AheadError {
         code: "invalid_input".to_owned(),
@@ -154,6 +186,7 @@ fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> ahead_core::Result<T> {
     })
 }
 
+/// Serializes a successful operation result into a generic JSON value.
 fn to_value<T: Serialize>(value: T) -> ahead_core::Result<Value> {
     serde_json::to_value(value).map_err(|error| ahead_core::AheadError {
         code: "serialization_failed".to_owned(),
@@ -161,6 +194,7 @@ fn to_value<T: Serialize>(value: T) -> ahead_core::Result<Value> {
     })
 }
 
+/// Serializes a structured error response, with an infallible fallback payload.
 fn error_json(code: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&Response::<Value> {
         ok: false,
@@ -173,10 +207,14 @@ fn error_json(code: &str, message: &str) -> Vec<u8> {
     .unwrap_or_else(|_| br#"{\"ok\":false}"#.to_vec())
 }
 
+/// Leaks an output buffer to the host and packs its pointer and length into a `u64`.
 fn leak_output(bytes: Vec<u8>) -> u64 {
     let mut bytes = bytes.into_boxed_slice();
-    let pointer = bytes.as_mut_ptr() as u32;
-    let length = bytes.len() as u32;
+    let pointer_address = bytes.as_mut_ptr() as usize;
+    let (Ok(pointer), Ok(length)) = (u32::try_from(pointer_address), u32::try_from(bytes.len()))
+    else {
+        return 0;
+    };
     std::mem::forget(bytes);
-    ((pointer as u64) << 32) | length as u64
+    (u64::from(pointer) << 32) | u64::from(length)
 }

@@ -31,9 +31,9 @@ AHEAD is being designed for several kinds of engineering work, including feature
 
 ## Status
 
-AHEAD has six minimal workflow profiles for manual pilot use and an executable vertical slice for Product Change. The deterministic Rust core compiles to WebAssembly; the Pi integration provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, and packages the framework Markdown for phase-aware human or AI reference.
+AHEAD has six minimal workflow profiles encoded as executable workflow definitions: Product Change, Corrective Debugging, Operational Stabilization, Decision, Investigation, and Internal Improvement. The deterministic Rust core compiles to WebAssembly; the Pi integration lets a human select a flow, provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, and packages the framework Markdown for workflow-aware human or AI reference.
 
-The current priority is to dogfood that slice, refine the reusable state model, and then encode the remaining workflow profiles. GitHub/CI enforcement and other editor integrations are not implemented yet.
+The current priority is to dogfood all six flows and refine their shared state model and workflow-specific gates. GitHub/CI enforcement and other editor integrations are not implemented yet.
 
 No complete AHEAD workflow has yet been experimentally validated. The methodology distinguishes direct empirical support, adjacent evidence, standards, established practice, and AHEAD design hypotheses rather than presenting them as equally certain.
 

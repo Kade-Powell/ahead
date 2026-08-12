@@ -1,12 +1,12 @@
 # Executable AHEAD Workflows
 
-Status: initial vertical slice v0.1
+Status: six-flow executable dogfood v0.1
 
 ## Purpose
 
 The executable layer makes AHEAD workflow state durable and makes selected human/AI boundaries enforceable across integrations. It does not turn judgment into a checklist or make workflow artifacts proof of understanding.
 
-The first vertical slice implements the Product Change workflow. The other five pilot workflows remain manual profiles until dogfooding provides evidence about the reusable state model.
+The executable layer implements all six pilot workflows. They share a versioned event model and enforcement engine while retaining workflow-specific phases, artifacts, gates, returns, AI capabilities, and generated instructions.
 
 ## Architecture
 
@@ -40,14 +40,19 @@ The initial WebAssembly boundary is a small versioned JSON ABI. This avoids coup
 |---|---|
 | Durable principles | `CONSTITUTION.md` |
 | AI authority | `docs/acceptable-ai-use.md` |
-| Human-readable Product Change flow | `docs/workflows/product-change.md` |
-| Executable phases, artifacts, gates, transitions, and capabilities | `spec/workflows/product-change-v0.1.json` |
+| Human-readable flows | `docs/workflows/*.md` |
+| Current executable phases, artifacts, gates, transitions, and capabilities | `spec/workflows/*.json` |
+| Published historical workflow definitions retained for replay | `spec/workflows/legacy/*.json` |
 | Compact binding agent profile and shared AI behavior | `policy/common.md` |
-| Phase AI behavior | `policy/product-change/*.md` |
+| Phase AI behavior | `policy/<workflow>/*.md` with shared engineering-tail fragments in `policy/shared/*.md` |
+| Reusable phase practices | `policy/methods/*.md`, selected by `policy/methods/index.json` |
+| Reviewed optional skills | `recommendations/skills-v0.1.json` |
 | State transition enforcement | `crates/ahead-core` |
 | Host mapping, storage, and UI | `integrations/pi` |
 
 Generated integration instructions are build artifacts. They include the compact agent profile, active phase policy, enforced contract, workflow version, and a source hash and must not be edited directly.
+
+The engine retains published historical workflow definitions for replay while new runs use the current definition. Product Change `0.1.0` remains embedded for existing runs; the review and audit disposition contract is Product Change `0.2.0`. A run is always replayed against the version recorded when it started rather than silently reinterpreted under the newest workflow.
 
 The Pi package also copies the canonical Constitution and `docs/**/*.md` into a generated reference catalog. These full documents are not injected into every prompt. The adapter recommends references applicable to the active phase, lets humans read them through `/ahead-guide`, and lets AI retrieve a specific source through `ahead_get_reference`. This keeps the binding prompt small while making the framework, rationale, evidence, and original page-level provenance available on demand.
 
@@ -81,11 +86,15 @@ These are intended to be inspectable, diffable repository artifacts. A team can 
 
 - Only a human actor can start a run, accept a gate, transition a phase, return work, or close a run.
 - Artifact definitions state whether a human, AI, or either may record them.
-- Human-first option and plan artifacts unlock AI assistance in those phases.
+- Workflow-specific human-first artifacts unlock AI assistance only after the human's initial model, option, plan, baseline, or other required reasoning exists.
 - Required current-visit artifacts must exist before gate acceptance.
 - Advancement requires the current human gate.
 - Independent human review must be recorded by an identity other than the latest changeset implementer, and that reviewer must accept the review gate.
-- The Product Change flow distinguishes implementation, deployment, observation, audit, and human outcome.
+- Lasting-change flows distinguish implementation, AI review, independent human review, deployment, observation, audit, and human outcome.
+- AI review is bound to a fingerprint of the exact current engineering changeset. The implementing human records a separate disposition for every material AI finding before independent human review.
+- AI-audit findings and their human disposition are separate required records, and the human disposer personally accepts the audit gate.
+- Operational Stabilization permits investigation and recovery work to proceed without proven root cause, but never grants AI the `execute` capability for the intervention or its execution phase.
+- Decision and Investigation close with human-owned records and do not silently authorize downstream implementation.
 - Model-invoked host tools require an explicit adapter mapping to an allowed canonical capability.
 
 Instructions explain these boundaries to the model. The Rust core enforces the transition, actor, artifact, identity, and capability decisions even if instructions are ignored.
@@ -102,9 +111,12 @@ The Pi adapter is an engineering workflow control, not a security sandbox.
 - Artifact and run writes are atomic, but v0.1 has no multi-process lock. One writer should operate a run at a time.
 - Workflow files can prove that a named action was recorded, not that a person genuinely understood it. Human review and organizational accountability remain necessary.
 - No GitHub checks, PR gates, migration engine, signature scheme, or backwards-compatible workflow upgrade exists yet.
+- Local review fingerprints detect changes but are not signatures. A future GitHub adapter must add remote identity and protected-branch evidence rather than treating the local record as cryptographic proof.
 
 ## Reuse path
 
 The reusable boundary is the engine API, not a CLI. Pi is the first adapter. A VS Code extension, GitHub check, or future WASM-capable editor can reuse the same compiled core and canonical fragments while providing its own UI, storage transport, identity strength, and tool-capability map.
 
-Dogfooding should test whether phase visits, artifacts, gates, returns, capability vocabulary, and identity rules generalize before the remaining five workflow profiles are encoded.
+Review presentation follows the same rule. The core requires snapshot-bound findings, dispositions, and review gates; a host maps portable paths and locations to a terminal viewer, VS Code diff/comment UI, or GitHub review API. See `docs/design/review-workbench.md`.
+
+Dogfooding should test whether the six encoded flows route real work correctly, whether their records and gates earn their cost, and whether phase visits, returns, capability vocabulary, and identity rules generalize across integrations.

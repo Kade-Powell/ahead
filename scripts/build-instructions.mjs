@@ -4,48 +4,80 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const specPath = join(root, "spec", "workflows", "product-change-v0.1.json");
+const specDirectory = join(root, "spec", "workflows");
 const commonPath = join(root, "policy", "common.md");
-const outputDir = join(root, "integrations", "pi", "generated", "product-change");
+const methodsIndexPath = join(root, "policy", "methods", "index.json");
+const recommendedSkillsPath = join(root, "recommendations", "skills-v0.1.json");
+const generatedDirectory = join(root, "integrations", "pi", "generated");
 const referenceOutputDir = join(root, "integrations", "pi", "generated", "reference");
 
-const specText = await readFile(specPath, "utf8");
-const spec = JSON.parse(specText);
 const common = (await readFile(commonPath, "utf8")).trim();
-await rm(outputDir, { recursive: true, force: true });
-await mkdir(outputDir, { recursive: true });
+const methodsIndex = JSON.parse(await readFile(methodsIndexPath, "utf8"));
+const methods = await loadMethods(methodsIndex);
+await rm(generatedDirectory, { recursive: true, force: true });
+await mkdir(generatedDirectory, { recursive: true });
 
-for (const phase of spec.phases) {
-  const fragmentPath = join(root, "policy", "product-change", `${phase.id}.md`);
-  const fragment = (await readFile(fragmentPath, "utf8")).trim();
-  const digest = createHash("sha256")
-    .update(specText)
-    .update("\0")
-    .update(common)
-    .update("\0")
-    .update(fragment)
-    .digest("hex");
-  const artifacts = phase.artifacts
-    .map((artifact) => {
-      const status = artifact.required ? "required" : "optional";
-      const independence = artifact.independent_of
-        ? `; actor identity must differ from latest ${artifact.independent_of}`
-        : "";
-      return `- \`${artifact.kind}\`: ${artifact.title} (${status}; actor: ${artifact.actor}${independence})`;
-    })
-    .join("\n");
-  const unlock = phase.ai_unlock_artifacts.length
-    ? phase.ai_unlock_artifacts.map((kind) => `\`${kind}\``).join(", ")
-    : "none";
-  const capabilities = phase.ai_capabilities.length
-    ? phase.ai_capabilities.map((capability) => `\`${capability}\``).join(", ")
-    : "none";
-  const returns = phase.returns_to.length ? phase.returns_to.join(", ") : "none";
-  const next = phase.next ?? "close run";
-  const gateActor = phase.gate.accepted_by_artifact
-    ? `; acceptance identity must match \`${phase.gate.accepted_by_artifact}\``
-    : "";
-  const output = `<!-- GENERATED FILE. DO NOT EDIT. -->
+const specPaths = (await readdir(specDirectory))
+  .filter((name) => name.endsWith(".json"))
+  .toSorted()
+  .map((name) => join(specDirectory, name));
+const specs = await Promise.all(
+  specPaths.map(async (specPath) => {
+    const specText = await readFile(specPath, "utf8");
+    return { specPath, specText, spec: JSON.parse(specText) };
+  }),
+);
+validateMethodApplications(
+  methods,
+  specs.map(({ spec }) => spec),
+);
+let generatedPhaseCount = 0;
+for (const { specPath, specText, spec } of specs) {
+  const outputDir = join(generatedDirectory, spec.id);
+  await mkdir(outputDir, { recursive: true });
+
+  for (const phase of spec.phases) {
+    const fragment = await readPhaseFragment(spec.id, phase.id);
+    const applicableMethods = methods.filter((method) =>
+      method.applies.some(
+        (application) => application.workflow === spec.id && application.phases.includes(phase.id),
+      ),
+    );
+    const methodInstructions = applicableMethods
+      .map((method) => `### ${method.title}\n\n${method.content}`)
+      .join("\n\n");
+    const digest = createHash("sha256")
+      .update(specText)
+      .update("\0")
+      .update(common)
+      .update("\0")
+      .update(fragment)
+      .update("\0")
+      .update(methodInstructions)
+      .digest("hex");
+    const artifacts = phase.artifacts
+      .map((artifact) => {
+        const status = artifact.required ? "required" : "optional";
+        const identity = artifact.independent_of
+          ? `; actor identity must differ from latest ${artifact.independent_of}`
+          : artifact.same_as
+            ? `; actor identity must match latest ${artifact.same_as}`
+            : "";
+        return `- \`${artifact.kind}\`: ${artifact.title} (${status}; actor: ${artifact.actor}${identity})`;
+      })
+      .join("\n");
+    const unlock = phase.ai_unlock_artifacts.length
+      ? phase.ai_unlock_artifacts.map((kind) => `\`${kind}\``).join(", ")
+      : "none";
+    const capabilities = phase.ai_capabilities.length
+      ? phase.ai_capabilities.map((capability) => `\`${capability}\``).join(", ")
+      : "none";
+    const returns = phase.returns_to.length ? phase.returns_to.join(", ") : "none";
+    const next = phase.next ?? "close run";
+    const gateActor = phase.gate.accepted_by_artifact
+      ? `; acceptance identity must match \`${phase.gate.accepted_by_artifact}\``
+      : "";
+    const output = `<!-- GENERATED FILE. DO NOT EDIT. -->
 <!-- workflow=${spec.id}@${spec.version} phase=${phase.id} sha256=${digest} -->
 
 ${common}
@@ -53,6 +85,8 @@ ${common}
 # Active phase: ${phase.title}
 
 ${fragment}
+
+${methodInstructions ? `## Applicable AHEAD methods\n\n${methodInstructions}\n` : ""}
 
 ## Enforced phase contract
 
@@ -68,33 +102,42 @@ ${fragment}
 
 ${artifacts}
 `;
-  await writeFile(join(outputDir, `${phase.id}.md`), output, "utf8");
+    await writeFile(join(outputDir, `${phase.id}.md`), output, "utf8");
+    generatedPhaseCount += 1;
+  }
+
+  await writeFile(
+    join(outputDir, "manifest.json"),
+    `${JSON.stringify(
+      {
+        workflow: spec.id,
+        version: spec.version,
+        generated: spec.phases.map((phase) => `${phase.id}.md`),
+        sources: [
+          relative(root, specPath),
+          relative(root, commonPath),
+          `policy/${spec.id}/<phase>.md or policy/shared/<phase>.md`,
+          relative(root, methodsIndexPath),
+          ...applicableMethodSources(spec.id, spec.phases, methods),
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 }
 
-const manifestPath = join(outputDir, "manifest.json");
 await writeFile(
-  manifestPath,
-  `${JSON.stringify(
-    {
-      workflow: spec.id,
-      version: spec.version,
-      generated: spec.phases.map((phase) => `${phase.id}.md`),
-      sources: [
-        relative(root, specPath),
-        relative(root, commonPath),
-        "policy/product-change/<phase>.md",
-      ],
-    },
-    null,
-    2,
-  )}\n`,
+  join(generatedDirectory, "recommended-skills.json"),
+  await readFile(recommendedSkillsPath, "utf8"),
   "utf8",
 );
 
 const referencePaths = [
   "CONSTITUTION.md",
   ...(await collectMarkdown(join(root, "docs"))).map((path) => relative(root, path)),
-].sort();
+].toSorted();
 await rm(referenceOutputDir, { recursive: true, force: true });
 const referenceEntries = [];
 for (const relativePath of referencePaths) {
@@ -108,6 +151,7 @@ for (const relativePath of referencePaths) {
     title: content.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? relativePath,
     summary: firstSummaryParagraph(content),
     phases: applicablePhases(relativePath),
+    workflows: applicableWorkflows(relativePath),
   });
 }
 await writeFile(
@@ -117,15 +161,80 @@ await writeFile(
 );
 
 console.log(
-  `Generated ${spec.phases.length} AHEAD Pi instruction bundles and ${referenceEntries.length} on-demand references`,
+  `Generated ${generatedPhaseCount} AHEAD Pi instruction bundles for ${specPaths.length} workflows and ${referenceEntries.length} on-demand references`,
 );
+
+async function readPhaseFragment(workflowId, phaseId) {
+  const workflowPath = join(root, "policy", workflowId, `${phaseId}.md`);
+  try {
+    return (await readFile(workflowPath, "utf8")).trim();
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  const sharedPath = join(root, "policy", "shared", `${phaseId}.md`);
+  return (await readFile(sharedPath, "utf8")).trim();
+}
+
+async function loadMethods(index) {
+  if (index.api_version !== "ahead.methods/v0.1" || !Array.isArray(index.methods)) {
+    throw new Error("invalid AHEAD method index");
+  }
+  const loaded = [];
+  for (const method of index.methods) {
+    const path = join(root, method.path);
+    loaded.push({ ...method, content: (await readFile(path, "utf8")).trim() });
+  }
+  return loaded;
+}
+
+function applicableMethodSources(workflowId, phases, availableMethods) {
+  const phaseIds = new Set(phases.map((phase) => phase.id));
+  return availableMethods
+    .filter((method) =>
+      method.applies.some(
+        (application) =>
+          application.workflow === workflowId &&
+          application.phases.some((phase) => phaseIds.has(phase)),
+      ),
+    )
+    .map((method) => method.path);
+}
+
+function validateMethodApplications(availableMethods, workflowSpecs) {
+  const phasesByWorkflow = new Map(
+    workflowSpecs.map((spec) => [spec.id, new Set(spec.phases.map((phase) => phase.id))]),
+  );
+  for (const method of availableMethods) {
+    for (const application of method.applies) {
+      const phaseIds = phasesByWorkflow.get(application.workflow);
+      if (!phaseIds) {
+        throw new Error(`${method.id} references unknown workflow ${application.workflow}`);
+      }
+      for (const phase of application.phases) {
+        if (!phaseIds.has(phase)) {
+          throw new Error(`${method.id} references unknown phase ${application.workflow}:${phase}`);
+        }
+      }
+    }
+  }
+}
+
+function isNodeError(error) {
+  return error instanceof Error && "code" in error;
+}
 
 async function collectMarkdown(directory) {
   const paths = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) paths.push(...await collectMarkdown(path));
-    else if (entry.isFile() && entry.name.endsWith(".md")) paths.push(path);
+    if (entry.isDirectory()) {
+      paths.push(...(await collectMarkdown(path)));
+    } else if (entry.isFile() && entry.name.endsWith(".md")) {
+      paths.push(path);
+    }
   }
   return paths;
 }
@@ -139,26 +248,63 @@ function referenceId(relativePath) {
 }
 
 function firstSummaryParagraph(content) {
-  return content
-    .split(/\n\s*\n/)
-    .map((paragraph) => paragraph.replace(/^#+\s+.*$/gm, "").trim())
-    .find((paragraph) => paragraph && !paragraph.startsWith("Status:") && !paragraph.startsWith("```"))
-    ?.replace(/\s+/g, " ")
-    .slice(0, 240) ?? "AHEAD framework reference.";
+  return (
+    content
+      .split(/\n\s*\n/)
+      .map((paragraph) => paragraph.replace(/^#+\s+.*$/gm, "").trim())
+      .find(
+        (paragraph) =>
+          paragraph && !paragraph.startsWith("Status:") && !paragraph.startsWith("```"),
+      )
+      ?.replace(/\s+/g, " ")
+      .slice(0, 240) ?? "AHEAD framework reference."
+  );
 }
 
 function applicablePhases(relativePath) {
-  if ([
-    "CONSTITUTION.md",
-    "docs/rationale.md",
-    "docs/acceptable-ai-use.md",
-    "docs/engineering-practice.md",
-    "docs/workflows/product-change.md",
-  ].includes(relativePath)) return ["*"];
+  if (/^docs\/workflows\/[^/]+\.md$/.test(relativePath)) {
+    return ["*"];
+  }
+  if (
+    [
+      "CONSTITUTION.md",
+      "docs/rationale.md",
+      "docs/acceptable-ai-use.md",
+      "docs/engineering-practice.md",
+    ].includes(relativePath)
+  ) {
+    return ["*"];
+  }
 
   if (relativePath === "docs/evidence/evidence-standard.md") {
-    return ["research", "questions", "decision", "plan", "ai-review", "human-review", "verify", "ai-audit", "outcome"];
+    return [
+      "research",
+      "questions",
+      "decision",
+      "plan",
+      "ai-review",
+      "human-review",
+      "verify",
+      "ai-audit",
+      "outcome",
+    ];
   }
-  if (relativePath === "docs/design/executable-workflows.md") return ["*"];
+  if (relativePath === "docs/design/executable-workflows.md") {
+    return ["*"];
+  }
+  if (relativePath === "docs/design/review-workbench.md") {
+    return ["ai-review", "human-review"];
+  }
   return [];
+}
+
+function applicableWorkflows(relativePath) {
+  const match = relativePath.match(/^docs\/workflows\/([^/]+)\.md$/);
+  if (match && match[1] !== "README") {
+    return [match[1]];
+  }
+  if (relativePath === "docs/design/review-workbench.md") {
+    return ["product-change", "corrective-debugging", "internal-improvement"];
+  }
+  return ["*"];
 }

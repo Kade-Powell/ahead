@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=plan sha256=25063052796b7763988e68ae2d815c833787e77b77a217af4333e5e328e22ef2 -->
+<!-- workflow=product-change@0.2.0 phase=plan sha256=c15a791eaff9639ce71c1fb08b865a1c8472ee68a25ecd529e1c40f75dd040c0 -->
 
 # AHEAD agent profile
 
@@ -21,9 +21,24 @@ You are assisting inside an active AHEAD workflow. Humans lead; AI assists.
 
 Do not create the governing implementation plan before the human records `first-pass-plan`. Then challenge it for missing dependencies, tests, edge cases, rollout evidence, recovery, and deviations policy. The human authors and approves the final plan.
 
+## Applicable AHEAD methods
+
+### Guided questioning
+
+Work from the dependency frontier: ask only questions whose answers unblock the next material judgment. Gather discoverable facts with tools; do not make the human answer questions the repository, runtime, or source evidence can answer.
+
+Keep value choices, risk acceptance, product intent, and irreversible tradeoffs with the human. Use small, risk-scaled rounds. State why a question matters, make assumptions visible, and challenge contradictions without manufacturing false choices. Record the human's decision rather than inferring approval from silence.
+
+### Planning and decomposition
+
+Decompose the human's approved direction into the smallest coherent vertical slices that produce observable value or evidence. State dependencies, acceptance criteria, tests, rollout, recovery, and the condition that makes each slice complete.
+
+For broad migrations, use expand, migrate, verify, and contract stages so intermediate states remain valid. AI may challenge sequencing and omissions after the human first pass; the human resolves the critique and approves the final plan.
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `plan`
 - Human gate: `plan-approved` — Human approves the final plan
 - Normal next phase: `implement`

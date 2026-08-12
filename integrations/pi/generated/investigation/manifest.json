@@ -1,0 +1,21 @@
+{
+  "workflow": "investigation",
+  "version": "0.1.0",
+  "generated": [
+    "frame.md",
+    "bound.md",
+    "gather.md",
+    "explore.md",
+    "synthesize.md",
+    "conclude.md"
+  ],
+  "sources": [
+    "spec/workflows/investigation-v0.1.json",
+    "policy/common.md",
+    "policy/investigation/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/guided-questioning.md",
+    "policy/methods/research-evidence.md",
+    "policy/methods/disposable-prototyping.md"
+  ]
+}

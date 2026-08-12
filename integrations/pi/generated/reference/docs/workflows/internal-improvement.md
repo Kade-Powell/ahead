@@ -23,20 +23,21 @@ Use product change when externally meaningful behavior is intentionally changing
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 2. BASELINE AND TARGET                       │
+│ 2. BASELINE                                  │
 │                                              │
-│ HUMAN                                        │
-│ • Accept current evidence and measurement    │
-│ • Define target quality                      │
-│ • Define success threshold                   │
-│                                              │
-│ AI — ASSIST                                  │
-│ • Gather metrics • find measurement gaps     │
-│ • Suggest unintended effects to watch        │
+│ HUMAN accepts method, evidence, uncertainty  │
+│ AI — ASSIST challenges noise / confounders   │
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 3. OPTIONS                                   │
+│ 3. TARGET                                    │
+│                                              │
+│ HUMAN defines quality, threshold, guardrails │
+│ AI — ASSIST exposes gaming / shifted cost    │
+└──────────────────────┬───────────────────────┘
+                       ↓
+┌──────────────────────────────────────────────┐
+│ 4. OPTIONS                                   │
 │                                              │
 │ HUMAN — FIRST PASS                           │
 │ • Propose at least one improvement approach  │
@@ -50,13 +51,13 @@ Use product change when externally meaningful behavior is intentionally changing
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 4. HUMAN DECISION GATE                       │
+│ 5. HUMAN DECISION GATE                       │
 │ • Select approach and accept tradeoffs       │
 │ • Record rationale                           │
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 5. PLAN                                      │
+│ 6. PLAN                                      │
 │                                              │
 │ HUMAN — FIRST PASS                           │
 │ • Sequence change, checks, and rollback      │
@@ -68,28 +69,31 @@ Use product change when externally meaningful behavior is intentionally changing
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 6. IMPLEMENT                                 │
+│ 7. IMPLEMENT                                 │
 │ ENGINEER owns and understands the change     │
 │ AI — ASSIST with bounded contributions       │
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 7. AI REVIEW                                 │
+│ 8. AI REVIEW                                 │
 │ • Hidden behavior changes • complexity       │
 │ • Tests • coupling • plan compliance         │
 └──────────────────────┬───────────────────────┘
                        ↓
+          HUMAN DISPOSITIONS EACH MATERIAL
+          AI FINDING WITH RATIONALE / EVIDENCE
+                       ↓
 ┌──────────────────────────────────────────────┐
-│ 8. INDEPENDENT HUMAN REVIEW                  │
+│ 9. INDEPENDENT HUMAN REVIEW                  │
 │ • Reviewer is not the implementer            │
 │ • Final judgment on preservation/improvement │
 └──────────────────────┬───────────────────────┘
                        ↓
-       9. HUMAN AUTHORIZES DEPLOY / RELEASE
+       10. HUMAN AUTHORIZES DEPLOY / RELEASE
                     WHEN APPLICABLE
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 10. VERIFY                                   │
+│ 11. VERIFY                                   │
 │                                              │
 │ HUMAN                                        │
 │ • Verify invariants                          │
@@ -100,11 +104,12 @@ Use product change when externally meaningful behavior is intentionally changing
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 11. AI AUDIT                                 │
+│ 12. AI AUDIT                                 │
 │ • Compare invariants, target, plan, reviews, │
 │   deployment, and observed evidence          │
-│ HUMAN disposes material findings             │
 └──────────────────────┬───────────────────────┘
+                       ↓
+          HUMAN DISPOSITIONS AUDIT FINDINGS
                        ↓
                 ┌───────────────┐
                 │ INVARIANTS    │
@@ -118,7 +123,7 @@ Use product change when externally meaningful behavior is intentionally changing
                      │  │ IMPROVED?      │
                      │  └───────┬────────┘
                      │     NO ↙   ↘ YES
-                     │       │      └────► HUMAN OUTCOME GATE
+                     │       │      └────► HUMAN OUTCOME GATE (13)
                      │       ▼
                      │  HUMAN CHOOSES
                      │  ├─ Rework ─────────────↺ IMPLEMENT
@@ -144,14 +149,15 @@ Preservation and improvement are separate judgments. A failed invariant cannot b
 | Invariants | Behavior that must remain unchanged, scope, and non-goals | Identify overlooked contracts and consumers | Explicit invariants and exclusions | Human accepts the preservation contract |
 | Baseline | Current quality evidence and measurement validity | Gather metrics and identify measurement gaps | Tests, measurements, structural evidence, or observations | Baseline is credible enough for comparison |
 | Target | Quality to improve, success threshold, and tradeoffs | Suggest measures and unintended effects | Target quality and acceptance signal | Improvement can be evaluated |
-| Options and decision | Initial approach, selection, and risk | Expand alternatives, expose coupling, and challenge abstraction | Options, decision, and rationale | Human approves the approach |
+| Options | Initial approach and evaluation of alternatives | After the human first pass, expand alternatives, expose coupling, and challenge abstraction | Human option, AI challenge when used, and evaluated options | Viable approaches and tradeoffs are understood |
+| Decision | Selection, risk, confidence, and reversibility | Check the option against baseline, target, and invariants | Decision and rationale | Human approves the approach |
 | Plan | First-pass sequence, verification, and rollback | Find affected boundaries, migration needs, and missing tests | Plan and invariant checks | Human approves the final plan |
 | Implement | Engineering change and scope control | Bounded refactoring, explanation, tests, and mechanical assistance | Linked changeset and deviations | Change is ready for review |
-| AI review | Disposition of valid findings | Review for hidden behavior changes, incidental complexity, tests, and plan alignment | AI findings and dispositions | Blocking findings are resolved or rejected with rationale |
+| AI review | Validate and disposition every material AI finding | Review the exact snapshot for hidden behavior changes, incidental complexity, tests, and plan alignment without modifying it | Snapshot-bound AI findings; separate human disposition | Every material finding is fixed, invalid, accepted risk, or follow-up with rationale |
 | Human review | Independent final judgment by someone other than the implementer about simplicity, coupling, risk, and preservation | Answer targeted questions and retrieve evidence | Current independent human review | Independent human reviewer accepts the current change |
 | Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended version reaches the target environment or deployment is explicitly not applicable |
 | Verify | Invariant preservation and target-quality comparison | Analyze measurements and suggest negative checks | Before/after and deployed-outcome evidence when applicable, plus invariant results | Invariants are evaluated and target-quality results are measured; an invariant failure routes to rollback, rework, or product-change reclassification |
-| AI audit | Disposition of findings and required response | Compare invariants, target, plan, reviews, deployment, and observed evidence; identify divergence or weak proof | Audit findings and dispositions | Human has reviewed material findings |
+| AI audit | Disposition of findings and required response | Compare invariants, target, plan, reviews, deployment, and observed evidence; identify divergence or weak proof | AI audit findings; separate human disposition | The human disposer accepts the audit gate or reopens work |
 | Outcome | Acceptance, rollback, partial result, or new work | Summarize learning | Outcome, remaining debt, and follow-ups | Human accepts closure |
 
 ## Preservation and improvement chain
@@ -172,7 +178,13 @@ HUMAN DECISION / FIRST-PASS PLAN
 ENGINEER-OWNED CHANGESET
                │
                ▼
-AI REVIEW + INDEPENDENT HUMAN REVIEW
+SNAPSHOT-BOUND AI REVIEW
+               │
+               ▼
+IMPLEMENTING-HUMAN DISPOSITION
+               │
+               ▼
+INDEPENDENT HUMAN REVIEW
                │
                ▼
 HUMAN-AUTHORIZED DEPLOYMENT WHEN APPLICABLE

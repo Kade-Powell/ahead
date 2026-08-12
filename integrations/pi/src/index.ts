@@ -21,12 +21,28 @@ import {
   relevantReferences,
 } from "./reference.js";
 import { showReferenceViewer } from "./reference-viewer.js";
+import {
+  collectReviewSnapshot,
+  extractFindingIds,
+  extractReviewFingerprint,
+  openInConfiguredEditor,
+  reviewDispositionTemplate,
+  reviewRequest,
+  reviewSnapshotMarkdown,
+  validateAiReviewArtifact,
+  validateReviewDisposition,
+} from "./review.js";
+import {
+  loadRecommendedSkills,
+  recommendedSkillsMarkdown,
+  relevantRecommendedSkills,
+} from "./skills.js";
 import { humanActor, projectRoot, RunStore } from "./storage.js";
 import type { Actor, Capability, EventAction, Run, RunState } from "./types.js";
 
 const wasmPath =
   process.env.AHEAD_WASM_PATH || fileURLToPath(new URL("../dist/ahead_wasm.wasm", import.meta.url));
-const instructionDirectory = fileURLToPath(new URL("../generated/product-change", import.meta.url));
+const instructionDirectory = fileURLToPath(new URL("../generated", import.meta.url));
 const enginePromise = AheadEngine.load(wasmPath);
 const instructions = new Map<string, string>();
 
@@ -46,106 +62,145 @@ const RecordArtifactParams = Type.Object({
   content: Type.String({ description: "Complete Markdown artifact content", maxLength: 100_000 }),
 });
 const ReferenceParams = Type.Object({
-  topic: Type.Optional(Type.String({ description: "Reference id, path, or title; omit to list phase-relevant references" })),
+  topic: Type.Optional(
+    Type.String({
+      description: "Reference id, path, or title; omit to list phase-relevant references",
+    }),
+  ),
 });
 
 export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ahead", {
     description: "Enter or continue the guided AHEAD mode",
-    handler: async (args, ctx) => command(ctx, async () => {
-      await openAheadMode(pi, args, ctx);
-    }),
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await openAheadMode(pi, args, ctx);
+      }),
   });
 
   pi.registerCommand("ahead-guide", {
     description: "Read the AHEAD framework guidance relevant to the active phase",
-    handler: async (args, ctx) => command(ctx, async () => {
-      await showAheadGuide(ctx, args);
-    }),
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await showAheadGuide(ctx, args);
+      }),
+  });
+
+  pi.registerCommand("ahead-skills", {
+    description: "Inspect optional skills reviewed for the active AHEAD phase",
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        await showRecommendedSkills(ctx);
+      }),
+  });
+
+  pi.registerCommand("ahead-review", {
+    description: "Inspect and perform the current changeset review handoff",
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        await openReviewWorkbench(pi, ctx);
+      }),
   });
 
   pi.registerCommand("ahead-start", {
-    description: "Advanced: start a Product Change run directly",
-    handler: async (args, ctx) => command(ctx, async () => {
-      await startRun(ctx, args);
-    }),
+    description: "Advanced: start a workflow directly with [workflow-id ::] title",
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await startRun(ctx, args);
+      }),
   });
 
   pi.registerCommand("ahead-status", {
     description: "Advanced: show the raw active AHEAD phase contract",
-    handler: async (_args, ctx) => command(ctx, async () => {
-      const run = await requireRun(ctx);
-      const state = (await enginePromise).deriveState(run);
-      await refreshUi(ctx, run);
-      ctx.ui.notify(formatState(state), state.blockers.length ? "warning" : "info");
-    }),
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        const run = await requireRun(ctx);
+        const state = (await enginePromise).deriveState(run);
+        await refreshUi(ctx, run);
+        ctx.ui.notify(formatState(state), state.blockers.length ? "warning" : "info");
+      }),
   });
 
   pi.registerCommand("ahead-record", {
     description: "Advanced: record a human-owned artifact directly",
-    handler: async (args, ctx) => command(ctx, async () => {
-      await recordHumanArtifact(ctx, args.trim());
-    }),
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await recordHumanArtifact(ctx, args.trim());
+      }),
   });
 
   pi.registerCommand("ahead-accept", {
     description: "Advanced: accept the active gate without advancing",
-    handler: async (_args, ctx) => command(ctx, async () => {
-      if (!ctx.hasUI) throw new Error("/ahead-accept requires interactive or RPC UI support");
-      const engine = await enginePromise;
-      const store = storeFor(ctx);
-      const run = await requireRun(ctx);
-      const state = engine.deriveState(run);
-      const confirmed = await ctx.ui.confirm(
-        `Accept ${state.gate.id}?`,
-        `${state.gate.title}\n\nThis records human acceptance as ${humanActor(store.projectRoot).identity}.`,
-      );
-      if (!confirmed) return;
-      const updated = engine.applyEvent(run, humanActor(store.projectRoot), {
-        type: "gate_accepted",
-        phase: state.phase.id,
-        gate: state.gate.id,
-      });
-      await store.save(updated);
-      await refreshUi(ctx, updated);
-      ctx.ui.notify(`Accepted gate ${state.gate.id}. Use /ahead-advance when ready.`, "info");
-    }),
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        if (!ctx.hasUI) {
+          throw new Error("/ahead-accept requires interactive or RPC UI support");
+        }
+        const engine = await enginePromise;
+        const store = storeFor(ctx);
+        const run = await requireRun(ctx);
+        const state = engine.deriveState(run);
+        const confirmed = await ctx.ui.confirm(
+          `Accept ${state.gate.id}?`,
+          `${state.gate.title}\n\nThis records human acceptance as ${humanActor(store.projectRoot).identity}.`,
+        );
+        if (!confirmed) {
+          return;
+        }
+        const updated = engine.applyEvent(run, humanActor(store.projectRoot), {
+          type: "gate_accepted",
+          phase: state.phase.id,
+          gate: state.gate.id,
+        });
+        await store.save(updated);
+        await refreshUi(ctx, updated);
+        ctx.ui.notify(`Accepted gate ${state.gate.id}. Use /ahead-advance when ready.`, "info");
+      }),
   });
 
   pi.registerCommand("ahead-advance", {
     description: "Advanced: advance an already accepted gate",
-    handler: async (_args, ctx) => command(ctx, async () => {
-      if (!ctx.hasUI) throw new Error("/ahead-advance requires interactive or RPC UI support");
-      const engine = await enginePromise;
-      const store = storeFor(ctx);
-      const run = await requireRun(ctx);
-      const state = engine.deriveState(run);
-      const destination = state.phase.next ?? "closed";
-      const confirmed = await ctx.ui.confirm(
-        state.phase.next ? `Advance to ${state.phase.next}?` : "Close this AHEAD run?",
-        `Current phase: ${state.phase.title}\nDestination: ${destination}\nActor: ${humanActor(store.projectRoot).identity}`,
-      );
-      if (!confirmed) return;
-      const action: EventAction = state.phase.next
-        ? {
-            type: "phase_transitioned",
-            from: state.phase.id,
-            to: state.phase.next,
-            direction: "advance",
-          }
-        : { type: "run_closed", phase: state.phase.id };
-      const updated = engine.applyEvent(run, humanActor(store.projectRoot), action);
-      await store.save(updated);
-      await refreshUi(ctx, updated);
-      ctx.ui.notify(state.phase.next ? `Advanced to ${state.phase.next}.` : "AHEAD run closed.", "info");
-    }),
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        if (!ctx.hasUI) {
+          throw new Error("/ahead-advance requires interactive or RPC UI support");
+        }
+        const engine = await enginePromise;
+        const store = storeFor(ctx);
+        const run = await requireRun(ctx);
+        const state = engine.deriveState(run);
+        const destination = state.phase.next ?? "closed";
+        const confirmed = await ctx.ui.confirm(
+          state.phase.next ? `Advance to ${state.phase.next}?` : "Close this AHEAD run?",
+          `Current phase: ${state.phase.title}\nDestination: ${destination}\nActor: ${humanActor(store.projectRoot).identity}`,
+        );
+        if (!confirmed) {
+          return;
+        }
+        const action: EventAction = state.phase.next
+          ? {
+              type: "phase_transitioned",
+              from: state.phase.id,
+              to: state.phase.next,
+              direction: "advance",
+            }
+          : { type: "run_closed", phase: state.phase.id };
+        const updated = engine.applyEvent(run, humanActor(store.projectRoot), action);
+        await store.save(updated);
+        await refreshUi(ctx, updated);
+        ctx.ui.notify(
+          state.phase.next ? `Advanced to ${state.phase.next}.` : "AHEAD run closed.",
+          "info",
+        );
+      }),
   });
 
   pi.registerCommand("ahead-return", {
     description: "Advanced: return to an earlier phase with a reason",
-    handler: async (args, ctx) => command(ctx, async () => {
-      await returnToEarlierPhase(ctx, args);
-    }),
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await returnToEarlierPhase(ctx, args);
+      }),
   });
 
   pi.registerCommand("ahead-help", {
@@ -153,8 +208,10 @@ export default function aheadExtension(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       ctx.ui.notify(
         [
-          "/ahead [title] — enter, resume, or act in guided AHEAD mode",
+          "/ahead [title] — choose a workflow for new work, or resume guided AHEAD mode",
           "/ahead-guide [topic] — read the applicable AHEAD framework Markdown",
+          "/ahead-skills — inspect optional reviewed skills relevant to this phase",
+          "/ahead-review — inspect the exact changeset and review handoff",
           "",
           "Once started, the repository run remains in AHEAD mode until an accountable human closes the outcome.",
           "Use normal conversation to think and work with AI. Run /ahead whenever you want the next valid action.",
@@ -171,7 +228,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ahead_get_context",
     label: "AHEAD context",
-    description: "Read the authoritative active AHEAD workflow state, phase contract, artifacts, gate, and blockers.",
+    description:
+      "Read the authoritative active AHEAD workflow state, phase contract, artifacts, gate, and blockers.",
     promptSnippet: "Read the active AHEAD workflow state and human/AI boundaries.",
     parameters: EmptyParams,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -184,28 +242,73 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "ahead_get_recommended_skills",
+    label: "AHEAD recommended skills",
+    description:
+      "List optional third-party skills reviewed for the active phase. Never installs a skill.",
+    promptSnippet:
+      "Discover reviewed optional skills only when they may help the active AHEAD work.",
+    parameters: EmptyParams,
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      return toolResult(async () => {
+        const catalog = await loadRecommendedSkills();
+        const run = await storeFor(ctx).loadCurrent();
+        const state = run ? (await enginePromise).deriveState(run) : undefined;
+        const phaseId = state && !state.closed ? state.phase.id : undefined;
+        const workflowId = state && !state.closed ? state.workflow_id : undefined;
+        return {
+          reviewed_at: catalog.reviewed_at,
+          phase: phaseId ?? null,
+          workflow: workflowId ?? null,
+          recommended: relevantRecommendedSkills(catalog, workflowId, phaseId),
+          available: catalog.skills,
+          instruction:
+            "Do not install automatically. Explain why a skill applies, show the pinned source and command, and let the human opt in. AHEAD remains authoritative.",
+        };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "ahead_get_review_snapshot",
+    label: "AHEAD review snapshot",
+    description:
+      "Capture the exact current Git changeset, merge base, status, paths, diff, and stable fingerprint without modifying it.",
+    promptSnippet: "Bind review findings to the exact current AHEAD changeset fingerprint.",
+    parameters: EmptyParams,
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      return toolResult(async () => collectReviewSnapshot(storeFor(ctx).projectRoot));
+    },
+  });
+
+  pi.registerTool({
     name: "ahead_get_reference",
     label: "AHEAD framework reference",
-    description: "List or read packaged AHEAD Constitution, philosophy, acceptable-use, engineering-practice, workflow, and evidence Markdown.",
-    promptSnippet: "Retrieve relevant AHEAD framework guidance when the phase or policy is unclear.",
+    description:
+      "List or read packaged AHEAD Constitution, philosophy, acceptable-use, engineering-practice, workflow, and evidence Markdown.",
+    promptSnippet:
+      "Retrieve relevant AHEAD framework guidance when the phase or policy is unclear.",
     parameters: ReferenceParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return toolResult(async () => {
         const run = await storeFor(ctx).loadCurrent();
-        const phase = run && !(await enginePromise).deriveState(run).closed
-          ? (await enginePromise).deriveState(run).phase.id
-          : undefined;
+        const state = run ? (await enginePromise).deriveState(run) : undefined;
+        const phase = state && !state.closed ? state.phase.id : undefined;
+        const workflowId = state && !state.closed ? state.workflow_id : undefined;
         if (!params.topic?.trim()) {
           const index = await loadReferenceIndex();
           return {
             phase: phase ?? null,
-            recommended: await relevantReferences(phase),
+            workflow: workflowId ?? null,
+            recommended: await relevantReferences(workflowId, phase),
             available: index.references.map(({ id, title, path }) => ({ id, title, path })),
             instruction: "Request one reference by id, path, or title. Load only what is relevant.",
           };
         }
         const entry = await findReference(params.topic);
-        if (!entry) throw new Error(`No packaged AHEAD reference matches ${params.topic}`);
+        if (!entry) {
+          throw new Error(`No packaged AHEAD reference matches ${params.topic}`);
+        }
         return { reference: entry, content: await readReference(entry) };
       });
     },
@@ -214,7 +317,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ahead_record_artifact",
     label: "Record AHEAD artifact",
-    description: "Persist an AI-owned or shared artifact permitted by the active phase. Cannot record human-owned artifacts.",
+    description:
+      "Persist an AI-owned or shared artifact permitted by the active phase. Cannot record human-owned artifacts.",
     promptSnippet: "Record an AI-permitted artifact in the active AHEAD run.",
     parameters: RecordArtifactParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -229,6 +333,13 @@ export default function aheadExtension(pi: ExtensionAPI): void {
             "artifact_not_ai_owned",
             `AI cannot record ${params.kind} in phase ${state.phase.id}`,
           );
+        }
+        if (artifact.kind === "ai-review") {
+          const snapshot = await collectReviewSnapshot(store.projectRoot);
+          const errors = validateAiReviewArtifact(params.content, snapshot.fingerprint);
+          if (errors.length) {
+            throw new AheadEngineError("invalid_ai_review", errors.join("; "));
+          }
         }
         const path = store.artifactPath(run, state.phase.id, artifact.kind);
         const updated = engine.applyEvent(run, aiActor(ctx), {
@@ -252,7 +363,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ahead_request_transition",
     label: "Request AHEAD transition",
-    description: "Report whether a human can advance the active AHEAD phase. This tool never accepts a gate or transitions state.",
+    description:
+      "Report whether a human can advance the active AHEAD phase. This tool never accepts a gate or transitions state.",
     parameters: EmptyParams,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       return toolResult(async () => {
@@ -272,10 +384,14 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ahead_validate",
     label: "Validate AHEAD run",
-    description: "Replay and validate the active AHEAD event log against the embedded workflow contract.",
+    description:
+      "Replay and validate the active AHEAD event log against the embedded workflow contract.",
     parameters: EmptyParams,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      return toolResult(async () => ({ valid: true, state: (await enginePromise).validateRun(await requireRun(ctx)) }));
+      return toolResult(async () => ({
+        valid: true,
+        state: (await enginePromise).validateRun(await requireRun(ctx)),
+      }));
     },
   });
 
@@ -298,17 +414,22 @@ export default function aheadExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (event, ctx) => {
     const run = await storeFor(ctx).loadCurrent();
-    if (!run) return;
+    if (!run) {
+      return undefined;
+    }
     const engine = await enginePromise;
     const state = engine.deriveState(run);
-    if (state.closed) return;
+    if (state.closed) {
+      return undefined;
+    }
     const workflow = engine.getWorkflow(run.workflow_id);
-    const guidance = phaseGuide(state.phase.id);
+    const guidance = phaseGuide(run.workflow_id, state.phase.id);
     const action = nextAction(state, workflow);
-    const phaseInstructions = await loadInstructions(state.phase.id);
+    const phaseInstructions = await loadInstructions(run.workflow_id, state.phase.id);
     const liveContext = [
       "# Live AHEAD run",
       `- Run: ${run.id} — ${run.title}`,
+      `- Workflow: ${workflow.title} (${workflow.id})`,
       `- Phase: ${state.phase.id} visit ${state.phase.visit}`,
       `- Gate accepted: ${state.gate.accepted}`,
       `- Current blockers: ${state.blockers.length ? state.blockers.join("; ") : "none"}`,
@@ -325,15 +446,22 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       "- Treat AI review findings as hypotheses. Independent human review remains required for lasting engineering changes.",
       "- Humans may ask questions at any phase. During implementation, help them understand or solve the problem without taking over; if their first attempt or current model is missing, ask for it.",
       "- When AHEAD policy or rationale is unclear, use ahead_get_reference to retrieve only the applicable packaged Markdown.",
+      "- Use ahead_get_recommended_skills only when an optional reviewed skill could materially help. Never install one without the human's explicit choice; AHEAD remains authoritative.",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${phaseInstructions}\n\n${liveContext}\n` };
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName.startsWith("ahead_")) return;
+    if (event.toolName.startsWith("ahead_")) {
+      return undefined;
+    }
     const run = await storeFor(ctx).loadCurrent();
-    if (!run) return;
-    if ((await enginePromise).deriveState(run).closed) return;
+    if (!run) {
+      return undefined;
+    }
+    if ((await enginePromise).deriveState(run).closed) {
+      return undefined;
+    }
     const capability = toolCapabilities[event.toolName];
     if (!capability) {
       return {
@@ -343,10 +471,13 @@ export default function aheadExtension(pi: ExtensionAPI): void {
     }
     try {
       const decision = (await enginePromise).toolAllowed(run, capability);
-      if (!decision.allowed) return { block: true, reason: `AHEAD: ${decision.reason}` };
+      if (!decision.allowed) {
+        return { block: true, reason: `AHEAD: ${decision.reason}` };
+      }
     } catch (error) {
       return { block: true, reason: `AHEAD state validation failed: ${errorMessage(error)}` };
     }
+    return undefined;
   });
 }
 
@@ -355,31 +486,42 @@ interface GuidedAction {
   run: () => Promise<void>;
 }
 
-async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function openAheadMode(
+  pi: ExtensionAPI,
+  args: string,
+  ctx: ExtensionCommandContext,
+): Promise<void> {
   const engine = await enginePromise;
   const store = storeFor(ctx);
   let run = await store.loadCurrent();
 
   if (run && engine.deriveState(run).closed) {
     if (!ctx.hasUI) {
-      ctx.ui.notify("The current AHEAD run is complete. Start new work in an interactive Pi session.", "info");
+      ctx.ui.notify(
+        "The current AHEAD run is complete. Start new work in an interactive Pi session.",
+        "info",
+      );
       return;
     }
     const choice = await ctx.ui.select("AHEAD work is complete", [
-      "Start a new Product Change",
+      "Start new AHEAD work",
       "View the completed run",
     ]);
     if (choice === "View the completed run") {
       ctx.ui.notify(formatState(engine.deriveState(run)), "info");
       return;
     }
-    if (choice !== "Start a new Product Change") return;
+    if (choice !== "Start new AHEAD work") {
+      return;
+    }
     run = undefined;
   }
 
   if (!run) {
     run = await startRun(ctx, args);
-    if (!run) return;
+    if (!run) {
+      return;
+    }
   }
 
   await refreshUi(ctx, run);
@@ -390,43 +532,60 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
 
   const state = engine.deriveState(run);
   const workflow = engine.getWorkflow(run.workflow_id);
-  const guidance = phaseGuide(state.phase.id);
+  const guidance = phaseGuide(run.workflow_id, state.phase.id);
   const action = nextAction(state, workflow);
   const actions: GuidedAction[] = [];
-  const missingRequired = state.artifacts.filter((artifact) => artifact.required && !artifact.present);
+  const missingRequired = state.artifacts.filter(
+    (artifact) => artifact.required && !artifact.present,
+  );
   if (action.artifactKind) {
+    const actionArtifact = state.artifacts.find(
+      (artifact) => artifact.kind === action.artifactKind,
+    );
     actions.push({
       label: action.label,
-      run: action.actor === "ai"
-        ? async () => requestAiAssistance(pi, state, action.artifactKind)
-        : async () => recordHumanArtifact(ctx, action.artifactKind ?? ""),
+      run:
+        action.actor === "ai"
+          ? state.phase.id === "ai-review"
+            ? async () => openReviewWorkbench(pi, ctx)
+            : async () => requestAiAssistance(pi, state, action.artifactKind)
+          : async () => recordHumanArtifact(ctx, action.artifactKind ?? ""),
     });
+    if (action.actor === "ai" && actionArtifact?.actor === "any") {
+      actions.push({
+        label: `Write ${actionArtifact.title} yourself`,
+        run: async () => recordHumanArtifact(ctx, actionArtifact.kind),
+      });
+    }
   }
 
   if (action.optional) {
-    const nextHumanArtifact = missingRequired.find((artifact) => artifact.actor === "human");
+    const nextHumanArtifact = missingRequired.find((artifact) => artifact.actor !== "ai");
     if (nextHumanArtifact) {
       actions.push({
         label: `Continue without optional AI challenge · Write ${nextHumanArtifact.title}`,
         run: async () => recordHumanArtifact(ctx, nextHumanArtifact.kind),
+      });
+    } else if (missingRequired.length === 0) {
+      actions.push({
+        label: `Continue without optional AI contribution · Accept ${state.gate.title}`,
+        run: async () => acceptAndContinue(ctx),
       });
     }
   }
 
   if (missingRequired.length === 0 && !action.artifactKind) {
     actions.push({
-      label: state.gate.accepted
-        ? action.label
-        : `Accept and continue · ${state.gate.title}`,
+      label: state.gate.accepted ? action.label : `Accept and continue · ${state.gate.title}`,
       run: async () => acceptAndContinue(ctx),
     });
   }
 
   if (
-    state.allowed_ai_capabilities.length > 0
-    && action.actor !== "ai"
-    && !missingRequired.some((artifact) => artifact.actor === "ai")
-    && state.phase.id !== "implement"
+    state.allowed_ai_capabilities.length > 0 &&
+    action.actor !== "ai" &&
+    !missingRequired.some((artifact) => artifact.actor === "ai") &&
+    state.phase.id !== "implement"
   ) {
     actions.push({
       label: `Ask AI to assist · ${state.phase.title}`,
@@ -441,6 +600,13 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
     });
   }
 
+  if (state.phase.id === "ai-review" || state.phase.id === "human-review") {
+    actions.push({
+      label: "Open the changeset review workbench",
+      run: async () => openReviewWorkbench(pi, ctx),
+    });
+  }
+
   if (state.return_targets.length > 0) {
     actions.push({
       label: "Return to an earlier phase",
@@ -451,6 +617,11 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
   actions.push({
     label: "Read AHEAD framework guidance for this phase",
     run: async () => showAheadGuide(ctx, ""),
+  });
+
+  actions.push({
+    label: "Inspect optional skills reviewed for this phase",
+    run: async () => showRecommendedSkills(ctx),
   });
 
   actions.push({
@@ -474,7 +645,78 @@ async function openAheadMode(pi: ExtensionAPI, args: string, ctx: ExtensionComma
     actions.map((candidate) => candidate.label),
   );
   const chosen = actions.find((candidate) => candidate.label === selected);
-  if (chosen) await chosen.run();
+  if (chosen) {
+    await chosen.run();
+  }
+}
+
+async function showRecommendedSkills(ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("Inspecting recommended skills requires interactive or RPC UI support");
+  }
+  const catalog = await loadRecommendedSkills();
+  const run = await storeFor(ctx).loadCurrent();
+  const state = run ? (await enginePromise).deriveState(run) : undefined;
+  const phaseId = state && !state.closed ? state.phase.id : undefined;
+  const workflowId = state && !state.closed ? state.workflow_id : undefined;
+  const relevant = relevantRecommendedSkills(catalog, workflowId, phaseId);
+  await showReferenceViewer(
+    ctx,
+    relevant.length ? `AHEAD skills · ${state?.phase.title}` : "AHEAD recommended skills",
+    recommendedSkillsMarkdown(catalog, relevant.length ? relevant : catalog.skills),
+  );
+}
+
+async function openReviewWorkbench(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("The review workbench requires interactive or RPC UI support");
+  }
+  const store = storeFor(ctx);
+  const run = await requireRun(ctx);
+  const state = (await enginePromise).deriveState(run);
+  const snapshot = await collectReviewSnapshot(store.projectRoot);
+  const aiReview = state.artifacts.find((artifact) => artifact.kind === "ai-review");
+  const disposition = state.artifacts.find((artifact) => artifact.kind === "review-disposition");
+  const options = ["View snapshot and changed files", "View exact terminal diff"];
+  if (snapshot.changed_files.length) {
+    options.push("Open a changed file in the configured editor");
+  }
+  if (state.phase.id === "ai-review" && !aiReview?.present) {
+    options.push("Request AI review of this exact snapshot");
+  }
+  if (state.phase.id === "ai-review" && aiReview?.present && !disposition?.present) {
+    options.push("Disposition the AI findings as the implementing human");
+  }
+  if (state.phase.id === "human-review") {
+    options.push("Record the independent human review of this snapshot");
+  }
+  const selected = await ctx.ui.select(
+    `AHEAD review · ${state.phase.title} · ${snapshot.changed_files.length} changed files`,
+    options,
+  );
+  if (selected === "View snapshot and changed files") {
+    await showReferenceViewer(ctx, "AHEAD exact review snapshot", reviewSnapshotMarkdown(snapshot));
+  } else if (selected === "View exact terminal diff") {
+    await showReferenceViewer(
+      ctx,
+      `AHEAD diff · ${snapshot.fingerprint.slice(0, 12)}`,
+      `${reviewSnapshotMarkdown(snapshot)}\n\n## Diff\n\n\`\`\`diff\n${snapshot.diff || "No tracked diff."}\n\`\`\``,
+    );
+  } else if (selected === "Open a changed file in the configured editor") {
+    const path = await ctx.ui.select("Open changed file", snapshot.changed_files);
+    if (path && !openInConfiguredEditor(store.projectRoot, { path })) {
+      ctx.ui.notify(
+        `No supported editor was detected. Open ${path} from the repository, or set AHEAD_EDITOR=vscode.`,
+        "info",
+      );
+    }
+  } else if (selected === "Request AI review of this exact snapshot") {
+    pi.sendUserMessage(reviewRequest(snapshot));
+  } else if (selected === "Disposition the AI findings as the implementing human") {
+    await recordHumanArtifact(ctx, "review-disposition");
+  } else if (selected === "Record the independent human review of this snapshot") {
+    await recordHumanArtifact(ctx, "human-review");
+  }
 }
 
 async function askImplementationQuestion(
@@ -482,7 +724,9 @@ async function askImplementationQuestion(
   ctx: ExtensionCommandContext,
   state: RunState,
 ): Promise<void> {
-  if (!ctx.hasUI) throw new Error("Implementation coaching requires interactive or RPC UI support");
+  if (!ctx.hasUI) {
+    throw new Error("Implementation coaching requires interactive or RPC UI support");
+  }
   const question = await ctx.ui.editor(
     "AHEAD implementation help · human first",
     [
@@ -501,50 +745,67 @@ async function askImplementationQuestion(
       "",
     ].join("\n"),
   );
-  if (!question?.trim()) return;
-  pi.sendUserMessage([
-    `AHEAD mode: help me with this ${state.phase.title} question while I remain the implementer.`,
-    "Use my current model and first attempt below. Help me understand or solve the problem with questions, explanation, evidence, hints, and bounded next steps.",
-    "Do not convert this question into autonomous implementation or author my human-owned records. If I later request a bounded mechanical edit, explain it so I can inspect and own it.",
-    "",
-    question.trim(),
-  ].join("\n"));
+  if (!question?.trim()) {
+    return;
+  }
+  pi.sendUserMessage(
+    [
+      `AHEAD mode: help me with this ${state.phase.title} question while I remain the implementer.`,
+      "Use my current model and first attempt below. Help me understand or solve the problem with questions, explanation, evidence, hints, and bounded next steps.",
+      "Do not convert this question into autonomous implementation or author my human-owned records. If I later request a bounded mechanical edit, explain it so I can inspect and own it.",
+      "",
+      question.trim(),
+    ].join("\n"),
+  );
 }
 
 async function showAheadGuide(ctx: ExtensionCommandContext, requestedTopic: string): Promise<void> {
-  if (!ctx.hasUI) throw new Error("Reading AHEAD framework guidance requires interactive or RPC UI support");
+  if (!ctx.hasUI) {
+    throw new Error("Reading AHEAD framework guidance requires interactive or RPC UI support");
+  }
   const run = await storeFor(ctx).loadCurrent();
-  const phase = run && !(await enginePromise).deriveState(run).closed
-    ? (await enginePromise).deriveState(run).phase.id
-    : undefined;
+  const state = run ? (await enginePromise).deriveState(run) : undefined;
+  const phase = state && !state.closed ? state.phase.id : undefined;
+  const workflowId = state && !state.closed ? state.workflow_id : undefined;
   const index = await loadReferenceIndex();
-  let entry = requestedTopic.trim() && requestedTopic.trim().toLowerCase() !== "all"
-    ? await findReference(requestedTopic)
-    : undefined;
+  let entry =
+    requestedTopic.trim() && requestedTopic.trim().toLowerCase() !== "all"
+      ? await findReference(requestedTopic)
+      : undefined;
 
   if (requestedTopic.trim() && requestedTopic.trim().toLowerCase() !== "all" && !entry) {
     throw new Error(`No packaged AHEAD reference matches ${requestedTopic.trim()}`);
   }
 
   if (!entry) {
-    const recommended = requestedTopic.trim().toLowerCase() === "all"
-      ? index.references
-      : await relevantReferences(phase);
+    const recommended =
+      requestedTopic.trim().toLowerCase() === "all"
+        ? index.references
+        : await relevantReferences(workflowId, phase);
     const browseAll = "Browse all packaged AHEAD Markdown";
     const selected = await ctx.ui.select(
       phase ? `AHEAD guidance · ${phase}` : "AHEAD framework guidance",
-      [...recommended.map((candidate) => candidate.title), ...(recommended.length < index.references.length ? [browseAll] : [])],
+      [
+        ...recommended.map((candidate) => candidate.title),
+        ...(recommended.length < index.references.length ? [browseAll] : []),
+      ],
     );
-    if (!selected) return;
-    if (selected === browseAll) return showAheadGuide(ctx, "all");
+    if (!selected) {
+      return;
+    }
+    if (selected === browseAll) {
+      return showAheadGuide(ctx, "all");
+    }
     entry = recommended.find((candidate) => candidate.title === selected);
   }
-  if (!entry) return;
+  if (!entry) {
+    return;
+  }
 
   await showReferenceViewer(ctx, `AHEAD reference · ${entry.title}`, await readReference(entry));
 }
 
-async function startRun(ctx: ExtensionCommandContext, requestedTitle: string): Promise<Run | undefined> {
+async function startRun(ctx: ExtensionCommandContext, request: string): Promise<Run | undefined> {
   const engine = await enginePromise;
   const store = storeFor(ctx);
   const current = await store.loadCurrent();
@@ -555,9 +816,40 @@ async function startRun(ctx: ExtensionCommandContext, requestedTitle: string): P
     );
   }
 
-  const title = requestedTitle.trim()
-    || (ctx.hasUI ? await ctx.ui.input("Enter AHEAD mode · Product Change", "What work are you doing?") : undefined);
-  if (!title?.trim()) return undefined;
+  const workflows = engine.listWorkflows();
+  const parsed = parseStartRequest(
+    request,
+    workflows.map((workflow) => workflow.id),
+  );
+  let workflow = parsed.workflowId
+    ? workflows.find((candidate) => candidate.id === parsed.workflowId)
+    : undefined;
+  if (parsed.workflowId && !workflow) {
+    throw new AheadEngineError(
+      "unknown_workflow",
+      `unknown workflow ${parsed.workflowId}; choose one of: ${workflows.map((candidate) => candidate.id).join(", ")}`,
+    );
+  }
+  if (!workflow && ctx.hasUI) {
+    const selected = await ctx.ui.select(
+      "Choose the AHEAD workflow that fits this work",
+      workflows.map((candidate) => candidate.title),
+    );
+    workflow = workflows.find((candidate) => candidate.title === selected);
+  }
+  workflow ??= workflows.find((candidate) => candidate.id === "product-change");
+  if (!workflow) {
+    throw new AheadEngineError("missing_workflow", "the engine did not provide Product Change");
+  }
+
+  const title =
+    parsed.title ||
+    (ctx.hasUI
+      ? await ctx.ui.input(`Enter AHEAD mode · ${workflow.title}`, "What work are you doing?")
+      : undefined);
+  if (!title?.trim()) {
+    return undefined;
+  }
 
   const owner = humanActor(store.projectRoot);
   const run = engine.createRun({
@@ -565,13 +857,13 @@ async function startRun(ctx: ExtensionCommandContext, requestedTitle: string): P
     title: title.trim(),
     owner,
     timestamp: new Date().toISOString(),
-    workflow_id: "product-change",
+    workflow_id: workflow.id,
   });
   await store.save(run);
   await refreshUi(ctx, run);
   ctx.ui.notify(
     [
-      `AHEAD mode started · ${run.title}`,
+      `AHEAD mode started · ${workflow.title} · ${run.title}`,
       "Human leads · AI assists",
       "This run remains active in the repository until an accountable human closes the outcome.",
       "Use /ahead for the next guided action; use normal conversation to think and work with AI.",
@@ -581,19 +873,27 @@ async function startRun(ctx: ExtensionCommandContext, requestedTitle: string): P
   return run;
 }
 
-async function recordHumanArtifact(ctx: ExtensionCommandContext, requestedKind: string): Promise<void> {
-  if (!ctx.hasUI) throw new Error("Recording a human artifact requires interactive or RPC UI support");
+async function recordHumanArtifact(
+  ctx: ExtensionCommandContext,
+  requestedKind: string,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("Recording a human artifact requires interactive or RPC UI support");
+  }
   const engine = await enginePromise;
   const store = storeFor(ctx);
   const run = await requireRun(ctx);
   const state = engine.deriveState(run);
-  const allowed = state.artifacts.filter((artifact) => artifact.actor !== "ai" && !artifact.present);
+  const allowed = state.artifacts.filter(
+    (artifact) => artifact.actor !== "ai" && !artifact.present,
+  );
   let kind = requestedKind.trim();
   if (!kind) {
-    kind = (await ctx.ui.select(
-      `AHEAD mode · Write for ${state.phase.title}`,
-      allowed.map((artifact) => artifact.title),
-    )) ?? "";
+    kind =
+      (await ctx.ui.select(
+        `AHEAD mode · Write for ${state.phase.title}`,
+        allowed.map((artifact) => artifact.title),
+      )) ?? "";
     kind = allowed.find((artifact) => artifact.title === kind)?.kind ?? kind;
   }
   const artifact = allowed.find((candidate) => candidate.kind === kind);
@@ -604,11 +904,15 @@ async function recordHumanArtifact(ctx: ExtensionCommandContext, requestedKind: 
     );
   }
 
+  const template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
   const content = await ctx.ui.editor(
     `AHEAD mode · ${artifact.title} · write in your own words`,
-    buildArtifactTemplate(run, state, artifact.kind, artifact.title),
+    template,
   );
-  if (!content?.trim()) return;
+  if (!content?.trim()) {
+    return;
+  }
+  await validateHumanReviewArtifact(store, state, artifact.kind, content);
   const path = store.artifactPath(run, state.phase.id, artifact.kind);
   const action: EventAction = {
     type: "artifact_recorded",
@@ -626,14 +930,81 @@ async function recordHumanArtifact(ctx: ExtensionCommandContext, requestedKind: 
   );
 }
 
+async function humanArtifactTemplate(
+  store: RunStore,
+  state: RunState,
+  run: Run,
+  kind: string,
+  title: string,
+): Promise<string> {
+  if (kind === "review-disposition") {
+    const reviewArtifact = state.artifacts.find((artifact) => artifact.kind === "ai-review");
+    if (!reviewArtifact?.path) {
+      throw new AheadEngineError(
+        "ai_review_missing",
+        "the AI review must be recorded before human disposition",
+      );
+    }
+    const aiReview = await store.readArtifact(reviewArtifact.path);
+    const snapshot = await collectReviewSnapshot(store.projectRoot);
+    return reviewDispositionTemplate(snapshot, extractFindingIds(aiReview));
+  }
+  if (kind === "human-review") {
+    const snapshot = await collectReviewSnapshot(store.projectRoot);
+    return `${buildArtifactTemplate(run, state, kind, title)}\n\nAHEAD-Review-Snapshot: ${snapshot.fingerprint}\n`;
+  }
+  return buildArtifactTemplate(run, state, kind, title);
+}
+
+async function validateHumanReviewArtifact(
+  store: RunStore,
+  state: RunState,
+  kind: string,
+  content: string,
+): Promise<void> {
+  if (kind !== "review-disposition" && kind !== "human-review") {
+    return;
+  }
+  const snapshot = await collectReviewSnapshot(store.projectRoot);
+  if (kind === "human-review") {
+    if (extractReviewFingerprint(content) !== snapshot.fingerprint) {
+      throw new AheadEngineError(
+        "review_snapshot_stale",
+        "the human review must identify the exact current AHEAD review snapshot",
+      );
+    }
+    return;
+  }
+  const reviewArtifact = state.artifacts.find((artifact) => artifact.kind === "ai-review");
+  if (!reviewArtifact?.path) {
+    throw new AheadEngineError("ai_review_missing", "the AI review artifact is missing");
+  }
+  const aiReview = await store.readArtifact(reviewArtifact.path);
+  const aiFingerprint = extractReviewFingerprint(aiReview);
+  if (!aiFingerprint || aiFingerprint !== snapshot.fingerprint) {
+    throw new AheadEngineError(
+      "review_snapshot_stale",
+      "the changeset changed after AI review; return to implementation and review the new snapshot",
+    );
+  }
+  const errors = validateReviewDisposition(
+    content,
+    snapshot.fingerprint,
+    extractFindingIds(aiReview),
+  );
+  if (errors.length) {
+    throw new AheadEngineError("review_disposition_incomplete", errors.join("; "));
+  }
+}
+
 function requestAiAssistance(pi: ExtensionAPI, state: RunState, requiredKind?: string): void {
-  const guidance = phaseGuide(state.phase.id);
+  const guidance = phaseGuide(state.workflow_id, state.phase.id);
   const artifact = requiredKind
     ? state.artifacts.find((candidate) => candidate.kind === requiredKind)
     : undefined;
   const request = artifact
     ? [
-        `AHEAD mode: perform the ${artifact.required ? "required" : "recommended"} ${state.phase.title} work for the exact current evidence and changeset.`,
+        `AHEAD mode: perform the ${artifact.required ? "required" : "recommended"} ${state.phase.title} work for the exact current run and evidence.`,
         `Produce ${artifact.title}.`,
         `Follow the active human/AI boundary: ${guidance.ai}`,
         `Use ahead_get_context first, then record the completed artifact as ${artifact.kind} with ahead_record_artifact.`,
@@ -649,7 +1020,9 @@ function requestAiAssistance(pi: ExtensionAPI, state: RunState, requiredKind?: s
 }
 
 async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
-  if (!ctx.hasUI) throw new Error("Accepting an AHEAD gate requires interactive or RPC UI support");
+  if (!ctx.hasUI) {
+    throw new Error("Accepting an AHEAD gate requires interactive or RPC UI support");
+  }
   const engine = await enginePromise;
   const store = storeFor(ctx);
   const run = await requireRun(ctx);
@@ -663,7 +1036,8 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const destination = state.phase.next
-    ? engine.getWorkflow(run.workflow_id).phases.find((phase) => phase.id === state.phase.next)?.title ?? state.phase.next
+    ? (engine.getWorkflow(run.workflow_id).phases.find((phase) => phase.id === state.phase.next)
+        ?.title ?? state.phase.next)
     : "close this AHEAD run";
   const confirmed = await ctx.ui.confirm(
     `Accept and continue from ${state.phase.title}?`,
@@ -676,7 +1050,9 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
       "This records human acceptance. AI cannot perform this action.",
     ].join("\n"),
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    return;
+  }
 
   const actor = humanActor(store.projectRoot);
   let updated = run;
@@ -689,7 +1065,10 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
     state = engine.deriveState(updated);
   }
   if (!state.can_advance) {
-    throw new AheadEngineError("cannot_advance", state.blockers.join("; ") || "the phase cannot advance");
+    throw new AheadEngineError(
+      "cannot_advance",
+      state.blockers.join("; ") || "the phase cannot advance",
+    );
   }
 
   const action: EventAction = state.phase.next
@@ -706,7 +1085,10 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
 
   const nextState = engine.deriveState(updated);
   if (nextState.closed) {
-    ctx.ui.notify("AHEAD work complete. The accountable human accepted the outcome and closed the run.", "info");
+    ctx.ui.notify(
+      "AHEAD work complete. The accountable human accepted the outcome and closed the run.",
+      "info",
+    );
   } else if (nextState.phase.id === "human-review") {
     ctx.ui.notify(
       [
@@ -725,14 +1107,22 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
-async function returnToEarlierPhase(ctx: ExtensionCommandContext, requestedTarget: string): Promise<void> {
-  if (!ctx.hasUI) throw new Error("Returning an AHEAD phase requires interactive or RPC UI support");
+async function returnToEarlierPhase(
+  ctx: ExtensionCommandContext,
+  requestedTarget: string,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("Returning an AHEAD phase requires interactive or RPC UI support");
+  }
   const engine = await enginePromise;
   const store = storeFor(ctx);
   const run = await requireRun(ctx);
   const state = engine.deriveState(run);
   if (!state.return_targets.length) {
-    throw new AheadEngineError("no_return_target", `phase ${state.phase.id} has no return transition`);
+    throw new AheadEngineError(
+      "no_return_target",
+      `phase ${state.phase.id} has no return transition`,
+    );
   }
   const workflow = engine.getWorkflow(run.workflow_id);
   const targetOptions = state.return_targets.map((target) => ({
@@ -756,12 +1146,16 @@ async function returnToEarlierPhase(ctx: ExtensionCommandContext, requestedTarge
   const reason = await ctx.ui.editor(
     `Why return to ${workflow.phases.find((phase) => phase.id === target)?.title ?? target}?`,
   );
-  if (!reason?.trim()) return;
+  if (!reason?.trim()) {
+    return;
+  }
   const confirmed = await ctx.ui.confirm(
     `Return to ${target}?`,
     "This opens a new phase visit. Earlier artifacts remain as history but cannot satisfy the reopened gate.",
   );
-  if (!confirmed) return;
+  if (!confirmed) {
+    return;
+  }
   const updated = engine.applyEvent(run, humanActor(store.projectRoot), {
     type: "phase_transitioned",
     from: state.phase.id,
@@ -771,7 +1165,10 @@ async function returnToEarlierPhase(ctx: ExtensionCommandContext, requestedTarge
   });
   await store.save(updated);
   await refreshUi(ctx, updated);
-  ctx.ui.notify(`Returned to ${target}. AHEAD mode remains active with fresh evidence and gate requirements.`, "warning");
+  ctx.ui.notify(
+    `Returned to ${target}. AHEAD mode remains active with fresh evidence and gate requirements.`,
+    "warning",
+  );
 }
 
 function storeFor(ctx: ExtensionContext): RunStore {
@@ -780,7 +1177,9 @@ function storeFor(ctx: ExtensionContext): RunStore {
 
 async function requireRun(ctx: ExtensionContext): Promise<Run> {
   const run = await storeFor(ctx).loadCurrent();
-  if (!run) throw new AheadEngineError("no_active_run", "no active AHEAD run; use /ahead [title]");
+  if (!run) {
+    throw new AheadEngineError("no_active_run", "no active AHEAD run; use /ahead [title]");
+  }
   return run;
 }
 
@@ -810,24 +1209,44 @@ async function refreshUi(ctx: ExtensionContext, supplied?: Run): Promise<void> {
       ? `AHEAD · complete · ${state.workflow_id}`
       : `AHEAD · ${position.current}/${position.total} · ${state.phase.id} · ${action.actor} action`,
   );
-  ctx.ui.setWidget(
-    "ahead",
-    buildWidgetLines(run, state, workflow),
-    { placement: "aboveEditor" },
-  );
+  ctx.ui.setWidget("ahead", buildWidgetLines(run, state, workflow), { placement: "aboveEditor" });
 }
 
-async function loadInstructions(phase: string): Promise<string> {
-  const cached = instructions.get(phase);
-  if (cached) return cached;
-  const content = await readFile(`${instructionDirectory}/${phase}.md`, "utf8");
-  instructions.set(phase, content);
+async function loadInstructions(workflowId: string, phase: string): Promise<string> {
+  const cacheKey = `${workflowId}/${phase}`;
+  const cached = instructions.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const content = await readFile(`${instructionDirectory}/${cacheKey}.md`, "utf8");
+  instructions.set(cacheKey, content);
   return content;
+}
+
+function parseStartRequest(
+  request: string,
+  workflowIds: string[],
+): { workflowId?: string; title: string } {
+  const trimmed = request.trim();
+  const separator = trimmed.indexOf("::");
+  if (separator >= 0) {
+    return {
+      workflowId: trimmed.slice(0, separator).trim(),
+      title: trimmed.slice(separator + 2).trim(),
+    };
+  }
+  if (workflowIds.includes(trimmed)) {
+    return { workflowId: trimmed, title: "" };
+  }
+  return { title: trimmed };
 }
 
 function formatState(state: RunState): string {
   const artifacts = state.artifacts
-    .map((artifact) => `${artifact.present ? "✓" : artifact.required ? "○" : "·"} ${artifact.kind} (${artifact.actor})`)
+    .map(
+      (artifact) =>
+        `${artifact.present ? "✓" : artifact.required ? "○" : "·"} ${artifact.kind} (${artifact.actor})`,
+    )
     .join("\n");
   return [
     `${state.title} · ${state.workflow_id}@${state.workflow_version}`,
@@ -852,14 +1271,23 @@ async function command(ctx: ExtensionCommandContext, action: () => Promise<void>
 async function toolResult(action: () => Promise<unknown>) {
   try {
     const result = await action();
-    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], details: result };
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      details: result,
+    };
   } catch (error) {
     const message = errorMessage(error);
-    return { content: [{ type: "text" as const, text: `AHEAD error: ${message}` }], details: { error: message }, isError: true };
+    return {
+      content: [{ type: "text" as const, text: `AHEAD error: ${message}` }],
+      details: { error: message },
+      isError: true,
+    };
   }
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof AheadEngineError) return `${error.code}: ${error.message}`;
+  if (error instanceof AheadEngineError) {
+    return `${error.code}: ${error.message}`;
+  }
   return error instanceof Error ? error.message : String(error);
 }

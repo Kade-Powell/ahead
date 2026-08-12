@@ -1,4 +1,5 @@
 import type { ArtifactState, Run, RunState, WorkflowDefinition } from "./types.js";
+import { flowGuides } from "./flow-guides.ts";
 
 export interface PhaseGuide {
   objective: string;
@@ -11,7 +12,8 @@ export interface PhaseGuide {
 const guides: Record<string, PhaseGuide> = {
   define: {
     objective: "Agree on the problem and the observable outcome before solution work begins.",
-    human: "Describe the users, current problem, desired outcome, scope, constraints, and success signals.",
+    human:
+      "Describe the users, current problem, desired outcome, scope, constraints, and success signals.",
     ai: "Explain the prompts. After your first statement, clarify ambiguity and expose assumptions without redefining the problem.",
     artifactPrompts: {
       problem: [
@@ -25,7 +27,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   research: {
     objective: "Build enough evidence to understand the problem before choosing a solution.",
-    human: "Set the research boundary, judge source relevance, and identify what evidence is material.",
+    human:
+      "Set the research boundary, judge source relevance, and identify what evidence is material.",
     ai: "Inspect authorized sources, organize evidence, surface contradictions, and state confidence and gaps.",
     artifactPrompts: {
       research: [
@@ -38,7 +41,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   questions: {
     objective: "Dispose the unknowns that could materially change the decision or plan.",
-    human: "Decide which unknowns must be answered and which uncertainty can be accepted explicitly.",
+    human:
+      "Decide which unknowns must be answered and which uncertainty can be accepted explicitly.",
     ai: "Challenge gaps, perform authorized follow-up research, and distinguish evidence from inference.",
     artifactPrompts: {
       unknowns: [
@@ -54,7 +58,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   options: {
     objective: "Understand viable approaches and tradeoffs before committing to one.",
-    human: "Produce the first option, then evaluate alternatives and tradeoffs in the system's real context.",
+    human:
+      "Produce the first option, then evaluate alternatives and tradeoffs in the system's real context.",
     ai: "After the human first pass, challenge assumptions and add materially different alternatives.",
     artifactPrompts: {
       "human-option": [
@@ -75,7 +80,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   decision: {
     objective: "Make an accountable and explainable choice.",
-    human: "Choose the approach and own its rationale, tradeoffs, remaining uncertainty, and reversibility.",
+    human:
+      "Choose the approach and own its rationale, tradeoffs, remaining uncertainty, and reversibility.",
     ai: "Test the recorded decision for contradictions, weak evidence, and hidden consequences.",
     artifactPrompts: {
       decision: [
@@ -88,7 +94,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   plan: {
     objective: "Create an implementable plan with verification, rollout, and recovery.",
-    human: "Write the first-pass sequence and approve the final plan after challenges are resolved.",
+    human:
+      "Write the first-pass sequence and approve the final plan after challenges are resolved.",
     ai: "After the human first pass, identify missing dependencies, tests, edge cases, rollout evidence, recovery, and decision points.",
     artifactPrompts: {
       "first-pass-plan": [
@@ -110,7 +117,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   implement: {
     objective: "Produce a change the engineer understands and can defend.",
-    human: "Make the first attempt, ask questions freely, own the implementation, understand every lasting change, run the planned checks, and record deviations.",
+    human:
+      "Make the first attempt, ask questions freely, own the implementation, understand every lasting change, run the planned checks, and record deviations.",
     ai: "Coach, explain, help diagnose, and suggest bounded next steps within the approved plan. Do not turn a question into taking over the implementation.",
     artifactPrompts: {
       changeset: [
@@ -130,20 +138,26 @@ const guides: Record<string, PhaseGuide> = {
   },
   "ai-review": {
     objective: "Add an AI review of the exact current changeset before independent human review.",
-    human: "Validate and dispose every material finding. Return to implementation when a change is required.",
+    human:
+      "Validate and dispose every material finding. Return to implementation when a change is required.",
     ai: "Review without modifying: correctness, security, tests, architecture, plan compliance, operations, and maintainability.",
     artifactPrompts: {
       "ai-review": [
-        "What exact commit or diff was reviewed?",
-        "What findings were identified, with evidence and severity?",
-        "What disposition is proposed for each finding?",
+        "What exact AHEAD review snapshot was reviewed?",
+        "What stable AR findings were identified, with severity, category, location, evidence, impact, and a falsifiable explanation?",
         "What could not be assessed?",
+      ],
+      "review-disposition": [
+        "Does the snapshot still match the AI review?",
+        "For every material AR finding, is it fixed, invalid, accepted risk, or follow-up?",
+        "What human rationale and evidence support each disposition?",
       ],
     },
   },
   "human-review": {
     objective: "Obtain independent final engineering judgment on the current change.",
-    human: "A reviewer other than the implementer examines the exact change and material evidence, then accepts or returns it.",
+    human:
+      "A reviewer other than the implementer examines the exact change and material evidence, then accepts or returns it.",
     ai: "Retrieve evidence and answer targeted questions. It cannot approve the change or replace reviewer judgment.",
     handoff: "READY FOR INDEPENDENT HUMAN REVIEW",
     artifactPrompts: {
@@ -157,7 +171,8 @@ const guides: Record<string, PhaseGuide> = {
   },
   deploy: {
     objective: "Authorize and record deployment or explicitly establish that it is not applicable.",
-    human: "Own the release decision and production risk. Record the exact version, target, actor, time, authorization, and result.",
+    human:
+      "Own the release decision and production risk. Record the exact version, target, actor, time, authorization, and result.",
     ai: "Analyze readiness evidence. It cannot authorize deployment or claim a version is live.",
     artifactPrompts: {
       deployment: [
@@ -169,8 +184,10 @@ const guides: Record<string, PhaseGuide> = {
     },
   },
   verify: {
-    objective: "Demonstrate the intended outcome using observed evidence, not just test or deployment status.",
-    human: "Select adequate checks and decide whether the original success signals are demonstrated.",
+    objective:
+      "Demonstrate the intended outcome using observed evidence, not just test or deployment status.",
+    human:
+      "Select adequate checks and decide whether the original success signals are demonstrated.",
     ai: "Suggest checks and analyze authorized observations while separating code, deployment, and observed behavior.",
     artifactPrompts: {
       verification: [
@@ -182,7 +199,8 @@ const guides: Record<string, PhaseGuide> = {
     },
   },
   "ai-audit": {
-    objective: "Compare the result with the original intent and expose weak evidence or divergence.",
+    objective:
+      "Compare the result with the original intent and expose weak evidence or divergence.",
     human: "Review and dispose material audit findings; reopen work when the evidence demands it.",
     ai: "Audit the full chain from problem through observed outcome without changing or approving the work.",
     artifactPrompts: {
@@ -191,11 +209,17 @@ const guides: Record<string, PhaseGuide> = {
         "Which claims have weak or missing evidence?",
         "Which findings require follow-up or reopening?",
       ],
+      "audit-disposition": [
+        "Which audit findings are accepted, rejected, resolved, or routed to follow-up?",
+        "What human rationale and evidence support each disposition?",
+        "Does any finding require reopening an earlier phase rather than closing the work?",
+      ],
     },
   },
   outcome: {
     objective: "Make the accountable outcome decision and preserve learning.",
-    human: "Accept, roll back, follow up, abandon, or reopen the work, including remaining uncertainty.",
+    human:
+      "Accept, roll back, follow up, abandon, or reopen the work, including remaining uncertainty.",
     ai: "Organize evidence and summarize learning. It cannot choose or accept the outcome.",
     artifactPrompts: {
       outcome: [
@@ -215,18 +239,137 @@ const fallbackGuide: PhaseGuide = {
   artifactPrompts: {},
 };
 
-export function phaseGuide(phaseId: string): PhaseGuide {
-  return guides[phaseId] ?? fallbackGuide;
+const artifactPromptCatalog: Record<string, string[]> = {
+  "failure-characterization": [
+    "What was observed, and what was expected instead?",
+    "How can it be reproduced, and when, where, or for whom does it occur?",
+    "What does not fail, and what does that boundary rule out?",
+  ],
+  "human-model": [
+    "What do you currently believe is happening, and why?",
+    "What predictions would distinguish this model from alternatives?",
+    "Which parts are observed facts, inferences, or assumptions?",
+  ],
+  "investigation-ledger": [
+    "Which facts, inferences, hypotheses, and confidence levels are current?",
+    "What did each hypothesis predict, what was tested, and what happened?",
+    "What evidence supports or contradicts each live explanation?",
+  ],
+  diagnosis: [
+    "What diagnosis is supported, or why does the cause remain unknown?",
+    "Which evidence and counterevidence determine the confidence?",
+    "What risk and uncertainty remain if work proceeds?",
+  ],
+  correction: [
+    "What correction is selected, and how does it follow from the diagnosis?",
+    "What blast radius, regressions, and reversibility matter?",
+    "How will the original failure and side effects be verified?",
+  ],
+  assessment: [
+    "What symptoms, impact, scope, urgency, and known facts define the situation?",
+    "Which signals would demonstrate recovery or worsening?",
+  ],
+  "response-mode": [
+    "Who owns the response and communication?",
+    "What authority boundaries, escalation path, and stop conditions apply?",
+  ],
+  "system-model": [
+    "What is the human's current model of the system and failure mode?",
+    "What is known, inferred, and still uncertain?",
+  ],
+  intervention: [
+    "What bounded action is proposed, who may execute it, and what is its scope?",
+    "What are the blast radius, rollback, expected signals, uncertainty, and stop conditions?",
+  ],
+  "action-record": [
+    "What authorized action actually occurred, who performed it, and when?",
+    "What immediate effects, stop decisions, and rollback status were observed?",
+  ],
+  "recovery-evidence": [
+    "Which system and user-visible recovery signals were checked?",
+    "What regressions, residual risk, and uncertainty remain?",
+  ],
+  monitoring: [
+    "What observation window and signals were selected?",
+    "Was there recurrence or delayed degradation, and what residual risk remains?",
+  ],
+  "decision-frame": [
+    "What exact choice must be made, by whom, and for whom?",
+    "What are its scope, deadline, consequences, and reversibility?",
+  ],
+  criteria: [
+    "Which priorities and constraints govern the choice?",
+    "What evidence standard and remaining uncertainty are acceptable?",
+  ],
+  comparison: [
+    "How does each option perform against the recorded criteria?",
+    "What tradeoffs, risks, sensitivity, confidence, and disagreement remain?",
+  ],
+  "published-decision": [
+    "Where is the durable decision and rationale recorded?",
+    "Who is affected, what downstream work is linked, and how will it be communicated?",
+    "What event or date should trigger review?",
+  ],
+  question: [
+    "What exact question is being investigated, and why does it matter?",
+    "Who owns it, how will findings be used, and what would count as an answer?",
+  ],
+  bounds: [
+    "What is in scope and explicitly out of scope?",
+    "What evidence standard, time or cost box, risks, and stop conditions apply?",
+  ],
+  evidence: [
+    "Which sources, observations, or measurements were gathered, with what provenance?",
+    "What is supported, contradicted, uncertain, or still missing?",
+  ],
+  "exploration-ledger": [
+    "Which models or paths were considered and what did each predict?",
+    "Which tests or prototypes ran, what happened, and how did confidence change?",
+  ],
+  "prototype-disposition": [
+    "What disposable prototype was created and what was learned, or was no prototype used?",
+    "How was the prototype isolated, retained, or discarded so it cannot silently become production code?",
+  ],
+  synthesis: [
+    "What findings follow from the evidence?",
+    "What contradictions, limitations, uncertainty, and confidence remain?",
+  ],
+  conclusion: [
+    "What answer or defensible non-answer follows from the investigation?",
+    "What remains unresolved, what evidence is reusable, and does consequential choice route to Decision?",
+  ],
+  invariants: [
+    "Which behavior, compatibility, safety, and operability properties must not regress?",
+    "How will each invariant be observed or tested?",
+  ],
+  baseline: [
+    "What is the current measurement and exact method?",
+    "What sample, noise, confounders, uncertainty, and reproducibility limitations apply?",
+  ],
+  target: [
+    "What measurable improvement and threshold are desired?",
+    "What guardrails, scope, acceptable tradeoffs, and stop conditions apply?",
+  ],
+};
+
+export function phaseGuide(workflowId: string, phaseId: string): PhaseGuide {
+  return flowGuides[`${workflowId}:${phaseId}`] ?? guides[phaseId] ?? fallbackGuide;
 }
 
-export function promptsForArtifact(phaseId: string, kind: string): string[] {
-  return phaseGuide(phaseId).artifactPrompts[kind] ?? [
-    "What must another engineer understand from this record?",
-    "What evidence, uncertainty, and rationale should remain durable?",
-  ];
+export function promptsForArtifact(workflowId: string, phaseId: string, kind: string): string[] {
+  return (
+    phaseGuide(workflowId, phaseId).artifactPrompts[kind] ??
+    artifactPromptCatalog[kind] ?? [
+      "What must another engineer understand from this record?",
+      "What evidence, uncertainty, and rationale should remain durable?",
+    ]
+  );
 }
 
-export function phasePosition(state: RunState, workflow: WorkflowDefinition): { current: number; total: number } {
+export function phasePosition(
+  state: RunState,
+  workflow: WorkflowDefinition,
+): { current: number; total: number } {
   const index = workflow.phases.findIndex((phase) => phase.id === state.phase.id);
   return { current: index < 0 ? 0 : index + 1, total: workflow.phases.length };
 }
@@ -239,68 +382,71 @@ export interface GuidedNextAction {
 }
 
 export function nextAction(state: RunState, workflow: WorkflowDefinition): GuidedNextAction {
-  if (state.closed) return { actor: "human", label: "Work complete; start another run only for new work" };
+  if (state.closed) {
+    return { actor: "human", label: "Work complete; start another run only for new work" };
+  }
 
-  const orderedAssist = optionalAssistBeforeFinalHumanRecord(state);
-  if (orderedAssist) return orderedAssist;
-
-  const artifact = state.artifacts.find((candidate) => candidate.required && !candidate.present);
+  const artifact = nextPendingArtifact(state);
   if (artifact) {
-    const actor = artifact.actor === "human"
-      ? "human"
-      : artifact.actor === "ai" || state.phase.id === "research"
-        ? "ai"
-        : "human";
+    const actor =
+      artifact.actor === "human"
+        ? "human"
+        : artifact.actor === "ai" || state.allowed_ai_capabilities.includes("record")
+          ? "ai"
+          : "human";
     if (actor === "human") {
-      const label = state.phase.id === "implement" && artifact.kind === "changeset"
-        ? "Implement first, then record the exact changeset"
-        : state.phase.id === "human-review"
-        ? "Independent reviewer records the current human review"
-        : `Write ${artifact.title}`;
+      const label =
+        state.phase.id === "implement" && artifact.kind === "changeset"
+          ? "Implement first, then record the exact changeset"
+          : state.phase.id === "human-review"
+            ? "Independent reviewer records the current human review"
+            : `Write ${artifact.title}`;
       return { actor, label, artifactKind: artifact.kind };
     }
 
-    const label = state.phase.id === "ai-review"
-      ? "Run AI review of the exact current changeset"
-      : state.phase.id === "ai-audit"
-        ? "Run AI audit across intent, evidence, and outcome"
-        : `Ask AI to produce ${artifact.title}`;
-    return { actor, label, artifactKind: artifact.kind };
+    const label = artifact.required
+      ? state.phase.id === "ai-review"
+        ? "Run AI review of the exact current changeset"
+        : state.phase.id === "ai-audit"
+          ? "Run AI audit across intent, evidence, and outcome"
+          : `Ask AI to produce ${artifact.title}`
+      : state.phase.id === "options"
+        ? "Ask AI to challenge the human option and expand alternatives"
+        : state.phase.id === "plan"
+          ? "Ask AI to challenge the human first-pass plan"
+          : `Ask AI to contribute ${artifact.title}`;
+    return artifact.required
+      ? { actor, label, artifactKind: artifact.kind }
+      : { actor, label, artifactKind: artifact.kind, optional: true };
   }
 
-  if (!state.gate.accepted) return { actor: "human", label: `Review evidence and accept: ${state.gate.title}` };
+  if (!state.gate.accepted) {
+    return { actor: "human", label: `Review evidence and accept: ${state.gate.title}` };
+  }
 
   const nextPhase = workflow.phases.find((phase) => phase.id === state.phase.next);
   return {
     actor: "human",
-    label: nextPhase ? `Continue to ${nextPhase.title}` : "Accept the outcome and close this AHEAD run",
+    label: nextPhase
+      ? `Continue to ${nextPhase.title}`
+      : "Accept the outcome and close this AHEAD run",
   };
 }
 
-function optionalAssistBeforeFinalHumanRecord(state: RunState): GuidedNextAction | undefined {
-  const orderedAssist = state.phase.id === "options"
-    ? { prerequisite: "human-option", assist: "ai-challenge", final: "options" }
-    : state.phase.id === "plan"
-      ? { prerequisite: "first-pass-plan", assist: "ai-plan-review", final: "plan" }
-      : undefined;
-  if (!orderedAssist) return undefined;
-
-  const prerequisite = state.artifacts.find((artifact) => artifact.kind === orderedAssist.prerequisite);
-  const assist = state.artifacts.find((artifact) => artifact.kind === orderedAssist.assist);
-  const final = state.artifacts.find((artifact) => artifact.kind === orderedAssist.final);
-  if (!prerequisite?.present || assist?.present || final?.present) return undefined;
-
-  return {
-    actor: "ai",
-    artifactKind: assist?.kind,
-    label: state.phase.id === "options"
-      ? "Ask AI to challenge the human option and expand alternatives"
-      : "Ask AI to challenge the human first-pass plan",
-    optional: true,
-  };
+function nextPendingArtifact(state: RunState): ArtifactState | undefined {
+  return state.artifacts.find(
+    (artifact) =>
+      !artifact.present &&
+      (artifact.required ||
+        (artifact.actor !== "human" && state.allowed_ai_capabilities.includes("record"))),
+  );
 }
 
-export function buildWidgetLines(run: Run, state: RunState, workflow: WorkflowDefinition): string[] {
+export function buildWidgetLines(
+  run: Run,
+  state: RunState,
+  workflow: WorkflowDefinition,
+): string[] {
   if (state.closed) {
     return [
       `AHEAD COMPLETE · ${run.title}`,
@@ -309,7 +455,7 @@ export function buildWidgetLines(run: Run, state: RunState, workflow: WorkflowDe
     ];
   }
 
-  const guide = phaseGuide(state.phase.id);
+  const guide = phaseGuide(state.workflow_id, state.phase.id);
   const position = phasePosition(state, workflow);
   const required = state.artifacts.filter((artifact) => artifact.required);
   const checklist = required.length
@@ -335,7 +481,7 @@ export function buildArtifactTemplate(
   kind: string,
   title: string,
 ): string {
-  const prompts = promptsForArtifact(state.phase.id, kind);
+  const prompts = promptsForArtifact(state.workflow_id, state.phase.id, kind);
   return [
     `# ${title}`,
     "",

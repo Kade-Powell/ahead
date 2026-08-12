@@ -1,0 +1,30 @@
+{
+  "workflow": "corrective-debugging",
+  "version": "0.1.0",
+  "generated": [
+    "characterize.md",
+    "model.md",
+    "investigate.md",
+    "conclude.md",
+    "correction.md",
+    "plan.md",
+    "implement.md",
+    "ai-review.md",
+    "human-review.md",
+    "deploy.md",
+    "verify.md",
+    "ai-audit.md",
+    "outcome.md"
+  ],
+  "sources": [
+    "spec/workflows/corrective-debugging-v0.1.json",
+    "policy/common.md",
+    "policy/corrective-debugging/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/guided-questioning.md",
+    "policy/methods/research-evidence.md",
+    "policy/methods/planning-decomposition.md",
+    "policy/methods/corrective-debugging.md",
+    "policy/methods/changeset-review.md"
+  ]
+}

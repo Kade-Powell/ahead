@@ -110,6 +110,9 @@ Do not use it when the main task is explaining an observed failure, restoring a 
 │ • Maintainability                            │
 └──────────────────────┬───────────────────────┘
                        ↓
+          HUMAN DISPOSITIONS EACH MATERIAL
+          AI FINDING WITH RATIONALE / EVIDENCE
+                       ↓
 ┌──────────────────────────────────────────────┐
 │ 9. INDEPENDENT HUMAN REVIEW                  │
 │ • Final engineering judgment by a reviewer   │
@@ -122,6 +125,8 @@ Do not use it when the main task is explaining an observed failure, restoring a 
            11. HUMAN VERIFIES / OBSERVES
                        ↓
                   12. AI AUDIT
+                       ↓
+          HUMAN DISPOSITIONS AUDIT FINDINGS
                        ↓
 ┌──────────────────────────────────────────────┐
 │ 13. HUMAN OUTCOME                            │
@@ -146,11 +151,11 @@ An important unknown is disposed only when it is answered or an accountable huma
 | Decide | Selection and consequences | Check rationale and surface risks | Decision, rationale, tradeoffs, reversibility | Accountable human approves the decision |
 | Plan | First-pass implementation plan | Identify gaps, dependencies, tests, risks, and rollback needs | Sequenced plan and deviations policy | Human approves the final plan |
 | Implement | Code and engineering changes | Bounded generation, explanation, tests, debugging, and refactoring assistance | Linked changeset and plan deviations | Work is ready for independent review and checks pass |
-| AI review | Resolution of valid findings | Review behavior, security, tests, architecture, and plan alignment | Findings and dispositions | Blocking findings are resolved or rejected with rationale |
+| AI review | Validate and disposition every material AI finding | Review the exact snapshot for behavior, security, tests, architecture, and plan alignment without modifying it | Snapshot-bound AI findings; separate human disposition | Every material finding is fixed, invalid, accepted risk, or follow-up with rationale |
 | Human review | Independent final engineering judgment by someone other than the implementer | Answer targeted questions and retrieve evidence | Current independent human review | Independent human reviewer accepts the current change |
 | Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended version reaches the target environment or deployment is explicitly not applicable |
 | Verify and observe | Evaluation against intended behavior | Suggest checks and analyze authorized observations | Test, deployment, and user-visible evidence | Intended outcome is demonstrated or failure is recorded |
-| AI audit | Disposition of findings and any required response | Compare the result with the problem, decision, plan, reviews, and observed behavior; identify divergence, weak evidence, and missed learning | Audit findings and dispositions | Human has reviewed material findings |
+| AI audit | Disposition of findings and any required response | Compare the result with the problem, decision, plan, reviews, and observed behavior; identify divergence, weak evidence, and missed learning | AI audit findings; separate human disposition | The human disposer accepts the audit gate or reopens work |
 | Outcome | Acceptance, rollback, follow-up, or abandonment | Summarize learning | Result, uncertainty, follow-ups | Human accepts closure or routes more work |
 
 ## Artifact and evidence chain
@@ -174,7 +179,13 @@ HUMAN FIRST-PASS / FINAL PLAN
 CHANGESET / TESTS
             │
             ▼
-AI REVIEW / INDEPENDENT HUMAN REVIEW
+SNAPSHOT-BOUND AI REVIEW
+            │
+            ▼
+IMPLEMENTING-HUMAN DISPOSITION
+            │
+            ▼
+INDEPENDENT HUMAN REVIEW
             │
             ▼
 HUMAN-AUTHORIZED DEPLOYMENT

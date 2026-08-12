@@ -4,6 +4,7 @@ import {
   buildArtifactTemplate,
   buildWidgetLines,
   nextAction,
+  phaseGuide,
 } from "../src/guidance.ts";
 
 const phaseIds = [
@@ -29,7 +30,10 @@ const workflow = {
   initial_phase: "define",
   phases: phaseIds.map((id, index) => ({
     id,
-    title: id.split("-").map((word) => `${word[0].toUpperCase()}${word.slice(1)}`).join(" "),
+    title: id
+      .split("-")
+      .map((word) => `${word[0].toUpperCase()}${word.slice(1)}`)
+      .join(" "),
     owner: "human",
     artifacts: [],
     gate: { id: `${id}-gate`, title: `${id} gate` },
@@ -87,7 +91,9 @@ test("define begins with a clearly human-owned problem record", () => {
 
 test("shared research is routed to AI in the documented Product Change sequence", () => {
   const action = nextAction(
-    state("research", [artifact("research", "Evidence and gaps", "any", true)]),
+    state("research", [artifact("research", "Evidence and gaps", "any", true)], {
+      allowed_ai_capabilities: ["inspect", "search", "analyze", "record"],
+    }),
     workflow,
   );
   assert.deepEqual(action, {
@@ -97,18 +103,35 @@ test("shared research is routed to AI in the documented Product Change sequence"
   });
 });
 
+test("shared evidence can remain human-led even when AI recording is available", () => {
+  const current = state("research", [artifact("research", "Evidence and gaps", "any", true)], {
+    allowed_ai_capabilities: ["inspect", "search", "analyze", "record"],
+  });
+  const action = nextAction(current, workflow);
+  assert.equal(action.actor, "ai");
+  assert.equal(current.artifacts[0].actor, "any");
+});
+
 test("human first pass precedes optional AI challenge and final human option", () => {
   const artifacts = [
     artifact("human-option", "Human first-pass option", "human", true, true),
     artifact("ai-challenge", "AI challenge", "ai", false),
     artifact("options", "Human-evaluated options", "human", true),
   ];
-  assert.deepEqual(nextAction(state("options", artifacts), workflow), {
-    actor: "ai",
-    artifactKind: "ai-challenge",
-    label: "Ask AI to challenge the human option and expand alternatives",
-    optional: true,
-  });
+  assert.deepEqual(
+    nextAction(
+      state("options", artifacts, {
+        allowed_ai_capabilities: ["inspect", "search", "analyze", "record"],
+      }),
+      workflow,
+    ),
+    {
+      actor: "ai",
+      artifactKind: "ai-challenge",
+      label: "Ask AI to challenge the human option and expand alternatives",
+      optional: true,
+    },
+  );
 });
 
 test("AI review is explicitly bound in guidance to the current changeset", () => {
@@ -118,14 +141,15 @@ test("AI review is explicitly bound in guidance to the current changeset", () =>
   );
   assert.equal(action.actor, "ai");
   assert.match(action.label, /exact current changeset/);
+  const guide = phaseGuide("product-change", "ai-review");
+  assert.match(guide.artifactPrompts["ai-review"].join("\n"), /stable AR findings/);
+  assert.match(guide.artifactPrompts["review-disposition"].join("\n"), /fixed, invalid/);
 });
 
 test("implementation guidance keeps the engineer first while making help explicit", () => {
-  const current = state(
-    "implement",
-    [artifact("changeset", "Linked changeset", "human", true)],
-    { allowed_ai_capabilities: ["inspect", "analyze", "modify", "execute"] },
-  );
+  const current = state("implement", [artifact("changeset", "Linked changeset", "human", true)], {
+    allowed_ai_capabilities: ["inspect", "analyze", "modify", "execute"],
+  });
   const action = nextAction(current, workflow);
   assert.deepEqual(action, {
     actor: "human",
@@ -138,10 +162,9 @@ test("implementation guidance keeps the engineer first while making help explici
 });
 
 test("human-review widget makes the independent handoff and authority boundary visible", () => {
-  const current = state(
-    "human-review",
-    [artifact("human-review", "Independent human review", "human", true)],
-  );
+  const current = state("human-review", [
+    artifact("human-review", "Independent human review", "human", true),
+  ]);
   const widget = buildWidgetLines(run, current, workflow).join("\n");
   assert.match(widget, /READY FOR INDEPENDENT HUMAN REVIEW/);
   assert.match(widget, /HUMAN LEADS · AI ASSISTS/);
@@ -149,12 +172,21 @@ test("human-review widget makes the independent handoff and authority boundary v
 });
 
 test("human artifact editor explains the expected record instead of showing a blank form", () => {
-  const current = state(
-    "define",
-    [artifact("problem", "Problem and success signals", "human", true)],
-  );
+  const current = state("define", [
+    artifact("problem", "Problem and success signals", "human", true),
+  ]);
   const template = buildArtifactTemplate(run, current, "problem", "Problem and success signals");
   assert.match(template, /Who experiences the problem/);
   assert.match(template, /observable signals/);
   assert.match(template, /human-owned record in your own words/);
+});
+
+test("workflow-specific guides expose debugging and operational authority boundaries", () => {
+  const debugging = phaseGuide("corrective-debugging", "model");
+  assert.match(debugging.human, /currently think is happening/);
+  assert.match(debugging.ai, /After the human model/);
+
+  const operations = phaseGuide("operational-stabilization", "execute-observe");
+  assert.match(operations.human, /authorized actor/);
+  assert.match(operations.ai, /no workflow authority to execute/);
 });

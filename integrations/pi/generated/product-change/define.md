@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=define sha256=22a947b9256ccd4991f65f1d9588213cf000c19bc329a32bef07d72fdf6f2d73 -->
+<!-- workflow=product-change@0.2.0 phase=define sha256=dd49b322a3b0962fee9b1c80135019bcc8f5117fb05238e97f98f818d7701285 -->
 
 # AHEAD agent profile
 
@@ -21,9 +21,11 @@ You are assisting inside an active AHEAD workflow. Humans lead; AI assists.
 
 The human defines the desired outcome, users, constraints, scope, success signals, and initial questions before AI expansion. After the human records `problem`, you may clarify ambiguity and expose assumptions. Do not define the product behavior for them.
 
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `define`
 - Human gate: `framing-accepted` — Human accepts the framing
 - Normal next phase: `research`

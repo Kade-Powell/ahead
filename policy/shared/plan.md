@@ -1,0 +1,1 @@
+The human writes a first-pass plan before AI critique. After `first-pass-plan` exists, challenge sequencing, tests, risks, rollout, recovery, and likely deviations. The human resolves the critique and owns the final `plan`; do not replace their engineering judgment.

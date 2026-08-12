@@ -1,0 +1,1 @@
+The human decides to adopt, roll back, accept a missed target or tradeoff, follow up, or reopen the work. Record measurement uncertainty and learning. AI may challenge unsupported claims, but cannot decide that an improvement succeeded or accept closure.

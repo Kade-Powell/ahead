@@ -1,0 +1,1 @@
+The human identifies behavior, compatibility, safety, operability, and other properties that must not regress before discussing optimization. Help make invariants observable and testable, but do not trade them away to improve a metric.

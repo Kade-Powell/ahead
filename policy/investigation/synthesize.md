@@ -1,0 +1,1 @@
+The human synthesizes the findings and distinguishes evidence, inference, contradiction, limitation, and confidence. Help check completeness and trace claims to evidence, but do not overstate convergence or write the human-owned synthesis.

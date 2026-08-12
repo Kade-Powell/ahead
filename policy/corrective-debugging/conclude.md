@@ -1,0 +1,1 @@
+The human determines whether evidence supports a diagnosis. A legitimate conclusion may instead be that the cause remains unknown, provided the evidence, confidence, risk, and uncertainty are explicit. Do not force certainty or write the human-owned `diagnosis`.

@@ -40,7 +40,8 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
         │                                            │
         ▼                                            ▼
 ┌──────────────────────┐          ┌──────────────────────┐
-│ 2A. INVESTIGATE      │          │ 2B. STABILIZE        │
+│ 2A. RESPOND:         │          │ 2B. RESPOND:         │
+│ INVESTIGATE          │          │ STABILIZE            │
 │                      │          │                      │
 │ HUMAN LEADS          │          │ HUMAN LEADS          │
 │ • Model system       │          │ • Set priorities     │
@@ -55,7 +56,7 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
            │ CONTINUES                         │
            │ WHILE NEEDED                      ▼
            │                      ┌─────────────────────────┐
-           │                      │ 3. HUMAN ACTION GATE    │
+           │                      │ 2C. HUMAN ACTION GATE   │
            │ MAY INFORM           │                         │
            ├─ - - - - - - - - - ►│ • Authorize actor/scope │
            │   NO BARRIER         │ • Blast radius          │
@@ -64,14 +65,14 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
            │                      └────────────┬────────────┘
            │                                   ↓
 ┌──────────────────────────────────────────────┐
-│ 4. EXECUTE AND OBSERVE                       │
+│ 3. EXECUTE AND OBSERVE                       │
 │                                              │
 │ HUMAN / PREAUTHORIZED AUTOMATION             │
 │ • Performs the operational action            │
 │                                              │
 │ AI — ASSIST                                  │
-│ • May act only through separate, scoped,     │
-│   human-authorized operational permission    │
+│ • Interprets authorized observations         │
+│ • Does not execute the intervention          │
 │ • Workflow phase grants no production access │
 └──────────────────────┬───────────────────────┘
                        ↓
@@ -82,7 +83,7 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
           ↺ INVESTIGATE     │
             / STABILIZE     ▼
 ┌──────────────────────────────────────────────┐
-│ 5. VERIFY RECOVERY                           │
+│ 4. VERIFY RECOVERY                           │
 │                                              │
 │ HUMAN                                        │
 │ • Verify convergence and user-visible state │
@@ -92,7 +93,7 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
 └──────────────────────┬───────────────────────┘
                        ↓
 ┌──────────────────────────────────────────────┐
-│ 6. MONITOR RECURRENCE                        │
+│ 5. MONITOR RECURRENCE                        │
 │ HUMAN selects duration and signals           │
 │ AI — ASSIST                                  │
 │ • Summarize authorized telemetry             │
@@ -105,7 +106,7 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
           ↺ INVESTIGATE     │
             / STABILIZE     ▼
 ┌──────────────────────────────────────────────┐
-│ 7. HUMAN OUTCOME                             │
+│ 6. HUMAN OUTCOME                             │
 │ • Accept closure and remaining risk          │
 │ • Link corrective, investigation, decision, │
 │   or improvement follow-up runs              │
@@ -114,14 +115,15 @@ Incident mode is an urgency and coordination overlay. It does not assert a cause
 
 Investigation and stabilization proceed independently: there is no join gate. Investigation may inform an intervention and continue after it, but service restoration does not wait for a complete causal explanation when a human authorizes a proportionate intervention.
 
+The executable `respond` phase contains both parallel tracks and the human action gate shown as 2A–2C. Combining their evidence in one phase visit preserves the no-join rule: a bounded intervention may be authorized while causal investigation remains incomplete.
+
 ## Minimal phases
 
 | Phase | Human owns | AI may | Minimum record | Advance when |
 |---|---|---|---|---|
-| Detect and assess | Incident declaration, impact, scope, severity, and desired operating state | Correlate authorized signals and expose missing information | Timeline start, affected users/systems, actual and desired state | Response mode and ownership are clear |
-| Investigate | System/control-loop model, hypothesis selection, test authorization, and conclusions | Organize telemetry, identify changes, generate hypotheses, find contradictions | Facts, timeline, model, hypotheses, tests, and unknowns | Enough is known to guide action or bound uncertainty |
-| Stabilize | Containment, mitigation, recovery priorities, and risk | Compare interventions, rollback paths, and likely side effects | Candidate action, purpose, scope, blast radius, rollback | Human authorizes consequential action |
-| Execute and observe | Action execution and interpretation | Assist only within separately authorized operational permissions | Actor, command or change, time, result, and new evidence | Result is known and desired state is approached |
+| Assess | Response-mode declaration, impact, scope, urgency, desired state, ownership, and recovery signals | Correlate authorized signals and expose missing information after the human assessment begins | Assessment and response-mode record | Response mode, ownership, boundaries, and recovery criteria are clear |
+| Respond | System model, investigation direction, stabilization priorities, and selected intervention | Organize telemetry, generate hypotheses, compare interventions, and expose contradictions or side effects | Human model, optional investigation ledger, and bounded intervention with rollback and stop conditions | Human authorizes the consequential action; proven root cause is not required |
+| Execute and observe | Action execution, stop or rollback decisions, and interpretation | Analyze observations; AI has no execute capability in this phase | Actor, command or change, time, result, and new evidence | Result is known and desired state is approached |
 | Verify recovery | Recovery criteria and user-visible validation | Analyze convergence and recurrence indicators | Health, convergence, and external behavior evidence | Recovery is demonstrated, not merely assumed |
 | Monitor | Duration and signals sufficient to detect recurrence | Summarize authorized telemetry | Monitoring window and result | Human accepts stability or reopens response |
 | Outcome and follow-up | Closure, remaining risk, causal confidence, and routed work | Summarize timeline and proposed follow-ups | Outcome, unknowns, deferred records, linked runs | Human accepts closure and follow-up disposition |

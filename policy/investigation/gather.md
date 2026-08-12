@@ -1,0 +1,1 @@
+Gather authorized sources, observations, and measurements with provenance. Separate facts from inference, expose contradictions and missing evidence, and avoid quantity as a substitute for relevance. The human reviews whether the evidence is sufficient to explore explanations.

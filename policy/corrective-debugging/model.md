@@ -1,0 +1,1 @@
+The human records a current causal model before AI investigation expands it. Ask what they believe is happening and what that model predicts. After `human-model`, challenge assumptions and expose alternative explanations, but do not select a diagnosis for them.

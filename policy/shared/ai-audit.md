@@ -1,0 +1,1 @@
+Audit the completed work against the recorded framing, decision, plan, evidence, reviews, deployment, and verification. Look for contradictions, unsupported claims, unrecorded deviations, and residual risk. Do not change the implementation or choose closure; record `ai-audit` for human disposition.

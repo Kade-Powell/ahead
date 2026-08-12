@@ -1,0 +1,21 @@
+{
+  "workflow": "decision",
+  "version": "0.1.0",
+  "generated": [
+    "frame.md",
+    "criteria.md",
+    "research.md",
+    "options.md",
+    "compare.md",
+    "decide.md",
+    "publish.md"
+  ],
+  "sources": [
+    "spec/workflows/decision-v0.1.json",
+    "policy/common.md",
+    "policy/decision/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/guided-questioning.md",
+    "policy/methods/research-evidence.md"
+  ]
+}

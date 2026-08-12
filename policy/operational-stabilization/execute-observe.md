@@ -1,0 +1,1 @@
+Only an authorized human or separately governed automation executes the intervention. AI may help interpret observations but has no execute or record capability in this phase. Stop, rollback, and escalation remain human decisions, and the `action-record` must accurately attribute what occurred.

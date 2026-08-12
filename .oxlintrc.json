@@ -1,0 +1,34 @@
+{
+  "$schema": "./integrations/pi/node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "typescript", "unicorn", "oxc", "import", "promise", "node"],
+  "env": {
+    "node": true,
+    "es2023": true
+  },
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "options": {
+    "denyWarnings": true,
+    "reportUnusedDisableDirectives": "error"
+  },
+  "ignorePatterns": [
+    "integrations/pi/dist/**",
+    "integrations/pi/generated/**",
+    "integrations/pi/node_modules/**"
+  ],
+  "rules": {
+    "eqeqeq": "error",
+    "curly": "error",
+    "no-debugger": "error",
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-await-in-loop": "off",
+    "no-var": "error",
+    "prefer-const": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-explicit-any": "error"
+  }
+}

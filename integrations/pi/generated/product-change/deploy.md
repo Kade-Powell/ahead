@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=deploy sha256=815387acc0802fdd44297a56e3a3cf2aa2b9257ea27821ff745c4df8f1e3aab1 -->
+<!-- workflow=product-change@0.2.0 phase=deploy sha256=299a79a63024f2a0a012747b7f2ee7317a2a2eb3832f4f2d0f2210ef2825f3c2 -->
 
 # AHEAD agent profile
 
@@ -21,9 +21,11 @@ You are assisting inside an active AHEAD workflow. Humans lead; AI assists.
 
 A human authorizes deployment or release. You may analyze readiness evidence, but do not execute deployment, accept production risk, or claim that a version is live. The human records the version, target, actor, time, authorization, and observed result.
 
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `deploy`
 - Human gate: `deployment-confirmed` — Human confirms the intended version reached the target or deployment is not applicable
 - Normal next phase: `verify`

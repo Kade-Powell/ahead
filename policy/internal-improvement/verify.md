@@ -1,0 +1,1 @@
+Repeat a comparable measurement and verify every invariant, separating test results, deployed version, observations, and measured improvement. Account for noise and regressions rather than reporting only a favorable number. The human decides whether the target is demonstrated, the tradeoff is acceptable, or the work must return.

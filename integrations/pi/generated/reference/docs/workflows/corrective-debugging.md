@@ -36,7 +36,7 @@ Use operational stabilization instead when a live system is unhealthy and restor
                       │
                       ▼
               ┌─────────────────┐
-              │ 3. AI ASSISTS   │
+              │ 3A. AI ASSISTS  │
               │ EVIDENCE REVIEW │
               │                 │
               │ • Code          │
@@ -48,7 +48,7 @@ Use operational stabilization instead when a live system is unhealthy and restor
                       │
                       ▼
               ┌─────────────────┐
-              │ 4. HYPOTHESES   │
+              │ 3B. HYPOTHESES  │
               │                 │
               │ HUMAN LEADS     │
               │ AI ASSISTS      │
@@ -60,8 +60,8 @@ Use operational stabilization instead when a live system is unhealthy and restor
                       │
                       ▼
               ┌─────────────────┐
-              │ 5. HUMAN SELECTS│
-              │ WHAT TO TEST    │
+              │ 3C. HUMAN       │
+              │ SELECTS TEST    │
               │                 │
               │ • Prediction    │
               │ • Safety/scope  │
@@ -69,7 +69,7 @@ Use operational stabilization instead when a live system is unhealthy and restor
                       │
                       ▼
               ┌─────────────────┐
-              │ 6. TEST         │
+              │ 3D. TEST        │
               │ HYPOTHESIS      │
               │                 │
               │ HUMAN/ENGINEER  │
@@ -87,38 +87,44 @@ Use operational stabilization instead when a live system is unhealthy and restor
                      │    │
                      │    ▼
         ↺ HUMAN MODEL     HUMAN ACCEPTS DIAGNOSIS
-                          OR UNKNOWN CAUSE / RISK
+                          OR UNKNOWN CAUSE / RISK (4)
                                   │
                                   ▼
-                         HUMAN FIX APPROACH
+                         HUMAN FIX APPROACH (5)
                                   │
                                   ▼
-                         HUMAN FIRST-PASS PLAN
+                         HUMAN FIRST-PASS PLAN (6)
                                   │
                                   ▼
-                       ENGINEER IMPLEMENTS
+                       ENGINEER IMPLEMENTS (7)
                                   │
                                   ▼
-                              AI REVIEW
+                              AI REVIEW (8)
                                   │
                                   ▼
-                    INDEPENDENT HUMAN REVIEW
+                 HUMAN DISPOSITIONS MATERIAL FINDINGS
                                   │
                                   ▼
-                  HUMAN AUTHORIZES DEPLOY / RELEASE
+                    INDEPENDENT HUMAN REVIEW (9)
+                                  │
+                                  ▼
+                  HUMAN AUTHORIZES DEPLOY / RELEASE (10)
                            WHEN APPLICABLE
                                   │
                                   ▼
-          HUMAN VERIFIES CORRECTION OF ORIGINAL FAILURE
+          HUMAN VERIFIES CORRECTION OF ORIGINAL FAILURE (11)
                                   │
                                   ▼
                  HUMAN OBSERVES DEPLOYED OUTCOME
                                   │
                                   ▼
-                              AI AUDIT
+                              AI AUDIT (12)
                                   │
                                   ▼
-                         HUMAN OUTCOME GATE
+                    HUMAN DISPOSITIONS AUDIT FINDINGS
+                                  │
+                                  ▼
+                         HUMAN OUTCOME GATE (13)
 
 Not corrected ───────────────────↺ HUMAN MODEL
 ```
@@ -127,21 +133,24 @@ Reproduction is useful but not a universal gate. Historical, intermittent, produ
 
 “Ready to choose” means either the evidence sufficiently supports a human-accepted diagnosis or the accountable human explicitly accepts that the cause remains unknown and records the risk of proceeding. Unsupported hypotheses alone do not satisfy the gate.
 
+Executable phase 3, `investigate`, contains the evidence review, hypothesis, human test-selection, and test loop shown as 3A–3D. The human conclusion is a separate gate so a plausible hypothesis cannot silently become a diagnosis.
+
 ## Minimal phases
 
 | Phase | Human owns | AI may | Minimum record | Advance when |
 |---|---|---|---|---|
 | Report and characterize | Intended behavior, observed behavior, impact, scope, and evidence quality | Organize evidence and identify missing characterization | Failure statement and evidence links | The failure is bounded enough to investigate |
 | Mental model | Current explanation of relevant components, state, and interactions | Explain unfamiliar mechanisms and challenge omissions | Model, assumptions, and unknowns | The model can generate testable hypotheses |
-| Hypothesize and test | Hypothesis selection, test authorization, prediction, and interpretation | Generate alternatives, evidence for/against, and discriminating tests | Facts, inferences, hypotheses, predictions, tests, results, confidence | Human accepts a diagnosis or explicitly accepts uncertainty |
+| Investigate and test | Hypothesis selection, test authorization, prediction, and interpretation | Generate alternatives, evidence for/against, and discriminating tests | Facts, inferences, hypotheses, predictions, tests, results, confidence | Evidence is ready for a human conclusion |
+| Conclude diagnosis | Supported diagnosis or explicit acceptance of unknown cause, confidence, and risk | Challenge the conclusion against evidence and counterevidence | Diagnosis or accepted uncertainty | Human accepts the diagnosis or remaining uncertainty |
 | Choose correction | Desired correction and tradeoffs | Compare fix approaches and recurrence risks | Selected correction and rationale | Human approves the correction |
 | Plan | First-pass correction and verification plan | Find missing cases, risks, regression tests, and rollout concerns | Plan and rollback or containment needs | Human approves the plan |
 | Implement | Code and engineering changes | Bounded implementation and debugging assistance | Linked changeset and regression evidence | Change is ready for review |
-| AI review | Disposition of valid findings | Review correction, tests, risks, and plan alignment | AI findings and dispositions | Blocking findings are resolved or rejected with rationale |
+| AI review | Validate and disposition every material AI finding | Review the exact snapshot for correction, tests, risks, and plan alignment without modifying it | Snapshot-bound AI findings; separate human disposition | Every material finding is fixed, invalid, accepted risk, or follow-up with rationale |
 | Human review | Independent final engineering judgment by someone other than the implementer | Answer targeted questions and retrieve evidence | Current independent human review | Independent human reviewer accepts the current change |
 | Deploy or release | Authorization and rollout decision | Analyze readiness evidence within policy | Version, environment, actor, time, and result | The intended correction reaches the target environment or deployment is explicitly not applicable |
 | Verify and observe | Original failure, regression protection, and deployed behavior when applicable | Suggest checks and analyze authorized evidence | Pre-change comparison, fix validation, deployment evidence, and observed outcome | The original failure and user-visible outcome are evaluated |
-| AI audit | Disposition of findings and required response | Compare the result with the failure, diagnosis or accepted uncertainty, correction, plan, reviews, and observed behavior | Audit findings and dispositions | Human has reviewed material findings |
+| AI audit | Disposition of findings and required response | Compare the result with the failure, diagnosis or accepted uncertainty, correction, plan, reviews, and observed behavior | AI audit findings; separate human disposition | The human disposer accepts the audit gate or reopens work |
 | Outcome | Acceptance, rollback, continued investigation, follow-up, or abandonment | Summarize learning | Result, causal confidence, uncertainty, and follow-ups | Human accepts closure or reopens/routes work |
 
 ## Evidence chain
@@ -167,7 +176,16 @@ FACTS / EVIDENCE ──► HUMAN MENTAL MODEL
              HUMAN CORRECTION DECISION / PLAN
                             │
                             ▼
-     ENGINEER CHANGE / AI REVIEW / INDEPENDENT REVIEW
+                  ENGINEER CHANGE
+                            │
+                            ▼
+              SNAPSHOT-BOUND AI REVIEW
+                            │
+                            ▼
+           IMPLEMENTING-HUMAN DISPOSITION
+                            │
+                            ▼
+               INDEPENDENT HUMAN REVIEW
                             │
                             ▼
                 HUMAN-AUTHORIZED DEPLOYMENT

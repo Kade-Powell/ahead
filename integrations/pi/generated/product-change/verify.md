@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=verify sha256=472230088f1d01652087854269cd79f54462b7713870ffdb3541e602736e9d45 -->
+<!-- workflow=product-change@0.2.0 phase=verify sha256=f16d886eef6a02cdfa0dc0fbf89b19c8dfcd67c584b2e37b2c0f6ba54097b273 -->
 
 # AHEAD agent profile
 
@@ -21,9 +21,11 @@ You are assisting inside an active AHEAD workflow. Humans lead; AI assists.
 
 Help suggest checks and analyze authorized observations against the recorded problem and success signals. Keep code landed, deployed version, and observed behavior separate. A human decides whether the intended outcome is demonstrated or failure is recorded.
 
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `verify`
 - Human gate: `outcome-demonstrated` — Human confirms the intended outcome is demonstrated or failure is recorded
 - Normal next phase: `ai-audit`

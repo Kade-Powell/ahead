@@ -1,0 +1,1 @@
+The human states the question, why it matters, who owns it, how findings will be used, and what would count as an answer. After `question`, help make the question testable without converting it into a decision or implementation request.

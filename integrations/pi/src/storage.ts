@@ -11,9 +11,11 @@ interface CurrentRunPointer {
 
 export class RunStore {
   readonly aheadDirectory: string;
+  readonly projectRoot: string;
 
-  constructor(readonly projectRoot: string) {
-    this.aheadDirectory = join(projectRoot, ".ahead");
+  constructor(rootPath: string) {
+    this.projectRoot = rootPath;
+    this.aheadDirectory = join(rootPath, ".ahead");
   }
 
   newRunId(): string {
@@ -23,19 +25,20 @@ export class RunStore {
 
   async loadCurrent(): Promise<Run | undefined> {
     try {
-      const pointer = JSON.parse(await readFile(join(this.aheadDirectory, "current.json"), "utf8")) as CurrentRunPointer;
-      if (pointer.api_version !== "ahead.current/v0" || !pointer.run_id) {
-        throw new Error("invalid .ahead/current.json");
-      }
+      const pointer = parseCurrentRunPointer(
+        await readFile(join(this.aheadDirectory, "current.json"), "utf8"),
+      );
       return this.load(pointer.run_id);
     } catch (error) {
-      if (isMissing(error)) return undefined;
+      if (isMissing(error)) {
+        return undefined;
+      }
       throw error;
     }
   }
 
   async load(runId: string): Promise<Run> {
-    return JSON.parse(await readFile(this.runPath(runId), "utf8")) as Run;
+    return parseRun(await readFile(this.runPath(runId), "utf8"));
   }
 
   async save(run: Run, makeCurrent = true): Promise<void> {
@@ -48,7 +51,13 @@ export class RunStore {
 
   artifactPath(run: Run, phase: string, kind: string): { absolute: string; relative: string } {
     const sequence = String(run.events.length + 1).padStart(4, "0");
-    const absolute = join(this.aheadDirectory, "runs", run.id, "artifacts", `${sequence}-${phase}-${kind}.md`);
+    const absolute = join(
+      this.aheadDirectory,
+      "runs",
+      run.id,
+      "artifacts",
+      `${sequence}-${phase}-${kind}.md`,
+    );
     return { absolute, relative: relative(this.projectRoot, absolute) };
   }
 
@@ -62,15 +71,28 @@ export class RunStore {
     await writeFile(resolved, `${content.trim()}\n`, { encoding: "utf8", flag: "wx" });
   }
 
+  async readArtifact(path: string): Promise<string> {
+    const resolved = resolve(this.projectRoot, path);
+    const artifactsRoot = resolve(this.aheadDirectory, "runs");
+    if (!resolved.startsWith(`${artifactsRoot}/`)) {
+      throw new Error("artifact path escaped .ahead/runs");
+    }
+    return readFile(resolved, "utf8");
+  }
+
   private runPath(runId: string): string {
-    if (!/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error("unsafe AHEAD run id");
+    if (!/^[A-Za-z0-9._-]+$/.test(runId)) {
+      throw new Error("unsafe AHEAD run id");
+    }
     return join(this.aheadDirectory, "runs", runId, "run.json");
   }
 }
 
 export function humanActor(cwd: string): Actor {
   const explicit = process.env.AHEAD_HUMAN_IDENTITY?.trim();
-  if (explicit) return { kind: "human", identity: explicit };
+  if (explicit) {
+    return { kind: "human", identity: explicit };
+  }
   for (const key of ["user.email", "user.name"]) {
     try {
       const value = execFileSync("git", ["config", key], {
@@ -78,7 +100,9 @@ export function humanActor(cwd: string): Actor {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
-      if (value) return { kind: "human", identity: value };
+      if (value) {
+        return { kind: "human", identity: value };
+      }
     } catch {
       // Fall through to the next local identity source.
     }
@@ -93,7 +117,9 @@ export function projectRoot(cwd: string): string {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    if (root) return root;
+    if (root) {
+      return root;
+    }
   } catch {
     // AHEAD can also persist beside work that is not yet in Git.
   }
@@ -109,4 +135,42 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 
 function isMissing(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
+}
+
+function parseCurrentRunPointer(content: string): CurrentRunPointer {
+  const value: unknown = JSON.parse(content);
+  if (
+    !isRecord(value) ||
+    value.api_version !== "ahead.current/v0" ||
+    typeof value.run_id !== "string" ||
+    value.run_id.length === 0
+  ) {
+    throw new Error("invalid .ahead/current.json");
+  }
+  return { api_version: value.api_version, run_id: value.run_id };
+}
+
+function parseRun(content: string): Run {
+  const value: unknown = JSON.parse(content);
+  if (!isRun(value)) {
+    throw new Error("invalid AHEAD run record");
+  }
+  return value;
+}
+
+function isRun(value: unknown): value is Run {
+  return (
+    isRecord(value) &&
+    typeof value.api_version === "string" &&
+    typeof value.id === "string" &&
+    typeof value.title === "string" &&
+    typeof value.workflow_id === "string" &&
+    typeof value.workflow_version === "string" &&
+    typeof value.owner === "string" &&
+    Array.isArray(value.events)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

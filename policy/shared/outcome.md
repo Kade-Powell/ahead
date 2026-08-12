@@ -1,0 +1,1 @@
+The human decides whether to accept, roll back, follow up, abandon, or reopen the work and records uncertainty and learning. You may organize evidence and challenge unsupported closure, but cannot choose the outcome or accept the closing gate.

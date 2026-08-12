@@ -1,62 +1,71 @@
 {
   "name": "ahead-pi",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "AHEAD workflow enforcement and context for Pi",
-  "license": "MIT",
-  "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Kade-Powell/ahead.git",
-    "directory": "integrations/pi"
-  },
+  "keywords": [
+    "ahead",
+    "human-in-the-loop",
+    "pi-package"
+  ],
   "homepage": "https://github.com/Kade-Powell/ahead/tree/main/integrations/pi#readme",
   "bugs": {
     "url": "https://github.com/Kade-Powell/ahead/issues"
   },
-  "engines": {
-    "node": ">=22.19.0"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kade-Powell/ahead.git",
+    "directory": "integrations/pi"
   },
   "files": [
     "dist/ahead_wasm.wasm",
     "generated/",
     "src/"
   ],
+  "type": "module",
   "publishConfig": {
     "access": "public",
     "provenance": true,
     "registry": "https://registry.npmjs.org/"
   },
-  "keywords": [
-    "pi-package",
-    "ahead",
-    "human-in-the-loop"
-  ],
-  "pi": {
-    "extensions": [
-      "./src/index.ts"
-    ]
-  },
   "scripts": {
     "build": "npm run build:instructions && npm run build:wasm && npm run typecheck",
     "build:instructions": "node ../../scripts/build-instructions.mjs",
     "build:wasm": "node ./scripts/build-wasm.mjs",
+    "format": "cd ../.. && integrations/pi/node_modules/.bin/oxfmt -c ./.oxfmtrc.json .oxfmtrc.json .oxlintrc.json scripts integrations/pi/scripts integrations/pi/src integrations/pi/test integrations/pi/package.json integrations/pi/tsconfig.json",
+    "format:check": "npm run format -- --check",
+    "lint": "npm run lint:source && npm run lint:types",
+    "lint:source": "cd ../.. && integrations/pi/node_modules/.bin/oxlint -c ./.oxlintrc.json --report-unused-disable-directives-severity=off scripts integrations/pi/scripts integrations/pi/src integrations/pi/test",
+    "lint:types": "cd ../.. && integrations/pi/node_modules/.bin/oxlint -c ./.oxlintrc.json --type-aware --tsconfig integrations/pi/tsconfig.json integrations/pi/src",
     "prepack": "npm run build",
     "prepublishOnly": "npm run verify",
     "pack:verify": "node ./scripts/verify-package.mjs",
+    "quality": "npm run format:check && npm run lint && npm run typecheck",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run build && node --test ./test/*.test.mjs",
+    "verify": "npm run build && npm run format:check && npm run lint && node --test ./test/*.test.mjs",
     "test": "npm run verify && npm run pack:verify"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-tui": "^0.84.1",
+    "@types/node": "24.12.4",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.1",
-    "@earendil-works/pi-tui": "^0.84.1",
-    "@types/node": "24.12.4",
-    "typebox": "1.1.38",
-    "typescript": "5.9.3"
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
   }
 }

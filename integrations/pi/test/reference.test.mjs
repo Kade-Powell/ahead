@@ -29,12 +29,17 @@ test("every canonical framework Markdown source is copied exactly into the packa
 
 test("active phases recommend a small applicable set while retaining the full catalog", async () => {
   const index = await loadReferenceIndex();
-  const implement = await relevantReferences("implement");
+  const implement = await relevantReferences("product-change", "implement");
   assert.ok(implement.length < index.references.length);
   assert.ok(implement.some((entry) => entry.id === "constitution"));
   assert.ok(implement.some((entry) => entry.id === "acceptable-ai-use"));
   assert.ok(implement.some((entry) => entry.id === "workflows:product-change"));
   assert.ok(!implement.some((entry) => entry.id === "releasing-pi"));
+  assert.ok(!implement.some((entry) => entry.id === "workflows:operational-stabilization"));
+
+  const operations = await relevantReferences("operational-stabilization", "respond");
+  assert.ok(operations.some((entry) => entry.id === "workflows:operational-stabilization"));
+  assert.ok(!operations.some((entry) => entry.id === "workflows:product-change"));
 });
 
 test("references resolve by human-friendly topic and retain the binding source text", async () => {
@@ -46,8 +51,41 @@ test("references resolve by human-friendly topic and retain the binding source t
 });
 
 test("generated implementation profile encodes coaching and on-demand reference behavior", async () => {
-  const content = await readFile(join(piRoot, "generated", "product-change", "implement.md"), "utf8");
+  const content = await readFile(
+    join(piRoot, "generated", "product-change", "implement.md"),
+    "utf8",
+  );
   assert.match(content, /The engineer implements and makes the first attempt/);
   assert.match(content, /do not turn a request for help into autonomous implementation/);
   assert.match(content, /Use `ahead_get_reference`/);
+});
+
+test("generated profiles contain only methods mapped to their phase", async () => {
+  const debugging = await readFile(
+    join(piRoot, "generated", "corrective-debugging", "investigate.md"),
+    "utf8",
+  );
+  assert.match(debugging, /### Corrective debugging/);
+  assert.match(debugging, /### Guided questioning/);
+  assert.match(debugging, /### Research and evidence/);
+
+  const publish = await readFile(join(piRoot, "generated", "decision", "publish.md"), "utf8");
+  assert.doesNotMatch(publish, /## Applicable AHEAD methods/);
+});
+
+test("every executable workflow has a generated instruction manifest", async () => {
+  for (const workflow of [
+    "product-change",
+    "corrective-debugging",
+    "operational-stabilization",
+    "decision",
+    "investigation",
+    "internal-improvement",
+  ]) {
+    const manifest = JSON.parse(
+      await readFile(join(piRoot, "generated", workflow, "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.workflow, workflow);
+    assert.ok(manifest.generated.length > 0);
+  }
 });

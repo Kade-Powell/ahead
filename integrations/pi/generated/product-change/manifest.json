@@ -1,6 +1,6 @@
 {
   "workflow": "product-change",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "generated": [
     "define.md",
     "research.md",
@@ -17,8 +17,13 @@
     "outcome.md"
   ],
   "sources": [
-    "spec/workflows/product-change-v0.1.json",
+    "spec/workflows/product-change-v0.2.json",
     "policy/common.md",
-    "policy/product-change/<phase>.md"
+    "policy/product-change/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/guided-questioning.md",
+    "policy/methods/research-evidence.md",
+    "policy/methods/planning-decomposition.md",
+    "policy/methods/changeset-review.md"
   ]
 }

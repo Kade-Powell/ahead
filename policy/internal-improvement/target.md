@@ -1,0 +1,1 @@
+The human sets a measurable desired improvement, threshold, guardrails, scope, and stop conditions. Help test whether the target encourages gaming or shifts cost elsewhere, but do not choose the target or treat a proxy metric as the outcome.

@@ -22,7 +22,10 @@ try {
   const metadata = JSON.parse(json)[0];
   assert.equal(metadata.name, packageJson.name);
   assert.equal(metadata.version, packageJson.version);
-  assert.ok(metadata.unpackedSize < 2_000_000, `package is unexpectedly large: ${metadata.unpackedSize} bytes`);
+  assert.ok(
+    metadata.unpackedSize < 2_000_000,
+    `package is unexpectedly large: ${metadata.unpackedSize} bytes`,
+  );
 
   const paths = new Set(metadata.files.map((file) => file.path));
   for (const required of [
@@ -30,25 +33,44 @@ try {
     "package.json",
     "dist/ahead_wasm.wasm",
     "generated/product-change/manifest.json",
+    "generated/corrective-debugging/manifest.json",
+    "generated/operational-stabilization/manifest.json",
+    "generated/decision/manifest.json",
+    "generated/investigation/manifest.json",
+    "generated/internal-improvement/manifest.json",
     "generated/reference/index.json",
     "generated/reference/CONSTITUTION.md",
     "generated/reference/docs/acceptable-ai-use.md",
     "generated/reference/docs/workflows/product-change.md",
+    "generated/recommended-skills.json",
     "src/engine.ts",
+    "src/flow-guides.ts",
     "src/guidance.ts",
     "src/index.ts",
     "src/reference.ts",
     "src/reference-viewer.ts",
+    "src/review.ts",
+    "src/skills.ts",
     "src/storage.ts",
     "src/types.ts",
   ]) {
     assert.ok(paths.has(required), `packed artifact is missing ${required}`);
   }
-  assert.equal(
-    [...paths].filter((path) => path.startsWith("generated/product-change/") && path.endsWith(".md")).length,
-    13,
-    "packed artifact must contain all 13 Product Change instruction bundles",
-  );
+  for (const [workflow, expected] of Object.entries({
+    "product-change": 13,
+    "corrective-debugging": 13,
+    "operational-stabilization": 6,
+    decision: 7,
+    investigation: 6,
+    "internal-improvement": 13,
+  })) {
+    assert.equal(
+      [...paths].filter((path) => path.startsWith(`generated/${workflow}/`) && path.endsWith(".md"))
+        .length,
+      expected,
+      `packed artifact must contain all ${expected} ${workflow} instruction bundles`,
+    );
+  }
   for (const path of paths) {
     assert.ok(!path.startsWith("node_modules/"), `package leaked node_modules content: ${path}`);
     assert.ok(!path.startsWith("test/"), `package leaked test content: ${path}`);

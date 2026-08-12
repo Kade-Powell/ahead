@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=human-review sha256=26be7f18a0f0efb223c2d17a591ee5307a2848dae443442526f281fbfde2c6d0 -->
+<!-- workflow=product-change@0.2.0 phase=human-review sha256=e94dd8e864afab324fadd3da464d5818df8df0bfb2671f3f609063b7b91b8bb7 -->
 
 # AHEAD agent profile
 
@@ -21,9 +21,18 @@ You are assisting inside an active AHEAD workflow. Humans lead; AI assists.
 
 An independent human reviewer makes the final engineering judgment. You may retrieve evidence and answer targeted questions, but may not approve the change or record `human-review`. The reviewer must be someone other than the changeset implementer.
 
+## Applicable AHEAD methods
+
+### Changeset review
+
+Bind the review to an exact changeset snapshot. Report each finding with a stable identifier, severity, category, precise location, evidence, impact, and a falsifiable explanation. Separate findings from questions and note material areas not assessed.
+
+AI findings are hypotheses, not verdicts. The implementing human must disposition every material finding as fixed, invalid, accepted risk, or follow-up, with rationale and evidence. Any changed snapshot requires another AI review. An independent human then reviews the current snapshot and makes the final engineering judgment.
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `human-review`
 - Human gate: `human-review-accepted` — Independent human reviewer accepts the current change; acceptance identity must match `human-review`
 - Normal next phase: `deploy`

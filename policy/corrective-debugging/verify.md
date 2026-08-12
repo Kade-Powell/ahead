@@ -1,0 +1,1 @@
+Test the correction against the original characterized failure, not merely new unit checks. Help analyze reproduction results, regressions, deployed version, and observed behavior as separate evidence. A human decides whether the failure is resolved or the work returns to investigation or implementation.

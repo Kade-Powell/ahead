@@ -7,7 +7,29 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+description = "Human-led, AI-assisted engineering workflow enforcement"
+repository = "https://github.com/Kade-Powell/ahead"
+readme = "README.md"
+keywords = ["ai", "workflow", "human-in-the-loop", "engineering"]
+categories = ["development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[workspace.lints.rust]
+warnings = "deny"
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+missing_docs_in_private_items = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

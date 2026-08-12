@@ -72,6 +72,8 @@ An investigation may end with no action, insufficient evidence, several viable i
 │ AI — ASSIST                                  │
 │ • May fully generate an isolated throwaway   │
 │   prototype under prototype policy           │
+│ HUMAN records prototype disposition, or      │
+│ explicitly records that none was used        │
 └──────────────────────┬───────────────────────┘
                        ↓
                 ┌───────────────┐
@@ -110,7 +112,7 @@ Stopping conditions may be satisfied by enough evidence for a conclusion, exhaus
 | Frame | Question, decision relevance, audience, scope, and initial understanding | Clarify ambiguity and identify adjacent questions | Primary question and why it matters | Human accepts the question |
 | Bound | Confidence needed, exclusions, time or evidence budget, and stopping conditions | Challenge whether the question is answerable | Scope, limits, and stopping rule | Investigation can proceed without unbounded research |
 | Gather | Source evaluation and evidence access | Locate, summarize, compare, cite, and expose conflicts | Evidence links, source quality, and observations | Relevant available evidence is assembled |
-| Model and explore | Mental model, path selection, test authorization, and interpretation | Generate hypotheses, analysis approaches, or prototype ideas | Model, assumptions, hypotheses, tests, and results | Evidence is sufficient for synthesis or budget is reached |
+| Model and explore | Mental model, path selection, test authorization, interpretation, and prototype disposition | Generate hypotheses, analysis approaches, or an isolated disposable prototype | Model, predictions, tests, results, and human prototype disposition or no-prototype record | Evidence is sufficient for synthesis or budget is reached |
 | Synthesize | Meaning, confidence, contradictory evidence, and limitations | Organize findings and challenge overclaiming | Findings, confidence, limits, and unknowns | Human can state a bounded conclusion |
 | Conclude and route | Accepted conclusion, recommendation, and next workflow | Suggest follow-up questions or routes | Conclusion and linked decision/change/debug/improvement runs | Human accepts closure or explicitly extends the investigation |
 

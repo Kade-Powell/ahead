@@ -1,0 +1,89 @@
+{
+  "id": "operational-stabilization",
+  "version": "0.1.0",
+  "title": "Operational Stabilization",
+  "initial_phase": "assess",
+  "phases": [
+    {
+      "id": "assess",
+      "title": "Assess and Establish Response Mode",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "assessment", "title": "Symptoms, impact, scope, urgency, known facts, and recovery signals", "actor": "human", "required": true },
+        { "kind": "response-mode", "title": "Human response-mode declaration, owner, communication path, authority, and stop conditions", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "response-owned", "title": "Human confirms response ownership, boundaries, and recovery criteria" },
+      "next": "respond",
+      "returns_to": [],
+      "ai_unlock_artifacts": ["assessment"],
+      "ai_capabilities": ["inspect", "search", "analyze"]
+    },
+    {
+      "id": "respond",
+      "title": "Investigate and Select a Stabilizing Action",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "system-model", "title": "Human current model of the system and failure mode", "actor": "human", "required": true },
+        { "kind": "investigation-ledger", "title": "Parallel evidence, hypotheses, observations, and uncertainty", "actor": "any", "required": false },
+        { "kind": "intervention", "title": "Human-selected action, actor, scope, blast radius, rollback, expected signal, uncertainty, and stop conditions", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "action-authorized", "title": "Authorized human approves the bounded stabilizing action" },
+      "next": "execute-observe",
+      "returns_to": ["assess"],
+      "ai_unlock_artifacts": ["system-model"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "execute-observe",
+      "title": "Execute and Observe",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "action-record", "title": "Authorized action, executor, time, observed effects, stop decisions, and rollback status", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "action-observed", "title": "Human confirms the action and immediate observations are recorded" },
+      "next": "verify-recovery",
+      "returns_to": ["respond"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "verify-recovery",
+      "title": "Verify Recovery",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "recovery-evidence", "title": "Recovery signals, user-visible behavior, regressions, residual risk, and confidence", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "recovery-demonstrated", "title": "Human confirms recovery is demonstrated or returns for another bounded action" },
+      "next": "monitor",
+      "returns_to": ["assess", "respond"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute"]
+    },
+    {
+      "id": "monitor",
+      "title": "Monitor Stability",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "monitoring", "title": "Observation window, signals, recurrence checks, residual risk, and exit result", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "stability-observed", "title": "Human confirms stability over the chosen observation window" },
+      "next": "outcome",
+      "returns_to": ["assess", "respond"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute"]
+    },
+    {
+      "id": "outcome",
+      "title": "Human Outcome and Follow-up",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "outcome", "title": "Operational outcome, residual risk, causal uncertainty, rollback state, follow-up work, and learning", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "response-closed", "title": "Human accepts operational closure and owns follow-up work" },
+      "next": null,
+      "returns_to": ["assess", "respond"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    }
+  ]
+}

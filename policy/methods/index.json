@@ -1,0 +1,66 @@
+{
+  "api_version": "ahead.methods/v0.1",
+  "methods": [
+    {
+      "id": "guided-questioning",
+      "title": "Guided questioning",
+      "path": "policy/methods/guided-questioning.md",
+      "applies": [
+        { "workflow": "product-change", "phases": ["questions", "options", "decision", "plan"] },
+        { "workflow": "decision", "phases": ["frame", "criteria", "options", "compare", "decide"] },
+        { "workflow": "corrective-debugging", "phases": ["model", "investigate", "conclude", "correction", "plan"] },
+        { "workflow": "investigation", "phases": ["frame", "bound", "explore", "synthesize", "conclude"] },
+        { "workflow": "internal-improvement", "phases": ["target", "options", "decision", "plan"] }
+      ]
+    },
+    {
+      "id": "research-evidence",
+      "title": "Research and evidence",
+      "path": "policy/methods/research-evidence.md",
+      "applies": [
+        { "workflow": "product-change", "phases": ["research", "questions"] },
+        { "workflow": "decision", "phases": ["research"] },
+        { "workflow": "corrective-debugging", "phases": ["characterize", "investigate", "conclude"] },
+        { "workflow": "operational-stabilization", "phases": ["assess", "execute-observe", "verify-recovery", "monitor"] },
+        { "workflow": "investigation", "phases": ["gather", "explore", "synthesize"] },
+        { "workflow": "internal-improvement", "phases": ["baseline", "verify"] }
+      ]
+    },
+    {
+      "id": "planning-decomposition",
+      "title": "Planning and decomposition",
+      "path": "policy/methods/planning-decomposition.md",
+      "applies": [
+        { "workflow": "product-change", "phases": ["plan"] },
+        { "workflow": "corrective-debugging", "phases": ["plan"] },
+        { "workflow": "internal-improvement", "phases": ["plan"] }
+      ]
+    },
+    {
+      "id": "corrective-debugging",
+      "title": "Corrective debugging",
+      "path": "policy/methods/corrective-debugging.md",
+      "applies": [
+        { "workflow": "corrective-debugging", "phases": ["characterize", "model", "investigate", "conclude", "correction", "verify"] }
+      ]
+    },
+    {
+      "id": "disposable-prototyping",
+      "title": "Disposable prototyping",
+      "path": "policy/methods/disposable-prototyping.md",
+      "applies": [
+        { "workflow": "investigation", "phases": ["explore"] }
+      ]
+    },
+    {
+      "id": "changeset-review",
+      "title": "Changeset review",
+      "path": "policy/methods/changeset-review.md",
+      "applies": [
+        { "workflow": "product-change", "phases": ["ai-review", "human-review"] },
+        { "workflow": "corrective-debugging", "phases": ["ai-review", "human-review"] },
+        { "workflow": "internal-improvement", "phases": ["ai-review", "human-review"] }
+      ]
+    }
+  ]
+}

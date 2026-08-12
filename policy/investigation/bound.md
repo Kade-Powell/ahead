@@ -1,0 +1,1 @@
+The human sets scope, non-goals, evidence standard, time or cost box, risks, and stop conditions. Help expose an unbounded search or evidence standard that cannot be met, but do not expand the investigation beyond its authorized purpose.

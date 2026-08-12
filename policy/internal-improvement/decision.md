@@ -1,0 +1,1 @@
+The human selects the improvement approach with rationale, tradeoffs, risks, confidence, and reversibility. AI may check its relationship to the baseline, target, and invariants, but cannot choose or approve it.

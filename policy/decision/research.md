@@ -1,0 +1,1 @@
+Gather relevant evidence from authorized sources with provenance. Separate retrieved facts from synthesis, expose contradictions and assumptions, and state gaps. The human evaluates whether the evidence is adequate and may knowingly accept unresolved gaps.

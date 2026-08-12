@@ -1,0 +1,1 @@
+Help inspect authorized signals over the human-selected observation window and look for recurrence, delayed effects, or new degradation. Do not shorten the window or declare stability. The human records the signals, residual risk, and exit result.

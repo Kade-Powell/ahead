@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.1.0 phase=implement sha256=4eb0d3f8bbcbd111f9feb42ae01ba97a8ff658400747f4d93315066fd15ba973 -->
+<!-- workflow=product-change@0.2.0 phase=implement sha256=c45eb2a3e2b83d5df27ee2dc3c5bda856486c57cbda0eefe6c950b6f2cb6815d -->
 
 # AHEAD agent profile
 
@@ -25,9 +25,11 @@ If the human has not supplied a current model, attempted approach, or intended b
 
 Call out plan deviations; do not silently redefine behavior or policy. Passing checks is evidence, not final review.
 
+
+
 ## Enforced phase contract
 
-- Workflow: `product-change@0.1.0`
+- Workflow: `product-change@0.2.0`
 - Current phase: `implement`
 - Human gate: `implementation-ready` — Human confirms work is ready for review and checks pass
 - Normal next phase: `ai-review`

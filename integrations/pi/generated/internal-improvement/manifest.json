@@ -1,0 +1,29 @@
+{
+  "workflow": "internal-improvement",
+  "version": "0.1.0",
+  "generated": [
+    "invariants.md",
+    "baseline.md",
+    "target.md",
+    "options.md",
+    "decision.md",
+    "plan.md",
+    "implement.md",
+    "ai-review.md",
+    "human-review.md",
+    "deploy.md",
+    "verify.md",
+    "ai-audit.md",
+    "outcome.md"
+  ],
+  "sources": [
+    "spec/workflows/internal-improvement-v0.1.json",
+    "policy/common.md",
+    "policy/internal-improvement/<phase>.md or policy/shared/<phase>.md",
+    "policy/methods/index.json",
+    "policy/methods/guided-questioning.md",
+    "policy/methods/research-evidence.md",
+    "policy/methods/planning-decomposition.md",
+    "policy/methods/changeset-review.md"
+  ]
+}

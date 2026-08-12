@@ -1,0 +1,1 @@
+The human first states what happened, what was expected, where and when it occurs, how it can be reproduced, its scope, and important non-occurrences. After `failure-characterization`, help tighten observations and identify missing discriminators without inventing a cause.

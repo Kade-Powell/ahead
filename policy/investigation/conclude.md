@@ -1,0 +1,1 @@
+The human records an answer or defensible non-answer, confidence, unresolved questions, and reusable evidence. If consequential choice remains, explicitly route it to a Decision workflow instead of letting investigation silently decide. AI may summarize but cannot accept closure.
