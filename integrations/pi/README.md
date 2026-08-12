@@ -1,14 +1,14 @@
 # AHEAD for Pi
 
-Status: dogfood v0.1
+Status: guided-mode dogfood v0.2
 
-The Pi integration runs the Rust AHEAD state machine as WebAssembly, injects generated phase instructions into any Pi model, persists the event/evidence chain, and exposes human gates through explicit slash commands.
+The Pi integration runs the Rust AHEAD state machine as WebAssembly, injects generated phase instructions into any Pi model, persists the event/evidence chain, and presents AHEAD as a guided mode with human-owned gates.
 
 It does not own model authentication. Use whichever provider Pi already supports and your organization permits, including an existing GitHub Copilot configuration. AHEAD never receives the model credential.
 
 ## Install from npm
 
-After the first public release, install the current version globally in Pi:
+Install the current version globally in Pi:
 
 ```sh
 pi install npm:ahead-pi
@@ -17,7 +17,7 @@ pi install npm:ahead-pi
 Pin an exact version for a team or project:
 
 ```sh
-pi install -l npm:ahead-pi@0.1.0
+pi install -l npm:ahead-pi@0.2.0
 ```
 
 Or try it for one session without changing settings:
@@ -51,30 +51,40 @@ pi
 
 Pi may ask you to trust the project-local extension. Review it before accepting; project trust is not a sandbox.
 
-## Dogfood loop
+## Guided mode
 
 1. Start Pi in the repository where the engineering work will occur.
-2. Run `/ahead-start <short title>`.
-3. Run `/ahead-status` to see the active phase contract.
-4. Use `/ahead-record [kind]` for human-owned artifacts.
-5. Ask the model for only the assistance allowed in the active phase. It can call `ahead_get_context` and, where allowed, `ahead_record_artifact`.
-6. Run `/ahead-accept` only after examining the evidence and owning the gate decision.
-7. Run `/ahead-advance`, or `/ahead-return [phase]` with a reason when the work must reopen.
-8. Commit appropriate `.ahead` records with the work so review and later adapters can validate them.
+2. Run `/ahead <short title>` once to enter AHEAD mode and start a Product Change run.
+3. Work through normal conversation. The persistent widget shows the current goal, what the human owns, what AI may do, required evidence, and the next valid action.
+4. Run `/ahead` again whenever you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, or returns to an earlier phase.
+5. Keep the `.ahead` records with the work so another session or independent reviewer resumes the same authoritative run.
 
-The footer and editor widget show the current phase, visit, gate, and first blocker.
+AHEAD remains active across Pi sessions until an accountable human completes the outcome phase and closes the run. Restarting Pi does not leave the mode or reset the workflow.
+
+The normal implementation handoff is:
+
+```text
+HUMAN IMPLEMENTS AND SELF-CHECKS
+              ↓
+AI REVIEWS THE EXACT CURRENT CHANGESET
+              ↓
+HUMAN DISPOSES MATERIAL AI FINDINGS
+              ↓
+READY FOR INDEPENDENT HUMAN REVIEW
+              ↓
+INDEPENDENT HUMAN REVIEWS AND ACCEPTS
+```
+
+A draft branch or draft PR may exist earlier. The handoff gate is requesting human review or marking the PR ready, not ordinary draft pushes.
 
 ## Human commands
 
 | Command | Effect |
 |---|---|
-| `/ahead-start [title]` | Human starts and owns a Product Change run |
-| `/ahead-status` | Show phase, artifacts, capabilities, gate, and blockers |
-| `/ahead-record [kind]` | Human writes and records a permitted artifact |
-| `/ahead-accept` | Human accepts the current gate after required evidence exists |
-| `/ahead-advance` | Human advances, or closes the accepted final phase |
-| `/ahead-return [phase]` | Human reopens an allowed earlier phase with a reason |
+| `/ahead [title]` | Enter, resume, or perform the next guided AHEAD action |
 | `/ahead-help` | Show commands and authority boundaries |
+
+`/ahead-start`, `/ahead-status`, `/ahead-record`, `/ahead-accept`, `/ahead-advance`, and `/ahead-return` remain available as advanced recovery and inspection commands. Normal use should not require memorizing them.
 
 ## AI tools
 
@@ -101,11 +111,11 @@ Human identity is resolved from `AHEAD_HUMAN_IDENTITY`, Git `user.email`, Git `u
 AHEAD_HUMAN_IDENTITY=reviewer@example.com pi -e ./integrations/pi/src/index.ts
 ```
 
-This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements only Product Change, and has no GitHub/CI workflow enforcement yet. See [Executable AHEAD workflows](https://github.com/Kade-Powell/ahead/blob/main/docs/design/executable-workflows.md) for the architecture and trust boundaries.
+This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements only Product Change, and has no GitHub/CI workflow enforcement yet. Review records ask for the exact commit or diff, but v0.2 does not yet cryptographically bind that changeset to the review; a changed changeset must be returned and reviewed again by the humans involved. See [Executable AHEAD workflows](https://github.com/Kade-Powell/ahead/blob/main/docs/design/executable-workflows.md) for the architecture and trust boundaries.
 
 ## Package and release verification
 
-`npm test` builds the Rust core for `wasm32-unknown-unknown`, regenerates instructions, runs Rust/WASM-facing tests, creates the exact npm tarball, verifies its allowlisted contents, loads the extracted package through the real Pi binary, and confirms that `/ahead-start` persists a valid run.
+`npm test` builds the Rust core for `wasm32-unknown-unknown`, regenerates instructions, runs Rust/WASM-facing and guided-mode tests, creates the exact npm tarball, verifies its allowlisted contents, loads the extracted package through the real Pi binary, and confirms that the packaged extension persists a valid run.
 
 The npm package contains only its README, package metadata, TypeScript runtime, generated phase instructions, and compiled WASM engine. Build scripts, tests, source specs, development dependencies, and repository files are excluded.
 

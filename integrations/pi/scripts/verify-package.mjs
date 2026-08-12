@@ -31,6 +31,7 @@ try {
     "dist/ahead_wasm.wasm",
     "generated/product-change/manifest.json",
     "src/engine.ts",
+    "src/guidance.ts",
     "src/index.ts",
     "src/storage.ts",
     "src/types.ts",
@@ -65,7 +66,7 @@ try {
   const piBinary = join(packageRoot, "node_modules", ".bin", "pi");
   run(
     piBinary,
-    ["--no-extensions", "-p", "-e", extractedPackage, "/ahead-start Packaged extension smoke"],
+    ["--no-extensions", "-p", "-e", extractedPackage, "/ahead Packaged extension smoke"],
     {
       cwd: project,
       env: {
