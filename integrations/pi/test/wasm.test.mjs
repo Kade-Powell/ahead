@@ -75,6 +75,64 @@ test("creating a run requires an explicit workflow selection", async () => {
   assert.equal(response.error.code, "invalid_input");
 });
 
+test("WASM run state retains provider-neutral work items and project policy", async () => {
+  const { call } = await loadEngine();
+  const created = call("create_run", {
+    id: "linked-work-item",
+    title: "Plan tracked work",
+    owner: human,
+    timestamp: "2026-08-13T12:00:00Z",
+    workflow_id: "investigation",
+    policy: { work_items: { required_before_phase: "conclude" } },
+  });
+  assert.equal(created.ok, true);
+  const linked = call("apply_event", {
+    run: created.result,
+    event: {
+      actor: human,
+      timestamp: "2026-08-13T12:01:00Z",
+      action: {
+        type: "work_item_linked",
+        work_item: {
+          provider: "jira",
+          url: "https://example.atlassian.net/browse/ENG-42",
+          external_id: "ENG-42",
+        },
+      },
+    },
+  });
+  assert.equal(linked.ok, true);
+  const state = call("derive_state", { run: linked.result });
+  assert.equal(state.result.policy.work_items.required_before_phase, "conclude");
+  assert.equal(state.result.work_item.external_id, "ENG-42");
+});
+
+test("run records created before work-item policy remain replayable", async () => {
+  const { call } = await loadEngine();
+  const response = call("derive_state", {
+    run: {
+      api_version: "ahead.run/v0",
+      id: "pre-policy-run",
+      title: "Existing AHEAD work",
+      workflow_id: "investigation",
+      workflow_version: "0.1.0",
+      owner: human.identity,
+      events: [
+        {
+          sequence: 1,
+          timestamp: "2026-08-12T12:00:00Z",
+          actor: human,
+          type: "run_started",
+          phase: "frame",
+        },
+      ],
+    },
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.policy.work_items.required_before_phase, null);
+  assert.equal(response.result.work_item, null);
+});
+
 test("operational stabilization never grants AI authority to execute the intervention", async () => {
   const { call } = await loadEngine();
   const response = call("get_workflow", { workflow_id: "operational-stabilization" });

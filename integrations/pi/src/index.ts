@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type {
@@ -8,6 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { projectConfigIssues, projectConfigMarkdown, runProjectConfigWizard } from "./config.js";
 import { AheadEngine, AheadEngineError } from "./engine.js";
 import {
   buildArtifactTemplate,
@@ -41,7 +43,15 @@ import {
   relevantRecommendedSkills,
 } from "./skills.js";
 import { humanActor, projectRoot, RunStore } from "./storage.js";
-import type { Actor, Capability, EventAction, Run, RunState } from "./types.js";
+import type {
+  Actor,
+  Capability,
+  EventAction,
+  Run,
+  RunState,
+  WorkflowDefinition,
+  WorkItem,
+} from "./types.js";
 
 const wasmPath =
   process.env.AHEAD_WASM_PATH || fileURLToPath(new URL("../dist/ahead_wasm.wasm", import.meta.url));
@@ -78,6 +88,22 @@ export default function aheadExtension(pi: ExtensionAPI): void {
     handler: async (args, ctx) =>
       command(ctx, async () => {
         await openAheadMode(pi, args, ctx);
+      }),
+  });
+
+  pi.registerCommand("ahead-work-item", {
+    description: "Link an existing work item or create a GitHub issue",
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await manageWorkItem(ctx, args.trim());
+      }),
+  });
+
+  pi.registerCommand("ahead-config", {
+    description: "Configure or migrate this project's AHEAD policy",
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        await manageProjectConfig(ctx);
       }),
   });
 
@@ -122,7 +148,7 @@ export default function aheadExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("ahead-start", {
-    description: "Advanced: start directly with <workflow-id> :: <title>",
+    description: "Advanced: start with <workflow-id> :: <title-or-work-item-url>",
     handler: async (args, ctx) =>
       command(ctx, async () => {
         await startRun(ctx, args);
@@ -228,6 +254,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(
         [
           "/ahead [title] — choose a workflow for new work, or open the active action menu",
+          "/ahead-work-item [url] — link an existing work item or create a GitHub issue",
+          "/ahead-config — configure, replace, or migrate this project's AHEAD policy",
           "/ahead-guide [topic] — read the applicable AHEAD framework Markdown",
           "/ahead-skills — inspect optional reviewed skills relevant to this phase",
           "/ahead-review — inspect the exact changeset and review handoff",
@@ -258,6 +286,47 @@ export default function aheadExtension(pi: ExtensionAPI): void {
         const run = await requireRun(ctx);
         const state = (await enginePromise).deriveState(run);
         return { run, state };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "ahead_get_work_item",
+    label: "AHEAD work item",
+    description:
+      "Read the linked provider-neutral work-item reference and resolve GitHub issue context when available.",
+    promptSnippet: "Read the human-linked work item when it is relevant to the active phase.",
+    parameters: EmptyParams,
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      return toolResult(async () => {
+        const store = storeFor(ctx);
+        const run = await requireRun(ctx);
+        const state = (await enginePromise).deriveState(run);
+        if (!state.work_item) {
+          throw new AheadEngineError("work_item_missing", "this AHEAD run has no linked work item");
+        }
+        if (state.work_item.provider !== "github") {
+          return {
+            resolved: false,
+            work_item: state.work_item,
+            instruction:
+              "No provider adapter is installed for this work item. Treat the URL as a human-selected coordination reference.",
+          };
+        }
+        const issue: unknown = JSON.parse(
+          await executeFile(
+            "gh",
+            [
+              "issue",
+              "view",
+              state.work_item.url,
+              "--json",
+              "number,title,body,state,url,labels,assignees",
+            ],
+            store.projectRoot,
+          ),
+        );
+        return { resolved: true, work_item: state.work_item, issue };
       });
     },
   });
@@ -458,6 +527,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       `- Run: ${run.id} — ${run.title}`,
       `- Workflow: ${workflow.title} (${workflow.id})`,
       `- Phase: ${state.phase.id} visit ${state.phase.visit}`,
+      `- Work item: ${state.work_item?.url ?? "none"}`,
+      `- Work-item boundary: ${state.policy.work_items.required_before_phase ?? "not required"}`,
       `- Gate accepted: ${state.gate.accepted}`,
       `- Current blockers: ${state.blockers.length ? state.blockers.join("; ") : "none"}`,
       `- Allowed AI capabilities: ${state.allowed_ai_capabilities.length ? state.allowed_ai_capabilities.join(", ") : "none"}`,
@@ -473,6 +544,7 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       "- Treat AI review findings as hypotheses. Independent human review remains required for lasting engineering changes.",
       "- Humans may ask questions at any phase. During implementation, help them understand or solve the problem without taking over; if their first attempt or current model is missing, ask for it.",
       "- When AHEAD policy or rationale is unclear, use ahead_get_reference to retrieve only the applicable packaged Markdown.",
+      "- When a linked work item is relevant, use ahead_get_work_item for its available provider context. Treat it as coordination input, not as a substitute for human framing, evidence, or approval.",
       "- Use ahead_get_recommended_skills only when an optional reviewed skill could materially help. Never install one without the human's explicit choice; AHEAD remains authoritative.",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n\n${phaseInstructions}\n\n${liveContext}\n` };
@@ -568,6 +640,10 @@ async function openAheadMode(
     }
   }
 
+  if (isHttpUrl(args.trim())) {
+    run = await linkWorkItem(ctx, store, run, workItemFromUrl(args));
+  }
+
   await refreshUi(ctx, run);
   if (!ctx.hasUI) {
     ctx.ui.notify(formatState(engine.deriveState(run)), "info");
@@ -618,7 +694,12 @@ async function openAheadMode(
     }
   }
 
-  if (missingRequired.length === 0 && !action.artifactKind) {
+  if (state.work_item_required_for_next_phase && state.gate.accepted) {
+    actions.push({
+      label: action.label,
+      run: async () => manageWorkItem(ctx, ""),
+    });
+  } else if (missingRequired.length === 0 && !action.artifactKind) {
     actions.push({
       label: state.gate.accepted ? action.label : `Accept and continue · ${state.gate.title}`,
       run: async () => acceptAndContinue(ctx),
@@ -638,6 +719,12 @@ async function openAheadMode(
   }
 
   if (state.phase.id === "implement") {
+    if (!state.artifacts.some((artifact) => artifact.kind === "changeset" && artifact.present)) {
+      actions.push({
+        label: "Save this ready-to-implement run for a later sprint",
+        run: async () => saveImplementationHandoff(ctx),
+      });
+    }
     actions.push({
       label: "Ask AI for help understanding or solving a problem",
       run: async () => askImplementationQuestion(pi, ctx, state),
@@ -657,6 +744,20 @@ async function openAheadMode(
       run: async () => returnToEarlierPhase(ctx, ""),
     });
   }
+
+  if (!state.work_item_required_for_next_phase || !state.gate.accepted) {
+    actions.push({
+      label: state.work_item
+        ? "View or replace the linked work item"
+        : "Link or create a work item",
+      run: async () => manageWorkItem(ctx, ""),
+    });
+  }
+
+  actions.push({
+    label: "Configure project AHEAD policy for future runs",
+    run: async () => manageProjectConfig(ctx),
+  });
 
   actions.push({
     label: "Read AHEAD framework guidance for this phase",
@@ -743,6 +844,40 @@ async function stopAheadMode(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
+async function saveImplementationHandoff(ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("Saving an implementation handoff requires interactive or RPC UI support");
+  }
+  const store = storeFor(ctx);
+  const run = await requireRun(ctx);
+  const state = (await enginePromise).deriveState(run);
+  if (state.phase.id !== "implement") {
+    throw new AheadEngineError(
+      "implementation_handoff_unavailable",
+      "a ready-to-implement handoff can be saved only after the approved plan enters implementation",
+    );
+  }
+  const confirmed = await ctx.ui.confirm(
+    "Save this implementation handoff?",
+    [
+      `${run.title} · ${run.id}`,
+      `Work item: ${state.work_item?.url ?? "not linked"}`,
+      "",
+      "AHEAD mode will stop without discarding the approved plan or workflow state.",
+      "The implementing engineer can resume this run in a later sprint.",
+    ].join("\n"),
+  );
+  if (!confirmed) {
+    return;
+  }
+  await store.saveCurrentForResume(run.id);
+  await refreshUi(ctx);
+  ctx.ui.notify(
+    `Saved ready-to-implement AHEAD run ${run.id}. Resume it with /ahead-resume ${run.id}.`,
+    "info",
+  );
+}
+
 async function resumeSavedRun(
   ctx: ExtensionCommandContext,
   requestedRunId: string,
@@ -817,6 +952,313 @@ async function loadResumableRuns(ctx: ExtensionContext): Promise<Run[]> {
 
 function savedRunOption(run: Run): string {
   return `${run.title} · ${run.workflow_id} · ${run.id}`;
+}
+
+async function manageProjectConfig(ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("/ahead-config requires interactive or RPC UI support");
+  }
+  const store = storeFor(ctx);
+  const workflows = (await enginePromise).listWorkflows();
+  const inspection = await store.inspectProjectConfig();
+  if (inspection.status === "missing") {
+    await runProjectConfigWizard(ctx, store, workflows, false);
+    return;
+  }
+
+  const issues =
+    inspection.status === "valid" ? projectConfigIssues(inspection.config, workflows) : [];
+  const problem =
+    inspection.status === "invalid"
+      ? inspection.error
+      : issues.length > 0
+        ? `invalid .ahead/config.json: ${issues.join("; ")}`
+        : undefined;
+  if (problem) {
+    const view = "View the current file and validation error";
+    const replace = "Run setup wizard and preserve the current file as a backup";
+    const selected = await ctx.ui.select(`AHEAD configuration needs attention\n${problem}`, [
+      view,
+      replace,
+    ]);
+    if (selected === view) {
+      await showReferenceViewer(
+        ctx,
+        "AHEAD configuration · invalid",
+        [
+          "# AHEAD project configuration needs attention",
+          "",
+          problem,
+          "",
+          "The setup wizard can replace this file while preserving its exact contents under `.ahead/backups/`.",
+          "",
+          "~~~json",
+          inspection.content,
+          "~~~",
+        ].join("\n"),
+      );
+    } else if (selected === replace) {
+      await runProjectConfigWizard(ctx, store, workflows, true);
+    }
+    return;
+  }
+  if (inspection.status !== "valid") {
+    throw new Error("AHEAD project configuration inspection returned an inconsistent result");
+  }
+
+  const view = "View current configuration";
+  const replace = "Run setup wizard and replace configuration";
+  const selected = await ctx.ui.select("AHEAD project configuration", [view, replace]);
+  if (selected === view) {
+    await showReferenceViewer(
+      ctx,
+      "AHEAD project configuration",
+      projectConfigMarkdown(inspection.config),
+    );
+  } else if (selected === replace) {
+    await runProjectConfigWizard(ctx, store, workflows, true);
+  }
+}
+
+async function ensureProjectConfiguration(
+  ctx: ExtensionCommandContext,
+  store: RunStore,
+  workflows: WorkflowDefinition[],
+): Promise<boolean> {
+  const inspection = await store.inspectProjectConfig();
+  if (inspection.status === "valid") {
+    const issues = projectConfigIssues(inspection.config, workflows);
+    if (issues.length === 0) {
+      return true;
+    }
+    const problem = `invalid .ahead/config.json: ${issues.join("; ")}`;
+    if (!ctx.hasUI) {
+      throw new Error(`${problem}; run /ahead-config in an interactive session`);
+    }
+    ctx.ui.notify(problem, "warning");
+    return repairProjectConfiguration(ctx, store, workflows);
+  }
+  if (inspection.status === "missing") {
+    if (!ctx.hasUI) {
+      return true;
+    }
+    const configure = "Run AHEAD project setup wizard";
+    const without = "Continue without project configuration";
+    const selected = await ctx.ui.select("No .ahead/config.json was found", [configure, without]);
+    if (selected === configure) {
+      return runProjectConfigWizard(ctx, store, workflows, false);
+    }
+    return selected === without;
+  }
+
+  if (!ctx.hasUI) {
+    throw new Error(`${inspection.error}; run /ahead-config in an interactive session`);
+  }
+  ctx.ui.notify(inspection.error, "warning");
+  return repairProjectConfiguration(ctx, store, workflows);
+}
+
+async function repairProjectConfiguration(
+  ctx: ExtensionCommandContext,
+  store: RunStore,
+  workflows: WorkflowDefinition[],
+): Promise<boolean> {
+  const repair = "Run setup wizard and preserve the current file as a backup";
+  const cancel = "Cancel this new AHEAD run";
+  const selected = await ctx.ui.select("AHEAD project configuration must be repaired", [
+    repair,
+    cancel,
+  ]);
+  if (selected !== repair) {
+    return false;
+  }
+  return runProjectConfigWizard(ctx, store, workflows, true);
+}
+
+async function manageWorkItem(ctx: ExtensionCommandContext, requestedUrl: string): Promise<void> {
+  const engine = await enginePromise;
+  const store = storeFor(ctx);
+  let run = await requireRun(ctx);
+  let state = engine.deriveState(run);
+
+  if (requestedUrl) {
+    run = await linkWorkItem(ctx, store, run, workItemFromUrl(requestedUrl));
+    await refreshUi(ctx, run);
+    state = engine.deriveState(run);
+    ctx.ui.notify(`Linked work item to AHEAD run ${run.id}: ${state.work_item?.url}`, "info");
+    return;
+  }
+  if (!ctx.hasUI) {
+    throw new Error("/ahead-work-item requires a URL without interactive UI");
+  }
+
+  const linkExisting = state.work_item
+    ? "Replace the linked work item"
+    : "Link an existing work item";
+  const createGitHub = "Create a GitHub issue in this repository";
+  const show = "Show the linked work item";
+  const choices = state.work_item
+    ? [show, linkExisting, createGitHub]
+    : [linkExisting, createGitHub];
+  const selected = await ctx.ui.select("AHEAD work item", choices);
+  if (selected === show && state.work_item) {
+    ctx.ui.notify(`${state.work_item.title ?? "Linked work item"}\n${state.work_item.url}`, "info");
+    return;
+  }
+  if (selected === linkExisting) {
+    const url = await ctx.ui.input("Link an existing work item", "https://…");
+    if (!url?.trim()) {
+      return;
+    }
+    run = await linkWorkItem(ctx, store, run, workItemFromUrl(url));
+  } else if (selected === createGitHub) {
+    const body = await ctx.ui.editor(
+      `Create GitHub issue · ${run.title}`,
+      await workItemBodyTemplate(store, run, state),
+    );
+    if (!body?.trim()) {
+      return;
+    }
+    const confirmed = await ctx.ui.confirm(
+      "Create this GitHub issue?",
+      [
+        `Repository: ${store.projectRoot}`,
+        `Title: ${run.title}`,
+        "",
+        "This writes to GitHub using the current gh authentication.",
+      ].join("\n"),
+    );
+    if (!confirmed) {
+      return;
+    }
+    const url = (
+      await executeFile(
+        "gh",
+        ["issue", "create", "--title", run.title, "--body", body],
+        store.projectRoot,
+      )
+    ).trim();
+    run = await linkWorkItem(ctx, store, run, workItemFromUrl(url, run.title));
+  } else {
+    return;
+  }
+
+  state = engine.deriveState(run);
+  await refreshUi(ctx, run);
+  ctx.ui.notify(`Linked work item to AHEAD run ${run.id}: ${state.work_item?.url}`, "info");
+}
+
+async function linkWorkItem(
+  ctx: ExtensionCommandContext,
+  store: RunStore,
+  run: Run,
+  workItem: WorkItem,
+): Promise<Run> {
+  const engine = await enginePromise;
+  const current = engine.deriveState(run).work_item;
+  if (current && current.url !== workItem.url && ctx.hasUI) {
+    const replace = await ctx.ui.confirm(
+      "Replace the linked work item?",
+      `${current.url}\n\nwill be replaced by\n\n${workItem.url}`,
+    );
+    if (!replace) {
+      return run;
+    }
+  }
+  if (current?.url === workItem.url) {
+    return run;
+  }
+  const updated = engine.applyEvent(run, humanActor(store.projectRoot), {
+    type: "work_item_linked",
+    work_item: workItem,
+  });
+  await store.save(updated);
+  return updated;
+}
+
+function workItemFromUrl(value: string, title?: string): WorkItem {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new AheadEngineError("invalid_work_item_url", "work item must be an absolute URL");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new AheadEngineError("invalid_work_item_url", "work item URL must use HTTP or HTTPS");
+  }
+  if (url.username || url.password) {
+    throw new AheadEngineError(
+      "invalid_work_item_url",
+      "work item URL cannot contain embedded credentials",
+    );
+  }
+  const host = url.hostname.toLowerCase();
+  const githubIssue =
+    host === "github.com" ? /^\/[^/]+\/[^/]+\/issues\/(\d+)\/?$/.exec(url.pathname) : null;
+  const provider = workItemProvider(host);
+  return {
+    provider,
+    url: url.toString(),
+    ...(githubIssue?.[1] ? { external_id: githubIssue[1] } : {}),
+    ...(title?.trim() ? { title: title.trim() } : {}),
+  };
+}
+
+function workItemProvider(host: string): string {
+  if (host === "github.com") {
+    return "github";
+  }
+  if (host === "linear.app") {
+    return "linear";
+  }
+  if (host === "dev.azure.com") {
+    return "azure-devops";
+  }
+  if (host.endsWith(".atlassian.net")) {
+    return "jira";
+  }
+  return host;
+}
+
+async function workItemBodyTemplate(store: RunStore, run: Run, state: RunState): Promise<string> {
+  const planPath = run.events
+    .toReversed()
+    .find((event) => event.type === "artifact_recorded" && event.kind === "plan")?.path;
+  const plan = planPath
+    ? (await store.readArtifact(planPath)).trim()
+    : "<!-- Link or summarize the approved AHEAD plan when it is ready. -->";
+  return [
+    "## Outcome",
+    "",
+    "<!-- Describe the human-owned outcome this work item should coordinate. -->",
+    "",
+    "## Scope and acceptance",
+    "",
+    "<!-- Record the accepted scope, constraints, and observable success signals. -->",
+    "",
+    "## Plan",
+    "",
+    plan,
+    "",
+    "---",
+    "",
+    `AHEAD run: \`${run.id}\``,
+    `Workflow: \`${run.workflow_id}\``,
+    `Current phase: \`${state.phase.id}\``,
+    "",
+  ].join("\n");
+}
+
+function executeFile(file: string, args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { cwd, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(stderr.trim() || error.message));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
 }
 
 async function showRecommendedSkills(ctx: ExtensionCommandContext): Promise<void> {
@@ -991,6 +1433,9 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
   }
 
   const workflows = engine.listWorkflows();
+  if (!(await ensureProjectConfiguration(ctx, store, workflows))) {
+    return undefined;
+  }
   const parsed = parseStartRequest(
     request,
     workflows.map((workflow) => workflow.id),
@@ -1017,33 +1462,51 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
   if (!workflow) {
     throw new AheadEngineError(
       "workflow_required",
-      `choose a workflow explicitly: ${workflows.map((candidate) => candidate.id).join(", ")}. Noninteractive usage: /ahead-start <workflow-id> :: <title>`,
+      `choose a workflow explicitly: ${workflows.map((candidate) => candidate.id).join(", ")}. Noninteractive usage: /ahead-start <workflow-id> :: <title-or-work-item-url>`,
     );
   }
 
+  const linkedTitle = parsed.workItemUrl
+    ? await resolveWorkItemTitle(parsed.workItemUrl, store.projectRoot)
+    : undefined;
   const title =
     parsed.title ||
+    linkedTitle ||
     (ctx.hasUI
       ? await ctx.ui.input(`Enter AHEAD mode · ${workflow.title}`, "What work are you doing?")
-      : undefined);
+      : parsed.workItemUrl);
   if (!title?.trim()) {
     return undefined;
   }
 
   const owner = humanActor(store.projectRoot);
-  const run = engine.createRun({
+  let run = engine.createRun({
     id: store.newRunId(),
     title: title.trim(),
     owner,
     timestamp: new Date().toISOString(),
     workflow_id: workflow.id,
+    policy: await store.policyForWorkflow(workflow.id),
   });
+  if (parsed.workItemUrl) {
+    run = engine.applyEvent(run, owner, {
+      type: "work_item_linked",
+      work_item: workItemFromUrl(parsed.workItemUrl, title.trim()),
+    });
+  }
   await store.save(run);
   await refreshUi(ctx, run);
+  const state = engine.deriveState(run);
   ctx.ui.notify(
     [
       `AHEAD mode started · ${workflow.title} · ${run.title}`,
       "Human leads · AI assists",
+      ...(state.work_item ? [`Work item: ${state.work_item.url}`] : []),
+      ...(state.policy.work_items.required_before_phase
+        ? [
+            `Project policy requires a work item before ${state.policy.work_items.required_before_phase}.`,
+          ]
+        : []),
       "This run remains active until an accountable human closes the outcome or uses /ahead-stop.",
       "Continue in normal conversation. /ahead is available when you need the action menu.",
     ].join("\n"),
@@ -1244,6 +1707,15 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
     state = engine.deriveState(updated);
   }
   if (!state.can_advance) {
+    if (state.gate.accepted && state.work_item_required_for_next_phase) {
+      await store.save(updated);
+      await refreshUi(ctx, updated);
+      ctx.ui.notify(
+        `Accepted ${state.gate.title}. Link or create the required work item before entering ${state.phase.next}.`,
+        "info",
+      );
+      return;
+    }
     throw new AheadEngineError(
       "cannot_advance",
       state.blockers.join("; ") || "the phase cannot advance",
@@ -1266,6 +1738,16 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
   if (nextState.closed) {
     ctx.ui.notify(
       "AHEAD work complete. The accountable human accepted the outcome and closed the run.",
+      "info",
+    );
+  } else if (nextState.phase.id === "implement") {
+    ctx.ui.notify(
+      [
+        "READY FOR IMPLEMENTATION",
+        "The human-approved plan and any configured work-item boundary are satisfied.",
+        "Continue now, or use /ahead and save this ready-to-implement run for a later sprint.",
+        `Work item: ${nextState.work_item?.url ?? "not linked"}`,
+      ].join("\n"),
       "info",
     );
   } else if (nextState.phase.id === "human-review") {
@@ -1433,7 +1915,7 @@ function formatAheadHeaderField(field: string, width: number, theme: Theme): str
     return truncateToWidth(theme.fg("text", field), width);
   }
 
-  const label = field.slice(0, separator).toUpperCase().padEnd(8);
+  const label = field.slice(0, separator).toUpperCase().padEnd(9);
   let value = field.slice(separator + 1).trimStart();
   let styledValue = theme.fg("text", value);
   if (label.trim() === "NEXT") {
@@ -1461,19 +1943,50 @@ async function loadInstructions(workflowId: string, phase: string): Promise<stri
 function parseStartRequest(
   request: string,
   workflowIds: string[],
-): { workflowId?: string; title: string } {
+): { workflowId?: string; title: string; workItemUrl?: string } {
   const trimmed = request.trim();
   const separator = trimmed.indexOf("::");
   if (separator >= 0) {
+    const value = trimmed.slice(separator + 2).trim();
     return {
       workflowId: trimmed.slice(0, separator).trim(),
-      title: trimmed.slice(separator + 2).trim(),
+      title: isHttpUrl(value) ? "" : value,
+      ...(isHttpUrl(value) ? { workItemUrl: value } : {}),
     };
   }
   if (workflowIds.includes(trimmed)) {
     return { workflowId: trimmed, title: "" };
   }
+  if (isHttpUrl(trimmed)) {
+    return { title: "", workItemUrl: trimmed };
+  }
   return { title: trimmed };
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+async function resolveWorkItemTitle(value: string, root: string): Promise<string | undefined> {
+  const workItem = workItemFromUrl(value);
+  if (workItem.provider !== "github") {
+    return undefined;
+  }
+  try {
+    const title = await executeFile(
+      "gh",
+      ["issue", "view", workItem.url, "--json", "title", "--jq", ".title"],
+      root,
+    );
+    return title.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function formatState(state: RunState): string {
@@ -1486,6 +1999,8 @@ function formatState(state: RunState): string {
   return [
     `${state.title} · ${state.workflow_id}@${state.workflow_version}`,
     `Phase: ${state.phase.title} (${state.phase.id}) · visit ${state.phase.visit}`,
+    `Work item: ${state.work_item?.url ?? "none"}`,
+    `Work item required before: ${state.policy.work_items.required_before_phase ?? "not required"}`,
     `Gate: ${state.gate.id} · ${state.gate.accepted ? `accepted by ${state.gate.accepted_by?.identity}` : "open"}`,
     `AI capabilities: ${state.allowed_ai_capabilities.join(", ") || "none"}`,
     "Artifacts:",

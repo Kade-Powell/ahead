@@ -160,6 +160,37 @@ pub struct Actor {
     pub identity: String,
 }
 
+/// Provider-neutral reference to the external item coordinating an AHEAD run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkItem {
+    /// Provider identifier such as `github`, `jira`, or `azure-devops`.
+    pub provider: String,
+    /// Absolute URL used by humans to open the work item.
+    pub url: String,
+    /// Provider-local identifier, when it can be derived without becoming authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Human-readable title captured when the work item is linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Project-selected rule controlling when a work item becomes mandatory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkItemPolicy {
+    /// Phase that cannot be entered until a work item is linked.
+    #[serde(default)]
+    pub required_before_phase: Option<String>,
+}
+
+/// Immutable policy snapshot applied to one run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunPolicy {
+    /// Work-item requirement resolved from the project configuration.
+    #[serde(default)]
+    pub work_items: WorkItemPolicy,
+}
+
 /// Append-only event record for one execution of a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Run {
@@ -175,6 +206,9 @@ pub struct Run {
     pub workflow_version: String,
     /// Identity of the human who owns the run.
     pub owner: String,
+    /// Project policy snapshot used for deterministic replay of this run.
+    #[serde(default)]
+    pub policy: RunPolicy,
     /// Ordered, append-only events that constitute the run.
     pub events: Vec<Event>,
 }
@@ -201,6 +235,11 @@ pub enum Action {
     RunStarted {
         /// Initial phase identifier.
         phase: String,
+    },
+    /// Links or replaces the provider-neutral work item associated with the run.
+    WorkItemLinked {
+        /// Work item selected or created by a human.
+        work_item: WorkItem,
     },
     /// Records an evidence artifact for the active phase visit.
     ArtifactRecorded {
@@ -258,6 +297,12 @@ pub struct RunState {
     pub workflow_id: String,
     /// Version of the active workflow.
     pub workflow_version: String,
+    /// Immutable project policy snapshot controlling this run.
+    pub policy: RunPolicy,
+    /// Most recently linked work item, when one exists.
+    pub work_item: Option<WorkItem>,
+    /// Whether the next forward transition is blocked until a work item is linked.
+    pub work_item_required_for_next_phase: bool,
     /// State of the current phase visit.
     pub phase: PhaseState,
     /// Artifact requirements and recorded evidence for the current visit.
@@ -356,6 +401,9 @@ pub struct CreateRunInput {
     pub timestamp: String,
     /// Explicitly selected workflow identifier.
     pub workflow_id: String,
+    /// Project policy to snapshot into the new run.
+    #[serde(default)]
+    pub policy: RunPolicy,
 }
 
 /// Structured validation or protocol error returned by the AHEAD engine.
@@ -461,6 +509,7 @@ pub fn create_run(input: CreateRunInput) -> Result<Run> {
     validate_nonempty("timestamp", &input.timestamp)?;
 
     let definition = workflow(&input.workflow_id)?;
+    validate_run_policy(&definition, &input.policy)?;
     Ok(Run {
         api_version: RUN_API_VERSION.to_owned(),
         id: input.id,
@@ -468,6 +517,7 @@ pub fn create_run(input: CreateRunInput) -> Result<Run> {
         workflow_id: definition.id.clone(),
         workflow_version: definition.version,
         owner: input.owner.identity.clone(),
+        policy: input.policy,
         events: vec![Event {
             sequence: 1,
             timestamp: input.timestamp,
@@ -517,6 +567,7 @@ pub fn validate_run(run: &Run) -> Result<RunState> {
     validate_nonempty("run title", &run.title)?;
     validate_nonempty("owner", &run.owner)?;
     let definition = workflow_version(&run.workflow_id, &run.workflow_version)?;
+    validate_run_policy(&definition, &run.policy)?;
     if run.events.is_empty() {
         return Err(AheadError::new("missing_start", "run has no start event"));
     }
@@ -608,6 +659,8 @@ struct ReplayState {
     artifacts: BTreeMap<String, RecordedArtifact>,
     /// Human who accepted the active phase gate, when accepted.
     gate_actor: Option<Actor>,
+    /// Most recently linked provider-neutral work item.
+    work_item: Option<WorkItem>,
     /// Whether the run has received its closing event.
     closed: bool,
 }
@@ -621,6 +674,7 @@ impl ReplayState {
             visits: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             gate_actor: None,
+            work_item: None,
             closed: false,
         }
     }
@@ -655,6 +709,10 @@ fn replay_event(
         Action::RunStarted { phase } => {
             replay_run_started(definition, run, replay, event, first, phase)?;
         }
+        Action::WorkItemLinked { work_item } => {
+            ensure_not_first(first)?;
+            replay_work_item_linked(replay, event, work_item)?;
+        }
         Action::ArtifactRecorded { phase, kind, path } => {
             ensure_not_first(first)?;
             replay_artifact_recorded(definition, run, replay, event, phase, kind, path)?;
@@ -663,28 +721,27 @@ fn replay_event(
             ensure_not_first(first)?;
             replay_gate_accepted(definition, replay, event, phase, gate)?;
         }
-        Action::PhaseTransitioned {
-            from,
-            to,
-            direction,
-            reason,
-        } => {
+        Action::PhaseTransitioned { .. } => {
             ensure_not_first(first)?;
-            replay_phase_transitioned(
-                definition,
-                replay,
-                event,
-                from,
-                to,
-                direction,
-                reason.as_deref(),
-            )?;
+            replay_phase_transitioned(definition, run, replay, event, &event.action)?;
         }
         Action::RunClosed { phase } => {
             ensure_not_first(first)?;
             replay_run_closed(definition, replay, event, phase)?;
         }
     }
+    Ok(())
+}
+
+/// Validates and retains a human-selected work item without coupling the core to its provider.
+fn replay_work_item_linked(
+    replay: &mut ReplayState,
+    event: &Event,
+    work_item: &WorkItem,
+) -> Result<()> {
+    require_human(event, "link an AHEAD work item")?;
+    validate_work_item(work_item)?;
+    replay.work_item = Some(work_item.clone());
     Ok(())
 }
 
@@ -908,20 +965,34 @@ fn validate_gate_actor(
 /// Validates and applies a forward or return phase transition.
 fn replay_phase_transitioned(
     definition: &WorkflowDefinition,
+    run: &Run,
     replay: &mut ReplayState,
     event: &Event,
-    from: &str,
-    to: &str,
-    direction: &TransitionDirection,
-    reason: Option<&str>,
+    action: &Action,
 ) -> Result<()> {
+    let Action::PhaseTransitioned {
+        from,
+        to,
+        direction,
+        reason,
+    } = action
+    else {
+        return Err(AheadError::new(
+            "invalid_transition_action",
+            "phase transition replay requires a phase_transitioned action",
+        ));
+    };
     ensure_current_phase(replay, from)?;
     require_human(event, "transition an AHEAD phase")?;
     let phase_definition = find_phase(definition, from)?;
     find_phase(definition, to)?;
     match direction {
-        TransitionDirection::Advance => validate_advance(phase_definition, replay, to, reason)?,
-        TransitionDirection::Return => validate_return(phase_definition, from, to, reason)?,
+        TransitionDirection::Advance => {
+            validate_advance(run, phase_definition, replay, to, reason.as_deref())?;
+        }
+        TransitionDirection::Return => {
+            validate_return(phase_definition, from, to, reason.as_deref())?;
+        }
     }
     replay.activate(to);
     Ok(())
@@ -929,6 +1000,7 @@ fn replay_phase_transitioned(
 
 /// Validates the gate, target, and empty rationale of a forward transition.
 fn validate_advance(
+    run: &Run,
     phase_definition: &PhaseDefinition,
     replay: &ReplayState,
     to: &str,
@@ -950,6 +1022,12 @@ fn validate_advance(
         return Err(AheadError::new(
             "invalid_advance",
             format!("{to} is not the next phase after {}", phase_definition.id),
+        ));
+    }
+    if work_item_required_for_transition(run, replay, to) {
+        return Err(AheadError::new(
+            "work_item_required",
+            format!("a work item must be linked before entering phase {to}"),
         ));
     }
     Ok(())
@@ -1038,6 +1116,10 @@ fn materialize_state(
         .filter(|kind| !replay.artifacts.contains_key(*kind))
         .cloned()
         .collect::<Vec<_>>();
+    let work_item_required_for_next_phase = phase
+        .next
+        .as_deref()
+        .is_some_and(|next| work_item_required_for_transition(run, replay, next));
     let mut blockers = missing
         .iter()
         .map(|kind| format!("required artifact missing: {kind}"))
@@ -1049,6 +1131,12 @@ fn materialize_state(
         blockers.push(format!(
             "AI assistance locked until human records: {}",
             locked.join(", ")
+        ));
+    }
+    if work_item_required_for_next_phase {
+        blockers.push(format!(
+            "work item required before entering phase: {}",
+            phase.next.as_deref().unwrap_or_default()
         ));
     }
 
@@ -1065,6 +1153,9 @@ fn materialize_state(
         title: run.title.clone(),
         workflow_id: run.workflow_id.clone(),
         workflow_version: run.workflow_version.clone(),
+        policy: run.policy.clone(),
+        work_item: replay.work_item.clone(),
+        work_item_required_for_next_phase,
         phase: PhaseState {
             id: phase.id.clone(),
             title: phase.title.clone(),
@@ -1081,9 +1172,75 @@ fn materialize_state(
         blockers,
         allowed_ai_capabilities,
         return_targets: phase.returns_to.clone(),
-        can_advance: replay.gate_actor.is_some() && !replay.closed,
+        can_advance: replay.gate_actor.is_some()
+            && !replay.closed
+            && !work_item_required_for_next_phase,
         closed: replay.closed,
     })
+}
+
+/// Returns whether the run policy requires a link before the requested forward transition.
+fn work_item_required_for_transition(run: &Run, replay: &ReplayState, to: &str) -> bool {
+    replay.work_item.is_none() && run.policy.work_items.required_before_phase.as_deref() == Some(to)
+}
+
+/// Validates that a run's snapshotted policy references a reachable noninitial phase.
+fn validate_run_policy(definition: &WorkflowDefinition, policy: &RunPolicy) -> Result<()> {
+    let Some(required_phase) = policy.work_items.required_before_phase.as_deref() else {
+        return Ok(());
+    };
+    validate_nonempty("work item required phase", required_phase)?;
+    if required_phase == definition.initial_phase {
+        return Err(AheadError::new(
+            "invalid_work_item_phase",
+            "a work item boundary must follow the workflow's initial phase",
+        ));
+    }
+    find_phase(definition, required_phase)
+        .map(|_| ())
+        .map_err(|_| {
+            AheadError::new(
+                "invalid_work_item_phase",
+                format!("workflow {} has no phase {required_phase}", definition.id),
+            )
+        })
+}
+
+/// Validates provider-neutral work-item fields without interpreting provider semantics.
+fn validate_work_item(work_item: &WorkItem) -> Result<()> {
+    validate_nonempty("work item provider", &work_item.provider)?;
+    validate_nonempty("work item URL", &work_item.url)?;
+    if !work_item.url.starts_with("https://") && !work_item.url.starts_with("http://") {
+        return Err(AheadError::new(
+            "invalid_work_item_url",
+            "work item URL must be an absolute HTTP or HTTPS URL",
+        ));
+    }
+    if work_item.url.chars().any(char::is_whitespace) {
+        return Err(AheadError::new(
+            "invalid_work_item_url",
+            "work item URL cannot contain whitespace",
+        ));
+    }
+    let authority = work_item
+        .url
+        .split_once("://")
+        .map_or("", |(_, remainder)| {
+            remainder.split('/').next().unwrap_or_default()
+        });
+    if authority.contains('@') {
+        return Err(AheadError::new(
+            "invalid_work_item_url",
+            "work item URL cannot contain embedded credentials",
+        ));
+    }
+    if let Some(external_id) = &work_item.external_id {
+        validate_nonempty("work item external id", external_id)?;
+    }
+    if let Some(title) = &work_item.title {
+        validate_nonempty("work item title", title)?;
+    }
+    Ok(())
 }
 
 /// Finds a phase definition by its workflow-local identifier.
@@ -1242,6 +1399,7 @@ mod tests {
             owner: human("implementer@example.com"),
             timestamp: "2026-08-12T12:00:00Z".to_owned(),
             workflow_id: "product-change".to_owned(),
+            policy: RunPolicy::default(),
         })
         .unwrap()
     }
@@ -1386,6 +1544,7 @@ mod tests {
                 owner: human("owner@example.com"),
                 timestamp: "2026-08-12T12:00:00Z".to_owned(),
                 workflow_id: definition.id.clone(),
+                policy: RunPolicy::default(),
             })
             .unwrap();
             let state = derive_state(&run).unwrap();
@@ -1405,6 +1564,7 @@ mod tests {
             workflow_id: "product-change".to_owned(),
             workflow_version: "0.1.0".to_owned(),
             owner: "owner@example.com".to_owned(),
+            policy: RunPolicy::default(),
             events: vec![Event {
                 sequence: 1,
                 timestamp: "2026-08-12T12:00:00Z".to_owned(),
@@ -1500,6 +1660,7 @@ mod tests {
                 owner: human("owner@example.com"),
                 timestamp: "2026-08-12T12:00:00Z".to_owned(),
                 workflow_id: definition.id.clone(),
+                policy: RunPolicy::default(),
             })
             .unwrap();
 
@@ -1664,6 +1825,192 @@ mod tests {
         )
         .unwrap();
         assert_eq!(derive_state(&run).unwrap().phase.id, "research");
+    }
+
+    #[test]
+    fn configured_work_item_boundary_blocks_implementation_until_a_human_links_one() {
+        let definition = workflow("product-change").unwrap();
+        let mut run = create_run(CreateRunInput {
+            id: "planned-ahead".to_owned(),
+            title: "Plan one sprint ahead".to_owned(),
+            owner: human("planner@example.com"),
+            timestamp: "2026-08-12T12:00:00Z".to_owned(),
+            workflow_id: definition.id.clone(),
+            policy: RunPolicy {
+                work_items: WorkItemPolicy {
+                    required_before_phase: Some("implement".to_owned()),
+                },
+            },
+        })
+        .unwrap();
+
+        loop {
+            let state = derive_state(&run).unwrap();
+            if state.phase.id == "plan" {
+                break;
+            }
+            let phase = definition
+                .phases
+                .iter()
+                .find(|phase| phase.id == state.phase.id)
+                .unwrap();
+            for artifact in phase.artifacts.iter().filter(|artifact| artifact.required) {
+                let actor = if artifact.actor == ActorRule::Ai {
+                    ai("model")
+                } else {
+                    human("planner@example.com")
+                };
+                run = apply_action(
+                    &run,
+                    actor,
+                    Action::ArtifactRecorded {
+                        phase: phase.id.clone(),
+                        kind: artifact.kind.clone(),
+                        path: format!(".ahead/{}/{}.md", phase.id, artifact.kind),
+                    },
+                )
+                .unwrap();
+            }
+            run = apply_action(
+                &run,
+                human("planner@example.com"),
+                Action::GateAccepted {
+                    phase: phase.id.clone(),
+                    gate: phase.gate.id.clone(),
+                },
+            )
+            .unwrap();
+            run = apply_action(
+                &run,
+                human("planner@example.com"),
+                Action::PhaseTransitioned {
+                    from: phase.id.clone(),
+                    to: phase.next.clone().unwrap(),
+                    direction: TransitionDirection::Advance,
+                    reason: None,
+                },
+            )
+            .unwrap();
+        }
+
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::ArtifactRecorded {
+                phase: "plan".to_owned(),
+                kind: "first-pass-plan".to_owned(),
+                path: ".ahead/first-pass-plan.md".to_owned(),
+            },
+        )
+        .unwrap();
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::ArtifactRecorded {
+                phase: "plan".to_owned(),
+                kind: "plan".to_owned(),
+                path: ".ahead/plan.md".to_owned(),
+            },
+        )
+        .unwrap();
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::GateAccepted {
+                phase: "plan".to_owned(),
+                gate: "plan-approved".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let state = derive_state(&run).unwrap();
+        assert!(state.work_item_required_for_next_phase);
+        assert!(!state.can_advance);
+        assert!(state.work_item.is_none());
+        assert!(
+            state
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("work item required"))
+        );
+
+        let error = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::PhaseTransitioned {
+                from: "plan".to_owned(),
+                to: "implement".to_owned(),
+                direction: TransitionDirection::Advance,
+                reason: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "work_item_required");
+
+        let work_item = WorkItem {
+            provider: "github".to_owned(),
+            url: "https://github.com/example/project/issues/42".to_owned(),
+            external_id: Some("42".to_owned()),
+            title: Some("Implement the approved change".to_owned()),
+        };
+        let error = apply_action(
+            &run,
+            ai("model"),
+            Action::WorkItemLinked {
+                work_item: work_item.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "human_action_required");
+
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::WorkItemLinked { work_item },
+        )
+        .unwrap();
+        let state = derive_state(&run).unwrap();
+        assert_eq!(
+            state
+                .work_item
+                .as_ref()
+                .map(|item| item.external_id.as_deref()),
+            Some(Some("42"))
+        );
+        assert!(state.can_advance);
+
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::PhaseTransitioned {
+                from: "plan".to_owned(),
+                to: "implement".to_owned(),
+                direction: TransitionDirection::Advance,
+                reason: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(derive_state(&run).unwrap().phase.id, "implement");
+    }
+
+    #[test]
+    fn work_item_boundary_must_name_a_noninitial_workflow_phase() {
+        for required_before_phase in ["missing", "define"] {
+            let error = create_run(CreateRunInput {
+                id: format!("invalid-{required_before_phase}"),
+                title: "Invalid policy".to_owned(),
+                owner: human("owner@example.com"),
+                timestamp: "2026-08-12T12:00:00Z".to_owned(),
+                workflow_id: "product-change".to_owned(),
+                policy: RunPolicy {
+                    work_items: WorkItemPolicy {
+                        required_before_phase: Some(required_before_phase.to_owned()),
+                    },
+                },
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_work_item_phase");
+        }
     }
 
     #[test]

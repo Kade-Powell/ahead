@@ -5,6 +5,7 @@ import type {
   EngineErrorShape,
   EventAction,
   Run,
+  RunPolicy,
   RunState,
   WorkflowDefinition,
 } from "./types.js";
@@ -61,6 +62,7 @@ export class AheadEngine {
     owner: Actor;
     timestamp: string;
     workflow_id: string;
+    policy?: RunPolicy;
   }): Run {
     return this.call("create_run", input);
   }

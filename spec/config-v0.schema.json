@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Kade-Powell/ahead/blob/main/spec/config-v0.schema.json",
+  "title": "AHEAD project configuration v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version"],
+  "properties": {
+    "api_version": {
+      "const": "ahead.config/v0"
+    },
+    "work_items": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required_before_phase": {
+          "type": "object",
+          "description": "Workflow ids mapped to the phase that cannot be entered without a linked work item.",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

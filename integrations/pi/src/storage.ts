@@ -1,12 +1,38 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import type { Actor, Run } from "./types.js";
+import type { Actor, Run, RunPolicy } from "./types.js";
 
 interface CurrentRunPointer {
   api_version: "ahead.current/v0";
   run_id: string;
+}
+
+export interface AheadProjectConfig {
+  api_version: "ahead.config/v0";
+  work_items: {
+    required_before_phase: Record<string, string>;
+  };
+}
+
+export type ProjectConfigInspection =
+  | { status: "missing" }
+  | { status: "valid"; config: AheadProjectConfig; content: string }
+  | { status: "invalid"; content: string; error: string };
+
+export interface SavedProjectConfig {
+  path: string;
+  backup?: string;
 }
 
 export class RunStore {
@@ -39,6 +65,74 @@ export class RunStore {
 
   async load(runId: string): Promise<Run> {
     return parseRun(await readFile(this.runPath(runId), "utf8"));
+  }
+
+  async loadProjectConfig(): Promise<AheadProjectConfig> {
+    const inspection = await this.inspectProjectConfig();
+    if (inspection.status === "missing") {
+      return emptyProjectConfig();
+    }
+    if (inspection.status === "invalid") {
+      throw new Error(inspection.error);
+    }
+    return inspection.config;
+  }
+
+  async inspectProjectConfig(): Promise<ProjectConfigInspection> {
+    let content: string;
+    try {
+      content = await readFile(join(this.aheadDirectory, "config.json"), "utf8");
+    } catch (error) {
+      if (isMissing(error)) {
+        return { status: "missing" };
+      }
+      throw error;
+    }
+    try {
+      return { status: "valid", config: parseProjectConfig(content), content };
+    } catch (error) {
+      return { status: "invalid", content, error: errorMessage(error) };
+    }
+  }
+
+  async saveProjectConfig(
+    config: AheadProjectConfig,
+    options: { overwrite: boolean },
+  ): Promise<SavedProjectConfig> {
+    const validated = parseProjectConfig(JSON.stringify(config));
+    const configPath = join(this.aheadDirectory, "config.json");
+    const inspection = await this.inspectProjectConfig();
+    if (inspection.status !== "missing" && !options.overwrite) {
+      throw new Error(".ahead/config.json already exists; explicit replacement is required");
+    }
+
+    let backup: string | undefined;
+    if (inspection.status !== "missing") {
+      const timestamp = new Date().toISOString().replaceAll(/[-:.]/g, "");
+      const backupPath = join(
+        this.aheadDirectory,
+        "backups",
+        `config-${timestamp}-${randomUUID().slice(0, 8)}.json`,
+      );
+      await mkdir(dirname(backupPath), { recursive: true });
+      await copyFile(configPath, backupPath);
+      backup = relative(this.projectRoot, backupPath);
+    }
+
+    await atomicJson(configPath, validated);
+    return {
+      path: relative(this.projectRoot, configPath),
+      ...(backup ? { backup } : {}),
+    };
+  }
+
+  async policyForWorkflow(workflowId: string): Promise<RunPolicy> {
+    const config = await this.loadProjectConfig();
+    return {
+      work_items: {
+        required_before_phase: config.work_items.required_before_phase[workflowId] ?? null,
+      },
+    };
   }
 
   async save(run: Run, makeCurrent = true): Promise<void> {
@@ -218,6 +312,55 @@ function parseRun(content: string): Run {
   return value;
 }
 
+function emptyProjectConfig(): AheadProjectConfig {
+  return {
+    api_version: "ahead.config/v0",
+    work_items: { required_before_phase: {} },
+  };
+}
+
+function parseProjectConfig(content: string): AheadProjectConfig {
+  const value: unknown = JSON.parse(content);
+  if (!isRecord(value) || value.api_version !== "ahead.config/v0") {
+    throw new Error("invalid .ahead/config.json: expected api_version ahead.config/v0");
+  }
+  if (!hasOnlyKeys(value, ["api_version", "work_items"])) {
+    throw new Error("invalid .ahead/config.json: unknown top-level property");
+  }
+  if (value.work_items === undefined) {
+    return emptyProjectConfig();
+  }
+  if (!isRecord(value.work_items)) {
+    throw new Error("invalid .ahead/config.json: work_items must be an object");
+  }
+  if (!hasOnlyKeys(value.work_items, ["required_before_phase"])) {
+    throw new Error("invalid .ahead/config.json: unknown work_items property");
+  }
+  const required = value.work_items.required_before_phase;
+  if (required === undefined) {
+    return emptyProjectConfig();
+  }
+  if (!isRecord(required)) {
+    throw new Error(
+      "invalid .ahead/config.json: work_items.required_before_phase must be an object",
+    );
+  }
+  const requiredBeforePhase = Object.fromEntries(
+    Object.entries(required).map(([workflow, phase]) => {
+      if (!workflow.trim() || typeof phase !== "string" || !phase.trim()) {
+        throw new Error(
+          "invalid .ahead/config.json: every work-item boundary needs a workflow and phase",
+        );
+      }
+      return [workflow, phase];
+    }),
+  );
+  return {
+    api_version: "ahead.config/v0",
+    work_items: { required_before_phase: requiredBeforePhase },
+  };
+}
+
 function isRun(value: unknown): value is Run {
   return (
     isRecord(value) &&
@@ -233,4 +376,12 @@ function isRun(value: unknown): value is Run {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

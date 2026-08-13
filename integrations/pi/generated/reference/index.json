@@ -12,6 +12,7 @@
     "docs/guide/engineering-practice.md",
     "docs/guide/rationale.md",
     "docs/guide/recommended-skills.md",
+    "docs/guide/work-items.md",
     "docs/guide/workflows/README.md",
     "docs/guide/workflows/corrective-debugging.md",
     "docs/guide/workflows/decision.md",
@@ -176,6 +177,19 @@
       "path": "docs/guide/recommended-skills.md",
       "title": "Recommended Skills",
       "summary": "AHEAD may recommend independently maintained agent skills when they strengthen an active phase. Recommendations are references, not bundled code or silent dependencies. A human chooses whether to inspect and install one, and AHEAD's workflo",
+      "audience": "practitioner",
+      "authority": "guidance",
+      "distribution": "agent-and-human",
+      "phases": [],
+      "workflows": [
+        "*"
+      ]
+    },
+    {
+      "id": "work-items",
+      "path": "docs/guide/work-items.md",
+      "title": "Work Items and Planning Handoffs",
+      "summary": "A work item is the team's coordination surface: a GitHub issue, Jira issue, Azure Boards item, Linear issue, or another durable URL. AHEAD owns the workflow state, evidence chain, human gates, and resumable handoff. Linking the two avoids m",
       "audience": "practitioner",
       "authority": "guidance",
       "distribution": "agent-and-human",

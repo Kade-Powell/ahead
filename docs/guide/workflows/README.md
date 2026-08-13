@@ -75,6 +75,7 @@ modifiers:
   assurance: standard | security | regulated | safety-critical
   environment: local | test | staging | production | external
 links: []
+work_item: optional provider-neutral URL
 ```
 
 The body records only the sections required by the selected flow. Evidence may remain in its native system and be linked rather than copied.

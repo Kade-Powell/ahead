@@ -11,7 +11,8 @@ This is the starting point for people applying AHEAD to engineering work. These 
 3. [Acceptable AI use](acceptable-ai-use.md) defines binding authority boundaries.
 4. [Engineering practice](engineering-practice.md) describes the habits AHEAD asks engineers to cultivate.
 5. [Pilot workflows](workflows/README.md) explains how to choose and execute one of the six flows.
-6. [Recommended skills](recommended-skills.md) lists optional, reviewed third-party aids.
+6. [Work items and planning handoffs](work-items.md) explains provider-neutral links, configurable gates, and sprint-ahead preparation.
+7. [Recommended skills](recommended-skills.md) lists optional, reviewed third-party aids.
 
 ## Authority
 

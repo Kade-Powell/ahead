@@ -424,6 +424,13 @@ export function nextAction(state: RunState, workflow: WorkflowDefinition): Guide
     return { actor: "human", label: `Review evidence and accept: ${state.gate.title}` };
   }
 
+  if (state.work_item_required_for_next_phase) {
+    return {
+      actor: "human",
+      label: `Link or create the required work item before ${state.phase.next ?? "continuing"}`,
+    };
+  }
+
   const nextPhase = workflow.phases.find((phase) => phase.id === state.phase.next);
   return {
     actor: "human",
@@ -463,8 +470,19 @@ export function buildHeaderLines(
     : "No required artifact";
   const action = nextAction(state, workflow);
 
+  const workItem = state.work_item
+    ? `Work item: ${state.work_item.url}`
+    : state.policy.work_items.required_before_phase
+      ? `Work item: Required before ${
+          workflow.phases.find(
+            (phase) => phase.id === state.policy.work_items.required_before_phase,
+          )?.title ?? state.policy.work_items.required_before_phase
+        }`
+      : undefined;
+
   return [
     `AHEAD · ${workflow.title} · ${position.current}/${position.total} · ${state.phase.title}`,
+    ...(workItem ? [workItem] : []),
     `Goal: ${guide.objective}`,
     `Required: ${checklist}`,
     `Next: ${action.actor === "human" ? "You" : "AI"} → ${action.label}`,

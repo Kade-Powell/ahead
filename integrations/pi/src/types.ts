@@ -7,6 +7,17 @@ export interface Actor {
   identity: string;
 }
 
+export interface WorkItem {
+  provider: string;
+  url: string;
+  external_id?: string;
+  title?: string;
+}
+
+export interface RunPolicy {
+  work_items: { required_before_phase: string | null };
+}
+
 export interface ArtifactDefinition {
   kind: string;
   title: string;
@@ -40,7 +51,13 @@ export interface Event {
   sequence: number;
   timestamp: string;
   actor: Actor;
-  type: "run_started" | "artifact_recorded" | "gate_accepted" | "phase_transitioned" | "run_closed";
+  type:
+    | "run_started"
+    | "work_item_linked"
+    | "artifact_recorded"
+    | "gate_accepted"
+    | "phase_transitioned"
+    | "run_closed";
   phase?: string;
   kind?: string;
   path?: string;
@@ -49,6 +66,7 @@ export interface Event {
   to?: string;
   direction?: "advance" | "return";
   reason?: string;
+  work_item?: WorkItem;
 }
 
 export interface Run {
@@ -58,6 +76,7 @@ export interface Run {
   workflow_id: string;
   workflow_version: string;
   owner: string;
+  policy?: RunPolicy;
   events: Event[];
 }
 
@@ -72,6 +91,9 @@ export interface RunState {
   title: string;
   workflow_id: string;
   workflow_version: string;
+  policy: RunPolicy;
+  work_item: WorkItem | null;
+  work_item_required_for_next_phase: boolean;
   phase: { id: string; title: string; visit: number; next: string | null };
   artifacts: ArtifactState[];
   gate: { id: string; title: string; accepted: boolean; accepted_by: Actor | null };
@@ -88,6 +110,7 @@ export interface EngineErrorShape {
 }
 
 export type EventAction =
+  | { type: "work_item_linked"; work_item: WorkItem }
   | { type: "artifact_recorded"; phase: string; kind: string; path: string }
   | { type: "gate_accepted"; phase: string; gate: string }
   | {

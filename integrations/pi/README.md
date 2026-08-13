@@ -31,7 +31,7 @@ pi -e npm:ahead-pi
 ## Guided mode
 
 1. Start Pi in the repository where the engineering work will occur.
-2. Run `/ahead <short title>` once, explicitly choose the workflow that fits the dominant outcome, and enter AHEAD mode. A new run never defaults to Product Change. Advanced noninteractive use must pass `/ahead-start <workflow-id> :: <title>`.
+2. Run `/ahead <short title>` or `/ahead <work-item-url>` once, explicitly choose the workflow that fits the dominant outcome, and enter AHEAD mode. A new run never defaults to Product Change. Advanced noninteractive use passes `/ahead-start <workflow-id> :: <title-or-work-item-url>`.
 3. Work through normal conversation. A compact header above the chat shows the phase goal, required evidence, and whether the human or AI owns the next action. The full human/AI boundary continues to govern every model turn without occupying the conversation.
 4. Run `/ahead` again only when you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, returns to an earlier phase, or opens applicable framework guidance.
 5. Keep the `.ahead` records with the work so another session or independent reviewer resumes the same authoritative run.
@@ -43,6 +43,27 @@ AHEAD remains active across Pi sessions until an accountable human completes the
 During implementation, the engineer can ask questions at any time. The guided help form captures the engineer's current model and first attempt, then asks AI for explanation, evidence, hints, debugging help, or bounded next steps without handing over human ownership. Normal conversation follows the same rule. A bounded mechanical edit still requires clear human intent and later human inspection and understanding.
 
 Run `/ahead-skills` to inspect optional third-party skills AHEAD has reviewed for the active phase. Recommendations pin the reviewed source and provide an opt-in install command; the extension never installs them. AHEAD's human ownership and gates override any conflicting skill guidance.
+
+## Work items and sprint-ahead planning
+
+`/ahead-work-item <url>` links an existing GitHub, Jira, Azure Boards, Linear, or other HTTP(S) work item. With no URL, the command can link an item interactively or create a GitHub issue in the current repository after the human reviews and confirms a body seeded with the available approved plan. The provider-neutral URL appears in the AHEAD header and run state.
+
+Repositories may configure a required boundary in `.ahead/config.json`. This example requires a work item before Product Change enters implementation:
+
+```json
+{
+  "api_version": "ahead.config/v0",
+  "work_items": {
+    "required_before_phase": {
+      "product-change": "implement"
+    }
+  }
+}
+```
+
+When a project has no config, starting new work offers a setup wizard or the option to continue without one. `/ahead-config` opens the wizard directly. It can apply the recommended boundaries, ask for each workflow's boundary, or make all work items optional. Rerunning it previews and confirms replacement, then preserves the exact prior file under `.ahead/backups/`; this also provides a safe path from an invalid or unsupported config version to the current schema.
+
+The boundary is configured separately for each workflow and copied into new runs for deterministic replay. Configuration changes never reinterpret active or saved runs. When an approved plan enters `implement`, `/ahead` offers to save it as a ready-to-implement handoff for a later sprint. This preserves the plan and work-item link without claiming the unfinished workflow is complete.
 
 ## Agent profile and framework references
 
@@ -73,6 +94,8 @@ A draft branch or draft PR may exist earlier. The handoff gate is requesting hum
 | Command | Effect |
 |---|---|
 | `/ahead [title]` | Choose a workflow for new work, or open the active workflow's action menu |
+| `/ahead-work-item [url]` | Link a provider-neutral work item or create a confirmed GitHub issue |
+| `/ahead-config` | Set up, inspect, replace, or migrate project policy with a recoverable backup |
 | `/ahead-guide [topic]` | Read phase-relevant or requested AHEAD Markdown |
 | `/ahead-skills` | Inspect optional skills reviewed for the active phase; never installs them |
 | `/ahead-review` | Inspect the exact diff and complete the AI-to-human review handoff |
@@ -85,6 +108,7 @@ A draft branch or draft PR may exist earlier. The handoff gate is requesting hum
 ## AI tools
 
 - `ahead_get_context` reads authoritative state.
+- `ahead_get_work_item` reads the linked reference and resolves GitHub issue context through `gh`.
 - `ahead_get_reference` lists or reads the packaged framework Markdown on demand.
 - `ahead_get_recommended_skills` lists reviewed optional skills without installing them.
 - `ahead_get_review_snapshot` captures the exact current changeset and fingerprint.

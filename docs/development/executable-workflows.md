@@ -63,6 +63,7 @@ The Pi package copies the canonical Constitution, `docs/guide/**/*.md`, and `doc
 A run is an append-only event log. Events record an actor kind and identity, host-supplied timestamp, sequence, and one action:
 
 - start the run;
+- link or replace a provider-neutral work item;
 - record an artifact;
 - accept a human gate;
 - advance or return between phases;
@@ -74,6 +75,9 @@ Pi stores state under the work's Git root:
 
 ```text
 .ahead/
+├── backups/
+│   └── config-<timestamp>-<id>.json
+├── config.json
 ├── current.json
 └── runs/
     └── <run-id>/
@@ -84,6 +88,10 @@ Pi stores state under the work's Git root:
 
 These are intended to be inspectable, diffable repository artifacts. A team can decide which records belong in Git, while CI and GitHub enforcement are later adapters over the same run contract.
 
+Project configuration may map each workflow to a phase that cannot be entered without a linked work item. The host resolves that configuration when a run starts and snapshots it into the append-only run record. The core then enforces the boundary without knowing whether the URL belongs to GitHub, Jira, Azure Boards, Linear, or another provider.
+
+The Pi host distinguishes missing, valid, and invalid project configuration before new work starts. Its setup wizard generates only the current schema. Replacing a valid, malformed, or unsupported config requires confirmation and first copies the exact source file into `.ahead/backups/`. This is a recoverable host-level configuration migration path, not an automatic semantic migration and not a workflow/run-version upgrade. Existing runs remain bound to their stored policy.
+
 Pi treats pause and resume as host lifecycle rather than workflow progress. Stopping discards the current unfinished run directory by default; an explicit save removes only the current pointer and retains the run for later resume. Resuming restores the pointer without adding evidence, accepting a gate, or changing phase. Neither stop path modifies engineering files outside that run's `.ahead` directory.
 
 ## Enforced boundaries in v0.1
@@ -93,6 +101,7 @@ Pi treats pause and resume as host lifecycle rather than workflow progress. Stop
 - Workflow-specific human-first artifacts unlock AI assistance only after the human's initial model, option, plan, baseline, or other required reasoning exists.
 - Required current-visit artifacts must exist before gate acceptance.
 - Advancement requires the current human gate.
+- A configured work-item boundary blocks the corresponding forward transition until a human links an absolute work-item URL.
 - Independent human review must be recorded by an identity other than the latest changeset implementer, and that reviewer must accept the review gate.
 - Lasting-change flows distinguish implementation, AI review, independent human review, deployment, observation, audit, and human outcome.
 - AI review is bound to a fingerprint of the exact current engineering changeset. The implementing human records a separate disposition for every material AI finding before independent human review.
@@ -114,7 +123,7 @@ The Pi adapter is an engineering workflow control, not a security sandbox.
 - Unknown model tools are denied until the adapter classifies them. This prevents a newly installed effectful tool from silently acquiring authority.
 - Artifact and run writes are atomic, but v0.1 has no multi-process lock. One writer should operate a run at a time.
 - Workflow files can prove that a named action was recorded, not that a person genuinely understood it. Human review and organizational accountability remain necessary.
-- No GitHub checks, PR gates, migration engine, signature scheme, or backwards-compatible workflow upgrade exists yet.
+- No GitHub checks, PR gates, automatic run/workflow migration engine, signature scheme, or backwards-compatible workflow upgrade exists yet.
 - Local review fingerprints detect changes but are not signatures. A future GitHub adapter must add remote identity and protected-branch evidence rather than treating the local record as cryptographic proof.
 
 ## Reuse path

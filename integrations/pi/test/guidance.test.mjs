@@ -61,6 +61,9 @@ function state(phase, artifacts, overrides = {}) {
     title: run.title,
     workflow_id: workflow.id,
     workflow_version: workflow.version,
+    policy: { work_items: { required_before_phase: null } },
+    work_item: null,
+    work_item_required_for_next_phase: false,
     phase: { id: phase, title: definition.title, visit: 1, next: definition.next },
     artifacts,
     gate: { id: `${phase}-gate`, title: `${phase} gate`, accepted: false, accepted_by: null },
@@ -172,6 +175,51 @@ test("active AHEAD header is compact and makes the next owner visible", () => {
   assert.match(header, /Next: You → Independent reviewer records/);
   assert.doesNotMatch(header, /HUMAN LEADS · AI ASSISTS/);
   assert.doesNotMatch(header, /Run \/ahead/);
+});
+
+test("linked work item is visible and satisfies the configured planning boundary", () => {
+  const current = state(
+    "plan",
+    [
+      artifact("first-pass-plan", "Human first-pass implementation plan", "human", true, true),
+      artifact("plan", "Approved plan", "human", true, true),
+    ],
+    {
+      gate: {
+        id: "plan-gate",
+        title: "plan gate",
+        accepted: true,
+        accepted_by: { kind: "human", identity: "planner@example.com" },
+      },
+      policy: { work_items: { required_before_phase: "implement" } },
+      work_item: {
+        provider: "github",
+        url: "https://github.com/example/project/issues/42",
+        external_id: "42",
+      },
+      work_item_required_for_next_phase: false,
+    },
+  );
+  const header = buildHeaderLines(run, current, workflow).join("\n");
+  assert.match(header, /Work item: https:\/\/github.com\/example\/project\/issues\/42/);
+  assert.match(header, /Next: You → Continue to Implement/);
+});
+
+test("accepted plan routes the human to a missing required work item", () => {
+  const current = state("plan", [], {
+    gate: {
+      id: "plan-gate",
+      title: "plan gate",
+      accepted: true,
+      accepted_by: { kind: "human", identity: "planner@example.com" },
+    },
+    policy: { work_items: { required_before_phase: "implement" } },
+    work_item_required_for_next_phase: true,
+  });
+  assert.deepEqual(nextAction(current, workflow), {
+    actor: "human",
+    label: "Link or create the required work item before implement",
+  });
 });
 
 test("human artifact editor explains the expected record instead of showing a blank form", () => {
