@@ -40,8 +40,9 @@ try {
     "generated/internal-improvement/manifest.json",
     "generated/reference/index.json",
     "generated/reference/CONSTITUTION.md",
-    "generated/reference/docs/acceptable-ai-use.md",
-    "generated/reference/docs/workflows/product-change.md",
+    "generated/reference/docs/guide/acceptable-ai-use.md",
+    "generated/reference/docs/guide/workflows/product-change.md",
+    "generated/reference/docs/evidence/research-map.md",
     "generated/recommended-skills.json",
     "src/engine.ts",
     "src/flow-guides.ts",
@@ -75,6 +76,10 @@ try {
     assert.ok(!path.startsWith("node_modules/"), `package leaked node_modules content: ${path}`);
     assert.ok(!path.startsWith("test/"), `package leaked test content: ${path}`);
     assert.ok(!path.startsWith("scripts/"), `package leaked build scripts: ${path}`);
+    assert.ok(
+      !path.startsWith("generated/reference/docs/development/"),
+      `package leaked maintainer documentation: ${path}`,
+    );
   }
 
   const tarball = join(packDirectory, metadata.filename);

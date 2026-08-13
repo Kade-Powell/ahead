@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, normalize, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,17 +13,61 @@ import {
 const piRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repositoryRoot = dirname(dirname(piRoot));
 
-test("every canonical framework Markdown source is copied exactly into the package", async () => {
+test("only practitioner and evidence Markdown is copied exactly into the package", async () => {
   const index = await loadReferenceIndex();
+  assert.equal(index.api_version, "ahead.references/v0.1");
   assert.ok(index.generated_from.includes("CONSTITUTION.md"));
-  assert.ok(index.generated_from.includes("docs/acceptable-ai-use.md"));
-  assert.ok(index.generated_from.includes("docs/references/pragmatic-programmer-page-index.md"));
-  assert.ok(index.generated_from.includes("docs/workflows/product-change.md"));
+  assert.ok(index.generated_from.includes("docs/guide/acceptable-ai-use.md"));
+  assert.ok(
+    index.generated_from.includes("docs/evidence/sources/pragmatic-programmer-page-index.md"),
+  );
+  assert.ok(index.generated_from.includes("docs/guide/workflows/product-change.md"));
+  assert.ok(!index.generated_from.some((path) => path.startsWith("docs/development/")));
 
   for (const path of index.generated_from) {
     const source = await readFile(join(repositoryRoot, path), "utf8");
     const packaged = await readFile(join(piRoot, "generated", "reference", path), "utf8");
     assert.equal(packaged, source, `${path} must not drift while being packaged`);
+  }
+});
+
+test("every runtime reference declares audience authority and distribution", async () => {
+  const index = await loadReferenceIndex();
+  const constitution = index.references.find((entry) => entry.id === "constitution");
+  assert.deepEqual(
+    {
+      audience: constitution?.audience,
+      authority: constitution?.authority,
+      distribution: constitution?.distribution,
+    },
+    {
+      audience: "practitioner",
+      authority: "binding",
+      distribution: "agent-and-human",
+    },
+  );
+
+  const researchMap = index.references.find((entry) => entry.id === "evidence:research-map");
+  assert.equal(researchMap?.audience, "evidence");
+  assert.equal(researchMap?.authority, "supporting");
+});
+
+test("local links in runtime references stay inside the packaged catalog", async () => {
+  const index = await loadReferenceIndex();
+  const packaged = new Set(index.generated_from.map(normalize));
+  for (const path of index.generated_from) {
+    const content = await readFile(join(repositoryRoot, path), "utf8");
+    for (const match of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+      const rawTarget = match[1].trim().replace(/^<|>$/g, "");
+      const target = rawTarget.split("#", 1)[0];
+      if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target)) {
+        continue;
+      }
+      const resolved = normalize(
+        relative(repositoryRoot, resolve(dirname(join(repositoryRoot, path)), target)),
+      );
+      assert.ok(packaged.has(resolved), `${path} links to unpackaged reference ${resolved}`);
+    }
   }
 });
 
@@ -34,7 +78,7 @@ test("active phases recommend a small applicable set while retaining the full ca
   assert.ok(implement.some((entry) => entry.id === "constitution"));
   assert.ok(implement.some((entry) => entry.id === "acceptable-ai-use"));
   assert.ok(implement.some((entry) => entry.id === "workflows:product-change"));
-  assert.ok(!implement.some((entry) => entry.id === "releasing-pi"));
+  assert.ok(!index.references.some((entry) => entry.id === "development:releasing-pi"));
   assert.ok(!implement.some((entry) => entry.id === "workflows:operational-stabilization"));
 
   const operations = await relevantReferences("operational-stabilization", "respond");

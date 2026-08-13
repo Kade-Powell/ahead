@@ -1,5 +1,7 @@
 # AHEAD Constitution
 
+Audience: AHEAD practitioners and framework maintainers
+
 This constitution records the durable principles of **Assisted Human Engineering and Development**. Workflows and tools may evolve. These principles define what makes them AHEAD.
 
 ## 1. Human ownership

@@ -8,11 +8,15 @@ export interface ReferenceEntry {
   path: string;
   title: string;
   summary: string;
+  audience: "practitioner" | "evidence";
+  authority: "binding" | "guidance" | "supporting";
+  distribution: "agent-and-human";
   phases: string[];
   workflows: string[];
 }
 
 interface ReferenceIndex {
+  api_version: "ahead.references/v0.1";
   generated_from: string[];
   references: ReferenceEntry[];
 }
@@ -75,9 +79,11 @@ function parseReferenceIndex(content: string): ReferenceIndex {
   if (!isRecord(value)) {
     throw new Error("Invalid packaged AHEAD reference index");
   }
+  const apiVersion = value.api_version;
   const generatedFrom = value.generated_from;
   const references = value.references;
   if (
+    apiVersion !== "ahead.references/v0.1" ||
     !Array.isArray(generatedFrom) ||
     !generatedFrom.every((entry) => typeof entry === "string") ||
     !Array.isArray(references) ||
@@ -85,7 +91,7 @@ function parseReferenceIndex(content: string): ReferenceIndex {
   ) {
     throw new Error("Invalid packaged AHEAD reference index");
   }
-  return { generated_from: generatedFrom, references };
+  return { api_version: apiVersion, generated_from: generatedFrom, references };
 }
 
 function isReferenceEntry(value: unknown): value is ReferenceEntry {
@@ -95,6 +101,11 @@ function isReferenceEntry(value: unknown): value is ReferenceEntry {
     typeof value.path === "string" &&
     typeof value.title === "string" &&
     typeof value.summary === "string" &&
+    (value.audience === "practitioner" || value.audience === "evidence") &&
+    (value.authority === "binding" ||
+      value.authority === "guidance" ||
+      value.authority === "supporting") &&
+    value.distribution === "agent-and-human" &&
     Array.isArray(value.phases) &&
     value.phases.every((phase) => typeof phase === "string") &&
     Array.isArray(value.workflows) &&

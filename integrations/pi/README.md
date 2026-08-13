@@ -1,5 +1,7 @@
 # AHEAD for Pi
 
+Audience: AHEAD practitioners
+
 Status: guided-mode dogfood v0.3
 
 The Pi integration runs the Rust AHEAD state machine as WebAssembly, injects generated phase instructions into any Pi model, persists the event/evidence chain, and presents AHEAD as a guided mode with human-owned gates.
@@ -26,31 +28,6 @@ Or try it for one session without changing settings:
 pi -e npm:ahead-pi
 ```
 
-## Build from this repository
-
-Requirements: Rust with `wasm32-unknown-unknown`, Node 22 or newer, npm, and Pi 0.84.1 or a compatible release.
-
-```sh
-cd integrations/pi
-npm install
-npm run build
-```
-
-For a quick source-checkout dogfood run from the repository root:
-
-```sh
-pi --no-extensions -e ./integrations/pi/src/index.ts
-```
-
-Or install the package into the current project through Pi:
-
-```sh
-pi install -l ./integrations/pi
-pi
-```
-
-Pi may ask you to trust the project-local extension. Review it before accepting; project trust is not a sandbox.
-
 ## Guided mode
 
 1. Start Pi in the repository where the engineering work will occur.
@@ -69,7 +46,7 @@ Run `/ahead-skills` to inspect optional third-party skills AHEAD has reviewed fo
 
 AHEAD behaves as a dynamic policy profile layered onto whichever model Pi is already using. Every model turn receives a compact binding agent profile, the active phase contract, current workflow state, and human/AI boundary. The full framework is not injected into every prompt.
 
-All repository framework Markdown is copied into the published package at build time and indexed for on-demand use. Run `/ahead-guide` to read references applicable to the active phase, `/ahead-guide all` to browse the complete packaged set, or `/ahead-guide <topic>` to open a specific document. AI uses `ahead_get_reference` when it needs the same source material. This preserves traceability without filling the context window with unrelated documents.
+The Constitution, practitioner guide, and evidence library are copied into the published package at build time and indexed with audience and authority metadata. Maintainer and tooling-development documents are excluded. Run `/ahead-guide` to read practitioner references applicable to the active phase, `/ahead-guide all` to browse the complete runtime set, or `/ahead-guide <topic>` to open a specific document. AI uses `ahead_get_reference` when it needs the same source material. This preserves traceability without filling the context window with unrelated documents.
 
 The normal implementation handoff is:
 
@@ -129,14 +106,8 @@ Human identity is resolved from `AHEAD_HUMAN_IDENTITY`, Git `user.email`, Git `u
 AHEAD_HUMAN_IDENTITY=reviewer@example.com pi -e ./integrations/pi/src/index.ts
 ```
 
-This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements all six pilot workflows, and has no GitHub/CI workflow enforcement yet. v0.3 binds local review records to a SHA-256 fingerprint of the selected base, merge base, HEAD, tracked diff, working-tree status, and untracked-file hashes. That fingerprint is not signed or remotely attested; a changed changeset must be reviewed again. See [Executable AHEAD workflows](https://github.com/Kade-Powell/ahead/blob/main/docs/design/executable-workflows.md) for the architecture and trust boundaries.
+This is local self-attestation, not cryptographic identity. The initial version is single-writer, implements all six pilot workflows, and has no GitHub/CI workflow enforcement yet. v0.3 binds local review records to a SHA-256 fingerprint of the selected base, merge base, HEAD, tracked diff, working-tree status, and untracked-file hashes. That fingerprint is not signed or remotely attested; a changed changeset must be reviewed again.
 
-## Package and release verification
+## Contributing
 
-`npm test` builds the Rust core for `wasm32-unknown-unknown`, regenerates instructions, checks formatting with Oxfmt, runs Oxlint source and type-aware analysis, runs TypeScript checking and the Rust/WASM-facing and guided-mode tests, creates the exact npm tarball, verifies its allowlisted contents, loads the extracted package through the real Pi binary, and confirms that the packaged extension persists a valid run.
-
-Use `npm run format`, `npm run format:check`, `npm run lint`, and `npm run typecheck` for individual JavaScript and TypeScript quality gates. Oxc configuration is repository-wide so the root generators and Pi integration follow the same policy.
-
-The npm package contains only its README, package metadata, TypeScript runtime, generated phase instructions, and compiled WASM engine. Build scripts, tests, source specs, development dependencies, and repository files are excluded.
-
-See [Releasing the Pi extension](https://github.com/Kade-Powell/ahead/blob/main/docs/releasing-pi.md) for versioning, first-publish authentication, trusted publishing, and rollback rules.
+Source builds, architecture, package verification, and release procedures are maintained separately in the [AHEAD development guide](https://github.com/Kade-Powell/ahead/blob/main/docs/development/README.md).

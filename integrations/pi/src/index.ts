@@ -19,6 +19,7 @@ import {
   loadReferenceIndex,
   readReference,
   relevantReferences,
+  type ReferenceEntry,
 } from "./reference.js";
 import { showReferenceViewer } from "./reference-viewer.js";
 import {
@@ -301,7 +302,13 @@ export default function aheadExtension(pi: ExtensionAPI): void {
             phase: phase ?? null,
             workflow: workflowId ?? null,
             recommended: await relevantReferences(workflowId, phase),
-            available: index.references.map(({ id, title, path }) => ({ id, title, path })),
+            available: index.references.map(({ id, title, path, audience, authority }) => ({
+              id,
+              title,
+              path,
+              audience,
+              authority,
+            })),
             instruction: "Request one reference by id, path, or title. Load only what is relevant.",
           };
         }
@@ -782,11 +789,11 @@ async function showAheadGuide(ctx: ExtensionCommandContext, requestedTopic: stri
       requestedTopic.trim().toLowerCase() === "all"
         ? index.references
         : await relevantReferences(workflowId, phase);
-    const browseAll = "Browse all packaged AHEAD Markdown";
+    const browseAll = "Browse all practitioner and evidence Markdown";
     const selected = await ctx.ui.select(
       phase ? `AHEAD guidance · ${phase}` : "AHEAD framework guidance",
       [
-        ...recommended.map((candidate) => candidate.title),
+        ...recommended.map(referenceOption),
         ...(recommended.length < index.references.length ? [browseAll] : []),
       ],
     );
@@ -796,13 +803,18 @@ async function showAheadGuide(ctx: ExtensionCommandContext, requestedTopic: stri
     if (selected === browseAll) {
       return showAheadGuide(ctx, "all");
     }
-    entry = recommended.find((candidate) => candidate.title === selected);
+    entry = recommended.find((candidate) => referenceOption(candidate) === selected);
   }
   if (!entry) {
     return;
   }
 
   await showReferenceViewer(ctx, `AHEAD reference · ${entry.title}`, await readReference(entry));
+}
+
+function referenceOption(entry: ReferenceEntry): string {
+  const classification = entry.audience === "evidence" ? "evidence" : entry.authority;
+  return `${classification} · ${entry.title}`;
 }
 
 async function startRun(ctx: ExtensionCommandContext, request: string): Promise<Run | undefined> {

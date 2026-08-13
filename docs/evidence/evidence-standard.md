@@ -1,5 +1,7 @@
 # AHEAD Evidence Standard
 
+Audience: AHEAD evidence readers and framework maintainers
+
 Status: proposed
 
 ## Purpose

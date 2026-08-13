@@ -136,7 +136,8 @@ await writeFile(
 
 const referencePaths = [
   "CONSTITUTION.md",
-  ...(await collectMarkdown(join(root, "docs"))).map((path) => relative(root, path)),
+  ...(await collectMarkdown(join(root, "docs", "guide"))).map((path) => relative(root, path)),
+  ...(await collectMarkdown(join(root, "docs", "evidence"))).map((path) => relative(root, path)),
 ].toSorted();
 await rm(referenceOutputDir, { recursive: true, force: true });
 const referenceEntries = [];
@@ -150,13 +151,22 @@ for (const relativePath of referencePaths) {
     path: relativePath,
     title: content.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? relativePath,
     summary: firstSummaryParagraph(content),
+    ...referenceMetadata(relativePath),
     phases: applicablePhases(relativePath),
     workflows: applicableWorkflows(relativePath),
   });
 }
 await writeFile(
   join(referenceOutputDir, "index.json"),
-  `${JSON.stringify({ generated_from: referencePaths, references: referenceEntries }, null, 2)}\n`,
+  `${JSON.stringify(
+    {
+      api_version: "ahead.references/v0.1",
+      generated_from: referencePaths,
+      references: referenceEntries,
+    },
+    null,
+    2,
+  )}\n`,
   "utf8",
 );
 
@@ -240,11 +250,50 @@ async function collectMarkdown(directory) {
 }
 
 function referenceId(relativePath) {
+  const indexIds = new Map([
+    ["docs/guide/README.md", "guide"],
+    ["docs/evidence/README.md", "evidence"],
+    ["docs/guide/workflows/README.md", "workflows"],
+  ]);
+  const indexId = indexIds.get(relativePath);
+  if (indexId) {
+    return indexId;
+  }
   return relativePath
     .replace(/\.md$/, "")
+    .replace(/^docs\/guide\//, "")
     .replace(/^docs\//, "")
     .replaceAll("/", ":")
     .toLowerCase();
+}
+
+function referenceMetadata(relativePath) {
+  if (
+    relativePath === "CONSTITUTION.md" ||
+    relativePath === "docs/guide/acceptable-ai-use.md" ||
+    /^docs\/guide\/workflows\/[^/]+\.md$/.test(relativePath)
+  ) {
+    return {
+      audience: "practitioner",
+      authority: "binding",
+      distribution: "agent-and-human",
+    };
+  }
+  if (relativePath.startsWith("docs/guide/")) {
+    return {
+      audience: "practitioner",
+      authority: "guidance",
+      distribution: "agent-and-human",
+    };
+  }
+  if (relativePath.startsWith("docs/evidence/")) {
+    return {
+      audience: "evidence",
+      authority: "supporting",
+      distribution: "agent-and-human",
+    };
+  }
+  throw new Error(`runtime reference has no audience classification: ${relativePath}`);
 }
 
 function firstSummaryParagraph(content) {
@@ -254,7 +303,10 @@ function firstSummaryParagraph(content) {
       .map((paragraph) => paragraph.replace(/^#+\s+.*$/gm, "").trim())
       .find(
         (paragraph) =>
-          paragraph && !paragraph.startsWith("Status:") && !paragraph.startsWith("```"),
+          paragraph &&
+          !paragraph.startsWith("Audience:") &&
+          !paragraph.startsWith("Status:") &&
+          !paragraph.startsWith("```"),
       )
       ?.replace(/\s+/g, " ")
       .slice(0, 240) ?? "AHEAD framework reference."
@@ -262,15 +314,16 @@ function firstSummaryParagraph(content) {
 }
 
 function applicablePhases(relativePath) {
-  if (/^docs\/workflows\/[^/]+\.md$/.test(relativePath)) {
+  if (/^docs\/guide\/workflows\/[^/]+\.md$/.test(relativePath)) {
     return ["*"];
   }
   if (
     [
       "CONSTITUTION.md",
-      "docs/rationale.md",
-      "docs/acceptable-ai-use.md",
-      "docs/engineering-practice.md",
+      "docs/guide/README.md",
+      "docs/guide/rationale.md",
+      "docs/guide/acceptable-ai-use.md",
+      "docs/guide/engineering-practice.md",
     ].includes(relativePath)
   ) {
     return ["*"];
@@ -289,22 +342,13 @@ function applicablePhases(relativePath) {
       "outcome",
     ];
   }
-  if (relativePath === "docs/design/executable-workflows.md") {
-    return ["*"];
-  }
-  if (relativePath === "docs/design/review-workbench.md") {
-    return ["ai-review", "human-review"];
-  }
   return [];
 }
 
 function applicableWorkflows(relativePath) {
-  const match = relativePath.match(/^docs\/workflows\/([^/]+)\.md$/);
+  const match = relativePath.match(/^docs\/guide\/workflows\/([^/]+)\.md$/);
   if (match && match[1] !== "README") {
     return [match[1]];
-  }
-  if (relativePath === "docs/design/review-workbench.md") {
-    return ["product-change", "corrective-debugging", "internal-improvement"];
   }
   return ["*"];
 }

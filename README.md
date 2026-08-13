@@ -12,22 +12,22 @@ Its core loop is:
 
 AHEAD is being designed for several kinds of engineering work, including features, bugs, operational issues, incidents, refactoring, architecture decisions, technical debt, security issues, and investigations. These work types share principles, but they do not have to share one rigid workflow.
 
-## Start here
+## Use AHEAD
 
-- [Why AHEAD](docs/rationale.md) explains the reasoning behind the methodology.
-- [Constitution](CONSTITUTION.md) records its non-negotiable principles.
-- [Acceptable AI use](docs/acceptable-ai-use.md) defines appropriate, conditional, and prohibited uses of AI in engineering work.
-- [Engineering practice](docs/engineering-practice.md) distills the general habits AHEAD expects engineers to cultivate.
-- [Pragmatic Programmer page index](docs/references/pragmatic-programmer-page-index.md) preserves the edition-specific page references behind the submitted practice notes.
-- [Submitted engineering notes](docs/references/submitted-engineering-notes.md) retain the additional tips, full checklists, and practices behind the distilled guide.
-- [Pilot workflows](docs/workflows/README.md) provide minimal, diagrammed flows for product change, corrective debugging, operational stabilization, decision, investigation, and internal improvement.
-- [Process taxonomy](docs/design/process-taxonomy.md) defines the six proposed workflow families and the test for adding another.
-- [Debugging and operational investigation](docs/design/debugging-and-operations.md) captures the current design discussion; it is not yet a final workflow specification.
-- [Executable workflows](docs/design/executable-workflows.md) defines the reusable Rust/WASM state engine and integration boundary.
-- [AHEAD for Pi](integrations/pi/README.md) is the first dogfood integration.
-- [Releasing the Pi extension](docs/releasing-pi.md) defines the verified npm packaging and trusted-publishing path.
-- [Evidence standard](docs/evidence/evidence-standard.md) defines what AHEAD means by evidence-backed.
-- [Research map](docs/evidence/research-map.md) connects current design claims to empirical studies, standards, limitations, and open hypotheses.
+- [Practitioner guide](docs/guide/README.md) is the starting point for applying the framework.
+- [Constitution](CONSTITUTION.md) records AHEAD's non-negotiable principles.
+- [Pilot workflows](docs/guide/workflows/README.md) provide the six diagrammed flows.
+- [AHEAD for Pi](integrations/pi/README.md) installs and operates the first dogfood integration.
+
+## Evidence and provenance
+
+- [Evidence library](docs/evidence/README.md) separates empirical evidence, standards, established practice, design hypotheses, and submitted source notes.
+
+## Develop AHEAD
+
+- [Development guide](docs/development/README.md) is the starting point for changing the methodology, workflow engine, generated policy, integrations, or publishing path.
+
+The Constitution and practitioner guide are packaged as Pi framework references. Evidence is available on demand. Development documents remain repository-only and are not placed in ordinary practitioner or agent context.
 
 ## Status
 
