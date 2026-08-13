@@ -442,7 +442,7 @@ function nextPendingArtifact(state: RunState): ArtifactState | undefined {
   );
 }
 
-export function buildWidgetLines(
+export function buildHeaderLines(
   run: Run,
   state: RunState,
   workflow: WorkflowDefinition,
@@ -464,14 +464,10 @@ export function buildWidgetLines(
   const action = nextAction(state, workflow);
 
   return [
-    `AHEAD MODE · ${workflow.title.toUpperCase()} · ${position.current}/${position.total}`,
-    `${guide.handoff ?? state.phase.title.toUpperCase()} · HUMAN LEADS · AI ASSISTS`,
+    `AHEAD · ${workflow.title} · ${position.current}/${position.total} · ${state.phase.title}`,
     `Goal: ${guide.objective}`,
-    `You: ${guide.human}`,
-    `AI: ${guide.ai}`,
     `Required: ${checklist}`,
-    `Next (${action.actor === "human" ? "you" : "AI"}): ${action.label}`,
-    "Run /ahead for the guided action · /ahead-guide for framework docs.",
+    `Next: ${action.actor === "human" ? "You" : "AI"} → ${action.label}`,
   ];
 }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildArtifactTemplate,
-  buildWidgetLines,
+  buildHeaderLines,
   nextAction,
   phaseGuide,
 } from "../src/guidance.ts";
@@ -156,19 +156,22 @@ test("implementation guidance keeps the engineer first while making help explici
     artifactKind: "changeset",
     label: "Implement first, then record the exact changeset",
   });
-  const widget = buildWidgetLines(run, current, workflow).join("\n");
-  assert.match(widget, /Make the first attempt, ask questions freely/);
-  assert.match(widget, /Do not turn a question into taking over/);
+  const guide = phaseGuide("product-change", "implement");
+  assert.match(guide.human, /Make the first attempt, ask questions freely/);
+  assert.match(guide.ai, /Do not turn a question into taking over/);
 });
 
-test("human-review widget makes the independent handoff and authority boundary visible", () => {
+test("active AHEAD header is compact and makes the next owner visible", () => {
   const current = state("human-review", [
     artifact("human-review", "Independent human review", "human", true),
   ]);
-  const widget = buildWidgetLines(run, current, workflow).join("\n");
-  assert.match(widget, /READY FOR INDEPENDENT HUMAN REVIEW/);
-  assert.match(widget, /HUMAN LEADS · AI ASSISTS/);
-  assert.match(widget, /Next \(you\): Independent reviewer records/);
+  const lines = buildHeaderLines(run, current, workflow);
+  const header = lines.join("\n");
+  assert.equal(lines.length, 4);
+  assert.match(header, /AHEAD · Product Change · 9\/13 · Human Review/);
+  assert.match(header, /Next: You → Independent reviewer records/);
+  assert.doesNotMatch(header, /HUMAN LEADS · AI ASSISTS/);
+  assert.doesNotMatch(header, /Run \/ahead/);
 });
 
 test("human artifact editor explains the expected record instead of showing a blank form", () => {

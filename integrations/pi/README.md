@@ -19,7 +19,7 @@ pi install npm:ahead-pi
 Pin an exact version for a team or project:
 
 ```sh
-pi install -l npm:ahead-pi@0.3.0
+pi install -l npm:ahead-pi@0.3.1
 ```
 
 Or try it for one session without changing settings:
@@ -32,8 +32,8 @@ pi -e npm:ahead-pi
 
 1. Start Pi in the repository where the engineering work will occur.
 2. Run `/ahead <short title>` once, explicitly choose the workflow that fits the dominant outcome, and enter AHEAD mode. A new run never defaults to Product Change. Advanced noninteractive use must pass `/ahead-start <workflow-id> :: <title>`.
-3. Work through normal conversation. The persistent widget shows the current goal, what the human owns, what AI may do, required evidence, and the next valid action.
-4. Run `/ahead` again whenever you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, returns to an earlier phase, or opens applicable framework guidance.
+3. Work through normal conversation. A compact header above the chat shows the phase goal, required evidence, and whether the human or AI owns the next action. The full human/AI boundary continues to govern every model turn without occupying the conversation.
+4. Run `/ahead` again only when you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, returns to an earlier phase, or opens applicable framework guidance.
 5. Keep the `.ahead` records with the work so another session or independent reviewer resumes the same authoritative run.
 
 AHEAD remains active across Pi sessions until an accountable human completes the outcome phase or runs `/ahead-stop`. Restarting Pi does not leave the mode or reset the workflow.
@@ -72,7 +72,7 @@ A draft branch or draft PR may exist earlier. The handoff gate is requesting hum
 
 | Command | Effect |
 |---|---|
-| `/ahead [title]` | Choose a workflow for new work, or resume and perform the next guided AHEAD action |
+| `/ahead [title]` | Choose a workflow for new work, or open the active workflow's action menu |
 | `/ahead-guide [topic]` | Read phase-relevant or requested AHEAD Markdown |
 | `/ahead-skills` | Inspect optional skills reviewed for the active phase; never installs them |
 | `/ahead-review` | Inspect the exact diff and complete the AI-to-human review handoff |

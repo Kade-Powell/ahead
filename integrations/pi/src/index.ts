@@ -4,12 +4,14 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { AheadEngine, AheadEngineError } from "./engine.js";
 import {
   buildArtifactTemplate,
-  buildWidgetLines,
+  buildHeaderLines,
   nextAction,
   phaseGuide,
   phasePosition,
@@ -72,7 +74,7 @@ const ReferenceParams = Type.Object({
 
 export default function aheadExtension(pi: ExtensionAPI): void {
   pi.registerCommand("ahead", {
-    description: "Enter or continue the guided AHEAD mode",
+    description: "Enter AHEAD mode or open its action menu",
     handler: async (args, ctx) =>
       command(ctx, async () => {
         await openAheadMode(pi, args, ctx);
@@ -225,7 +227,7 @@ export default function aheadExtension(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       ctx.ui.notify(
         [
-          "/ahead [title] — choose a workflow for new work, or resume guided AHEAD mode",
+          "/ahead [title] — choose a workflow for new work, or open the active action menu",
           "/ahead-guide [topic] — read the applicable AHEAD framework Markdown",
           "/ahead-skills — inspect optional reviewed skills relevant to this phase",
           "/ahead-review — inspect the exact changeset and review handoff",
@@ -233,8 +235,8 @@ export default function aheadExtension(pi: ExtensionAPI): void {
           "/ahead-resume [run-id] — resume an unfinished run that you explicitly saved",
           "",
           "Once started, the repository run remains in AHEAD mode until an accountable human closes it or uses /ahead-stop.",
-          "Use normal conversation to think and work with AI. Run /ahead whenever you want the next valid action.",
-          "The persistent guide explains what you own, what AI may do, required evidence, and what happens next.",
+          "Use normal conversation to think and work with AI. AHEAD remains active and guides every turn.",
+          "The compact header shows the goal, required evidence, and next owner. /ahead reopens the action menu when you need a recorded action.",
           "",
           "Advanced fallback commands: /ahead-status, /ahead-record, /ahead-accept, /ahead-advance, /ahead-return.",
           "AI can record only AI/shared artifacts allowed in the active phase. It cannot accept gates, transition, approve, deploy, or close the run.",
@@ -427,7 +429,7 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       if (run && !(await enginePromise).deriveState(run).closed && ctx.hasUI) {
         const state = (await enginePromise).deriveState(run);
         ctx.ui.notify(
-          `AHEAD mode resumed · ${state.phase.title}. Human leads, AI assists. Run /ahead for the next guided action.`,
+          `AHEAD mode resumed · ${state.phase.title}. Continue in normal conversation; /ahead is available when you need the action menu.`,
           "info",
         );
       }
@@ -1043,7 +1045,7 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
       `AHEAD mode started · ${workflow.title} · ${run.title}`,
       "Human leads · AI assists",
       "This run remains active until an accountable human closes the outcome or uses /ahead-stop.",
-      "Use /ahead for the next guided action; use normal conversation to think and work with AI.",
+      "Continue in normal conversation. /ahead is available when you need the action menu.",
     ].join("\n"),
     "info",
   );
@@ -1102,7 +1104,7 @@ async function recordHumanArtifact(
   await store.save(updated);
   await refreshUi(ctx, updated);
   ctx.ui.notify(
-    `Saved ${artifact.title}. AHEAD mode remains active; continue the conversation or run /ahead for the next guided action.`,
+    `Saved ${artifact.title}. AHEAD mode remains active; continue the conversation.`,
     "info",
   );
 }
@@ -1272,13 +1274,13 @@ async function acceptAndContinue(ctx: ExtensionCommandContext): Promise<void> {
         "READY FOR INDEPENDENT HUMAN REVIEW",
         "The AI review is recorded and its material findings were disposed by a human.",
         "A draft branch may already exist, but a human must now request review or mark the PR ready.",
-        "The independent reviewer opens this repository, runs /ahead, and records the review.",
+        "The independent reviewer opens this repository; AHEAD resumes at Human Review and guides the review record.",
       ].join("\n"),
       "info",
     );
   } else {
     ctx.ui.notify(
-      `Continued to ${nextState.phase.title}. AHEAD mode remains active; run /ahead for the next guided action.`,
+      `Continued to ${nextState.phase.title}. AHEAD mode remains active; continue the conversation.`,
       "info",
     );
   }
@@ -1373,6 +1375,9 @@ async function refreshUi(ctx: ExtensionContext, supplied?: Run): Promise<void> {
   if (!run) {
     ctx.ui.setStatus("ahead", undefined);
     ctx.ui.setWidget("ahead", undefined);
+    if (ctx.mode === "tui") {
+      ctx.ui.setHeader(undefined);
+    }
     return;
   }
   const engine = await enginePromise;
@@ -1386,7 +1391,60 @@ async function refreshUi(ctx: ExtensionContext, supplied?: Run): Promise<void> {
       ? `AHEAD · complete · ${state.workflow_id}`
       : `AHEAD · ${position.current}/${position.total} · ${state.phase.id} · ${action.actor} action`,
   );
-  ctx.ui.setWidget("ahead", buildWidgetLines(run, state, workflow), { placement: "aboveEditor" });
+  if (state.closed) {
+    ctx.ui.setWidget("ahead", undefined);
+    if (ctx.mode === "tui") {
+      ctx.ui.setHeader(undefined);
+    }
+    return;
+  }
+
+  const lines = buildHeaderLines(run, state, workflow);
+  if (ctx.mode === "tui") {
+    ctx.ui.setWidget("ahead", undefined);
+    ctx.ui.setHeader((_tui, theme) => aheadHeader(lines, theme));
+  } else {
+    ctx.ui.setWidget("ahead", lines, { placement: "aboveEditor" });
+  }
+}
+
+function aheadHeader(lines: string[], theme: Theme) {
+  return {
+    render(width: number): string[] {
+      const [heading = "AHEAD", ...fields] = lines;
+      const styledHeading = `${theme.fg("accent", theme.bold("AHEAD"))}${theme.fg("muted", heading.slice("AHEAD".length))}`;
+      const ruleWidth = Math.max(0, width - visibleWidth(styledHeading) - 1);
+      const headingLine = `${styledHeading}${
+        ruleWidth > 0 ? ` ${theme.fg("borderMuted", "─".repeat(ruleWidth))}` : ""
+      }`;
+
+      return [
+        truncateToWidth(headingLine, width),
+        ...fields.map((field) => formatAheadHeaderField(field, width, theme)),
+      ];
+    },
+    invalidate() {},
+  };
+}
+
+function formatAheadHeaderField(field: string, width: number, theme: Theme): string {
+  const separator = field.indexOf(":");
+  if (separator < 0) {
+    return truncateToWidth(theme.fg("text", field), width);
+  }
+
+  const label = field.slice(0, separator).toUpperCase().padEnd(8);
+  let value = field.slice(separator + 1).trimStart();
+  let styledValue = theme.fg("text", value);
+  if (label.trim() === "NEXT") {
+    const actor = value.startsWith("You →") ? "You →" : value.startsWith("AI →") ? "AI →" : "";
+    if (actor) {
+      value = value.slice(actor.length);
+      styledValue = `${theme.fg(actor.startsWith("You") ? "success" : "accent", theme.bold(actor))}${theme.fg("text", value)}`;
+    }
+  }
+
+  return truncateToWidth(`${theme.fg("muted", theme.bold(label))} ${styledValue}`, width);
 }
 
 async function loadInstructions(workflowId: string, phase: string): Promise<string> {
