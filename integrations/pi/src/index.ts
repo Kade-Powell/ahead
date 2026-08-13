@@ -103,8 +103,24 @@ export default function aheadExtension(pi: ExtensionAPI): void {
       }),
   });
 
+  pi.registerCommand("ahead-stop", {
+    description: "Exit AHEAD mode; discard the unfinished record or explicitly save it",
+    handler: async (_args, ctx) =>
+      command(ctx, async () => {
+        await stopAheadMode(ctx);
+      }),
+  });
+
+  pi.registerCommand("ahead-resume", {
+    description: "Resume unfinished AHEAD work that was explicitly saved",
+    handler: async (args, ctx) =>
+      command(ctx, async () => {
+        await resumeSavedRun(ctx, args.trim());
+      }),
+  });
+
   pi.registerCommand("ahead-start", {
-    description: "Advanced: start a workflow directly with [workflow-id ::] title",
+    description: "Advanced: start directly with <workflow-id> :: <title>",
     handler: async (args, ctx) =>
       command(ctx, async () => {
         await startRun(ctx, args);
@@ -213,8 +229,10 @@ export default function aheadExtension(pi: ExtensionAPI): void {
           "/ahead-guide [topic] — read the applicable AHEAD framework Markdown",
           "/ahead-skills — inspect optional reviewed skills relevant to this phase",
           "/ahead-review — inspect the exact changeset and review handoff",
+          "/ahead-stop — leave AHEAD mode; discard the unfinished record by default or explicitly save it",
+          "/ahead-resume [run-id] — resume an unfinished run that you explicitly saved",
           "",
-          "Once started, the repository run remains in AHEAD mode until an accountable human closes the outcome.",
+          "Once started, the repository run remains in AHEAD mode until an accountable human closes it or uses /ahead-stop.",
           "Use normal conversation to think and work with AI. Run /ahead whenever you want the next valid action.",
           "The persistent guide explains what you own, what AI may do, required evidence, and what happens next.",
           "",
@@ -525,6 +543,23 @@ async function openAheadMode(
   }
 
   if (!run) {
+    if (!args.trim() && ctx.hasUI) {
+      const saved = await loadResumableRuns(ctx);
+      if (saved.length > 0) {
+        const choice = await ctx.ui.select("No active AHEAD run", [
+          "Resume explicitly saved AHEAD work",
+          "Start new AHEAD work",
+        ]);
+        if (choice === "Resume explicitly saved AHEAD work") {
+          run = await resumeSavedRun(ctx, "", saved);
+        } else if (choice !== "Start new AHEAD work") {
+          return;
+        }
+      }
+    }
+  }
+
+  if (!run) {
     run = await startRun(ctx, args);
     if (!run) {
       return;
@@ -647,6 +682,11 @@ async function openAheadMode(
     },
   });
 
+  actions.push({
+    label: "Stop AHEAD mode",
+    run: async () => stopAheadMode(ctx),
+  });
+
   const selected = await ctx.ui.select(
     `AHEAD mode · ${state.phase.title}\nNext (${action.actor === "human" ? "you" : "AI"}): ${action.label}`,
     actions.map((candidate) => candidate.label),
@@ -655,6 +695,126 @@ async function openAheadMode(
   if (chosen) {
     await chosen.run();
   }
+}
+
+async function stopAheadMode(ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error("/ahead-stop requires interactive or RPC UI support");
+  }
+  const store = storeFor(ctx);
+  const run = await requireRun(ctx);
+  const state = (await enginePromise).deriveState(run);
+  if (state.closed) {
+    ctx.ui.notify("This AHEAD run is already complete.", "info");
+    return;
+  }
+
+  const discard = "Stop and discard the unfinished AHEAD record";
+  const save = "Stop and save the unfinished run for later";
+  const selected = await ctx.ui.select("Stop AHEAD mode", [discard, save]);
+  if (selected === discard) {
+    const confirmed = await ctx.ui.confirm(
+      "Discard this unfinished AHEAD record?",
+      [
+        `${run.title} · ${state.phase.title}`,
+        "",
+        "This removes only this run's .ahead workflow state and artifacts.",
+        "It does not delete, reset, or revert source code or other repository changes.",
+      ].join("\n"),
+    );
+    if (!confirmed) {
+      return;
+    }
+    await store.discardCurrent(run.id);
+    await refreshUi(ctx);
+    ctx.ui.notify(
+      "AHEAD mode stopped and its unfinished workflow record was discarded. Repository changes were left untouched.",
+      "info",
+    );
+  } else if (selected === save) {
+    await store.saveCurrentForResume(run.id);
+    await refreshUi(ctx);
+    ctx.ui.notify(
+      `AHEAD mode stopped and run ${run.id} was saved. Resume it with /ahead-resume ${run.id}.`,
+      "info",
+    );
+  }
+}
+
+async function resumeSavedRun(
+  ctx: ExtensionCommandContext,
+  requestedRunId: string,
+  supplied?: Run[],
+): Promise<Run | undefined> {
+  const store = storeFor(ctx);
+  const current = await store.loadCurrent();
+  if (current && !(await enginePromise).deriveState(current).closed) {
+    throw new AheadEngineError(
+      "active_run_exists",
+      `run ${current.id} is still active; stop it before resuming another run`,
+    );
+  }
+
+  const saved = supplied ?? (await loadResumableRuns(ctx));
+  if (saved.length === 0) {
+    ctx.ui.notify("No saved unfinished AHEAD runs are available.", "info");
+    return undefined;
+  }
+
+  let selected = requestedRunId
+    ? saved.find((candidate) => candidate.id === requestedRunId)
+    : undefined;
+  if (requestedRunId && !selected) {
+    throw new AheadEngineError(
+      "saved_run_not_found",
+      `saved unfinished run ${requestedRunId} was not found`,
+    );
+  }
+  if (!selected) {
+    if (!ctx.hasUI) {
+      throw new Error("/ahead-resume requires a run id without interactive UI");
+    }
+    const options = saved.map(savedRunOption);
+    const choice = await ctx.ui.select("Resume saved AHEAD work", options);
+    selected = saved.find((candidate) => savedRunOption(candidate) === choice);
+  }
+  if (!selected) {
+    return undefined;
+  }
+
+  const resumed = await store.resume(selected.id);
+  const state = (await enginePromise).deriveState(resumed);
+  await refreshUi(ctx, resumed);
+  ctx.ui.notify(
+    `AHEAD mode resumed · ${state.phase.title}. Existing artifacts and unmet gates were preserved.`,
+    "info",
+  );
+  return resumed;
+}
+
+async function loadResumableRuns(ctx: ExtensionContext): Promise<Run[]> {
+  const store = storeFor(ctx);
+  const engine = await enginePromise;
+  const resumable: Run[] = [];
+  const invalid: string[] = [];
+  for (const runId of await store.listRunIds()) {
+    try {
+      const run = await store.load(runId);
+      if (!engine.deriveState(run).closed) {
+        resumable.push(run);
+      }
+    } catch {
+      invalid.push(runId);
+    }
+  }
+  if (invalid.length > 0 && ctx.hasUI) {
+    ctx.ui.notify(`Ignored invalid saved AHEAD runs: ${invalid.join(", ")}`, "warning");
+  }
+  return resumable;
+}
+
+function savedRunOption(run: Run): string {
+  return `${run.title} · ${run.workflow_id} · ${run.id}`;
 }
 
 async function showRecommendedSkills(ctx: ExtensionCommandContext): Promise<void> {
@@ -848,10 +1008,15 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
       workflows.map((candidate) => candidate.title),
     );
     workflow = workflows.find((candidate) => candidate.title === selected);
+    if (!workflow) {
+      return undefined;
+    }
   }
-  workflow ??= workflows.find((candidate) => candidate.id === "product-change");
   if (!workflow) {
-    throw new AheadEngineError("missing_workflow", "the engine did not provide Product Change");
+    throw new AheadEngineError(
+      "workflow_required",
+      `choose a workflow explicitly: ${workflows.map((candidate) => candidate.id).join(", ")}. Noninteractive usage: /ahead-start <workflow-id> :: <title>`,
+    );
   }
 
   const title =
@@ -877,7 +1042,7 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
     [
       `AHEAD mode started · ${workflow.title} · ${run.title}`,
       "Human leads · AI assists",
-      "This run remains active in the repository until an accountable human closes the outcome.",
+      "This run remains active until an accountable human closes the outcome or uses /ahead-stop.",
       "Use /ahead for the next guided action; use normal conversation to think and work with AI.",
     ].join("\n"),
     "info",

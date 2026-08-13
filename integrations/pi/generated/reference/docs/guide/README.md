@@ -24,3 +24,5 @@ Use the [evidence library](../evidence/README.md) for research, limitations, and
 ## Tooling
 
 [AHEAD for Pi](https://github.com/Kade-Powell/ahead/tree/main/integrations/pi) explains installation, guided mode, commands, review handoff, identity, and current pilot limitations. Implementation architecture and release procedures belong in the repository's [development guide](https://github.com/Kade-Powell/ahead/blob/main/docs/development/README.md), which is intentionally not packaged as runtime guidance.
+
+Stopping AHEAD does not imply completion. An integration should discard unfinished workflow records by default without touching engineering work, retain them only when the human explicitly chooses to save, and resume saved work at the same phase and gates.

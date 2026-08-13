@@ -31,12 +31,14 @@ pi -e npm:ahead-pi
 ## Guided mode
 
 1. Start Pi in the repository where the engineering work will occur.
-2. Run `/ahead <short title>` once, choose the workflow that fits the dominant outcome, and enter AHEAD mode. Advanced noninteractive use may pass `/ahead-start <workflow-id> :: <title>`.
+2. Run `/ahead <short title>` once, explicitly choose the workflow that fits the dominant outcome, and enter AHEAD mode. A new run never defaults to Product Change. Advanced noninteractive use must pass `/ahead-start <workflow-id> :: <title>`.
 3. Work through normal conversation. The persistent widget shows the current goal, what the human owns, what AI may do, required evidence, and the next valid action.
 4. Run `/ahead` again whenever you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, returns to an earlier phase, or opens applicable framework guidance.
 5. Keep the `.ahead` records with the work so another session or independent reviewer resumes the same authoritative run.
 
-AHEAD remains active across Pi sessions until an accountable human completes the outcome phase and closes the run. Restarting Pi does not leave the mode or reset the workflow.
+AHEAD remains active across Pi sessions until an accountable human completes the outcome phase or runs `/ahead-stop`. Restarting Pi does not leave the mode or reset the workflow.
+
+`/ahead-stop` defaults to discarding the unfinished AHEAD run record and its `.ahead` artifacts; it never deletes, resets, or reverts source code or other repository changes. The human may instead explicitly save the run for later. `/ahead-resume` restores that exact workflow, phase, evidence, and unmet gates.
 
 During implementation, the engineer can ask questions at any time. The guided help form captures the engineer's current model and first attempt, then asks AI for explanation, evidence, hints, debugging help, or bounded next steps without handing over human ownership. Normal conversation follows the same rule. A bounded mechanical edit still requires clear human intent and later human inspection and understanding.
 
@@ -74,6 +76,8 @@ A draft branch or draft PR may exist earlier. The handoff gate is requesting hum
 | `/ahead-guide [topic]` | Read phase-relevant or requested AHEAD Markdown |
 | `/ahead-skills` | Inspect optional skills reviewed for the active phase; never installs them |
 | `/ahead-review` | Inspect the exact diff and complete the AI-to-human review handoff |
+| `/ahead-stop` | Leave AHEAD mode; discard the unfinished record by default or explicitly save it |
+| `/ahead-resume [run-id]` | Resume an unfinished run that was explicitly saved |
 | `/ahead-help` | Show commands and authority boundaries |
 
 `/ahead-start`, `/ahead-status`, `/ahead-record`, `/ahead-accept`, `/ahead-advance`, and `/ahead-return` remain available as advanced recovery and inspection commands. Normal use should not require memorizing them.

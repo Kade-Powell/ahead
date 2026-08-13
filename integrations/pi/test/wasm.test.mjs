@@ -63,6 +63,18 @@ test("raw JSON ABI lists all six executable AHEAD workflows", async () => {
   );
 });
 
+test("creating a run requires an explicit workflow selection", async () => {
+  const { call } = await loadEngine();
+  const response = call("create_run", {
+    id: "missing-workflow",
+    title: "No implicit product flow",
+    owner: human,
+    timestamp: "2026-08-12T12:00:00Z",
+  });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "invalid_input");
+});
+
 test("operational stabilization never grants AI authority to execute the intervention", async () => {
   const { call } = await loadEngine();
   const response = call("get_workflow", { workflow_id: "operational-stabilization" });

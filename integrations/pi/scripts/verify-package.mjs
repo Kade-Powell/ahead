@@ -99,7 +99,13 @@ try {
   const piBinary = join(packageRoot, "node_modules", ".bin", "pi");
   run(
     piBinary,
-    ["--no-extensions", "-p", "-e", extractedPackage, "/ahead Packaged extension smoke"],
+    [
+      "--no-extensions",
+      "-p",
+      "-e",
+      extractedPackage,
+      "/ahead-start product-change :: Packaged extension smoke",
+    ],
     {
       cwd: project,
       env: {

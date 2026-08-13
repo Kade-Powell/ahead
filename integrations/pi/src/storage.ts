@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import type { Actor, Run } from "./types.js";
 
@@ -49,6 +49,39 @@ export class RunStore {
     }
   }
 
+  async listRunIds(): Promise<string[]> {
+    try {
+      const entries = await readdir(join(this.aheadDirectory, "runs"), { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory() && isSafeRunId(entry.name))
+        .map((entry) => entry.name)
+        .toSorted((left, right) => right.localeCompare(left));
+    } catch (error) {
+      if (isMissing(error)) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  async saveCurrentForResume(runId: string): Promise<void> {
+    await this.load(runId);
+    await this.clearCurrent(runId);
+  }
+
+  async resume(runId: string): Promise<Run> {
+    const run = await this.load(runId);
+    const pointer: CurrentRunPointer = { api_version: "ahead.current/v0", run_id: runId };
+    await atomicJson(join(this.aheadDirectory, "current.json"), pointer);
+    return run;
+  }
+
+  async discardCurrent(runId: string): Promise<void> {
+    const directory = this.runDirectory(runId);
+    await this.clearCurrent(runId);
+    await rm(directory, { recursive: true, force: false });
+  }
+
   artifactPath(run: Run, phase: string, kind: string): { absolute: string; relative: string } {
     const sequence = String(run.events.length + 1).padStart(4, "0");
     const absolute = join(
@@ -81,10 +114,33 @@ export class RunStore {
   }
 
   private runPath(runId: string): string {
-    if (!/^[A-Za-z0-9._-]+$/.test(runId)) {
+    return join(this.runDirectory(runId), "run.json");
+  }
+
+  private runDirectory(runId: string): string {
+    if (!isSafeRunId(runId)) {
       throw new Error("unsafe AHEAD run id");
     }
-    return join(this.aheadDirectory, "runs", runId, "run.json");
+    return join(this.aheadDirectory, "runs", runId);
+  }
+
+  private async clearCurrent(expectedRunId: string): Promise<void> {
+    const path = join(this.aheadDirectory, "current.json");
+    let pointer: CurrentRunPointer;
+    try {
+      pointer = parseCurrentRunPointer(await readFile(path, "utf8"));
+    } catch (error) {
+      if (isMissing(error)) {
+        return;
+      }
+      throw error;
+    }
+    if (pointer.run_id !== expectedRunId) {
+      throw new Error(
+        `active AHEAD run changed from ${expectedRunId} to ${pointer.run_id}; stop or resume again`,
+      );
+    }
+    await unlink(path);
   }
 }
 
@@ -135,6 +191,10 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 
 function isMissing(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
+}
+
+function isSafeRunId(runId: string): boolean {
+  return runId !== "." && runId !== ".." && /^[A-Za-z0-9._-]+$/.test(runId);
 }
 
 function parseCurrentRunPointer(content: string): CurrentRunPointer {

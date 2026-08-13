@@ -354,14 +354,8 @@ pub struct CreateRunInput {
     pub owner: Actor,
     /// Caller-provided timestamp for the initial event.
     pub timestamp: String,
-    /// Workflow identifier, defaulting to `product-change`.
-    #[serde(default = "default_workflow_id")]
+    /// Explicitly selected workflow identifier.
     pub workflow_id: String,
-}
-
-/// Returns the default workflow identifier used by deserialization.
-fn default_workflow_id() -> String {
-    "product-change".to_owned()
 }
 
 /// Structured validation or protocol error returned by the AHEAD engine.

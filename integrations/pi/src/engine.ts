@@ -60,7 +60,7 @@ export class AheadEngine {
     title: string;
     owner: Actor;
     timestamp: string;
-    workflow_id?: string;
+    workflow_id: string;
   }): Run {
     return this.call("create_run", input);
   }

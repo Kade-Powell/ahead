@@ -84,6 +84,8 @@ Pi stores state under the work's Git root:
 
 These are intended to be inspectable, diffable repository artifacts. A team can decide which records belong in Git, while CI and GitHub enforcement are later adapters over the same run contract.
 
+Pi treats pause and resume as host lifecycle rather than workflow progress. Stopping discards the current unfinished run directory by default; an explicit save removes only the current pointer and retains the run for later resume. Resuming restores the pointer without adding evidence, accepting a gate, or changing phase. Neither stop path modifies engineering files outside that run's `.ahead` directory.
+
 ## Enforced boundaries in v0.1
 
 - Only a human actor can start a run, accept a gate, transition a phase, return work, or close a run.
