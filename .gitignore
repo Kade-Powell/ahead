@@ -6,4 +6,7 @@
 /target/
 /integrations/pi/node_modules/
 /integrations/pi/dist/*.wasm
-
+/integrations/vscode/node_modules/
+/integrations/vscode/dist/
+/integrations/vscode/generated/
+*.vsix

@@ -1,0 +1,104 @@
+name: Publish VS Code extension
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: publish-vscode-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'vscode-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: vscode-marketplace
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Require a release commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Validate release version
+        id: release
+        working-directory: integrations/vscode
+        run: node ./scripts/check-release.mjs "$RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+      - name: Install exact dependencies
+        working-directory: integrations/vscode
+        run: npm ci
+
+      - name: Build, test, and verify package contents
+        working-directory: integrations/vscode
+        run: npm test
+
+      - name: Package exact release artifact
+        working-directory: integrations/vscode
+        run: npm run package -- --out "$VSIX_PATH"
+        env:
+          VSIX_PATH: ${{ runner.temp }}/${{ steps.release.outputs.vsix_name }}
+
+      - name: Attach VSIX to GitHub Release
+        run: gh release upload "$RELEASE_TAG" "$VSIX_PATH" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VSIX_PATH: ${{ runner.temp }}/${{ steps.release.outputs.vsix_name }}
+
+      - name: Sign in to Microsoft Entra with workload identity
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Publish exact VSIX to Visual Studio Marketplace
+        working-directory: integrations/vscode
+        run: npx vsce publish --azure-credential --packagePath "$VSIX_PATH"
+        env:
+          VSIX_PATH: ${{ runner.temp }}/${{ steps.release.outputs.vsix_name }}
+
+      - name: Verify Marketplace version
+        working-directory: integrations/vscode
+        run: |
+          for attempt in {1..12}; do
+            if npx vsce show "$EXTENSION_ID" --json > "$RUNNER_TEMP/marketplace.json" 2>/dev/null &&
+              jq -e --arg version "$EXTENSION_VERSION" '.versions[]?.version == $version' "$RUNNER_TEMP/marketplace.json" >/dev/null; then
+              echo "Verified $EXTENSION_ID@$EXTENSION_VERSION"
+              exit 0
+            fi
+
+            echo "$EXTENSION_ID@$EXTENSION_VERSION is not visible yet (attempt $attempt/12)"
+            if [[ "$attempt" -lt 12 ]]; then
+              sleep 10
+            fi
+          done
+
+          echo "$EXTENSION_ID@$EXTENSION_VERSION did not become visible in time" >&2
+          exit 1
+        env:
+          EXTENSION_ID: ${{ steps.release.outputs.extension_id }}
+          EXTENSION_VERSION: ${{ steps.release.outputs.version }}

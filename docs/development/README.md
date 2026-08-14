@@ -17,6 +17,7 @@ This is the starting point for changing AHEAD itself: its methodology, executabl
 - [Review workbench](review-workbench.md) defines the editor-neutral review contract and Pi host behavior.
 - [Pi integration development](pi-integration.md) covers local builds, tests, and packaging.
 - [Releasing the Pi extension](releasing-pi.md) defines trusted npm publishing and rollback.
+- [Releasing the VS Code extension](releasing-vscode.md) defines Marketplace publishing and identity setup.
 
 ## Repository source map
 
@@ -29,7 +30,7 @@ This is the starting point for changing AHEAD itself: its methodology, executabl
 | Generated agent-policy sources | `policy/**` |
 | Deterministic workflow engine | `crates/ahead-core` |
 | WebAssembly boundary | `crates/ahead-wasm` |
-| Host integration | `integrations/pi` |
+| Host integrations | `integrations/pi`, `integrations/vscode` |
 | Reference and instruction generator | `scripts/build-instructions.mjs` |
 
 ## Documentation distribution rule

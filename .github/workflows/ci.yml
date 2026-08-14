@@ -45,3 +45,22 @@ jobs:
       - run: npm test
         working-directory: integrations/pi
       - run: git diff --exit-code -- integrations/pi/generated
+
+  vscode:
+    name: VS Code integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: integrations/vscode/package-lock.json
+      - run: npm ci
+        working-directory: integrations/vscode
+      - run: npm test
+        working-directory: integrations/vscode
+      - run: git diff --exit-code -- integrations/pi/generated

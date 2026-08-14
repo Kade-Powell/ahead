@@ -18,6 +18,7 @@ AHEAD is being designed for several kinds of engineering work, including feature
 - [Constitution](CONSTITUTION.md) records AHEAD's non-negotiable principles.
 - [Pilot workflows](docs/guide/workflows/README.md) provide the six diagrammed flows.
 - [AHEAD for Pi](integrations/pi/README.md) installs and operates the first dogfood integration.
+- [AHEAD for VS Code](integrations/vscode/README.md) provides the editor workflow UI and Copilot integration.
 
 ## Evidence and provenance
 
@@ -33,7 +34,9 @@ The Constitution and practitioner guide are packaged as Pi framework references.
 
 AHEAD has six minimal workflow profiles encoded as executable workflow definitions: Product Change, Corrective Debugging, Operational Stabilization, Decision, Investigation, and Internal Improvement. The deterministic Rust core compiles to WebAssembly; the Pi integration lets a human select a flow, provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, and packages the framework Markdown for workflow-aware human or AI reference.
 
-The current priority is to dogfood all six flows and refine their shared state model and workflow-specific gates. GitHub/CI enforcement and other editor integrations are not implemented yet.
+The current priority is to dogfood all six flows and refine their shared state model and workflow-specific gates. GitHub/CI enforcement is not implemented yet.
+
+Zed support is planned, but its current extension API cannot provide the dynamic tool controls, persistent workflow UI, and human gate/review integration needed for AHEAD parity. We will revisit it as those APIs mature.
 
 No complete AHEAD workflow has yet been experimentally validated. The methodology distinguishes direct empirical support, adjacent evidence, standards, established practice, and AHEAD design hypotheses rather than presenting them as equally certain.
 

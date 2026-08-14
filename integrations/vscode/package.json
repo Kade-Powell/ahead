@@ -1,0 +1,260 @@
+{
+  "name": "ahead-vscode",
+  "displayName": "AHEAD",
+  "version": "0.1.0",
+  "description": "Human-led AHEAD workflows and GitHub Copilot context for VS Code",
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "ahead",
+    "copilot",
+    "human-in-the-loop",
+    "workflow"
+  ],
+  "homepage": "https://github.com/Kade-Powell/ahead/tree/main/integrations/vscode#readme",
+  "bugs": {
+    "url": "https://github.com/Kade-Powell/ahead/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kade-Powell/ahead.git"
+  },
+  "publisher": "ahead-framework",
+  "files": [
+    "agents/",
+    "dist/",
+    "generated/",
+    "resources/",
+    "LICENSE",
+    "README.md"
+  ],
+  "type": "module",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "npm run build:instructions && npm run build:assets && npm run bundle && npm run typecheck",
+    "build:instructions": "node ../../scripts/build-instructions.mjs",
+    "build:assets": "node ./scripts/build-assets.mjs",
+    "bundle": "rolldown src/extension.ts --file dist/extension.js --format esm --platform node --external vscode --tsconfig tsconfig.json",
+    "format": "cd ../.. && integrations/vscode/node_modules/.bin/oxfmt -c ./.oxfmtrc.json integrations/vscode/scripts integrations/vscode/src integrations/vscode/test integrations/vscode/package.json integrations/vscode/tsconfig.json",
+    "format:check": "npm run format -- --check",
+    "lint": "npm run lint:source && npm run lint:types",
+    "lint:source": "cd ../.. && integrations/vscode/node_modules/.bin/oxlint -c ./.oxlintrc.json --report-unused-disable-directives-severity=off integrations/vscode/scripts integrations/vscode/src integrations/vscode/test",
+    "lint:types": "cd ../.. && integrations/vscode/node_modules/.bin/oxlint -c ./.oxlintrc.json --type-aware --tsconfig integrations/vscode/tsconfig.json integrations/vscode/src",
+    "typecheck": "tsc --noEmit",
+    "quality": "npm run format:check && npm run lint && npm run typecheck",
+    "verify": "npm run build && npm run format:check && npm run lint && node --test ./test/*.test.mjs",
+    "test": "npm run verify && npm run package:verify",
+    "package": "npm run build && vsce package --allow-missing-repository",
+    "package:verify": "node ./scripts/verify-package.mjs",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "@types/vscode": "1.125.0",
+    "@vscode/vsce": "3.9.2",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "rolldown": "1.2.4",
+    "typescript": "5.9.3"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ahead",
+          "title": "AHEAD",
+          "icon": "resources/ahead.svg"
+        }
+      ]
+    },
+    "views": {
+      "ahead": [
+        {
+          "id": "ahead.workflow",
+          "name": "Workflow"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "ahead.workflow",
+        "contents": "Human-led engineering, amplified by AI.\n[Start workflow](command:ahead.start)\n[Configure project](command:ahead.configure)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "ahead.start",
+        "title": "AHEAD: Start Workflow",
+        "icon": "$(play)"
+      },
+      {
+        "command": "ahead.recordHumanArtifact",
+        "title": "AHEAD: Write or Record Human Artifact",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "ahead.askCopilot",
+        "title": "AHEAD: Ask Copilot to Assist",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "ahead.acceptAndAdvance",
+        "title": "AHEAD: Accept Gate and Continue",
+        "icon": "$(pass-filled)"
+      },
+      {
+        "command": "ahead.return",
+        "title": "AHEAD: Return to Earlier Phase",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "ahead.linkWorkItem",
+        "title": "AHEAD: Link Work Item",
+        "icon": "$(link)"
+      },
+      {
+        "command": "ahead.openGuide",
+        "title": "AHEAD: Open Framework Guide",
+        "icon": "$(book)"
+      },
+      {
+        "command": "ahead.configure",
+        "title": "AHEAD: Configure Project",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "ahead.stop",
+        "title": "AHEAD: Stop",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "ahead.resume",
+        "title": "AHEAD: Resume Saved Run",
+        "icon": "$(history)"
+      },
+      {
+        "command": "ahead.refresh",
+        "title": "AHEAD: Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "ahead.start",
+          "when": "view == ahead.workflow",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ahead.refresh",
+          "when": "view == ahead.workflow",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ahead.configure",
+          "when": "view == ahead.workflow",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "chatAgents": [
+      {
+        "path": "./agents/ahead.agent.md"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "ahead_get_context",
+        "displayName": "Read AHEAD Context",
+        "modelDescription": "Read the active AHEAD run, phase contract, human and AI boundaries, evidence, blockers, and next action. Call this before acting in an AHEAD workspace.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "aheadContext",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "ahead_get_reference",
+        "displayName": "Read AHEAD Reference",
+        "modelDescription": "List or read packaged AHEAD practitioner and evidence Markdown relevant to the active workflow.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "aheadReference",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional reference id, path, or title."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "ahead_get_review_snapshot",
+        "displayName": "Capture AHEAD Review Snapshot",
+        "modelDescription": "Read the exact current Git changeset, diff, and stable fingerprint without modifying files.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "aheadReviewSnapshot",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "ahead_record_artifact",
+        "displayName": "Record AHEAD AI Artifact",
+        "modelDescription": "Record an AI-owned or shared artifact permitted by the active AHEAD phase. This cannot record human-owned evidence or approve or transition work.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "aheadRecordArtifact",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "kind",
+            "content"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Artifact kind from the active AHEAD context."
+            },
+            "content": {
+              "type": "string",
+              "description": "Complete Markdown artifact content."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "ahead_request_transition",
+        "displayName": "Check AHEAD Transition",
+        "modelDescription": "Report blockers and whether the human can continue. Never accepts a gate or transitions the run.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "aheadTransitionCheck",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    ]
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "engines": {
+    "node": ">=22.19.0",
+    "vscode": "^1.130.0"
+  }
+}
