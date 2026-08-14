@@ -1,6 +1,14 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AheadProjectConfig, RunStore } from "./storage.js";
 import type { PhaseDefinition, WorkflowDefinition } from "./types.js";
+
+interface ProjectConfigCommandContext {
+  readonly hasUI: boolean;
+  readonly ui: {
+    select(title: string, options: string[]): Promise<string | undefined>;
+    confirm(title: string, message: string): Promise<boolean>;
+    notify(message: string, type?: "info" | "warning" | "error"): void;
+  };
+}
 
 const recommendedWorkItemBoundaries: Readonly<Record<string, string>> = {
   "product-change": "implement",
@@ -12,7 +20,7 @@ const recommendedWorkItemBoundaries: Readonly<Record<string, string>> = {
 };
 
 export async function runProjectConfigWizard(
-  ctx: ExtensionCommandContext,
+  ctx: ProjectConfigCommandContext,
   store: RunStore,
   workflows: WorkflowDefinition[],
   overwrite: boolean,
@@ -127,7 +135,7 @@ export function projectConfigIssues(
 }
 
 async function chooseWorkItemBoundaries(
-  ctx: ExtensionCommandContext,
+  ctx: ProjectConfigCommandContext,
   workflows: WorkflowDefinition[],
 ): Promise<Record<string, string> | undefined> {
   const boundaries: Record<string, string> = {};
