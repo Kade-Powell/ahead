@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./integrations/vscode/resources/ahead-wordmark.svg" alt="AHEAD — Human-led engineering, amplified by AI." width="680">
+</p>
+
 # AHEAD
 
 **Assisted Human Engineering and Development**

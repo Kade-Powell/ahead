@@ -21,6 +21,9 @@ for (const required of [
   "LICENSE",
   "package.json",
   "README.md",
+  "resources/ahead-logo.svg",
+  "resources/ahead-wordmark.svg",
+  "resources/ahead.png",
   "resources/ahead.svg",
 ]) {
   assert.ok(files.has(required), `VSIX payload is missing ${required}`);

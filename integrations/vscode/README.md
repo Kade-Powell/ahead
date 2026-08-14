@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./resources/ahead-wordmark.svg" alt="AHEAD — Human-led engineering, amplified by AI." width="680">
+</p>
+
 # AHEAD for VS Code
 
 This extension keeps an AHEAD run visible in VS Code and gives GitHub Copilot the active workflow context without transferring human gates to the model.
