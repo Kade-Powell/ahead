@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./resources/ahead-wordmark.svg" alt="AHEAD — Human-led engineering, amplified by AI." width="680">
+  <img src="./resources/ahead-wordmark.png" alt="AHEAD — Human-led engineering, amplified by AI." width="680">
 </p>
 
 # AHEAD for VS Code

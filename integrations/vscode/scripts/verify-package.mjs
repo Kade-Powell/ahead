@@ -23,6 +23,7 @@ for (const required of [
   "README.md",
   "resources/ahead-logo.svg",
   "resources/ahead-wordmark.svg",
+  "resources/ahead-wordmark.png",
   "resources/ahead.png",
   "resources/ahead.svg",
 ]) {
