@@ -7,6 +7,7 @@
     "docs/evidence/research-map.md",
     "docs/evidence/sources/pragmatic-programmer-page-index.md",
     "docs/evidence/sources/submitted-engineering-notes.md",
+    "docs/evidence/sources/tigerstyle.md",
     "docs/guide/README.md",
     "docs/guide/acceptable-ai-use.md",
     "docs/guide/engineering-practice.md",
@@ -104,6 +105,19 @@
       "path": "docs/evidence/sources/submitted-engineering-notes.md",
       "title": "Submitted Engineering Notes",
       "summary": "This document preserves submitted engineering tips, checklists, and practices that are intentionally condensed in the [AHEAD Engineering Practice](../../guide/engineering-practice.md) guide. It is a source record, not a claim that every ite",
+      "audience": "evidence",
+      "authority": "supporting",
+      "distribution": "agent-and-human",
+      "phases": [],
+      "workflows": [
+        "*"
+      ]
+    },
+    {
+      "id": "evidence:sources:tigerstyle",
+      "path": "docs/evidence/sources/tigerstyle.md",
+      "title": "TigerStyle Practitioner Source",
+      "summary": "[TigerStyle](https://tigerstyle.dev/) is TigerBeetle's published software-engineering methodology for advancing safety, performance, and developer experience in its distributed financial database. TigerBeetle is both the author of the sourc",
       "audience": "evidence",
       "authority": "supporting",
       "distribution": "agent-and-human",

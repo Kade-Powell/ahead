@@ -496,6 +496,17 @@ export function buildArtifactTemplate(
   title: string,
 ): string {
   const prompts = promptsForArtifact(state.workflow_id, state.phase.id, kind);
+  const fields = prompts.flatMap((prompt, index) => {
+    const number = index + 1;
+    return [
+      `### ${number}. ${prompt}`,
+      `<!-- AHEAD-FIELD:${number}:BEGIN -->`,
+      "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
+      "",
+      `<!-- AHEAD-FIELD:${number}:END -->`,
+      "",
+    ];
+  });
   return [
     `# ${title}`,
     "",
@@ -503,15 +514,40 @@ export function buildArtifactTemplate(
     `Phase: ${state.phase.id} (visit ${state.phase.visit})`,
     `Artifact: ${kind}`,
     "",
-    "## What to cover",
+    "## Required responses",
     "",
-    ...prompts.map((prompt) => `- ${prompt}`),
+    "Complete every field in your own words. Preserve evidence, uncertainty, and rationale; form completion does not replace accountable judgment.",
     "",
-    "## Record",
-    "",
-    "<!-- Write this human-owned record in your own words. Preserve evidence, uncertainty, and rationale. -->",
-    "",
+    ...fields,
   ].join("\n");
+}
+
+export function validateArtifactForm(content: string, prompts: string[]): string[] {
+  const errors: string[] = [];
+  for (const [index, prompt] of prompts.entries()) {
+    const number = index + 1;
+    const begin = `<!-- AHEAD-FIELD:${number}:BEGIN -->`;
+    const end = `<!-- AHEAD-FIELD:${number}:END -->`;
+    const beginIndex = content.indexOf(begin);
+    const endIndex = beginIndex < 0 ? -1 : content.indexOf(end, beginIndex + begin.length);
+    if (beginIndex < 0 || endIndex < 0) {
+      errors.push(`${prompt} (the required form field is missing)`);
+      continue;
+    }
+
+    const response = content
+      .slice(beginIndex + begin.length, endIndex)
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .trim();
+    if (!response) {
+      errors.push(prompt);
+      continue;
+    }
+    if (/^(?:n\/?a|not applicable)\s*[.!]?$/i.test(response)) {
+      errors.push(`${prompt} (explain why it is not applicable)`);
+    }
+  }
+  return errors;
 }
 
 function formatArtifactStatus(artifact: ArtifactState): string {

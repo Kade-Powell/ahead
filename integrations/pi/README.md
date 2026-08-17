@@ -34,6 +34,8 @@ pi -e npm:ahead-pi
 2. Run `/ahead <short title>` or `/ahead <work-item-url>` once, explicitly choose the workflow that fits the dominant outcome, and enter AHEAD mode. A new run never defaults to Product Change. Advanced noninteractive use passes `/ahead-start <workflow-id> :: <title-or-work-item-url>`.
 3. Work through normal conversation. A compact header above the chat shows the phase goal, required evidence, and whether the human or AI owns the next action. The full human/AI boundary continues to govern every model turn without occupying the conversation.
 4. Run `/ahead` again only when you want the contextual action menu. It opens the right guided editor, requests the right AI contribution, accepts and advances a human gate, returns to an earlier phase, or opens applicable framework guidance.
+
+Human-owned artifact editors use structured Markdown forms. Every expected input has a required response field, and an incomplete or removed field blocks saving with a specific list of what remains. A field may say `Not applicable — reason` when justified. Completing the form makes omissions visible; it does not substitute for accountable judgment or gate review.
 5. Keep the `.ahead` records with the work so another session or independent reviewer resumes the same authoritative run.
 
 AHEAD remains active across Pi sessions until an accountable human completes the outcome phase or runs `/ahead-stop`. Restarting Pi does not leave the mode or reset the workflow.

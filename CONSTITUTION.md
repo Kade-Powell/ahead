@@ -43,3 +43,7 @@ The workflow engine, editor extensions, repository artifacts, and CI gates exist
 ## 10. Learning closes the loop
 
 Deployment or remediation is not the end. Teams observe outcomes, audit assumptions, capture learning, improve the system, and improve the way humans and AI work together.
+
+## 11. Quality is designed, bounded, and verified
+
+Relevant quality attributes are considered from the beginning rather than only during final inspection. Teams make material invariants, limits, resource budgets, fault models, and operational consequences explicit, apply defenses proportionate to the work, and verify assumptions against observed behavior. Specific techniques remain contextual and must not become rituals detached from the system's purpose.

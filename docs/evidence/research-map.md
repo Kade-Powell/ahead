@@ -38,6 +38,18 @@ The evidence supports using AI and evaluating it contextually. It gives indirect
 
 The evidence supports substantial but bounded AI assistance and supports prototyping as a learning mechanism. It does not establish that AI-generated prototypes are production-ready or that vibe coding is safe outside the prototype boundary. AHEAD's acceptable-use rules combine direct evidence, risk guidance, and constitutional choices; the rules should be reevaluated as tools and work practices change.
 
+## Engineering quality and systems practice
+
+| AHEAD claim | Evidence | Class | What it supports | Important limitation |
+|---|---|---:|---|---|
+| Relevant quality attributes, material limits, fault models, and invariants should be considered while shaping a design. | [TigerStyle](https://tigerstyle.dev/) documents TigerBeetle's use of upfront design, explicit bounds, executable invariants, and layered verification in a distributed financial database. | E4 | Add risk-proportionate design and review prompts for limits, resource budgets, failure behavior, interfaces, and independent checks. | A self-reported practice from a specialized organization does not establish causation or make its concrete Zig and infrastructure rules universal. |
+| Early physical estimates can challenge performance assumptions before architecture hardens. | [TigerStyle](https://tigerstyle.dev/) describes back-of-the-envelope analysis across network, storage, memory, and compute, considering bandwidth and latency, followed by systems-specific optimization techniques. | E4 | Encourage rough estimates when performance is material and require later comparison with representative measurements. | The source does not independently measure estimate accuracy or show that its batching, allocation, cache, and data-layout techniques fit other workloads. |
+| Dependencies and tools should be judged by lifecycle costs, not only immediate authoring convenience. | [TigerStyle](https://tigerstyle.dev/) documents TigerBeetle's dependency-minimization and standardized-tooling rationale, including supply-chain, performance, installation, operational, and team-comprehension costs. | E4 | Make dependency and tooling costs explicit, especially when AI proposes additions casually. | TigerBeetle's zero-dependency and single-language policies are local choices, not general AHEAD requirements; alternatives may have lower total cost in other contexts. |
+
+### Current conclusion
+
+TigerStyle supplies a coherent practitioner example for designing safety, performance, and engineering experience together. AHEAD adapts its technology-neutral questions while keeping concrete prescriptions contextual. Whether any derived practice improves outcomes across AHEAD users remains a hypothesis to evaluate through direct evidence or pilot measurement. See the [source record](sources/tigerstyle.md) for provenance and detailed limitations.
+
 ## Feature and change work
 
 | AHEAD claim | Evidence | Class | What it supports | Important limitation |

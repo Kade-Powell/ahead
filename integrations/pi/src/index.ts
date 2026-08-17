@@ -17,6 +17,8 @@ import {
   nextAction,
   phaseGuide,
   phasePosition,
+  promptsForArtifact,
+  validateArtifactForm,
 } from "./guidance.js";
 import {
   findReference,
@@ -1553,6 +1555,20 @@ async function recordHumanArtifact(
   );
   if (!content?.trim()) {
     return;
+  }
+  if (artifact.kind !== "review-disposition") {
+    const formErrors = validateArtifactForm(
+      content,
+      promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind),
+    );
+    if (formErrors.length > 0) {
+      throw new AheadEngineError(
+        "artifact_form_incomplete",
+        `complete these required fields before saving ${artifact.title}:\n${formErrors
+          .map((error) => `- ${error}`)
+          .join("\n")}`,
+      );
+    }
   }
   await validateHumanReviewArtifact(store, state, artifact.kind, content);
   const path = store.artifactPath(run, state.phase.id, artifact.kind);

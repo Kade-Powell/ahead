@@ -13,5 +13,6 @@ This library records why AHEAD makes its process choices and how strong the supp
 
 - [Pragmatic Programmer page index](sources/pragmatic-programmer-page-index.md) preserves edition-specific page locators.
 - [Submitted engineering notes](sources/submitted-engineering-notes.md) preserves the original tips and checklists behind the distilled practitioner guidance.
+- [TigerStyle practitioner source](sources/tigerstyle.md) records the provenance, systems context, selected adaptations, and limitations of TigerBeetle's documented engineering practice.
 
 Practitioners may consult this material when they need the basis or limitation of a rule. Framework maintainers use it when proposing, evaluating, or revising AHEAD policy.

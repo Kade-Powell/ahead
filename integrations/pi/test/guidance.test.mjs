@@ -5,6 +5,8 @@ import {
   buildHeaderLines,
   nextAction,
   phaseGuide,
+  promptsForArtifact,
+  validateArtifactForm,
 } from "../src/guidance.ts";
 
 const phaseIds = [
@@ -222,14 +224,58 @@ test("accepted plan routes the human to a missing required work item", () => {
   });
 });
 
-test("human artifact editor explains the expected record instead of showing a blank form", () => {
+test("human artifact editor renders every expected input as a required form field", () => {
   const current = state("define", [
     artifact("problem", "Problem and success signals", "human", true),
   ]);
   const template = buildArtifactTemplate(run, current, "problem", "Problem and success signals");
-  assert.match(template, /Who experiences the problem/);
-  assert.match(template, /observable signals/);
-  assert.match(template, /human-owned record in your own words/);
+  assert.match(template, /## Required responses/);
+  assert.match(template, /### 1\. Who experiences the problem/);
+  assert.match(template, /### 4\. What observable signals/);
+  assert.match(template, /AHEAD-FIELD:1:BEGIN/);
+  assert.match(template, /Complete every field in your own words/);
+});
+
+test("artifact form validation identifies each unanswered or removed required field", () => {
+  const current = state("define", [
+    artifact("problem", "Problem and success signals", "human", true),
+  ]);
+  const prompts = promptsForArtifact("product-change", "define", "problem");
+  const template = buildArtifactTemplate(run, current, "problem", "Problem and success signals");
+  assert.deepEqual(validateArtifactForm(template, prompts), prompts);
+
+  const partiallyCompleted = template.replace(
+    "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
+    "$&\nAffected maintainers cannot tell which inputs are required.",
+  );
+  assert.deepEqual(validateArtifactForm(partiallyCompleted, prompts), prompts.slice(1));
+
+  const damaged = partiallyCompleted.replace("<!-- AHEAD-FIELD:2:END -->", "");
+  assert.match(validateArtifactForm(damaged, prompts)[0], /required form field is missing/);
+});
+
+test("artifact form validation allows justified non-applicability but rejects a bare answer", () => {
+  const prompts = ["Which deployment target applies?"];
+  const stateWithDeployment = state("deploy", [
+    artifact("deployment", "Deployment record", "human", true),
+  ]);
+  const template = buildArtifactTemplate(
+    run,
+    stateWithDeployment,
+    "deployment",
+    "Deployment record",
+  );
+  const bare = template.replace(
+    "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
+    "$&\nNot applicable",
+  );
+  assert.match(validateArtifactForm(bare, prompts)[0], /explain why/);
+
+  const justified = bare.replace(
+    "\nNot applicable\n",
+    "\nNot applicable — this change only updates local documentation.\n",
+  );
+  assert.deepEqual(validateArtifactForm(justified, prompts), []);
 });
 
 test("workflow-specific guides expose debugging and operational authority boundaries", () => {

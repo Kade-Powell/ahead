@@ -10,7 +10,7 @@ AHEAD is not only a sequence of AI gates. It is a way of practicing engineering.
 
 Many of these ideas come from practitioner literature rather than controlled experiments. The source type matters: a useful craft principle can guide work without being misrepresented as science.
 
-The submitted notes include page-level references to *The Pragmatic Programmer*. Those locators are preserved in the [edition-specific page index](../evidence/sources/pragmatic-programmer-page-index.md) and grouped below so the distillation remains traceable to its source. Additional submitted tips, complete checklists, and practices are retained in the [submitted engineering notes](../evidence/sources/submitted-engineering-notes.md); the practice guide condenses them without replacing that source record.
+The submitted notes include page-level references to *The Pragmatic Programmer*. Those locators are preserved in the [edition-specific page index](../evidence/sources/pragmatic-programmer-page-index.md) and grouped below so the distillation remains traceable to its source. Additional submitted tips, complete checklists, and practices are retained in the [submitted engineering notes](../evidence/sources/submitted-engineering-notes.md); the practice guide condenses them without replacing that source record. Selected systems-engineering practices are adapted from [TigerStyle](../evidence/sources/tigerstyle.md), with its infrastructure context and limits kept explicit.
 
 ## 1. Care about the craft and own the result
 
@@ -30,21 +30,23 @@ Basis: *The Pragmatic Programmer* tips 2 (p. xlx as submitted), 9 (p. 16), 27 (p
 
 Requirements are discovered and refined, not merely received. Work with users and domain experts, use their language, identify the desired outcome, and separate real constraints from inherited habits.
 
-Quality is contextual. Reliability, latency, accessibility, security, cost, maintainability, and delivery time do not have one universal ordering; accountable humans decide what the work requires.
+Quality is contextual. Reliability, latency, accessibility, security, cost, maintainability, and delivery time do not have one universal ordering; accountable humans decide what the work requires. Consider the relevant qualities while shaping the design, when foundational assumptions are still inexpensive to change, rather than relying on inspection at the end.
 
-Basis: requirements and traceability research, ISO/IEC/IEEE life-cycle standards, and *The Pragmatic Programmer* tips 7 (p. 11), 17 (p. 58), 51 (p. 202), 52 (p. 204), 54 (p. 210), and 55 (p. 213).
+Basis: requirements and traceability research, ISO/IEC/IEEE life-cycle standards, *The Pragmatic Programmer* tips 7 (p. 11), 17 (p. 58), 51 (p. 202), 52 (p. 204), 54 (p. 210), and 55 (p. 213), and TigerStyle's documented design practice. The priority and timing appropriate to one safety- and performance-sensitive system do not establish a universal ordering for other work.
 
 ## 4. Make reasoning visible
 
-Record important assumptions, options, decisions, tradeoffs, evidence, uncertainty, and changes in understanding. Link intent to implementation and verification without creating documents that nobody uses.
+Record important assumptions, options, decisions, tradeoffs, evidence, uncertainty, and changes in understanding. Link intent to implementation and verification without creating documents that nobody uses. Use domain-accurate names, include units and meaningful qualifiers where ambiguity would matter, and preserve the reasons behind non-obvious choices in durable repository artifacts.
 
-Traceability should help future engineers understand why and where—not become compliance theater.
+Traceability should help future engineers understand why and where—not become compliance theater. Optimize communication for the people who will repeatedly read, review, operate, diagnose, and change the system, not only for its first author.
 
 Basis: controlled evidence that requirements-to-code traceability can improve maintenance-task performance, AHEAD's evidence standard, and *The Pragmatic Programmer* tips 10 (p. 21), 18 (p. 64), 19 (p. 69), 20 (p. 74), and 23 (p. 88).
 
 ## 5. Prefer simple, local reasoning
 
 Choose designs that minimize the number of concepts a person must hold simultaneously. Keep unrelated concerns independently changeable. Make state explicit and contained. Keep policy distinct from mechanism. Prefer stable values, plain data, clear interfaces, and declarative rules when they fit the problem.
+
+Treat interface quality as a system property: minimize unnecessary surface area, define failure semantics and fault models, avoid ambiguous parameters and return states, and keep state close to where it is checked and used. Do not rely silently on call ordering, timing, or defaults whose change would alter correctness.
 
 Modularity is not automatically simplicity: separate modules can remain tightly coupled through hidden assumptions, timing, shared state, or required call order.
 
@@ -56,7 +58,9 @@ Decisions can be revised, so record their rationale, reversibility, and review t
 
 Use a “rule of three” only as a prompt for judgment, not a mechanical law. Duplication of knowledge is more dangerous than superficially similar code; premature abstraction can couple cases that should evolve separately.
 
-Basis: *The Pragmatic Programmer* tips 4 (p. 5), 12 (p. 33), 14 (p. 46), 47 (p. 186), and 53 (p. 209). The precise abstraction threshold is context-dependent.
+Address material design risks while the context is fresh. This does not require “zero technical debt” or pretending every first decision is final. When debt is accepted, make its rationale, consequences, owner, containment, and review or removal trigger visible so it does not become invisible or ownerless.
+
+Basis: *The Pragmatic Programmer* tips 4 (p. 5), 12 (p. 33), 14 (p. 46), 47 (p. 186), and 53 (p. 209), plus TigerStyle's practitioner case for proactive design. The precise abstraction threshold and acceptable debt are context-dependent.
 
 ## 7. Prototype to learn
 
@@ -74,17 +78,29 @@ Use source control, shells, scripts, formatters, generators, CI, and other autom
 
 Do not automate a process you cannot evaluate. Judge tools by the long-lived artifacts and operational behavior they produce, not only authoring convenience or initial speed.
 
-Basis: *The Pragmatic Programmer* tips 21 (p. 80), 22 (p. 85), 28 (p. 100), 29 (p. 103), and 61 (p. 231), NIST secure-development guidance, and AHEAD's Toyota analogy.
+Dependencies and tools carry lifecycle costs: supply-chain exposure, build and installation behavior, performance, operational complexity, team comprehension, maintenance, upgrades, and abandonment risk. Evaluate those costs in proportion to the dependency's criticality. Neither zero dependencies nor one standardized tool for every task is a universal goal.
+
+Basis: *The Pragmatic Programmer* tips 21 (p. 80), 22 (p. 85), 28 (p. 100), 29 (p. 103), and 61 (p. 231), NIST secure-development guidance, AHEAD's Toyota analogy, and TigerStyle's documented dependency and tooling discipline.
 
 ## 9. Design for testing and failure
 
-Think about verification before implementation. Define observable behavior, invariants, boundaries, significant states, failure modes, resource exhaustion, recovery, and performance expectations.
+Think about verification before implementation. Define observable behavior, invariants, boundaries, significant states, failure modes, resource exhaustion, recovery, and performance expectations. Identify material limits on queues, retries, loops, concurrency, memory, storage, request sizes, and execution; a limit may be dynamic or operational, but the underlying resource is not infinite.
 
-Coverage is evidence about execution, not proof of correctness. Test the tests through mutation, fault injection, or known negative cases where proportionate. When a defect is fixed, preserve a regression check when one can reliably express the failure.
+Build a mental model first, then encode important expectations through types, contracts, assertions, tests, runtime checks, or other appropriate defenses. Distinguish expected operating errors, which need defined handling, from violated program invariants. Whether an invariant violation should stop a process, isolate work, reject input, or degrade service depends on the fault model and blast radius.
 
-Basis: software-testing research and *The Pragmatic Programmer* tips 30–35 (pp. 107–129), 48–50 (pp. 192–199), and 62–66 (pp. 237–247). Evidence for specific methods such as strict test-driven development is mixed and context-dependent; AHEAD does not mandate one universal test-writing order.
+Coverage is evidence about execution, not proof of correctness. Exercise expected and invalid states and transitions between them. Test the tests through mutation, fault injection, known negative cases, or other independent checks where proportionate. Assertions, fuzzing, static analysis, and types can expose defects; none substitutes for human understanding or proves their absence. When a defect is fixed, preserve a regression check when one can reliably express the failure.
 
-## 10. Debug with evidence, not confidence or blame
+Basis: software-testing research, *The Pragmatic Programmer* tips 30–35 (pp. 107–129), 48–50 (pp. 192–199), and 62–66 (pp. 237–247), and TigerStyle's documented use of explicit limits, executable invariants, and layered verification. Evidence for specific methods such as strict test-driven development is mixed and context-dependent; AHEAD does not mandate one universal test-writing order, assertion density, or failure response.
+
+## 10. Estimate physical performance early and measure it later
+
+When performance is material, make rough design-time estimates across network, storage, memory, and compute, considering both latency and bandwidth. Sketches are inexpensive ways to expose impossible assumptions, likely bottlenecks, and order-of-magnitude opportunities before architecture hardens.
+
+Use the estimate to identify a relevant constraint, implement proportionately, and then measure in a representative environment. Revise the model when observations disagree. Batching, control- and data-plane separation, static allocation, cache-aware layout, and reduced copying or serialization are contextual techniques, not default AHEAD requirements.
+
+Basis: *The Pragmatic Programmer* tips 18 (p. 64), 45 (p. 180), and 46 (p. 182), and TigerStyle's documented performance-sketch practice. TigerStyle is a practitioner source from a specialized systems context, not controlled evidence that its techniques generalize to every system.
+
+## 11. Debug with evidence, not confidence or blame
 
 Do not panic, guess from the loudest log, or assume the platform is broken. Establish the observation, characterize it, build a mental model, generate hypotheses, predict discriminating results, test safely, and update the model.
 
@@ -92,7 +108,7 @@ Treat application code, dependencies, infrastructure, configuration, data, opera
 
 Basis: direct empirical debugging and incident-response studies, plus *The Pragmatic Programmer* tips 24–27 (pp. 91–97) and debugging checklist (p. 98).
 
-## 11. Review independently and communicate honestly
+## 12. Review independently and communicate honestly
 
 Review is a reasoning activity, not an approval button. Review the current artifact against intended behavior, architecture, risks, tests, operations, and maintainability. Automated and AI review add coverage; they do not replace accountable human judgment. A lasting engineering change requires review by a person other than the implementer; implementer self-review is still necessary, but it does not satisfy that independent gate.
 
@@ -100,7 +116,7 @@ Technical communication should be clear, audience-aware, and grounded in the aut
 
 Basis: empirical code-review research, NIST generative-AI risk guidance, and *The Pragmatic Programmer* tips 3 (p. 3), 10 (p. 21), and 67–70 (pp. 248–258).
 
-## 12. Learn continuously and measure the tools
+## 13. Learn continuously and measure the tools
 
 Build breadth by learning new languages, paradigms, ecosystems, tools, and operational models. Reimplementing a small system in contrasting languages can reveal how type systems, concurrency models, package managers, and idioms change design choices.
 
@@ -117,6 +133,8 @@ Before implementation:
 - What is the simplest model of the problem?
 - Which concerns can vary independently?
 - What must remain invariant?
+- Which limits, resource budgets, and fault-model assumptions are material?
+- If performance matters, what do rough network, storage, memory, and compute estimates predict?
 - How will we know the change works and fails safely?
 - Are we prototyping to learn or building production code?
 - If this is a disposable prototype, what is its learning question, isolation boundary, and disposal date?
@@ -126,6 +144,7 @@ Before accepting AI-assisted work:
 - Can the responsible engineer explain and change it?
 - Did the AI define behavior that a human should own?
 - Are claims, sources, dependencies, and commands verified?
+- Were added dependencies and tools evaluated for lifecycle and supply-chain cost?
 - Did AI-generated tests inherit the implementation's assumptions?
 - Was sensitive context authorized for the selected tool?
 - Has a person other than the implementer independently reviewed every lasting engineering change, with additional specialist review proportionate to risk?
@@ -135,6 +154,8 @@ Before merge or delivery:
 - Does the change trace to the approved problem and decision?
 - Are tests meaningful, current, and capable of failing?
 - Are failure, rollback, observation, and recovery understood?
+- Are material limits and invariants implemented and independently exercised?
+- Were relevant performance assumptions compared with representative measurements?
 - Did review examine system behavior rather than only style?
 - Is the documentation close enough to the system to remain accurate?
 - What accepted uncertainty or follow-up remains?
@@ -148,6 +169,7 @@ These are recommended practitioner sources, not scientific proof of AHEAD:
 - Luca Palmieri, [*Zero To Production In Rust*](https://www.zero2prod.com/), ISBN 9798847211437. This is a concrete production-backend learning path rather than a general philosophy source.
 - Richard Hamming, [*The Art of Doing Science and Engineering: Learning to Learn*](https://press.stripe.com/the-art-of-doing-science-and-engineering), ISBN 9781732265172.
 - Rich Hickey, [*Simple Made Easy*](https://www.youtube.com/watch?v=SxdOUGdseq4), Strange Loop 2011.
+- TigerBeetle, [*TigerStyle*](https://tigerstyle.dev/). AHEAD adapts selected systems-engineering practices while keeping their specialized context and limitations explicit in the [source record](../evidence/sources/tigerstyle.md).
 
 ## Research sources
 
