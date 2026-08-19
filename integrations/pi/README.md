@@ -19,7 +19,7 @@ pi install npm:ahead-pi
 Pin an exact version for a team or project:
 
 ```sh
-pi install -l npm:ahead-pi@0.3.1
+pi install -l npm:ahead-pi@0.5.0
 ```
 
 Or try it for one session without changing settings:
@@ -27,6 +27,42 @@ Or try it for one session without changing settings:
 ```sh
 pi -e npm:ahead-pi
 ```
+
+## Install with oh-my-pi
+
+[oh-my-pi (OMP)](https://github.com/can1357/oh-my-pi) can load Pi-compatible extension packages. `ahead-pi` declares its extension entry point in the `omp` and legacy `pi` package manifests, so install it through OMP's plugin manager:
+
+```sh
+omp install ahead-pi
+```
+
+Restart OMP after installing the package, then start a session in the repository where the engineering work will occur. Use the same AHEAD commands as in Pi, starting with:
+
+```text
+/ahead <short title>
+```
+
+Pin a version with the normal OMP package syntax:
+
+```sh
+omp install ahead-pi@0.5.0
+```
+
+Do not pass the npm package name to `omp -e`. In OMP, `-e` / `--extension` is a direct filesystem loader for local extension files or directories, not a remote npm-package loader. For a local checkout, use the extension entry file directly:
+
+```sh
+omp -e ./integrations/pi/src/index.ts
+```
+
+OMP loads extensions in-process and uses its Pi compatibility remapping for the Pi package imports used by AHEAD. If the package installs but `/ahead` is missing, inspect OMP's extension-load log:
+
+```sh
+tail -F ~/.omp/logs/omp.$(date +%F).log
+```
+
+Errors mentioning `legacy-pi-coding-agent-shim`, `@oh-my-pi/pi-coding-agent`, or a `/$bunfs/` path indicate an OMP loader/runtime compatibility issue rather than an AHEAD command or configuration problem. Check [OMP issue #2166](https://github.com/can1357/oh-my-pi/issues/2166) and report the exact error with the OMP version and platform. The OMP binary's extension loader and compatibility layer are maintained by OMP, not by AHEAD.
+
+The bundled AHEAD extension commands and workflow state work through OMP. AHEAD's Pi-specific Agent Skills are currently exposed through Pi's `pi.skills` manifest; use the extension commands and `/ahead-guide` in OMP, and do not assume `/skill:research`, `/skill:to-tickets`, or `/skill:diagnosing-bugs` are available unless OMP's skill discovery lists them.
 
 ## Guided mode
 

@@ -63,6 +63,11 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"
