@@ -28,6 +28,7 @@ This is the starting point for changing AHEAD itself: its methodology, executabl
 | Maintainer documentation | `docs/development/**` |
 | Executable workflow contracts | `spec/workflows/**` |
 | Generated agent-policy sources | `policy/**` |
+| AHEAD-owned Agent Skills | `skills/**` |
 | Deterministic workflow engine | `crates/ahead-core` |
 | WebAssembly boundary | `crates/ahead-wasm` |
 | Host integrations | `integrations/pi`, `integrations/vscode` |

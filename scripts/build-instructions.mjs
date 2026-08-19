@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,12 +10,15 @@ const methodsIndexPath = join(root, "policy", "methods", "index.json");
 const recommendedSkillsPath = join(root, "recommendations", "skills-v0.1.json");
 const generatedDirectory = join(root, "integrations", "pi", "generated");
 const referenceOutputDir = join(root, "integrations", "pi", "generated", "reference");
+const bundledSkillsSourceDir = join(root, "skills");
+const bundledSkillsOutputDir = join(root, "integrations", "pi", "generated", "skills");
 
 const common = (await readFile(commonPath, "utf8")).trim();
 const methodsIndex = JSON.parse(await readFile(methodsIndexPath, "utf8"));
 const methods = await loadMethods(methodsIndex);
 await rm(generatedDirectory, { recursive: true, force: true });
 await mkdir(generatedDirectory, { recursive: true });
+await cp(bundledSkillsSourceDir, bundledSkillsOutputDir, { recursive: true });
 
 const specPaths = (await readdir(specDirectory))
   .filter((name) => name.endsWith(".json"))

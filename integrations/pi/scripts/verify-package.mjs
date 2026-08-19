@@ -44,6 +44,12 @@ try {
     "generated/reference/docs/guide/workflows/product-change.md",
     "generated/reference/docs/evidence/research-map.md",
     "generated/recommended-skills.json",
+    "generated/skills/manifest.json",
+    "generated/skills/research/SKILL.md",
+    "generated/skills/research/LICENSE.ahead",
+    "generated/skills/research/LICENSE.mattpocock",
+    "generated/skills/to-tickets/SKILL.md",
+    "generated/skills/diagnosing-bugs/SKILL.md",
     "src/engine.ts",
     "src/flow-guides.ts",
     "src/guidance.ts",
@@ -95,6 +101,7 @@ try {
   const extractedJson = JSON.parse(await readFile(join(extractedPackage, "package.json"), "utf8"));
   assert.equal(extractedJson.name, "ahead-pi");
   assert.notEqual(extractedJson.private, true);
+  assert.deepEqual(extractedJson.pi.skills, ["./generated/skills"]);
 
   const piBinary = join(packageRoot, "node_modules", ".bin", "pi");
   run(

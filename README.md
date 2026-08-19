@@ -32,11 +32,11 @@ AHEAD is being designed for several kinds of engineering work, including feature
 
 - [Development guide](docs/development/README.md) is the starting point for changing the methodology, workflow engine, generated policy, integrations, or publishing path.
 
-The Constitution and practitioner guide are packaged as Pi framework references. Evidence is available on demand. Development documents remain repository-only and are not placed in ordinary practitioner or agent context.
+The Constitution and practitioner guide are packaged as Pi framework references. Evidence is available on demand. AHEAD-owned research, ticket-decomposition, and debugging skills are bundled for progressive disclosure. Development documents remain repository-only and are not placed in ordinary practitioner or agent context.
 
 ## Status
 
-AHEAD has six minimal workflow profiles encoded as executable workflow definitions: Product Change, Corrective Debugging, Operational Stabilization, Decision, Investigation, and Internal Improvement. The deterministic Rust core compiles to WebAssembly; the Pi integration lets a human select a flow, provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, and packages the framework Markdown for workflow-aware human or AI reference.
+AHEAD has six minimal workflow profiles encoded as executable workflow definitions: Product Change, Corrective Debugging, Operational Stabilization, Decision, Investigation, and Internal Improvement. The deterministic Rust core compiles to WebAssembly; the Pi integration lets a human select a flow, provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, packages the framework Markdown for workflow-aware human or AI reference, and supplies thin AHEAD-owned skills for research, ticket decomposition, and disciplined bug diagnosis.
 
 The current priority is to dogfood all six flows and refine their shared state model and workflow-specific gates. GitHub/CI enforcement is not implemented yet.
 

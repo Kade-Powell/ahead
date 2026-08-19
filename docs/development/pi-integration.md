@@ -35,4 +35,4 @@ Pi may ask the user to trust the project-local extension. Project trust is not a
 
 Use `npm run format`, `npm run format:check`, `npm run lint`, and `npm run typecheck` for individual JavaScript and TypeScript quality gates. Oxc configuration is repository-wide so the root generators and Pi integration follow the same policy.
 
-The npm package contains only its practitioner README, package metadata, TypeScript runtime, generated phase instructions, runtime reference catalog, and compiled WASM engine. Build scripts, tests, source specs, maintainer documents, development dependencies, and other repository files are excluded.
+The npm package contains only its practitioner README, package metadata, TypeScript runtime, generated phase instructions, runtime reference catalog, bundled AHEAD-owned skills, and compiled WASM engine. Skill sources live at repository-root `skills/` and are copied unchanged into `integrations/pi/generated/skills/` by the instruction build. Build scripts, tests, source specs, maintainer documents, development dependencies, and other repository files are excluded.

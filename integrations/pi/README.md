@@ -46,6 +46,8 @@ During implementation, the engineer can ask questions at any time. The guided he
 
 Run `/ahead-skills` to inspect optional third-party skills AHEAD has reviewed for the active phase. Recommendations pin the reviewed source and provide an opt-in install command; the extension never installs them. AHEAD's human ownership and gates override any conflicting skill guidance.
 
+The package itself includes three AHEAD-owned Agent Skills: `/skill:research`, `/skill:to-tickets`, and `/skill:diagnosing-bugs`. Pi loads their descriptions at startup and their full instructions only when selected. They are thin interfaces to AHEAD's canonical methods, not extra workflow authority. `to-tickets` requires explicit invocation and human approval of the complete breakdown before any tracker write. `diagnosing-bugs` uses AHEAD's human-model-first order. Projects should keep domain language, tracker configuration, and repository-specific review rules in their own instructions rather than copying these skills locally.
+
 ## Work items and sprint-ahead planning
 
 `/ahead-work-item <url>` links an existing GitHub, Jira, Azure Boards, Linear, or other HTTP(S) work item. With no URL, the command can link an item interactively or create a GitHub issue in the current repository after the human reviews and confirms a body seeded with the available approved plan. The provider-neutral URL appears in the AHEAD header and run state.

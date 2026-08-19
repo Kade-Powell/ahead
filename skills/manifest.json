@@ -1,0 +1,21 @@
+{
+  "api_version": "ahead.bundled-skills/v0.1",
+  "source": "mattpocock/skills",
+  "source_revision": "885e2ca4d842d139e9aef4e48d366c63cb1b8013",
+  "source_license": "MIT",
+  "hash_algorithm": "sha256 of sorted per-file sha256 lines within each skill directory",
+  "skills": [
+    {
+      "id": "research",
+      "adapted_hash": "406e18b61a0cd2633e9c2e4476fe1316823792c102caea8ac1455628f57d11d4"
+    },
+    {
+      "id": "to-tickets",
+      "adapted_hash": "7f3b802e66bdee3a01bfc16d63fdf226aeeda0cecc1252c4c1d3d266ae475138"
+    },
+    {
+      "id": "diagnosing-bugs",
+      "adapted_hash": "d082d37eeafb1540a4f5454a5461715c65ac7f9b34cc4b86de20b7c9b2b4983c"
+    }
+  ]
+}

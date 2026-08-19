@@ -14,7 +14,7 @@ Use three layers:
 2. The generator adds the workflow phase fragment and only the method overlays mapped to that phase in `policy/methods/index.json`.
 3. Humans and AI retrieve full framework Markdown on demand through the host integration.
 
-The canonical workflow spec owns phases, artifacts, gates, transitions, and capabilities. Phase policies own local AI behavior. Method overlays own reusable practices such as evidence handling or debugging. Full documents explain why. Do not restate one rule in every layer.
+The canonical workflow spec owns phases, artifacts, gates, transitions, and capabilities. Phase policies own local AI behavior. Method overlays own reusable practices such as evidence handling or debugging. Full documents explain why. Bundled Agent Skills provide opt-in procedural detail and must defer to those canonical layers rather than restating or extending their authority. Do not restate one rule in every layer.
 
 ## Authoring rules
 

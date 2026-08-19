@@ -1,6 +1,6 @@
 {
   "name": "ahead-pi",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AHEAD workflow enforcement and context for Pi",
   "keywords": [
     "ahead",
@@ -66,6 +66,9 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
+    ],
+    "skills": [
+      "./generated/skills"
     ]
   }
 }

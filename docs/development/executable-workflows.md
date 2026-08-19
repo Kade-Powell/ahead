@@ -48,7 +48,8 @@ The initial WebAssembly boundary is a small versioned JSON ABI. This avoids coup
 | Compact binding agent profile and shared AI behavior | `policy/common.md` |
 | Phase AI behavior | `policy/<workflow>/*.md` with shared engineering-tail fragments in `policy/shared/*.md` |
 | Reusable phase practices | `policy/methods/*.md`, selected by `policy/methods/index.json` |
-| Reviewed optional skills | `recommendations/skills-v0.1.json` |
+| AHEAD-owned progressively disclosed skills | `skills/*/SKILL.md`, with provenance in `skills/manifest.json` |
+| Reviewed optional third-party skills | `recommendations/skills-v0.1.json` |
 | State transition enforcement | `crates/ahead-core` |
 | Host mapping, storage, and UI | `integrations/pi` |
 
