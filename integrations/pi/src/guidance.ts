@@ -35,6 +35,7 @@ const guides: Record<string, PhaseGuide> = {
         "What sources, code, behavior, history, or measurements were examined?",
         "What findings are supported, contradicted, or still uncertain?",
         "How directly does each finding apply to this work?",
+        "Does novelty or unfamiliarity require primary documentation, direct inspection, or an experiment?",
         "What important evidence is still missing?",
       ],
     },
@@ -109,7 +110,7 @@ const guides: Record<string, PhaseGuide> = {
       ],
       plan: [
         "What is the final ordered implementation sequence?",
-        "What tests and observable evidence are required?",
+        "What human-defined behavior, invariants, test oracles, and observable evidence must the checks evaluate?",
         "How will rollout and recovery work?",
         "Which deviations require returning to decision or plan?",
       ],

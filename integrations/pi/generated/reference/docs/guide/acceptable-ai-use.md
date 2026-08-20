@@ -6,7 +6,7 @@ Status: binding pilot policy v0.1
 
 ## Authority
 
-This policy is binding for AHEAD pilot workflows. The [AHEAD Constitution](../../CONSTITUTION.md) is the highest authority; this policy interprets its human-ownership boundaries; workflow profiles apply both and may narrow AI permissions for a phase. A workflow phase, diagram, tool permission, or local convenience cannot broaden AI authority beyond this policy. Organization and repository policies may impose stricter controls.
+This policy is binding for AHEAD pilot workflows. The [AHEAD Constitution](../../CONSTITUTION.md) is the highest authority; this policy interprets its human-ownership boundaries; workflow profiles apply both and may narrow AI permissions for a phase. A workflow phase, diagram, tool permission, or local convenience cannot broaden AI authority beyond this policy. Organization and repository policies may impose stricter controls. Because AHEAD is an AI-assisted methodology, it cannot be used as designed where AI use is prohibited entirely.
 
 If two rules appear to conflict, apply the more protective rule and record the ambiguity for correction. No exception may transfer human authorship, judgment, approval, accountability, or unscoped consequential authority to AI.
 
@@ -42,6 +42,8 @@ An AI-assisted contribution is acceptable only when all applicable conditions ho
 AI may locate, organize, compare, and summarize approved internal and external sources. The engineer follows important claims to their sources and distinguishes retrieved evidence from AI synthesis.
 
 Why: AI increases search and synthesis capacity, while NIST identifies confident false content as an inherent generative-AI risk. Summaries are navigation aids, not new authorities.
+
+For novel, complex, or unfamiliar work, prefer primary documentation, direct inspection, and experiments. State what the AI may not know and treat confident synthesis as unverified until evidence supports it.
 
 ### Boilerplate and repetitive structure
 
@@ -101,7 +103,7 @@ AI may help organize evidence, explain unfamiliar mechanisms, generate competing
 
 Before broad AI assistance in normal debugging, the human records at least the observed failure, evidence already checked, and an initial mental model or question. A team may use a timebox before asking AI, but the purpose is independent thought—not withholding useful tools. During incidents, AI may assist immediately once the current observation and safety constraints are established.
 
-The human remains the investigator: selecting or authorizing tests, interpreting results, deciding whether evidence supports a conclusion, and choosing the intervention.
+Debugging is not grunt work. The human remains the investigator: selecting or authorizing tests, interpreting results, deciding whether evidence supports a conclusion, and choosing the intervention.
 
 ### Design alternatives
 
@@ -215,5 +217,6 @@ For a disposable prototype, also answer:
 - [NIST AI 600-1, *Generative Artificial Intelligence Profile*](https://doi.org/10.6028/NIST.AI.600-1) — authoritative risk guidance on confabulation, privacy, provenance, testing, and governance.
 - [NIST DevSecOps reference model: Artificial Intelligence](https://pages.nist.gov/nccoe-devsecops/notational-reference-model.html#artificial-intelligence) — human validation and verifiable-process guidance for AI-augmented software development.
 - [OWASP Secure Coding with AI Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secure_Coding_with_AI_Cheat_Sheet.html) — practitioner security guidance for sensitive context, agent permissions, generated tests, supply chains, and CI/CD.
+- [Google Summer of Code, *Guidance for GSoC Contributors using AI tooling in GSoC 2026*](https://developers.google.com/open-source/gsoc/resources/ai_guidance) — practitioner guidance summarizing mentor advice on human responsibility, understanding, research, human-defined test scope, and the limits of AI on complex work.
 
 The [research map](../evidence/research-map.md) classifies these sources and records their limitations. Exact boundaries such as “core business logic” and the human-first debugging checkpoint remain AHEAD policy choices that should be tested and refined.
