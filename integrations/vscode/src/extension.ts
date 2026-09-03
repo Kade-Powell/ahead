@@ -5,9 +5,12 @@ import { recommendedProjectConfig } from "../../pi/src/config.js";
 import { AheadEngine, AheadEngineError } from "../../pi/src/engine.js";
 import {
   buildArtifactTemplate,
+  insertFieldExamples,
   nextAction,
   phaseGuide,
   phasePosition,
+  promptsForArtifact,
+  validateArtifactForm,
 } from "../../pi/src/guidance.js";
 import {
   findReference,
@@ -38,6 +41,7 @@ import type {
   WorkItem,
   WorkflowDefinition,
 } from "../../pi/src/types.js";
+import { draftFieldExamples } from "./examples.js";
 
 interface ActiveRun {
   root: string;
@@ -419,7 +423,8 @@ class AheadController {
     }
     const title = await vscode.window.showInputBox({
       title: `Start AHEAD · ${selected.workflow.title}`,
-      prompt: "What work are you doing?",
+      prompt: `Short name for this work — e.g. ${titleExample(selected.workflow.id)}`,
+      placeHolder: titleExample(selected.workflow.id),
       validateInput: (value) => (value.trim() ? undefined : "A title is required"),
     });
     if (!title?.trim()) {
@@ -477,7 +482,47 @@ class AheadController {
       !editor ||
       !editor.document.getText().match(new RegExp(`^Artifact:\\s*${escapePattern(kind)}\\s*$`, "m"))
     ) {
-      const template = await this.humanArtifactTemplate(active, artifact);
+      let template = await this.humanArtifactTemplate(active, artifact);
+      if (artifact.kind !== "review-disposition") {
+        const prompts = promptsForArtifact(
+          active.state.workflow_id,
+          active.state.phase.id,
+          artifact.kind,
+        );
+        if (prompts.length > 0) {
+          const seeded = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: "AHEAD: drafting example prompts (inspiration only)…",
+              cancellable: true,
+            },
+            async (_progress, token) => {
+              if (token.isCancellationRequested) {
+                return undefined;
+              }
+              const draft = await draftFieldExamples(
+                {
+                  workflowTitle: active.workflow.title,
+                  phaseTitle: active.state.phase.title,
+                  runTitle: active.run.title,
+                  fields: prompts,
+                },
+                token,
+              );
+              if (draft.skipped === "no-model") {
+                await vscode.window.showInformationMessage(
+                  "AHEAD example prompts unavailable: no chat model is available.",
+                );
+              }
+              // Other failures stay silent: the plain template is the fallback.
+              return draft.examples;
+            },
+          );
+          if (seeded) {
+            template = insertFieldExamples(template, seeded);
+          }
+        }
+      }
       const document = await vscode.workspace.openTextDocument({
         content: template,
         language: "markdown",
@@ -494,6 +539,22 @@ class AheadController {
         "Complete the human-owned record and remove its placeholder before recording it",
       );
     }
+    if (artifact.kind !== "review-disposition") {
+      const formErrors = validateArtifactForm(
+        content,
+        promptsForArtifact(active.state.workflow_id, active.state.phase.id, artifact.kind),
+      );
+      if (formErrors.length > 0) {
+        throw new Error(
+          [
+            `Some required fields in ${artifact.title} are still empty:`,
+            ...formErrors.map((field) => `• ${field}`),
+            "",
+            "Your text is preserved in this editor — fill the fields and run “AHEAD: Write or Record Human Artifact” again.",
+          ].join("\n"),
+        );
+      }
+    }
     await this.validateHumanReview(active, artifact.kind, content);
     const path = active.store.artifactPath(active.run, active.state.phase.id, artifact.kind);
     const updated = (await this.engine).applyEvent(active.run, humanActor(active.root), {
@@ -505,7 +566,14 @@ class AheadController {
     await active.store.writeArtifact(path.absolute, content);
     await active.store.save(updated);
     await this.refresh();
-    await vscode.window.showInformationMessage(`Recorded ${artifact.title}.`);
+    const nextState = (await this.engine).deriveState(updated);
+    const nextArtifact = nextState.artifacts.find(
+      (candidate) => candidate.required && !candidate.present,
+    );
+    const nextStep = nextArtifact
+      ? `Next: ${nextArtifact.title}.`
+      : `Next: accept “${nextState.gate.title}” with AHEAD: Accept Gate and Continue.`;
+    await vscode.window.showInformationMessage(`Recorded ${artifact.title}. ${nextStep}`);
   }
 
   private async askCopilot(requestedKind?: string): Promise<void> {
@@ -1062,4 +1130,23 @@ function escapePattern(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function titleExample(workflowId: string): string {
+  switch (workflowId) {
+    case "product-change":
+      return '"Add audit log viewer page"';
+    case "internal-improvement":
+      return '"Reduce cold-start time"';
+    case "corrective-debugging":
+      return '"Fix race in worker claim loop"';
+    case "operational-stabilization":
+      return '"Restore queue throughput after incident"';
+    case "decision":
+      return '"Choose audit-log retention policy"';
+    case "investigation":
+      return '"Why are runs flaking on CI?"';
+    default:
+      return '"Improve X"';
+  }
 }
