@@ -424,7 +424,9 @@ export function nextAction(state: RunState, workflow: WorkflowDefinition): Guide
         ? "Ask AI to challenge the human option and expand alternatives"
         : state.phase.id === "plan"
           ? "Ask AI to challenge the human first-pass plan"
-          : `Ask AI to contribute ${artifact.title}`;
+          : artifact.title.startsWith("AI ")
+            ? `Ask AI for ${lowercaseFirst(artifact.title.slice(3))}`
+            : `Ask AI to contribute ${artifact.title}`;
     return artifact.required
       ? { actor, label, artifactKind: artifact.kind }
       : { actor, label, artifactKind: artifact.kind, optional: true };
@@ -604,6 +606,10 @@ export function validateArtifactForm(content: string, prompts: string[]): string
     }
   }
   return errors;
+}
+
+function lowercaseFirst(value: string): string {
+  return value.charAt(0).toLowerCase() + value.slice(1);
 }
 
 function formatArtifactStatus(artifact: ArtifactState): string {

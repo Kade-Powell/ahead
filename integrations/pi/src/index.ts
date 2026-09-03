@@ -702,7 +702,7 @@ async function openAheadMode(
         });
       } else if (missingRequired.length === 0) {
         actions.push({
-          label: `Continue without optional AI contribution · Accept ${state.gate.title}`,
+          label: `Continue without optional AI contribution · ${state.gate.title}`,
           run: async () => acceptAndContinue(ctx),
         });
       }
@@ -752,8 +752,12 @@ async function openAheadMode(
       });
     }
 
+    // The generic challenger appears only when the next move is the human's.
+    // When the primary action is already an AI contribution, the formal AI
+    // artifact owns that job and a second "challenge me" entry is noise.
     if (
       state.allowed_ai_capabilities.length > 0 &&
+      action.actor !== "ai" &&
       state.artifacts.some(
         (artifact) => artifact.present && artifact.recorded_by?.kind === "human" && artifact.path,
       )

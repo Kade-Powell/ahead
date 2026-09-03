@@ -139,6 +139,32 @@ test("human first pass precedes optional AI challenge and final human option", (
   );
 });
 
+test("optional AI artifact titles starting with AI do not stutter", () => {
+  const artifacts = [
+    artifact("baseline", "Baseline measurements", "human", true, true),
+    artifact(
+      "ai-measurement-review",
+      "AI challenge of the measurement method and confounders",
+      "ai",
+      false,
+    ),
+  ];
+  assert.deepEqual(
+    nextAction(
+      state("decision", artifacts, {
+        allowed_ai_capabilities: ["inspect", "search", "analyze", "record"],
+      }),
+      workflow,
+    ),
+    {
+      actor: "ai",
+      artifactKind: "ai-measurement-review",
+      label: "Ask AI for challenge of the measurement method and confounders",
+      optional: true,
+    },
+  );
+});
+
 test("AI review is explicitly bound in guidance to the current changeset", () => {
   const action = nextAction(
     state("ai-review", [artifact("ai-review", "AI review findings", "ai", true)]),
