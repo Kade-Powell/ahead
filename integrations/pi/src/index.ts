@@ -1617,15 +1617,27 @@ async function recordHumanArtifact(
   const prompts = promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind);
   let template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
   if (ctx.hasUI && artifact.kind !== "review-disposition" && prompts.length > 0) {
-    if (ctx.model) {
-      ctx.ui.notify("Drafting two example prompts per field (inspiration only)…", "info");
+    // Visible progress while drafting: the loader row and footer status show
+    // until the call resolves, so the wait never looks like a hang.
+    const showProgress = ctx.model !== undefined;
+    if (showProgress) {
+      ctx.ui.setWorkingMessage("Drafting example prompts (inspiration only)…");
+      ctx.ui.setStatus("ahead-examples", "Drafting example prompts…");
     }
-    const draft = await draftFieldExamples(ctx, {
-      workflowTitle: engine.getWorkflow(state.workflow_id).title,
-      phaseTitle: state.phase.title,
-      runTitle: run.title,
-      fields: prompts,
-    });
+    let draft;
+    try {
+      draft = await draftFieldExamples(ctx, {
+        workflowTitle: engine.getWorkflow(state.workflow_id).title,
+        phaseTitle: state.phase.title,
+        runTitle: run.title,
+        fields: prompts,
+      });
+    } finally {
+      if (showProgress) {
+        ctx.ui.setWorkingMessage();
+        ctx.ui.setStatus("ahead-examples", undefined);
+      }
+    }
     if (draft.examples) {
       template = insertFieldExamples(template, draft.examples);
     } else if (draft.skipped === "no-auth") {

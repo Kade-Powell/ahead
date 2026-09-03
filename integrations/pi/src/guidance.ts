@@ -533,8 +533,10 @@ export function buildArtifactTemplate(
 }
 
 /**
- * Insert inspiration-only example lines into each field as HTML comments.
- * Validation strips comments, so an untouched field still counts as empty.
+ * Insert inspiration-only example lines into each field as plain text with
+ * an "ex. - " prefix. Validation strips these lines for the emptiness
+ * check and rejects any saved form that still contains them, so no example
+ * line can ever persist in a recorded artifact.
  */
 export function insertFieldExamples(template: string, perField: string[][]): string {
   let updated = template;
@@ -548,14 +550,25 @@ export function insertFieldExamples(template: string, perField: string[][]): str
     }
     updated = updated.replace(
       marker,
-      [
-        marker,
-        "<!-- Examples — inspiration only, not requirements. Delete them and write your own answer. -->",
-        ...examples.map((example) => `<!-- ~ ${example} ~ -->`),
-      ].join("\n"),
+      [marker, ...examples.map((example) => `ex. - ${example}`)].join("\n"),
     );
   }
   return updated;
+}
+
+const EXAMPLE_LINE_PATTERN = /^\s*ex\.\s*-\s?/;
+
+function stripExampleLines(text: string): { cleaned: string; hadExamples: boolean } {
+  const kept: string[] = [];
+  let hadExamples = false;
+  for (const line of text.split("\n")) {
+    if (EXAMPLE_LINE_PATTERN.test(line)) {
+      hadExamples = true;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { cleaned: kept.join("\n").trim(), hadExamples };
 }
 
 export function validateArtifactForm(content: string, prompts: string[]): string[] {
@@ -575,11 +588,18 @@ export function validateArtifactForm(content: string, prompts: string[]): string
       .slice(beginIndex + begin.length, endIndex)
       .replace(/<!--[\s\S]*?-->/g, "")
       .trim();
-    if (!response) {
-      errors.push(prompt);
+    const { cleaned, hadExamples } = stripExampleLines(response);
+    if (!cleaned) {
+      errors.push(
+        hadExamples ? `${prompt} (replace the “ex. -” example lines with your own answer)` : prompt,
+      );
       continue;
     }
-    if (/^(?:n\/?a|not applicable)\s*[.!]?$/i.test(response)) {
+    if (hadExamples) {
+      errors.push(`${prompt} (remove the leftover “ex. -” example lines)`);
+      continue;
+    }
+    if (/^(?:n\/?a|not applicable)\s*[.!]?$/i.test(cleaned)) {
       errors.push(`${prompt} (explain why it is not applicable)`);
     }
   }

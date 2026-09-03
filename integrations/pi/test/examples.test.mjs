@@ -102,7 +102,7 @@ test("draftFieldExamples reports no-auth when no credential resolves", async () 
   assert.deepEqual(result, { skipped: "no-auth" });
 });
 
-test("inserted examples are labeled and do not satisfy validation", () => {
+test("inserted examples are quiet plain-text lines and do not satisfy validation", () => {
   const current = state("define", [artifact("problem", "Problem and success signals")]);
   const prompts = promptsForArtifact("product-change", "define", "problem");
   assert.ok(prompts.length > 0);
@@ -110,13 +110,37 @@ test("inserted examples are labeled and do not satisfy validation", () => {
 
   const seeded = insertFieldExamples(
     template,
-    prompts.map((_, index) => [`seeded example one for field ${index + 1}`, `seeded example two`]),
+    prompts.map((_, index) => [`seeded example one for field ${index + 1}`, "seeded example two"]),
   );
-  assert.match(seeded, /inspiration only, not requirements/);
+  assert.match(seeded, /ex\. - seeded example one for field 1/);
+  assert.doesNotMatch(seeded, /inspiration only/);
+  assert.doesNotMatch(seeded, /<!-- ~/);
 
-  // The mechanical guarantee: examples are comments, so an untouched field
-  // still counts as empty and the AI cannot author the artifact by prefilling.
-  assert.deepEqual(validateArtifactForm(seeded, prompts), prompts);
+  // The mechanical guarantee: untouched example lines never satisfy a field.
+  const errors = validateArtifactForm(seeded, prompts);
+  assert.equal(errors.length, prompts.length);
+  assert.match(errors[0], /replace the “ex\. -” example lines/);
+});
+
+test("leftover example lines are rejected even alongside real content", () => {
+  const current = state("define", [artifact("problem", "Problem and success signals")]);
+  const prompts = promptsForArtifact("product-change", "define", "problem");
+  const template = buildArtifactTemplate(run, current, "problem", "Problem and success signals");
+
+  const seeded = insertFieldExamples(
+    template,
+    prompts.map(() => ["seeded example"]),
+  );
+  const answered = seeded.replace(
+    "<!-- AHEAD-FIELD:1:BEGIN -->\n",
+    "<!-- AHEAD-FIELD:1:BEGIN -->\nMaintainers cannot tell which inputs are required.\n",
+  );
+  const errors = validateArtifactForm(answered, prompts);
+  assert.ok(errors.some((error) => /remove the leftover “ex\. -” example lines/.test(error)));
+  assert.equal(errors.length, prompts.length);
+
+  const cleaned = answered.replace(/^\s*ex\.\s*-.*$/gm, "");
+  assert.deepEqual(validateArtifactForm(cleaned, prompts), prompts.slice(1));
 });
 
 test("insertFieldExamples skips empty or unknown fields", () => {
