@@ -14,12 +14,14 @@ import { AheadEngine, AheadEngineError } from "./engine.js";
 import {
   buildArtifactTemplate,
   buildHeaderLines,
+  insertFieldExamples,
   nextAction,
   phaseGuide,
   phasePosition,
   promptsForArtifact,
   validateArtifactForm,
 } from "./guidance.js";
+import { draftFieldExamples } from "./examples.js";
 import {
   findReference,
   loadReferenceIndex,
@@ -737,6 +739,35 @@ async function openAheadMode(
     actions.push({
       label: "Open the changeset review workbench",
       run: async () => openReviewWorkbench(pi, ctx),
+    });
+  }
+
+  if (
+    state.allowed_ai_capabilities.length > 0 &&
+    state.artifacts.some(
+      (artifact) => artifact.present && artifact.recorded_by?.kind === "human" && artifact.path,
+    )
+  ) {
+    actions.push({
+      label: "Ask AI to challenge the latest artifact",
+      run: async () => {
+        const artifact = [...state.artifacts]
+          .toReversed()
+          .find(
+            (candidate) =>
+              candidate.present && candidate.recorded_by?.kind === "human" && candidate.path,
+          );
+        if (!artifact?.path) {
+          return;
+        }
+        pi.sendUserMessage(
+          [
+            `AHEAD mode: challenge my ${artifact.title} artifact before I accept the gate.`,
+            `Read ${artifact.path} and name the 2-3 weakest points: missing risks, vague claims, or things that would not survive implementation.`,
+            "Be specific and brief. Do not rewrite the artifact; I stay the author.",
+          ].join("\n"),
+        );
+      },
     });
   }
 
@@ -1475,8 +1506,8 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
     linkedTitle ||
     (ctx.hasUI
       ? await ctx.ui.input(
-          `Enter AHEAD mode · ${workflow.title}`,
-          `Short name for this work — e.g. ${titleExample(workflow.id)}`,
+          `AHEAD · ${workflow.title} · Name this work — e.g. ${titleExample(workflow.id)}`,
+          "",
         )
       : parsed.workItemUrl);
   if (!title?.trim()) {
@@ -1569,7 +1600,19 @@ async function recordHumanArtifact(
     );
   }
 
-  const template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
+  const prompts = promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind);
+  let template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
+  if (ctx.hasUI && artifact.kind !== "review-disposition" && prompts.length > 0) {
+    const examples = await draftFieldExamples(ctx, {
+      workflowTitle: engine.getWorkflow(state.workflow_id).title,
+      phaseTitle: state.phase.title,
+      runTitle: run.title,
+      fields: prompts,
+    });
+    if (examples) {
+      template = insertFieldExamples(template, examples);
+    }
+  }
   let content = await ctx.ui.editor(
     `AHEAD mode · ${artifact.title} · write in your own words`,
     template,
@@ -1581,10 +1624,7 @@ async function recordHumanArtifact(
     // Keep the form open until validation passes or the human explicitly cancels,
     // so partial input is never discarded by a validation failure.
     while (true) {
-      const formErrors = validateArtifactForm(
-        content,
-        promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind),
-      );
+      const formErrors = validateArtifactForm(content, prompts);
       if (formErrors.length === 0) {
         break;
       }

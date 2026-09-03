@@ -1,6 +1,6 @@
 {
   "name": "ahead-pi",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "AHEAD workflow enforcement and context for Pi",
   "keywords": [
     "ahead",
@@ -44,6 +44,9 @@
     "typecheck": "tsc --noEmit",
     "verify": "npm run build && npm run format:check && npm run lint && node --test ./test/*.test.mjs",
     "test": "npm run verify && npm run pack:verify"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.84.4"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1",

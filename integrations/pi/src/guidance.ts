@@ -532,6 +532,32 @@ export function buildArtifactTemplate(
   ].join("\n");
 }
 
+/**
+ * Insert inspiration-only example lines into each field as HTML comments.
+ * Validation strips comments, so an untouched field still counts as empty.
+ */
+export function insertFieldExamples(template: string, perField: string[][]): string {
+  let updated = template;
+  for (const [index, examples] of perField.entries()) {
+    if (!examples || examples.length === 0) {
+      continue;
+    }
+    const marker = `<!-- AHEAD-FIELD:${index + 1}:BEGIN -->`;
+    if (!updated.includes(marker)) {
+      continue;
+    }
+    updated = updated.replace(
+      marker,
+      [
+        marker,
+        "<!-- Examples — inspiration only, not requirements. Delete them and write your own answer. -->",
+        ...examples.map((example) => `<!-- ~ ${example} ~ -->`),
+      ].join("\n"),
+    );
+  }
+  return updated;
+}
+
 export function validateArtifactForm(content: string, prompts: string[]): string[] {
   const errors: string[] = [];
   for (const [index, prompt] of prompts.entries()) {
