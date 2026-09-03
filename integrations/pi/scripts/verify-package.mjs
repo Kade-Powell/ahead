@@ -123,7 +123,9 @@ try {
     },
   );
 
-  const current = JSON.parse(await readFile(join(project, ".ahead", "current.json"), "utf8"));
+  const current = JSON.parse(
+    await readFile(join(project, ".ahead", "local", "current.json"), "utf8"),
+  );
   const runState = JSON.parse(
     await readFile(join(project, ".ahead", "runs", current.run_id, "run.json"), "utf8"),
   );
