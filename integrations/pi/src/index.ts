@@ -757,33 +757,32 @@ async function openAheadMode(
   }
 
   actions.push({
-    label: "Configure project AHEAD policy for future runs",
-    run: async () => manageProjectConfig(ctx),
-  });
-
-  actions.push({
-    label: "Read AHEAD framework guidance for this phase",
-    run: async () => showAheadGuide(ctx, ""),
-  });
-
-  actions.push({
-    label: "Inspect optional skills reviewed for this phase",
-    run: async () => showRecommendedSkills(ctx),
-  });
-
-  actions.push({
-    label: "Explain this phase and its expectations",
+    label: "Help · policy, guidance, skills, phase explanation",
     run: async () => {
-      ctx.ui.notify(
-        [
-          `${state.phase.title} · Human leads, AI assists`,
-          `Goal: ${guidance.objective}`,
-          `You: ${guidance.human}`,
-          `AI: ${guidance.ai}`,
-          `Gate: ${state.gate.title}`,
-        ].join("\n"),
-        "info",
-      );
+      const helpChoice = await ctx.ui.select("Help · pick one", [
+        "Configure project AHEAD policy for future runs",
+        "Read AHEAD framework guidance for this phase",
+        "Inspect optional skills reviewed for this phase",
+        "Explain this phase and its expectations",
+      ]);
+      if (helpChoice === "Configure project AHEAD policy for future runs") {
+        await manageProjectConfig(ctx);
+      } else if (helpChoice === "Read AHEAD framework guidance for this phase") {
+        await showAheadGuide(ctx, "");
+      } else if (helpChoice === "Inspect optional skills reviewed for this phase") {
+        await showRecommendedSkills(ctx);
+      } else if (helpChoice === "Explain this phase and its expectations") {
+        ctx.ui.notify(
+          [
+            state.phase.title,
+            `Goal: ${guidance.objective}`,
+            `You: ${guidance.human}`,
+            `AI: ${guidance.ai}`,
+            `Gate: ${state.gate.title}`,
+          ].join("\n"),
+          "info",
+        );
+      }
     },
   });
 
@@ -1475,7 +1474,10 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
     parsed.title ||
     linkedTitle ||
     (ctx.hasUI
-      ? await ctx.ui.input(`Enter AHEAD mode · ${workflow.title}`, "What work are you doing?")
+      ? await ctx.ui.input(
+          `Enter AHEAD mode · ${workflow.title}`,
+          `Short name for this work — e.g. ${titleExample(workflow.id)}`,
+        )
       : parsed.workItemUrl);
   if (!title?.trim()) {
     return undefined;
@@ -1499,14 +1501,14 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
   await store.save(run);
   await refreshUi(ctx, run);
   const state = engine.deriveState(run);
+  const requiredPhase = state.policy.work_items.required_before_phase;
   ctx.ui.notify(
     [
       `AHEAD mode started · ${workflow.title} · ${run.title}`,
-      "Human leads · AI assists",
       ...(state.work_item ? [`Work item: ${state.work_item.url}`] : []),
-      ...(state.policy.work_items.required_before_phase
+      ...(requiredPhase && !state.work_item
         ? [
-            `Project policy requires a work item before ${state.policy.work_items.required_before_phase}.`,
+            `Before the ${requiredPhase} phase, link a work item: /ahead, then choose “Link or create a work item”.`,
           ]
         : []),
       "This run remains active until an accountable human closes the outcome or uses /ahead-stop.",
@@ -1515,6 +1517,25 @@ async function startRun(ctx: ExtensionCommandContext, request: string): Promise<
     "info",
   );
   return run;
+}
+
+function titleExample(workflowId: string): string {
+  switch (workflowId) {
+    case "product-change":
+      return "“Add audit log viewer page”";
+    case "internal-improvement":
+      return "“Reduce cola-api cold-start time”";
+    case "corrective-debugging":
+      return "“Fix race in worker claim loop”";
+    case "operational-stabilization":
+      return "“Restore queue throughput after incident”";
+    case "decision":
+      return "“Choose audit-log retention policy”";
+    case "investigation":
+      return "“Why are runs flaking on CI?”";
+    default:
+      return "“Improve X”";
+  }
 }
 
 async function recordHumanArtifact(
@@ -1549,7 +1570,7 @@ async function recordHumanArtifact(
   }
 
   const template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
-  const content = await ctx.ui.editor(
+  let content = await ctx.ui.editor(
     `AHEAD mode · ${artifact.title} · write in your own words`,
     template,
   );
@@ -1557,17 +1578,39 @@ async function recordHumanArtifact(
     return;
   }
   if (artifact.kind !== "review-disposition") {
-    const formErrors = validateArtifactForm(
-      content,
-      promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind),
-    );
-    if (formErrors.length > 0) {
-      throw new AheadEngineError(
-        "artifact_form_incomplete",
-        `complete these required fields before saving ${artifact.title}:\n${formErrors
-          .map((error) => `- ${error}`)
-          .join("\n")}`,
+    // Keep the form open until validation passes or the human explicitly cancels,
+    // so partial input is never discarded by a validation failure.
+    while (true) {
+      const formErrors = validateArtifactForm(
+        content,
+        promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind),
       );
+      if (formErrors.length === 0) {
+        break;
+      }
+      const retry = await ctx.ui.confirm(
+        "Some required fields are still empty",
+        [
+          `The following fields in ${artifact.title} need a response:`,
+          "",
+          ...formErrors.map((error) => `- ${error}`),
+          "",
+          "Your text is preserved. Reopen to finish, or discard?",
+        ].join("\n"),
+      );
+      if (!retry) {
+        ctx.ui.notify("Draft discarded. Nothing was saved.", "info");
+        return;
+      }
+      const revised = await ctx.ui.editor(
+        `AHEAD mode · ${artifact.title} · finish the required fields`,
+        content,
+      );
+      if (!revised?.trim()) {
+        ctx.ui.notify("Draft kept in this dialog only — nothing was saved.", "info");
+        return;
+      }
+      content = revised;
     }
   }
   await validateHumanReviewArtifact(store, state, artifact.kind, content);
@@ -1582,8 +1625,21 @@ async function recordHumanArtifact(
   await store.writeArtifact(path.absolute, content);
   await store.save(updated);
   await refreshUi(ctx, updated);
+  const nextState = engine.deriveState(updated);
+  const nextArtifact = nextState.artifacts.find(
+    (candidate) => candidate.required && !candidate.present,
+  );
+  const nextStep = nextState.gate.accepted
+    ? nextState.gate.title
+    : nextArtifact
+      ? `Next artifact: ${nextArtifact.title}`
+      : `Accept the gate when ready: ${nextState.gate.title}`;
   ctx.ui.notify(
-    `Saved ${artifact.title}. AHEAD mode remains active; continue the conversation.`,
+    [
+      `✓ Saved ${artifact.title}.`,
+      `Next: ${nextStep}`,
+      "/ahead is available for the action menu; or just tell me what to do next.",
+    ].join("\n"),
     "info",
   );
 }
@@ -1887,7 +1943,7 @@ async function refreshUi(ctx: ExtensionContext, supplied?: Run): Promise<void> {
     "ahead",
     state.closed
       ? `AHEAD · complete · ${state.workflow_id}`
-      : `AHEAD · ${position.current}/${position.total} · ${state.phase.id} · ${action.actor} action`,
+      : `AHEAD · ${state.phase.id} · ${action.actor} action  (${position.current}/${position.total})`,
   );
   if (state.closed) {
     ctx.ui.setWidget("ahead", undefined);
@@ -2052,8 +2108,8 @@ async function toolResult(action: () => Promise<unknown>) {
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof AheadEngineError) {
-    return `${error.code}: ${error.message}`;
-  }
+  // User-facing messages should read as prose. The internal error code is
+  // available on AheadEngineError.code for tooling, but does not belong in
+  // the user-visible text.
   return error instanceof Error ? error.message : String(error);
 }

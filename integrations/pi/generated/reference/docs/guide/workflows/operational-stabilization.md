@@ -177,6 +177,7 @@ During incident or emergency mode, maintain at minimum:
 - A live intervention requires an accountable human unless existing automation was previously authorized for that action.
 - Any lasting engineering change produced during stabilization still requires a human first-pass plan and independent human review, either in this record or a linked change run; emergency policy may defer but not erase those gates.
 - Kubernetes readiness, controller status, or a successful command is not automatically user-visible recovery.
+- The outcome records the durable references (runbooks, design docs, decision records) this stabilization creates or updates, or explicit none; emergency policy may defer the reference-update record to a linked postmortem, but the deferral itself is recorded. See [Durable references](../durable-reference.md).
 - The conclusion may include mechanism, trigger, enabling conditions, and detection or containment gaps rather than one root cause.
 - Closure does not require every follow-up to remain inside the operational run.
 

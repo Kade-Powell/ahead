@@ -173,7 +173,7 @@ test("active AHEAD header is compact and makes the next owner visible", () => {
   const lines = buildHeaderLines(run, current, workflow);
   const header = lines.join("\n");
   assert.equal(lines.length, 4);
-  assert.match(header, /AHEAD · Product Change · 9\/13 · Human Review/);
+  assert.match(header, /AHEAD · Product Change · Human Review  \(9\/13\)/);
   assert.match(header, /Next: You → Independent reviewer records/);
   assert.doesNotMatch(header, /HUMAN LEADS · AI ASSISTS/);
   assert.doesNotMatch(header, /Run \/ahead/);
@@ -233,7 +233,7 @@ test("human artifact editor renders every expected input as a required form fiel
   assert.match(template, /### 1\. Who experiences the problem/);
   assert.match(template, /### 4\. What observable signals/);
   assert.match(template, /AHEAD-FIELD:1:BEGIN/);
-  assert.match(template, /Complete every field in your own words/);
+  assert.match(template, /Write directly under each question/);
 });
 
 test("artifact form validation identifies each unanswered or removed required field", () => {
@@ -245,8 +245,8 @@ test("artifact form validation identifies each unanswered or removed required fi
   assert.deepEqual(validateArtifactForm(template, prompts), prompts);
 
   const partiallyCompleted = template.replace(
-    "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
-    "$&\nAffected maintainers cannot tell which inputs are required.",
+    `<!-- AHEAD-FIELD:1:BEGIN -->\n\n\n`,
+    `<!-- AHEAD-FIELD:1:BEGIN -->\nAffected maintainers cannot tell which inputs are required.\n\n`,
   );
   assert.deepEqual(validateArtifactForm(partiallyCompleted, prompts), prompts.slice(1));
 
@@ -266,8 +266,8 @@ test("artifact form validation allows justified non-applicability but rejects a 
     "Deployment record",
   );
   const bare = template.replace(
-    "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
-    "$&\nNot applicable",
+    `<!-- AHEAD-FIELD:1:BEGIN -->\n\n\n`,
+    "<!-- AHEAD-FIELD:1:BEGIN -->\nNot applicable\n\n",
   );
   assert.match(validateArtifactForm(bare, prompts)[0], /explain why/);
 

@@ -491,7 +491,7 @@ export function buildHeaderLines(
       : undefined;
 
   return [
-    `AHEAD · ${workflow.title} · ${position.current}/${position.total} · ${state.phase.title}`,
+    `AHEAD · ${workflow.title} · ${state.phase.title}  (${position.current}/${position.total})`,
     ...(workItem ? [workItem] : []),
     `Goal: ${guide.objective}`,
     `Required: ${checklist}`,
@@ -511,14 +511,14 @@ export function buildArtifactTemplate(
     return [
       `### ${number}. ${prompt}`,
       `<!-- AHEAD-FIELD:${number}:BEGIN -->`,
-      "<!-- Required. Replace this comment with your response. Use “Not applicable — reason” only when justified. -->",
+      "",
       "",
       `<!-- AHEAD-FIELD:${number}:END -->`,
       "",
     ];
   });
   return [
-    `# ${title}`,
+    "# " + title,
     "",
     `AHEAD run: ${run.id}`,
     `Phase: ${state.phase.id} (visit ${state.phase.visit})`,
@@ -526,7 +526,7 @@ export function buildArtifactTemplate(
     "",
     "## Required responses",
     "",
-    "Complete every field in your own words. Preserve evidence, uncertainty, and rationale; form completion does not replace accountable judgment.",
+    "Write directly under each question, between the AHEAD-FIELD markers. Every field is required; use “Not applicable — reason” only when you can justify it.",
     "",
     ...fields,
   ].join("\n");

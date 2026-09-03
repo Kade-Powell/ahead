@@ -44,23 +44,74 @@ export class RunStore {
     this.aheadDirectory = join(rootPath, ".ahead");
   }
 
-  newRunId(): string {
-    const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-    return `${date}-${randomUUID().slice(0, 8)}`;
+  private get localDirectory(): string {
+    return join(this.aheadDirectory, "local");
   }
 
-  async loadCurrent(): Promise<Run | undefined> {
+  private get currentPath(): string {
+    return join(this.localDirectory, "current.json");
+  }
+
+  private get legacyCurrentPath(): string {
+    return join(this.aheadDirectory, "current.json");
+  }
+
+  private async ensureLocalDirectory(): Promise<void> {
+    await mkdir(this.localDirectory, { recursive: true });
+    const gitignorePath = join(this.localDirectory, ".gitignore");
     try {
-      const pointer = parseCurrentRunPointer(
-        await readFile(join(this.aheadDirectory, "current.json"), "utf8"),
-      );
-      return this.load(pointer.run_id);
+      await writeFile(gitignorePath, "*\n!.gitignore\n", { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if (!isExists(error)) {
+        throw error;
+      }
+    }
+  }
+
+  private async writeCurrentPointer(pointer: CurrentRunPointer): Promise<void> {
+    await this.ensureLocalDirectory();
+    await atomicJson(this.currentPath, pointer);
+    // Cleanup legacy pointer at the old shared path, if present.
+    try {
+      await unlink(this.legacyCurrentPath);
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+  }
+
+  private async readCurrentPointer(): Promise<string | undefined> {
+    try {
+      return await readFile(this.currentPath, "utf8");
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+    // Legacy fallback: read from the pre-0.7.0 shared path if the local path is absent.
+    try {
+      return await readFile(this.legacyCurrentPath, "utf8");
     } catch (error) {
       if (isMissing(error)) {
         return undefined;
       }
       throw error;
     }
+  }
+
+  newRunId(): string {
+    const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+    return `${date}-${randomUUID().slice(0, 8)}`;
+  }
+
+  async loadCurrent(): Promise<Run | undefined> {
+    const content = await this.readCurrentPointer();
+    if (content === undefined) {
+      return undefined;
+    }
+    const pointer = parseCurrentRunPointer(content);
+    return this.load(pointer.run_id);
   }
 
   async load(runId: string): Promise<Run> {
@@ -139,7 +190,7 @@ export class RunStore {
     await atomicJson(this.runPath(run.id), run);
     if (makeCurrent) {
       const pointer: CurrentRunPointer = { api_version: "ahead.current/v0", run_id: run.id };
-      await atomicJson(join(this.aheadDirectory, "current.json"), pointer);
+      await this.writeCurrentPointer(pointer);
     }
   }
 
@@ -166,7 +217,7 @@ export class RunStore {
   async resume(runId: string): Promise<Run> {
     const run = await this.load(runId);
     const pointer: CurrentRunPointer = { api_version: "ahead.current/v0", run_id: runId };
-    await atomicJson(join(this.aheadDirectory, "current.json"), pointer);
+    await this.writeCurrentPointer(pointer);
     return run;
   }
 
@@ -219,23 +270,29 @@ export class RunStore {
   }
 
   private async clearCurrent(expectedRunId: string): Promise<void> {
-    const path = join(this.aheadDirectory, "current.json");
-    let pointer: CurrentRunPointer;
-    try {
-      pointer = parseCurrentRunPointer(await readFile(path, "utf8"));
-    } catch (error) {
-      if (isMissing(error)) {
-        return;
+    // Clear the current pointer wherever it lives (new local path and legacy shared path).
+    for (const path of [this.currentPath, this.legacyCurrentPath]) {
+      let pointer: CurrentRunPointer;
+      try {
+        pointer = parseCurrentRunPointer(await readFile(path, "utf8"));
+      } catch (error) {
+        if (isMissing(error)) {
+          continue;
+        }
+        throw error;
       }
-      throw error;
+      if (pointer.run_id !== expectedRunId) {
+        throw new Error(
+          `active AHEAD run changed from ${expectedRunId} to ${pointer.run_id}; stop or resume again`,
+        );
+      }
+      await unlink(path);
     }
-    if (pointer.run_id !== expectedRunId) {
-      throw new Error(
-        `active AHEAD run changed from ${expectedRunId} to ${pointer.run_id}; stop or resume again`,
-      );
-    }
-    await unlink(path);
   }
+}
+
+function isExists(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === "EEXIST";
 }
 
 export function humanActor(cwd: string): Actor {

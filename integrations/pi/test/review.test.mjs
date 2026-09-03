@@ -119,6 +119,8 @@ test("review snapshots support unborn repositories and exclude AHEAD records", a
     await writeFile(join(root, unusualPath), "unusual path\n", "utf8");
     await mkdir(join(root, ".ahead"));
     await writeFile(join(root, ".ahead", "current.json"), "{}\n", "utf8");
+    await mkdir(join(root, ".ahead", "local"));
+    await writeFile(join(root, ".ahead", "local", "current.json"), "{}\n", "utf8");
     const captured = await collectReviewSnapshot(root);
     assert.equal(captured.base_ref, "empty-tree");
     assert.equal(captured.head_oid, "UNBORN");
