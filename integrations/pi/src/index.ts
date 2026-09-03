@@ -648,186 +648,200 @@ async function openAheadMode(
     run = await linkWorkItem(ctx, store, run, workItemFromUrl(args));
   }
 
-  await refreshUi(ctx, run);
   if (!ctx.hasUI) {
     ctx.ui.notify(formatState(engine.deriveState(run)), "info");
     return;
   }
 
-  const state = engine.deriveState(run);
-  const workflow = engine.getWorkflow(run.workflow_id);
-  const guidance = phaseGuide(run.workflow_id, state.phase.id);
-  const action = nextAction(state, workflow);
-  const actions: GuidedAction[] = [];
-  const missingRequired = state.artifacts.filter(
-    (artifact) => artifact.required && !artifact.present,
-  );
-  if (action.artifactKind) {
-    const actionArtifact = state.artifacts.find(
-      (artifact) => artifact.kind === action.artifactKind,
-    );
-    actions.push({
-      label: action.label,
-      run:
-        action.actor === "ai"
-          ? state.phase.id === "ai-review"
-            ? async () => openReviewWorkbench(pi, ctx)
-            : async () => requestAiAssistance(pi, state, action.artifactKind)
-          : async () => recordHumanArtifact(ctx, action.artifactKind ?? ""),
-    });
-    if (action.actor === "ai" && actionArtifact?.actor === "any") {
-      actions.push({
-        label: `Write ${actionArtifact.title} yourself`,
-        run: async () => recordHumanArtifact(ctx, actionArtifact.kind),
-      });
+  // Action-menu loop: the run is reloaded and the state re-derived after
+  // every action, then the menu reappears — help screens and completed
+  // actions never strand the user. Escaping the menu, or an action that
+  // clears the run, leaves the wizard.
+  while (true) {
+    const current = await store.loadCurrent();
+    if (!current) {
+      return;
     }
-  }
-
-  if (action.optional) {
-    const nextHumanArtifact = missingRequired.find((artifact) => artifact.actor !== "ai");
-    if (nextHumanArtifact) {
+    run = current;
+    await refreshUi(ctx, run);
+    const state = engine.deriveState(run);
+    const workflow = engine.getWorkflow(run.workflow_id);
+    const guidance = phaseGuide(run.workflow_id, state.phase.id);
+    const action = nextAction(state, workflow);
+    const actions: GuidedAction[] = [];
+    const missingRequired = state.artifacts.filter(
+      (artifact) => artifact.required && !artifact.present,
+    );
+    if (action.artifactKind) {
+      const actionArtifact = state.artifacts.find(
+        (artifact) => artifact.kind === action.artifactKind,
+      );
       actions.push({
-        label: `Continue without optional AI challenge · Write ${nextHumanArtifact.title}`,
-        run: async () => recordHumanArtifact(ctx, nextHumanArtifact.kind),
+        label: action.label,
+        run:
+          action.actor === "ai"
+            ? state.phase.id === "ai-review"
+              ? async () => openReviewWorkbench(pi, ctx)
+              : async () => requestAiAssistance(pi, state, action.artifactKind)
+            : async () => recordHumanArtifact(ctx, action.artifactKind ?? ""),
       });
-    } else if (missingRequired.length === 0) {
+      if (action.actor === "ai" && actionArtifact?.actor === "any") {
+        actions.push({
+          label: `Write ${actionArtifact.title} yourself`,
+          run: async () => recordHumanArtifact(ctx, actionArtifact.kind),
+        });
+      }
+    }
+
+    if (action.optional) {
+      const nextHumanArtifact = missingRequired.find((artifact) => artifact.actor !== "ai");
+      if (nextHumanArtifact) {
+        actions.push({
+          label: `Continue without optional AI challenge · Write ${nextHumanArtifact.title}`,
+          run: async () => recordHumanArtifact(ctx, nextHumanArtifact.kind),
+        });
+      } else if (missingRequired.length === 0) {
+        actions.push({
+          label: `Continue without optional AI contribution · Accept ${state.gate.title}`,
+          run: async () => acceptAndContinue(ctx),
+        });
+      }
+    }
+
+    if (state.work_item_required_for_next_phase && state.gate.accepted) {
       actions.push({
-        label: `Continue without optional AI contribution · Accept ${state.gate.title}`,
+        label: action.label,
+        run: async () => manageWorkItem(ctx, ""),
+      });
+    } else if (missingRequired.length === 0 && !action.artifactKind) {
+      actions.push({
+        label: state.gate.accepted ? action.label : `Accept and continue · ${state.gate.title}`,
         run: async () => acceptAndContinue(ctx),
       });
     }
-  }
 
-  if (state.work_item_required_for_next_phase && state.gate.accepted) {
-    actions.push({
-      label: action.label,
-      run: async () => manageWorkItem(ctx, ""),
-    });
-  } else if (missingRequired.length === 0 && !action.artifactKind) {
-    actions.push({
-      label: state.gate.accepted ? action.label : `Accept and continue · ${state.gate.title}`,
-      run: async () => acceptAndContinue(ctx),
-    });
-  }
-
-  if (
-    state.allowed_ai_capabilities.length > 0 &&
-    action.actor !== "ai" &&
-    !missingRequired.some((artifact) => artifact.actor === "ai") &&
-    state.phase.id !== "implement"
-  ) {
-    actions.push({
-      label: `Ask AI to assist · ${state.phase.title}`,
-      run: async () => requestAiAssistance(pi, state),
-    });
-  }
-
-  if (state.phase.id === "implement") {
-    if (!state.artifacts.some((artifact) => artifact.kind === "changeset" && artifact.present)) {
+    if (
+      state.allowed_ai_capabilities.length > 0 &&
+      action.actor !== "ai" &&
+      !missingRequired.some((artifact) => artifact.actor === "ai") &&
+      state.phase.id !== "implement"
+    ) {
       actions.push({
-        label: "Save this ready-to-implement run for a later sprint",
-        run: async () => saveImplementationHandoff(ctx),
+        label: `Ask AI to assist · ${state.phase.title}`,
+        run: async () => requestAiAssistance(pi, state),
       });
     }
-    actions.push({
-      label: "Ask AI for help understanding or solving a problem",
-      run: async () => askImplementationQuestion(pi, ctx, state),
-    });
-  }
 
-  if (state.phase.id === "ai-review" || state.phase.id === "human-review") {
-    actions.push({
-      label: "Open the changeset review workbench",
-      run: async () => openReviewWorkbench(pi, ctx),
-    });
-  }
+    if (state.phase.id === "implement") {
+      if (!state.artifacts.some((artifact) => artifact.kind === "changeset" && artifact.present)) {
+        actions.push({
+          label: "Save this ready-to-implement run for a later sprint",
+          run: async () => saveImplementationHandoff(ctx),
+        });
+      }
+      actions.push({
+        label: "Ask AI for help understanding or solving a problem",
+        run: async () => askImplementationQuestion(pi, ctx, state),
+      });
+    }
 
-  if (
-    state.allowed_ai_capabilities.length > 0 &&
-    state.artifacts.some(
-      (artifact) => artifact.present && artifact.recorded_by?.kind === "human" && artifact.path,
-    )
-  ) {
-    actions.push({
-      label: "Ask AI to challenge the latest artifact",
-      run: async () => {
-        const artifact = [...state.artifacts]
-          .toReversed()
-          .find(
-            (candidate) =>
-              candidate.present && candidate.recorded_by?.kind === "human" && candidate.path,
+    if (state.phase.id === "ai-review" || state.phase.id === "human-review") {
+      actions.push({
+        label: "Open the changeset review workbench",
+        run: async () => openReviewWorkbench(pi, ctx),
+      });
+    }
+
+    if (
+      state.allowed_ai_capabilities.length > 0 &&
+      state.artifacts.some(
+        (artifact) => artifact.present && artifact.recorded_by?.kind === "human" && artifact.path,
+      )
+    ) {
+      actions.push({
+        label: "Ask AI to challenge the latest artifact",
+        run: async () => {
+          const artifact = [...state.artifacts]
+            .toReversed()
+            .find(
+              (candidate) =>
+                candidate.present && candidate.recorded_by?.kind === "human" && candidate.path,
+            );
+          if (!artifact?.path) {
+            return;
+          }
+          pi.sendUserMessage(
+            [
+              `AHEAD mode: challenge my ${artifact.title} artifact before I accept the gate.`,
+              `Read ${artifact.path} and name the 2-3 weakest points: missing risks, vague claims, or things that would not survive implementation.`,
+              "Be specific and brief. Do not rewrite the artifact; I stay the author.",
+            ].join("\n"),
           );
-        if (!artifact?.path) {
-          return;
+        },
+      });
+    }
+
+    if (state.return_targets.length > 0) {
+      actions.push({
+        label: "Return to an earlier phase",
+        run: async () => returnToEarlierPhase(ctx, ""),
+      });
+    }
+
+    if (!state.work_item_required_for_next_phase || !state.gate.accepted) {
+      actions.push({
+        label: state.work_item
+          ? "View or replace the linked work item"
+          : "Link or create a work item",
+        run: async () => manageWorkItem(ctx, ""),
+      });
+    }
+
+    actions.push({
+      label: "Help · policy, guidance, skills, phase explanation",
+      run: async () => {
+        // "← Back" and escaping both return to the action-menu loop above.
+        const helpChoice = await ctx.ui.select("Help · pick one", [
+          "← Back to action menu",
+          "Configure project AHEAD policy for future runs",
+          "Read AHEAD framework guidance for this phase",
+          "Inspect optional skills reviewed for this phase",
+          "Explain this phase and its expectations",
+        ]);
+        if (helpChoice === "Configure project AHEAD policy for future runs") {
+          await manageProjectConfig(ctx);
+        } else if (helpChoice === "Read AHEAD framework guidance for this phase") {
+          await showAheadGuide(ctx, "");
+        } else if (helpChoice === "Inspect optional skills reviewed for this phase") {
+          await showRecommendedSkills(ctx);
+        } else if (helpChoice === "Explain this phase and its expectations") {
+          ctx.ui.notify(
+            [
+              state.phase.title,
+              `Goal: ${guidance.objective}`,
+              `You: ${guidance.human}`,
+              `AI: ${guidance.ai}`,
+              `Gate: ${state.gate.title}`,
+            ].join("\n"),
+            "info",
+          );
         }
-        pi.sendUserMessage(
-          [
-            `AHEAD mode: challenge my ${artifact.title} artifact before I accept the gate.`,
-            `Read ${artifact.path} and name the 2-3 weakest points: missing risks, vague claims, or things that would not survive implementation.`,
-            "Be specific and brief. Do not rewrite the artifact; I stay the author.",
-          ].join("\n"),
-        );
       },
     });
-  }
 
-  if (state.return_targets.length > 0) {
     actions.push({
-      label: "Return to an earlier phase",
-      run: async () => returnToEarlierPhase(ctx, ""),
+      label: "Stop AHEAD mode",
+      run: async () => stopAheadMode(ctx),
     });
-  }
 
-  if (!state.work_item_required_for_next_phase || !state.gate.accepted) {
-    actions.push({
-      label: state.work_item
-        ? "View or replace the linked work item"
-        : "Link or create a work item",
-      run: async () => manageWorkItem(ctx, ""),
-    });
-  }
-
-  actions.push({
-    label: "Help · policy, guidance, skills, phase explanation",
-    run: async () => {
-      const helpChoice = await ctx.ui.select("Help · pick one", [
-        "Configure project AHEAD policy for future runs",
-        "Read AHEAD framework guidance for this phase",
-        "Inspect optional skills reviewed for this phase",
-        "Explain this phase and its expectations",
-      ]);
-      if (helpChoice === "Configure project AHEAD policy for future runs") {
-        await manageProjectConfig(ctx);
-      } else if (helpChoice === "Read AHEAD framework guidance for this phase") {
-        await showAheadGuide(ctx, "");
-      } else if (helpChoice === "Inspect optional skills reviewed for this phase") {
-        await showRecommendedSkills(ctx);
-      } else if (helpChoice === "Explain this phase and its expectations") {
-        ctx.ui.notify(
-          [
-            state.phase.title,
-            `Goal: ${guidance.objective}`,
-            `You: ${guidance.human}`,
-            `AI: ${guidance.ai}`,
-            `Gate: ${state.gate.title}`,
-          ].join("\n"),
-          "info",
-        );
-      }
-    },
-  });
-
-  actions.push({
-    label: "Stop AHEAD mode",
-    run: async () => stopAheadMode(ctx),
-  });
-
-  const selected = await ctx.ui.select(
-    `AHEAD mode · ${state.phase.title}\nNext (${action.actor === "human" ? "you" : "AI"}): ${action.label}`,
-    actions.map((candidate) => candidate.label),
-  );
-  const chosen = actions.find((candidate) => candidate.label === selected);
-  if (chosen) {
+    const selected = await ctx.ui.select(
+      `AHEAD mode · ${state.phase.title}\nNext (${action.actor === "human" ? "you" : "AI"}): ${action.label}`,
+      actions.map((candidate) => candidate.label),
+    );
+    const chosen = actions.find((candidate) => candidate.label === selected);
+    if (!chosen) {
+      return;
+    }
     await chosen.run();
   }
 }
@@ -1555,7 +1569,7 @@ function titleExample(workflowId: string): string {
     case "product-change":
       return "“Add audit log viewer page”";
     case "internal-improvement":
-      return "“Reduce cola-api cold-start time”";
+      return "“Reduce cold-start time”";
     case "corrective-debugging":
       return "“Fix race in worker claim loop”";
     case "operational-stabilization":
