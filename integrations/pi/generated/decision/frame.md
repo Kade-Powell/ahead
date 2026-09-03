@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=decision@0.1.0 phase=frame sha256=d9176492d364a56dbdbcbc3f75490711a16582899a0fe11cae2fd1efce1a4e7b -->
+<!-- workflow=decision@0.2.0 phase=frame sha256=ff4170dae9f5a75f2ae599f8558e7df210312ef79e53123289e686291907a002 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `decision@0.1.0`
+- Workflow: `decision@0.2.0`
 - Current phase: `frame`
 - Human gate: `decision-framed` — Human confirms the decision is correctly framed
 - Normal next phase: `criteria`

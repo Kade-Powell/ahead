@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=ai-audit sha256=f96c02eed7d85afff47183285dda58fbfbdefea52313dc7da61d12cff62dd88a -->
+<!-- workflow=product-change@0.3.0 phase=ai-audit sha256=330c2b1c17dd332c73710cfd97a7b0769f62ca557017e448de0b3c32c2f675db -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ Compare the result with the problem, research, decision, plan, implementation, r
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `ai-audit`
 - Human gate: `audit-disposed` — Human reviews and disposes material audit findings; acceptance identity must match `audit-disposition`
 - Normal next phase: `outcome`
@@ -37,5 +37,5 @@ Compare the result with the problem, research, decision, plan, implementation, r
 
 ### Phase artifacts
 
-- `ai-audit`: AI audit findings (required; actor: ai)
+- `ai-audit`: AI audit findings evaluated against the full open run (required; actor: ai)
 - `audit-disposition`: Human disposition of material AI audit findings (required; actor: human)

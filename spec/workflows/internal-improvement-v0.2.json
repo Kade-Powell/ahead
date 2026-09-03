@@ -1,0 +1,189 @@
+{
+  "id": "internal-improvement",
+  "version": "0.2.0",
+  "title": "Internal Improvement",
+  "initial_phase": "invariants",
+  "phases": [
+    {
+      "id": "invariants",
+      "title": "Define Invariants",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "invariants", "title": "Behavior, compatibility, safety, operability, and other properties that must not regress", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "invariants-accepted", "title": "Human confirms the protected behavior is explicit and testable" },
+      "next": "baseline",
+      "returns_to": [],
+      "ai_unlock_artifacts": ["invariants"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "baseline",
+      "title": "Establish the Baseline",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "baseline", "title": "Current measurements, method, sample, uncertainty, and reproducibility", "actor": "human", "required": true },
+        { "kind": "ai-measurement-review", "title": "AI challenge of the measurement method and confounders", "actor": "ai", "required": false }
+      ],
+      "gate": { "id": "baseline-accepted", "title": "Human accepts the baseline as adequate for comparison" },
+      "next": "target",
+      "returns_to": ["invariants"],
+      "ai_unlock_artifacts": ["baseline"],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute", "record"]
+    },
+    {
+      "id": "target",
+      "title": "Set the Improvement Target",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "target", "title": "Desired measurable improvement, threshold, guardrails, scope, and stop conditions", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "target-approved", "title": "Human approves the improvement target and guardrails" },
+      "next": "options",
+      "returns_to": ["invariants", "baseline"],
+      "ai_unlock_artifacts": ["target"],
+      "ai_capabilities": ["inspect", "search", "analyze"]
+    },
+    {
+      "id": "options",
+      "title": "Develop Improvement Options",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-option", "title": "Human first-pass improvement option and reasoning", "actor": "human", "required": true },
+        { "kind": "ai-challenge", "title": "AI challenges, alternatives, and measurement risks", "actor": "ai", "required": false },
+        { "kind": "options", "title": "Human-evaluated options and tradeoffs", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "options-understood", "title": "Human confirms viable options and tradeoffs are understood" },
+      "next": "decision",
+      "returns_to": ["baseline", "target"],
+      "ai_unlock_artifacts": ["human-option"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "decision",
+      "title": "Choose the Improvement",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "decision", "title": "Human-selected option, rationale, tradeoffs, risks, confidence, and reversibility", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "decision-approved", "title": "Accountable human approves the improvement approach" },
+      "next": "plan",
+      "returns_to": ["baseline", "target", "options"],
+      "ai_unlock_artifacts": ["decision"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "plan",
+      "title": "Plan",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "first-pass-plan", "title": "Human first-pass implementation and measurement plan", "actor": "human", "required": true },
+        { "kind": "ai-plan-review", "title": "AI plan challenge", "actor": "ai", "required": false },
+        { "kind": "plan", "title": "Human-approved sequenced plan, invariant checks, measurement, rollout, recovery, and deviations policy", "actor": "human", "required": true },
+        { "kind": "reference-updates", "title": "Planned creates or updates of decision records, design docs, and runbooks, or explicit none", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "plan-approved", "title": "Human approves the final plan and its planned durable reference updates" },
+      "next": "implement",
+      "returns_to": ["target", "options", "decision"],
+      "ai_unlock_artifacts": ["first-pass-plan", "reference-updates"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "implement",
+      "title": "Implement",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "changeset", "title": "Linked changeset", "actor": "human", "required": true },
+        { "kind": "tests", "title": "Invariant, test, and check evidence", "actor": "human", "required": true },
+        { "kind": "plan-deviations", "title": "Plan deviations and rationale, including none", "actor": "human", "required": true },
+        { "kind": "reference-updates", "title": "Actual creates or updates of decision records, design docs, and runbooks during implementation, or explicit none; AI may propose entries, human accepts each", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "implementation-ready", "title": "Human confirms work, tests, and durable reference updates are ready for review" },
+      "next": "ai-review",
+      "returns_to": ["plan"],
+      "ai_unlock_artifacts": ["reference-updates"],
+      "ai_capabilities": ["inspect", "search", "analyze", "modify", "execute"]
+    },
+    {
+      "id": "ai-review",
+      "title": "AI Review",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "review-inputs", "title": "Enumeration of run inputs read for review: decision, plan, plan-deviations, reference-updates, changeset, tests, and evidence", "actor": "ai", "required": true },
+        { "kind": "ai-review", "title": "AI review findings bound to the current changeset and evaluated against the full open run", "actor": "ai", "required": true },
+        { "kind": "review-disposition", "title": "Implementing-human disposition of every material AI finding", "actor": "human", "required": true, "same_as": "changeset" }
+      ],
+      "gate": { "id": "ai-review-disposed", "title": "Implementing human disposes blocking AI findings", "accepted_by_artifact": "review-disposition" },
+      "next": "human-review",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute", "record"]
+    },
+    {
+      "id": "human-review",
+      "title": "Independent Human Review",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-review", "title": "Independent human review made against the full open run", "actor": "human", "required": true, "independent_of": "changeset" }
+      ],
+      "gate": { "id": "human-review-accepted", "title": "Independent human reviewer accepts the current change", "accepted_by_artifact": "human-review" },
+      "next": "deploy",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "deploy",
+      "title": "Deploy or Release",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "deployment", "title": "Version, environment, actor, time, authorization, and result", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "deployment-confirmed", "title": "Human confirms the intended version reached the target or deployment is not applicable" },
+      "next": "verify",
+      "returns_to": ["implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "verify",
+      "title": "Verify Invariants and Improvement",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "verification", "title": "Invariant results, repeated measurement, before-and-after comparison, regressions, and observed outcome", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "improvement-demonstrated", "title": "Human confirms invariants hold and the improvement is demonstrated or failure is recorded" },
+      "next": "ai-audit",
+      "returns_to": ["baseline", "target", "decision", "plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "execute"]
+    },
+    {
+      "id": "ai-audit",
+      "title": "AI Audit",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "ai-audit", "title": "AI audit findings evaluated against the full open run", "actor": "ai", "required": true },
+        { "kind": "audit-disposition", "title": "Human disposition of material AI audit findings", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "audit-disposed", "title": "Human reviews and disposes material audit findings", "accepted_by_artifact": "audit-disposition" },
+      "next": "outcome",
+      "returns_to": ["baseline", "plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze", "record"]
+    },
+    {
+      "id": "outcome",
+      "title": "Human Outcome",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "outcome", "title": "Adoption, rollback, failed target, accepted tradeoff, follow-up, uncertainty, and learning", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "outcome-accepted", "title": "Human accepts closure and explicitly closes the run" },
+      "next": null,
+      "returns_to": ["baseline", "target", "plan", "implement"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "analyze"]
+    }
+  ]
+}

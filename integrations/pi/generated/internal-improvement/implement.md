@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=implement sha256=87fa58b7265be5b17c2af80d61f27048f02f3a837dbd6af599c060e4f1e4ac1c -->
+<!-- workflow=internal-improvement@0.2.0 phase=implement sha256=3b252bce2aa7136fc993c75e6342db67d4d26a94f4b63f2ec07445c02912fd34 -->
 
 # AHEAD agent profile
 
@@ -29,12 +29,12 @@ Ask for the human's current model, attempted approach, or intended behavior befo
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `implement`
-- Human gate: `implementation-ready` — Human confirms work is ready for review and checks pass
+- Human gate: `implementation-ready` — Human confirms work, tests, and durable reference updates are ready for review
 - Normal next phase: `ai-review`
 - Human-authorized return targets: plan
-- AI unlock artifacts: none
+- AI unlock artifacts: `reference-updates`
 - AI capabilities after unlock: `inspect`, `search`, `analyze`, `modify`, `execute`
 
 ### Phase artifacts
@@ -42,3 +42,4 @@ Ask for the human's current model, attempted approach, or intended behavior befo
 - `changeset`: Linked changeset (required; actor: human)
 - `tests`: Invariant, test, and check evidence (required; actor: human)
 - `plan-deviations`: Plan deviations and rationale, including none (required; actor: human)
+- `reference-updates`: Actual creates or updates of decision records, design docs, and runbooks during implementation, or explicit none; AI may propose entries, human accepts each (required; actor: human)

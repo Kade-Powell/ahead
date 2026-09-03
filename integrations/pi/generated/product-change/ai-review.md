@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=ai-review sha256=ff114ee0a859569db494eecf5bc969ea95d92e3b808d8823d047ad1bcd91ad05 -->
+<!-- workflow=product-change@0.3.0 phase=ai-review sha256=869a69183087b1ee4c2ea7382a54209bd1c56d6faf460312e919a0073f64cae4 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `ai-review`
 - Human gate: `ai-review-disposed` — Implementing human disposes blocking AI findings; acceptance identity must match `review-disposition`
 - Normal next phase: `human-review`
@@ -44,5 +44,6 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ### Phase artifacts
 
-- `ai-review`: AI review findings bound to the current changeset (required; actor: ai)
+- `review-inputs`: Enumeration of run inputs read for review: decision, plan, plan-deviations, reference-updates, changeset, tests, and evidence (required; actor: ai)
+- `ai-review`: AI review findings bound to the current changeset and evaluated against the full open run (required; actor: ai)
 - `review-disposition`: Implementing-human disposition of every material AI finding (required; actor: human; actor identity must match latest changeset)

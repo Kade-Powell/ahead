@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=verify sha256=f1eec011ca5dea07be27bbca6124198b9e64815695be9684290c646ab784ad01 -->
+<!-- workflow=internal-improvement@0.2.0 phase=verify sha256=0aef7f8fc713b16c71b489cb637576f407c917ff5b712a22abab890b61920be9 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Research should change a decision, hypothesis, plan, or confidence level. Put pr
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `verify`
 - Human gate: `improvement-demonstrated` — Human confirms invariants hold and the improvement is demonstrated or failure is recorded
 - Normal next phase: `ai-audit`

@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=define sha256=fdb0a9f7dc06fbf3c8e7ce49be120ee676ebf64ad2f7683431f41affc92c9871 -->
+<!-- workflow=product-change@0.3.0 phase=define sha256=c4b57dc030a4064864b3497e6d8363686ccbb9147fdd76a46c8b974fd7db07fd -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ The human defines the desired outcome, users, constraints, scope, success signal
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `define`
 - Human gate: `framing-accepted` — Human accepts the framing
 - Normal next phase: `research`

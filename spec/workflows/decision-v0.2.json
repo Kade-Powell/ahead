@@ -1,0 +1,101 @@
+{
+  "id": "decision",
+  "version": "0.2.0",
+  "title": "Decision",
+  "initial_phase": "frame",
+  "phases": [
+    {
+      "id": "frame",
+      "title": "Frame the Decision",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "decision-frame", "title": "Decision to make, owner, stakeholders, scope, deadline, and reversibility", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "decision-framed", "title": "Human confirms the decision is correctly framed" },
+      "next": "criteria",
+      "returns_to": [],
+      "ai_unlock_artifacts": ["decision-frame"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "criteria",
+      "title": "Set Criteria and Constraints",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "criteria", "title": "Human priorities, constraints, evidence standard, and acceptable uncertainty", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "criteria-accepted", "title": "Human accepts the criteria before comparing options" },
+      "next": "research",
+      "returns_to": ["frame"],
+      "ai_unlock_artifacts": ["criteria"],
+      "ai_capabilities": ["inspect", "search", "analyze"]
+    },
+    {
+      "id": "research",
+      "title": "Research",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "research", "title": "Relevant evidence, sources, contradictions, assumptions, and gaps", "actor": "any", "required": true }
+      ],
+      "gate": { "id": "research-reviewed", "title": "Human confirms the decision has adequate evidence or accepts the gaps" },
+      "next": "options",
+      "returns_to": ["frame", "criteria"],
+      "ai_unlock_artifacts": [],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "options",
+      "title": "Develop Options",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "human-option", "title": "Human first-pass options and reasoning", "actor": "human", "required": true },
+        { "kind": "ai-challenge", "title": "AI challenges, missing alternatives, and assumptions", "actor": "ai", "required": false },
+        { "kind": "options", "title": "Human-evaluated viable options", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "options-understood", "title": "Human confirms viable options are understood" },
+      "next": "compare",
+      "returns_to": ["criteria", "research"],
+      "ai_unlock_artifacts": ["human-option"],
+      "ai_capabilities": ["inspect", "search", "analyze", "record"]
+    },
+    {
+      "id": "compare",
+      "title": "Compare Tradeoffs",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "comparison", "title": "Human comparison against criteria, tradeoffs, risks, confidence, and disagreement", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "comparison-accepted", "title": "Human confirms the comparison represents the material tradeoffs" },
+      "next": "decide",
+      "returns_to": ["criteria", "research", "options"],
+      "ai_unlock_artifacts": ["comparison"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "decide",
+      "title": "Decide",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "decision", "title": "Human decision, rationale, tradeoffs, dissent, unknowns, confidence, and reversibility", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "decision-approved", "title": "Accountable human approves the decision" },
+      "next": "publish",
+      "returns_to": ["research", "options", "compare"],
+      "ai_unlock_artifacts": ["decision"],
+      "ai_capabilities": ["inspect", "analyze"]
+    },
+    {
+      "id": "publish",
+      "title": "Publish and Revisit",
+      "owner": "human",
+      "artifacts": [
+        { "kind": "decision-record", "title": "Durable decision record with context, drivers, options, outcome, consequences, review trigger, and revisit date; MADR-shaped and stored in the project's decision-record directory", "actor": "human", "required": true }
+      ],
+      "gate": { "id": "decision-published", "title": "Human confirms the decision record is written, communicated, and cross-linked" },
+      "next": null,
+      "returns_to": ["frame", "research", "options", "compare", "decide"],
+      "ai_unlock_artifacts": ["decision-record"],
+      "ai_capabilities": ["inspect", "analyze"]
+    }
+  ]
+}

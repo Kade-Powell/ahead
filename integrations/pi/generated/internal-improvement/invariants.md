@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=invariants sha256=52335b37be328b0278b504624641e8cf2b645ee348e932a3b4c384c7accd4781 -->
+<!-- workflow=internal-improvement@0.2.0 phase=invariants sha256=dc706d370298a42b4c81b8bb6ea778805b017a626648a419b2ed42097bc98453 -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ The human identifies behavior, compatibility, safety, operability, and other pro
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `invariants`
 - Human gate: `invariants-accepted` — Human confirms the protected behavior is explicit and testable
 - Normal next phase: `baseline`

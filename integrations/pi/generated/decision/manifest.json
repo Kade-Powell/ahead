@@ -1,6 +1,6 @@
 {
   "workflow": "decision",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "generated": [
     "frame.md",
     "criteria.md",
@@ -11,7 +11,7 @@
     "publish.md"
   ],
   "sources": [
-    "spec/workflows/decision-v0.1.json",
+    "spec/workflows/decision-v0.2.json",
     "policy/common.md",
     "policy/decision/<phase>.md or policy/shared/<phase>.md",
     "policy/methods/index.json",

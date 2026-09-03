@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=decision@0.1.0 phase=decide sha256=92131b089672f71004be7c8e900620cb826bd8cca357aa1ab588d0a73178b92e -->
+<!-- workflow=decision@0.2.0 phase=decide sha256=be63e473a27c0e27e6181e58b313ee58f358e1f74dcc68a4b9a9c5c7dbfbe164 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `decision@0.1.0`
+- Workflow: `decision@0.2.0`
 - Current phase: `decide`
 - Human gate: `decision-approved` — Accountable human approves the decision
 - Normal next phase: `publish`

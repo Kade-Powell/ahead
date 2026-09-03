@@ -10,6 +10,7 @@
     "docs/evidence/sources/tigerstyle.md",
     "docs/guide/README.md",
     "docs/guide/acceptable-ai-use.md",
+    "docs/guide/durable-reference.md",
     "docs/guide/engineering-practice.md",
     "docs/guide/rationale.md",
     "docs/guide/recommended-skills.md",
@@ -152,6 +153,19 @@
       "phases": [
         "*"
       ],
+      "workflows": [
+        "*"
+      ]
+    },
+    {
+      "id": "durable-reference",
+      "path": "docs/guide/durable-reference.md",
+      "title": "Durable References",
+      "summary": "AHEAD's workflows produce two kinds of records. **Run artifacts** are scoped to a single run and describe what happened: framing, research, decisions, plans, changesets, review findings, outcomes. **Durable references** outlive a run and de",
+      "audience": "practitioner",
+      "authority": "guidance",
+      "distribution": "agent-and-human",
+      "phases": [],
       "workflows": [
         "*"
       ]

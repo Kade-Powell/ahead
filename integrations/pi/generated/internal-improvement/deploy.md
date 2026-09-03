@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=deploy sha256=c8c59de77167b2f7f4617511d65b666ee57765176929d4efdaa4bb5766e14405 -->
+<!-- workflow=internal-improvement@0.2.0 phase=deploy sha256=160f8867e877564e5119f8249d92518e80d162137041a87c716022f4e2269c38 -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ Keep authorization, attempted action, and observed result distinct. A human reco
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `deploy`
 - Human gate: `deployment-confirmed` — Human confirms the intended version reached the target or deployment is not applicable
 - Normal next phase: `verify`

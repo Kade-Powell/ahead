@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=research sha256=871000313681366e424b39a987b9973edc7c03e82d68668d3fb49e5e3f56bdc5 -->
+<!-- workflow=product-change@0.3.0 phase=research sha256=38da5e605e95015ac13bbe84b65ab5d38cf98937dee1cb07ad52f9f1edc0ceb0 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Research should change a decision, hypothesis, plan, or confidence level. Put pr
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `research`
 - Human gate: `research-reviewed` — Human confirms material evidence is available
 - Normal next phase: `questions`

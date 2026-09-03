@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=decision sha256=ea1f08dcc57e7bccdcf697783f31160cdafba70b66c4ec673bc98356f4b1c9c3 -->
+<!-- workflow=internal-improvement@0.2.0 phase=decision sha256=5a581f655863151aa6150d44a099669e7ac4e9cb24909d00b5501fd9182c211c -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `decision`
 - Human gate: `decision-approved` — Accountable human approves the improvement approach
 - Normal next phase: `plan`

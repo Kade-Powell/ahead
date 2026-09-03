@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=outcome sha256=bfbbe413253e561851999982330c73f477e05fccdf54e99251c33a763492b335 -->
+<!-- workflow=internal-improvement@0.2.0 phase=outcome sha256=5dd75c61b5152bafdc6464adb9402cf0f9558083c26101dd3b71054e5cfb6aeb -->
 
 # AHEAD agent profile
 
@@ -27,9 +27,9 @@ The human decides to adopt, roll back, accept a missed target or tradeoff, follo
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `outcome`
-- Human gate: `outcome-accepted` — Human accepts closure
+- Human gate: `outcome-accepted` — Human accepts closure and explicitly closes the run
 - Normal next phase: `close run`
 - Human-authorized return targets: baseline, target, plan, implement
 - AI unlock artifacts: none

@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=baseline sha256=c6681cb018e61c13084e0b35fc969aebfc6ebbd1d2c3313f14fa584c5c7d136e -->
+<!-- workflow=internal-improvement@0.2.0 phase=baseline sha256=9fd7a1977ad0f35bed9a9e0c657c0599707e20e05bed8f8424108274bdc3faa2 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Research should change a decision, hypothesis, plan, or confidence level. Put pr
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `baseline`
 - Human gate: `baseline-accepted` — Human accepts the baseline as adequate for comparison
 - Normal next phase: `target`

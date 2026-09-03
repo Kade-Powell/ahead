@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=human-review sha256=ed70af1697f2a87fb3e7757b65f0dd3fa94bc6113da5c9e95862edfad37f20c2 -->
+<!-- workflow=product-change@0.3.0 phase=human-review sha256=f666027a5648ffa0c84c50dc245f7eb45fb60c4dddb33acd2c9000bc84e3e577 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `human-review`
 - Human gate: `human-review-accepted` — Independent human reviewer accepts the current change; acceptance identity must match `human-review`
 - Normal next phase: `deploy`
@@ -44,4 +44,4 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ### Phase artifacts
 
-- `human-review`: Independent human review (required; actor: human; actor identity must differ from latest changeset)
+- `human-review`: Independent human review made against the full open run (required; actor: human; actor identity must differ from latest changeset)

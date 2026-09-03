@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=verify sha256=69ad233303afbfe6de12aa14e50243c41955de7a5a56ebdecf4939adff9c20ec -->
+<!-- workflow=product-change@0.3.0 phase=verify sha256=c1e3ade3f9d79fa2c51001799f3d83798252e0e063bbb8a1b22bc9d146f68076 -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ Help suggest checks and analyze authorized observations against the recorded pro
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `verify`
 - Human gate: `outcome-demonstrated` — Human confirms the intended outcome is demonstrated or failure is recorded
 - Normal next phase: `ai-audit`

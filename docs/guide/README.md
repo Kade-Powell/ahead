@@ -12,11 +12,16 @@ This is the starting point for people applying AHEAD to engineering work. These 
 4. [Engineering practice](engineering-practice.md) describes the habits AHEAD asks engineers to cultivate.
 5. [Pilot workflows](workflows/README.md) explains how to choose and execute one of the six flows.
 6. [Work items and planning handoffs](work-items.md) explains provider-neutral links, configurable gates, and sprint-ahead preparation.
-7. [Recommended skills](recommended-skills.md) lists optional, reviewed third-party aids.
+7. [Durable references](durable-reference.md) defines the three durable artifact classes AHEAD standardizes — decision records, design docs, and runbooks — and adopts Diátaxis for the rest.
+8. [Recommended skills](recommended-skills.md) lists optional, reviewed third-party aids.
 
 ## Authority
 
-The Constitution, Acceptable AI Use policy, and active workflow contract are binding during an AHEAD pilot. The rationale explains why those rules exist. Engineering Practice is proposed guidance, and recommended skills are optional. Organization and repository rules may narrow AI authority but cannot broaden it beyond AHEAD policy.
+The Constitution, Acceptable AI Use policy, and active workflow contract are binding during an AHEAD pilot. The rationale explains why those rules exist. Engineering Practice, durable references, and work-item guidance are proposed guidance, and recommended skills are optional. Organization and repository rules may narrow AI authority but cannot broaden it beyond AHEAD policy.
+
+## Scope
+
+AHEAD prescribes run artifacts, workflow gates, decision records, design docs, and runbooks. It explicitly leaves tutorials, most how-to guides, user-facing product documentation, contributor references, and project-specific coding-agent instructions to each project. [Durable references](durable-reference.md) names what AHEAD covers and points at [Diátaxis](https://diataxis.fr/) for the rest.
 
 ## When you need the basis for a rule
 

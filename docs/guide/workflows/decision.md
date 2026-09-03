@@ -106,7 +106,7 @@ Reframe or seek evidence ─────────↺ FRAME / RESEARCH
 | Options | At least one human-originated option | Expand, combine, challenge, and propose alternatives | Options with provenance | Plausible option space is understood |
 | Compare | Interpretation of tradeoffs | Structure comparison and sensitivity analysis | Benefits, costs, risks, consequences, reversibility | Decision is ready for accountable judgment |
 | Decide | Selection, rationale, accepted tradeoffs, and dissent | Test rationale for inconsistency or missing consequence | Decision and rejected alternatives | Accountable human approves a specific revision |
-| Publish and revisit | Consequence check, communication, review trigger, revisit date, and linked work | Improve clarity, traceability, and proposed validation checks | Consequences, reversibility, review trigger, revisit date, and links | Decision is published and accepted as current |
+| Publish and revisit | Consequence check, communication, review trigger, revisit date, linked work, and a durable decision record written in the project's ADR convention | Improve clarity, traceability, and proposed validation checks | MADR-shaped decision record with status, consequences, reversibility, review trigger, revisit date, and links | Decision record is written, communicated, and accepted as current |
 
 ## Decision evidence chain
 

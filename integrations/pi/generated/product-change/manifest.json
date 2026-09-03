@@ -1,6 +1,6 @@
 {
   "workflow": "product-change",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "generated": [
     "define.md",
     "research.md",
@@ -17,7 +17,7 @@
     "outcome.md"
   ],
   "sources": [
-    "spec/workflows/product-change-v0.2.json",
+    "spec/workflows/product-change-v0.3.json",
     "policy/common.md",
     "policy/product-change/<phase>.md or policy/shared/<phase>.md",
     "policy/methods/index.json",

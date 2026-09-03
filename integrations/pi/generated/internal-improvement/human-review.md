@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=human-review sha256=cd14cf4c8537924a57e796434a368757aab34202793cf2939d404bcbc0456ef2 -->
+<!-- workflow=internal-improvement@0.2.0 phase=human-review sha256=f8ba53819295e6717e5d972a7e54a1941632ccd0158e65faa7eaf42d6c58cb23 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `human-review`
 - Human gate: `human-review-accepted` — Independent human reviewer accepts the current change; acceptance identity must match `human-review`
 - Normal next phase: `deploy`
@@ -44,4 +44,4 @@ AI findings are hypotheses, not verdicts. The implementing human must dispositio
 
 ### Phase artifacts
 
-- `human-review`: Independent human review (required; actor: human; actor identity must differ from latest changeset)
+- `human-review`: Independent human review made against the full open run (required; actor: human; actor identity must differ from latest changeset)

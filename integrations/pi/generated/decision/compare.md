@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=decision@0.1.0 phase=compare sha256=45dd4e63965da74605742ee0fa17d758717fd30f00bf865b93de1e6caaf8cdaa -->
+<!-- workflow=decision@0.2.0 phase=compare sha256=f4f58b0edb987e6e53df60cca0bf8b31119edad600b7250c5a44e70ad882381e -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `decision@0.1.0`
+- Workflow: `decision@0.2.0`
 - Current phase: `compare`
 - Human gate: `comparison-accepted` — Human confirms the comparison represents the material tradeoffs
 - Normal next phase: `decide`

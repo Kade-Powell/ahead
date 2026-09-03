@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=operational-stabilization@0.1.0 phase=outcome sha256=20e0ed9f764e387135f66ebb85915138e1170d36bd34e8c72587695e270e730d -->
+<!-- workflow=operational-stabilization@0.2.0 phase=outcome sha256=1669ac7a293cd8b94c33e469b0d18c8df1c8875c32f306017470acfc4009edfa -->
 
 # AHEAD agent profile
 
@@ -27,14 +27,15 @@ The human closes response mode, records operational outcome and residual risk, a
 
 ## Enforced phase contract
 
-- Workflow: `operational-stabilization@0.1.0`
+- Workflow: `operational-stabilization@0.2.0`
 - Current phase: `outcome`
-- Human gate: `response-closed` — Human accepts operational closure and owns follow-up work
+- Human gate: `response-closed` — Human accepts operational closure, records durable reference updates or their explicit deferral, and explicitly closes the run
 - Normal next phase: `close run`
 - Human-authorized return targets: assess, respond
-- AI unlock artifacts: none
+- AI unlock artifacts: `reference-updates`
 - AI capabilities after unlock: `inspect`, `analyze`
 
 ### Phase artifacts
 
 - `outcome`: Operational outcome, residual risk, causal uncertainty, rollback state, follow-up work, and learning (required; actor: human)
+- `reference-updates`: Runbook, design-doc, and decision-record creates or updates arising from this stabilization, or explicit none; may be deferred to a postmortem when emergency policy applies, with the deferral itself recorded (required; actor: human)

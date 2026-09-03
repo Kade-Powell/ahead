@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=operational-stabilization@0.1.0 phase=verify-recovery sha256=0cf0fce584ec74179800e0de14c705794879febedb2a9fb0c8f93491e06a2c22 -->
+<!-- workflow=operational-stabilization@0.2.0 phase=verify-recovery sha256=24afac8c299092366f42e2301f46971f2fb14a5317bca6a6068f858c70e7da6d -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Research should change a decision, hypothesis, plan, or confidence level. Put pr
 
 ## Enforced phase contract
 
-- Workflow: `operational-stabilization@0.1.0`
+- Workflow: `operational-stabilization@0.2.0`
 - Current phase: `verify-recovery`
 - Human gate: `recovery-demonstrated` — Human confirms recovery is demonstrated or returns for another bounded action
 - Normal next phase: `monitor`

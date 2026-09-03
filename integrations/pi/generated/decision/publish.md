@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=decision@0.1.0 phase=publish sha256=3cebabb95b98d04673d4ff737efc21ee8821f86788e8fb65eb34ae63b4f814c2 -->
+<!-- workflow=decision@0.2.0 phase=publish sha256=6a4ff9d1bf4a57ad5df6577a11abf51319bb01d4c191225ba2f52d46c85b9d5a -->
 
 # AHEAD agent profile
 
@@ -27,14 +27,14 @@ The human makes the decision durable and understandable to affected people, link
 
 ## Enforced phase contract
 
-- Workflow: `decision@0.1.0`
+- Workflow: `decision@0.2.0`
 - Current phase: `publish`
-- Human gate: `decision-published` — Human confirms the decision is recorded and communicated
+- Human gate: `decision-published` — Human confirms the decision record is written, communicated, and cross-linked
 - Normal next phase: `close run`
 - Human-authorized return targets: frame, research, options, compare, decide
-- AI unlock artifacts: none
+- AI unlock artifacts: `decision-record`
 - AI capabilities after unlock: `inspect`, `analyze`
 
 ### Phase artifacts
 
-- `published-decision`: Decision record, affected work, communication, review trigger, and revisit date (required; actor: human)
+- `decision-record`: Durable decision record with context, drivers, options, outcome, consequences, review trigger, and revisit date; MADR-shaped and stored in the project's decision-record directory (required; actor: human)

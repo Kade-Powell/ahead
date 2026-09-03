@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=options sha256=6ea367b248068491760a3f140f7dbef7c27d8767f7e7c4e5b0e4146c8580c58f -->
+<!-- workflow=internal-improvement@0.2.0 phase=options sha256=b9e13f33aafe24ab866b217f9b793fae991bcd1dbd3692655b7f8d38a8780030 -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `options`
 - Human gate: `options-understood` — Human confirms viable options and tradeoffs are understood
 - Normal next phase: `decision`

@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=operational-stabilization@0.1.0 phase=respond sha256=ff92cdcf56f02d1819f12630b86b18d426903913e85ab848d6173f39a469548a -->
+<!-- workflow=operational-stabilization@0.2.0 phase=respond sha256=efa131e4d764e05726b4c2f2371da510c5b4810062ce48fcf8cd41f8a9b8ee76 -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ Investigation and stabilization may proceed in parallel; there is no requirement
 
 ## Enforced phase contract
 
-- Workflow: `operational-stabilization@0.1.0`
+- Workflow: `operational-stabilization@0.2.0`
 - Current phase: `respond`
 - Human gate: `action-authorized` — Authorized human approves the bounded stabilizing action
 - Normal next phase: `execute-observe`

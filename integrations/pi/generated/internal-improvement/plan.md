@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=plan sha256=3b050ec6653ac18b8e5c9bdf348e8c91243d9bc3fbee718c147c9e56f5186a37 -->
+<!-- workflow=internal-improvement@0.2.0 phase=plan sha256=9d5297ef85ec984f9bd5407152b6001199c0ba5940a3d06263180164320b2d2e -->
 
 # AHEAD agent profile
 
@@ -40,12 +40,12 @@ For broad migrations, use expand, migrate, verify, and contract stages so interm
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `plan`
-- Human gate: `plan-approved` — Human approves the final plan
+- Human gate: `plan-approved` — Human approves the final plan and its planned durable reference updates
 - Normal next phase: `implement`
 - Human-authorized return targets: target, options, decision
-- AI unlock artifacts: `first-pass-plan`
+- AI unlock artifacts: `first-pass-plan`, `reference-updates`
 - AI capabilities after unlock: `inspect`, `search`, `analyze`, `record`
 
 ### Phase artifacts
@@ -53,3 +53,4 @@ For broad migrations, use expand, migrate, verify, and contract stages so interm
 - `first-pass-plan`: Human first-pass implementation and measurement plan (required; actor: human)
 - `ai-plan-review`: AI plan challenge (optional; actor: ai)
 - `plan`: Human-approved sequenced plan, invariant checks, measurement, rollout, recovery, and deviations policy (required; actor: human)
+- `reference-updates`: Planned creates or updates of decision records, design docs, and runbooks, or explicit none (required; actor: human)

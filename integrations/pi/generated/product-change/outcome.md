@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=outcome sha256=0c2a79dcb011adc8e99985e2add7ea90b12d7056839f0d746654f2dc34aa54ab -->
+<!-- workflow=product-change@0.3.0 phase=outcome sha256=98e154ceaf14f6971995da0319dde1f084b62ae192d82aa815986ca9bd3ad77b -->
 
 # AHEAD agent profile
 
@@ -27,9 +27,9 @@ The human decides to accept, roll back, follow up, abandon, or reopen work and r
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `outcome`
-- Human gate: `outcome-accepted` — Human accepts closure
+- Human gate: `outcome-accepted` — Human accepts closure and explicitly closes the run
 - Normal next phase: `close run`
 - Human-authorized return targets: plan, implement
 - AI unlock artifacts: none

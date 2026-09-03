@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=plan sha256=9863c8de33161735bb3bf9ba146c4d520faa99ce617d974ae763be1ac7f0e266 -->
+<!-- workflow=product-change@0.3.0 phase=plan sha256=0816b73f07560b714a0eaeedf7fb7f642072258bde7429f7593141314b89c431 -->
 
 # AHEAD agent profile
 
@@ -40,12 +40,12 @@ For broad migrations, use expand, migrate, verify, and contract stages so interm
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `plan`
-- Human gate: `plan-approved` — Human approves the final plan
+- Human gate: `plan-approved` — Human approves the final plan and its planned durable reference updates
 - Normal next phase: `implement`
 - Human-authorized return targets: options, decision
-- AI unlock artifacts: `first-pass-plan`
+- AI unlock artifacts: `first-pass-plan`, `reference-updates`
 - AI capabilities after unlock: `inspect`, `search`, `analyze`, `record`
 
 ### Phase artifacts
@@ -53,3 +53,4 @@ For broad migrations, use expand, migrate, verify, and contract stages so interm
 - `first-pass-plan`: Human first-pass implementation plan (required; actor: human)
 - `ai-plan-review`: AI plan challenge (optional; actor: ai)
 - `plan`: Human-approved sequenced plan, tests, rollout, recovery, and deviations policy (required; actor: human)
+- `reference-updates`: Planned creates or updates of decision records, design docs, and runbooks, or explicit none (required; actor: human)

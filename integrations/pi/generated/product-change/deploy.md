@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=deploy sha256=b7f6d2e3844c8719ec01bc277ebdfb66b4501cb4f024ce5cdc5fb71ccdec78ba -->
+<!-- workflow=product-change@0.3.0 phase=deploy sha256=395dd1c2d28831ea323f89153d136f0675b93a0b5d53b959ec86730d1888c720 -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ A human authorizes deployment or release. You may analyze readiness evidence, bu
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `deploy`
 - Human gate: `deployment-confirmed` — Human confirms the intended version reached the target or deployment is not applicable
 - Normal next phase: `verify`

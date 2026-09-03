@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=implement sha256=80c450e0f6487c32f5a8b4f4bc7338ab9eb13e5f54d78f1606a21f6d5c2e57bb -->
+<!-- workflow=product-change@0.3.0 phase=implement sha256=1a9c33bb3f8ff0e5bc2e6a2314e2996d79eb090792f9d35fb85fd2d599ff3319 -->
 
 # AHEAD agent profile
 
@@ -31,12 +31,12 @@ Call out plan deviations; do not silently redefine behavior or policy. Passing c
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `implement`
-- Human gate: `implementation-ready` — Human confirms work is ready for review and checks pass
+- Human gate: `implementation-ready` — Human confirms work, tests, and durable reference updates are ready for review
 - Normal next phase: `ai-review`
 - Human-authorized return targets: plan
-- AI unlock artifacts: none
+- AI unlock artifacts: `reference-updates`
 - AI capabilities after unlock: `inspect`, `search`, `analyze`, `modify`, `execute`
 
 ### Phase artifacts
@@ -44,3 +44,4 @@ Call out plan deviations; do not silently redefine behavior or policy. Passing c
 - `changeset`: Linked changeset (required; actor: human)
 - `tests`: Test and check evidence (required; actor: human)
 - `plan-deviations`: Plan deviations and rationale, including none (required; actor: human)
+- `reference-updates`: Actual creates or updates of decision records, design docs, and runbooks during implementation, or explicit none; AI may propose entries, human accepts each (required; actor: human)

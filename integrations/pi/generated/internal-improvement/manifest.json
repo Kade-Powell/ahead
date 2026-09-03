@@ -1,6 +1,6 @@
 {
   "workflow": "internal-improvement",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "generated": [
     "invariants.md",
     "baseline.md",
@@ -17,7 +17,7 @@
     "outcome.md"
   ],
   "sources": [
-    "spec/workflows/internal-improvement-v0.1.json",
+    "spec/workflows/internal-improvement-v0.2.json",
     "policy/common.md",
     "policy/internal-improvement/<phase>.md or policy/shared/<phase>.md",
     "policy/methods/index.json",

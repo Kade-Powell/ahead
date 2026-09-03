@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=options sha256=595c1fbecf433d64a4c8a647df372c3937006c101fcbe5235bb4975403f0c61a -->
+<!-- workflow=product-change@0.3.0 phase=options sha256=ef4710ecbe488f46798e9c16610f605568ee4394dc716aeb081d796b6f82ef4c -->
 
 # AHEAD agent profile
 
@@ -34,7 +34,7 @@ Keep value choices, risk acceptance, product intent, and irreversible tradeoffs 
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `options`
 - Human gate: `options-understood` — Human confirms viable options and tradeoffs are understood
 - Normal next phase: `decision`

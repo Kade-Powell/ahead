@@ -306,10 +306,19 @@ const artifactPromptCatalog: Record<string, string[]> = {
     "How does each option perform against the recorded criteria?",
     "What tradeoffs, risks, sensitivity, confidence, and disagreement remain?",
   ],
-  "published-decision": [
-    "Where is the durable decision and rationale recorded?",
+  "decision-record": [
+    "Where is the durable decision record written, and does it follow the project's ADR convention?",
     "Who is affected, what downstream work is linked, and how will it be communicated?",
     "What event or date should trigger review?",
+  ],
+  "reference-updates": [
+    "Which decision records, design docs, or runbooks does this run create or update?",
+    "For each, what section changes and who accepts the change?",
+    "If none, is the run genuinely not altering any durable behavior or documented contract?",
+  ],
+  "review-inputs": [
+    "Which run inputs did the review read: decision, plan, plan-deviations, reference-updates, changeset, tests, and evidence?",
+    "Which inputs were unavailable or intentionally excluded?",
   ],
   question: [
     "What exact question is being investigated, and why does it matter?",

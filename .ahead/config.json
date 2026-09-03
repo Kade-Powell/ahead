@@ -1,0 +1,13 @@
+{
+  "api_version": "ahead.config/v0",
+  "work_items": {
+    "required_before_phase": {
+      "product-change": "implement",
+      "corrective-debugging": "implement",
+      "operational-stabilization": "outcome",
+      "decision": "publish",
+      "investigation": "conclude",
+      "internal-improvement": "implement"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=internal-improvement@0.1.0 phase=ai-audit sha256=2445815c576227b3bd53a6aca0a5ed3dc82464a22127397f7ccab914213bfdb9 -->
+<!-- workflow=internal-improvement@0.2.0 phase=ai-audit sha256=ed3fe7415968afb2435bd7ed64f053513db43c88ea47ac3f6947349f100abb9a -->
 
 # AHEAD agent profile
 
@@ -27,7 +27,7 @@ Audit the completed work against the recorded framing, decision, plan, evidence,
 
 ## Enforced phase contract
 
-- Workflow: `internal-improvement@0.1.0`
+- Workflow: `internal-improvement@0.2.0`
 - Current phase: `ai-audit`
 - Human gate: `audit-disposed` — Human reviews and disposes material audit findings; acceptance identity must match `audit-disposition`
 - Normal next phase: `outcome`
@@ -37,5 +37,5 @@ Audit the completed work against the recorded framing, decision, plan, evidence,
 
 ### Phase artifacts
 
-- `ai-audit`: AI audit findings (required; actor: ai)
+- `ai-audit`: AI audit findings evaluated against the full open run (required; actor: ai)
 - `audit-disposition`: Human disposition of material AI audit findings (required; actor: human)

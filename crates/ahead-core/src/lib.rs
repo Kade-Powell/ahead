@@ -20,23 +20,34 @@ const WORKFLOW_IDS: &[&str] = &[
     "internal-improvement",
 ];
 /// Current embedded specification for the product-change workflow.
-const PRODUCT_CHANGE_SPEC: &str = include_str!("../../../spec/workflows/product-change-v0.2.json");
-/// Historical product-change definition retained for replay of persisted runs.
+const PRODUCT_CHANGE_SPEC: &str = include_str!("../../../spec/workflows/product-change-v0.3.json");
+/// Historical product-change v0.2 definition retained for replay of persisted runs.
+const PRODUCT_CHANGE_V0_2_SPEC: &str =
+    include_str!("../../../spec/workflows/legacy/product-change-v0.2.json");
+/// Historical product-change v0.1 definition retained for replay of persisted runs.
 const PRODUCT_CHANGE_V0_1_SPEC: &str =
     include_str!("../../../spec/workflows/legacy/product-change-v0.1.json");
 /// Embedded specification for the corrective-debugging workflow.
 const CORRECTIVE_DEBUGGING_SPEC: &str =
     include_str!("../../../spec/workflows/corrective-debugging-v0.1.json");
-/// Embedded specification for the operational-stabilization workflow.
+/// Current embedded specification for the operational-stabilization workflow.
 const OPERATIONAL_STABILIZATION_SPEC: &str =
-    include_str!("../../../spec/workflows/operational-stabilization-v0.1.json");
-/// Embedded specification for the decision workflow.
-const DECISION_SPEC: &str = include_str!("../../../spec/workflows/decision-v0.1.json");
+    include_str!("../../../spec/workflows/operational-stabilization-v0.2.json");
+/// Historical operational-stabilization v0.1 definition retained for replay of persisted runs.
+const OPERATIONAL_STABILIZATION_V0_1_SPEC: &str =
+    include_str!("../../../spec/workflows/legacy/operational-stabilization-v0.1.json");
+/// Current embedded specification for the decision workflow.
+const DECISION_SPEC: &str = include_str!("../../../spec/workflows/decision-v0.2.json");
+/// Historical decision v0.1 definition retained for replay of persisted runs.
+const DECISION_V0_1_SPEC: &str = include_str!("../../../spec/workflows/legacy/decision-v0.1.json");
 /// Embedded specification for the investigation workflow.
 const INVESTIGATION_SPEC: &str = include_str!("../../../spec/workflows/investigation-v0.1.json");
-/// Embedded specification for the internal-improvement workflow.
+/// Current embedded specification for the internal-improvement workflow.
 const INTERNAL_IMPROVEMENT_SPEC: &str =
-    include_str!("../../../spec/workflows/internal-improvement-v0.1.json");
+    include_str!("../../../spec/workflows/internal-improvement-v0.2.json");
+/// Historical internal-improvement v0.1 definition retained for replay of persisted runs.
+const INTERNAL_IMPROVEMENT_V0_1_SPEC: &str =
+    include_str!("../../../spec/workflows/legacy/internal-improvement-v0.1.json");
 
 /// Declarative definition of an AHEAD workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -459,17 +470,22 @@ pub fn workflow(workflow_id: &str) -> Result<WorkflowDefinition> {
 
 /// Loads the exact workflow definition recorded by a persisted run.
 fn workflow_version(workflow_id: &str, version: &str) -> Result<WorkflowDefinition> {
-    let specification = if (workflow_id, version) == ("product-change", "0.1.0") {
-        PRODUCT_CHANGE_V0_1_SPEC
-    } else {
-        let current = workflow(workflow_id)?;
-        if current.version == version {
-            return Ok(current);
+    let specification = match (workflow_id, version) {
+        ("product-change", "0.1.0") => PRODUCT_CHANGE_V0_1_SPEC,
+        ("product-change", "0.2.0") => PRODUCT_CHANGE_V0_2_SPEC,
+        ("operational-stabilization", "0.1.0") => OPERATIONAL_STABILIZATION_V0_1_SPEC,
+        ("decision", "0.1.0") => DECISION_V0_1_SPEC,
+        ("internal-improvement", "0.1.0") => INTERNAL_IMPROVEMENT_V0_1_SPEC,
+        _ => {
+            let current = workflow(workflow_id)?;
+            if current.version == version {
+                return Ok(current);
+            }
+            return Err(AheadError::new(
+                "unsupported_workflow_version",
+                format!("engine does not provide {workflow_id}@{version}"),
+            ));
         }
-        return Err(AheadError::new(
-            "unsupported_workflow_version",
-            format!("engine does not provide {workflow_id}@{version}"),
-        ));
     };
     serde_json::from_str(specification).map_err(|error| {
         AheadError::new(
@@ -1577,7 +1593,7 @@ mod tests {
         let state = derive_state(&run).unwrap();
         assert_eq!(state.workflow_version, "0.1.0");
         assert_eq!(state.phase.id, "define");
-        assert_eq!(workflow("product-change").unwrap().version, "0.2.0");
+        assert_eq!(workflow("product-change").unwrap().version, "0.3.0");
     }
 
     #[test]
@@ -1910,6 +1926,16 @@ mod tests {
                 phase: "plan".to_owned(),
                 kind: "plan".to_owned(),
                 path: ".ahead/plan.md".to_owned(),
+            },
+        )
+        .unwrap();
+        run = apply_action(
+            &run,
+            human("planner@example.com"),
+            Action::ArtifactRecorded {
+                phase: "plan".to_owned(),
+                kind: "reference-updates".to_owned(),
+                path: ".ahead/reference-updates.md".to_owned(),
             },
         )
         .unwrap();

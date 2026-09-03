@@ -1,5 +1,5 @@
 <!-- GENERATED FILE. DO NOT EDIT. -->
-<!-- workflow=product-change@0.2.0 phase=questions sha256=7960c7ed009449dfe17c6219890645066d6aa72dcee6c3059279dccc4386cee7 -->
+<!-- workflow=product-change@0.3.0 phase=questions sha256=e075c845d6a88b58a78b53e974e28414bfdea70d6cc69adb6ea99bc4eb12677d -->
 
 # AHEAD agent profile
 
@@ -40,7 +40,7 @@ Research should change a decision, hypothesis, plan, or confidence level. Put pr
 
 ## Enforced phase contract
 
-- Workflow: `product-change@0.2.0`
+- Workflow: `product-change@0.3.0`
 - Current phase: `questions`
 - Human gate: `unknowns-disposed` — Human confirms important unknowns are answered or explicitly accepted
 - Normal next phase: `options`
