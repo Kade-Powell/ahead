@@ -1603,15 +1603,27 @@ async function recordHumanArtifact(
   const prompts = promptsForArtifact(state.workflow_id, state.phase.id, artifact.kind);
   let template = await humanArtifactTemplate(store, state, run, artifact.kind, artifact.title);
   if (ctx.hasUI && artifact.kind !== "review-disposition" && prompts.length > 0) {
-    const examples = await draftFieldExamples(ctx, {
+    if (ctx.model) {
+      ctx.ui.notify("Drafting two example prompts per field (inspiration only)…", "info");
+    }
+    const draft = await draftFieldExamples(ctx, {
       workflowTitle: engine.getWorkflow(state.workflow_id).title,
       phaseTitle: state.phase.title,
       runTitle: run.title,
       fields: prompts,
     });
-    if (examples) {
-      template = insertFieldExamples(template, examples);
+    if (draft.examples) {
+      template = insertFieldExamples(template, draft.examples);
+    } else if (draft.skipped === "no-auth") {
+      ctx.ui.notify(
+        "Example prompts unavailable: no usable model credential could be resolved for this session.",
+        "info",
+      );
+    } else if (draft.skipped === "no-model") {
+      ctx.ui.notify("Example prompts unavailable: no active model in this session.", "info");
     }
+    // "failed" (timeout, unparseable output, transient error) stays silent:
+    // the plain template is the fallback and needs no apology.
   }
   let content = await ctx.ui.editor(
     `AHEAD mode · ${artifact.title} · write in your own words`,

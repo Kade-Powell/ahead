@@ -8,7 +8,14 @@ export interface FieldExamplesInput {
   fields: string[];
 }
 
-const EXAMPLES_TIMEOUT_MS = 25_000;
+const EXAMPLES_TIMEOUT_MS = 12_000;
+
+export type FieldExamplesSkipped = "no-model" | "no-auth" | "failed";
+
+export interface FieldExamplesResult {
+  examples?: string[][];
+  skipped?: FieldExamplesSkipped;
+}
 
 /**
  * Draft two inspiration-only example lines per artifact field.
@@ -21,10 +28,10 @@ const EXAMPLES_TIMEOUT_MS = 25_000;
 export async function draftFieldExamples(
   ctx: ExtensionCommandContext,
   input: FieldExamplesInput,
-): Promise<string[][] | undefined> {
+): Promise<FieldExamplesResult> {
   const model = ctx.model;
   if (!model) {
-    return undefined;
+    return { skipped: "no-model" };
   }
 
   const prompt = [
@@ -46,9 +53,13 @@ export async function draftFieldExamples(
   ].join("\n");
 
   try {
+    // getProviderAuth returning undefined means no usable credential of any
+    // kind could be resolved — only then is a heads-up accurate. A resolved
+    // auth object without an apiKey (e.g. OAuth) may still succeed through
+    // the adapter's own credential resolution, so we attempt the call.
     const auth = await ctx.modelRegistry.getProviderAuth(model.provider);
     if (!auth) {
-      return undefined;
+      return { skipped: "no-auth" };
     }
     const message = await Promise.race([
       completeSimple(
@@ -74,11 +85,15 @@ export async function draftFieldExamples(
       }),
     ]);
     if (!message) {
-      return undefined;
+      return { skipped: "failed" };
     }
-    return parseExampleLines(message, input.fields.length);
+    const examples = parseExampleLines(message, input.fields.length);
+    if (!examples) {
+      return { skipped: "failed" };
+    }
+    return { examples };
   } catch {
-    return undefined;
+    return { skipped: "failed" };
   }
 }
 
@@ -99,7 +114,8 @@ function textBlocks(content: unknown): string[] {
   return blocks;
 }
 
-function parseExampleLines(message: unknown, fieldCount: number): string[][] | undefined {
+/** Exported for unit testing; the wire shape is validated defensively at runtime. */
+export function parseExampleLines(message: unknown, fieldCount: number): string[][] | undefined {
   const text = textBlocks(isRecord(message) ? message.content : undefined).join("\n");
 
   const perField: string[][] = Array.from({ length: fieldCount }, () => []);
