@@ -13,6 +13,8 @@ export interface SourceLocation {
   column?: number;
 }
 
+export type EditorKind = "vscode" | "zed";
+
 export interface ReviewSnapshot {
   api_version: "ahead.review-snapshot/v0.1";
   base_ref: string;
@@ -242,16 +244,23 @@ export function validateReviewDisposition(
   return errors;
 }
 
-export function openInConfiguredEditor(root: string, location: SourceLocation): boolean {
-  const command = configuredEditorCommand();
-  if (!command) {
+export function openInConfiguredEditor(
+  root: string,
+  location: SourceLocation,
+  options: { wait?: boolean } = {},
+): boolean {
+  const editor = detectEditor();
+  if (!editor) {
     return false;
   }
   const absolute = safeRepositoryPath(root, location.path);
   const line = location.line ?? 1;
   const column = location.column ?? 1;
   const target = `${absolute}:${line}:${column}`;
-  const result = spawnSync(command, ["--goto", target], { stdio: "ignore" });
+  const command = editor === "zed" ? "zed" : "code";
+  const wait = options.wait ? ["--wait"] : [];
+  const args = editor === "zed" ? [...wait, target] : [...wait, "--goto", target];
+  const result = spawnSync(command, args, { stdio: "ignore" });
   return !result.error && result.status === 0;
 }
 
@@ -280,16 +289,22 @@ function resolveReviewBase(root: string): string {
   return "HEAD";
 }
 
-function configuredEditorCommand(): string | undefined {
+export function detectEditor(): EditorKind | undefined {
   const explicit = process.env.AHEAD_EDITOR?.trim();
   if (explicit === "vscode" || explicit === "code") {
-    return "code";
+    return "vscode";
+  }
+  if (explicit === "zed") {
+    return "zed";
   }
   if (explicit === "none") {
     return undefined;
   }
+  if (process.env.ZED === "1" || process.env.TERM_PROGRAM === "zed") {
+    return "zed";
+  }
   return process.env.VSCODE_IPC_HOOK_CLI || process.env.TERM_PROGRAM === "vscode"
-    ? "code"
+    ? "vscode"
     : undefined;
 }
 

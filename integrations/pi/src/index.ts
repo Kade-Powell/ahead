@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
@@ -32,6 +34,7 @@ import {
 import { showReferenceViewer } from "./reference-viewer.js";
 import {
   collectReviewSnapshot,
+  detectEditor,
   extractFindingIds,
   extractReviewFingerprint,
   openInConfiguredEditor,
@@ -1367,7 +1370,7 @@ async function openReviewWorkbench(pi: ExtensionAPI, ctx: ExtensionCommandContex
     const path = await ctx.ui.select("Open changed file", snapshot.changed_files);
     if (path && !openInConfiguredEditor(store.projectRoot, { path })) {
       ctx.ui.notify(
-        `No supported editor was detected. Open ${path} from the repository, or set AHEAD_EDITOR=vscode.`,
+        `No supported editor was detected. Open ${path} from the repository, or set AHEAD_EDITOR=vscode or AHEAD_EDITOR=zed.`,
         "info",
       );
     }
@@ -1655,7 +1658,8 @@ async function recordHumanArtifact(
     // "failed" (timeout, unparseable output, transient error) stays silent:
     // the plain template is the fallback and needs no apology.
   }
-  let content = await ctx.ui.editor(
+  let content = await editHumanArtifact(
+    ctx,
     `AHEAD mode · ${artifact.title} · write in your own words`,
     template,
   );
@@ -1684,7 +1688,8 @@ async function recordHumanArtifact(
         ctx.ui.notify("Draft discarded. Nothing was saved.", "info");
         return;
       }
-      const revised = await ctx.ui.editor(
+      const revised = await editHumanArtifact(
+        ctx,
         `AHEAD mode · ${artifact.title} · finish the required fields`,
         content,
       );
@@ -1724,6 +1729,29 @@ async function recordHumanArtifact(
     ].join("\n"),
     "info",
   );
+}
+
+async function editHumanArtifact(
+  ctx: ExtensionCommandContext,
+  title: string,
+  content: string,
+): Promise<string | undefined> {
+  if (!detectEditor()) {
+    return ctx.ui.editor(title, content);
+  }
+
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "ahead-artifact-"));
+  const temporaryPath = join(temporaryRoot, "artifact.md");
+  try {
+    await writeFile(temporaryPath, content, "utf8");
+    if (openInConfiguredEditor(temporaryRoot, { path: "artifact.md" }, { wait: true })) {
+      return await readFile(temporaryPath, "utf8");
+    }
+    ctx.ui.notify("The configured editor could not be opened; using Pi's editor instead.", "info");
+    return await ctx.ui.editor(title, content);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 }
 
 async function humanArtifactTemplate(

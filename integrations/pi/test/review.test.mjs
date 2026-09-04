@@ -6,12 +6,33 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   collectReviewSnapshot,
+  detectEditor,
   extractFindingIds,
   extractReviewFingerprint,
   reviewDispositionTemplate,
   validateAiReviewArtifact,
   validateReviewDisposition,
 } from "../src/review.ts";
+
+function withEditorEnvironment(values, callback) {
+  const keys = ["AHEAD_EDITOR", "ZED", "TERM_PROGRAM", "VSCODE_IPC_HOOK_CLI"];
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) {
+    delete process.env[key];
+  }
+  Object.assign(process.env, values);
+  try {
+    return callback();
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original[key];
+      }
+    }
+  }
+}
 
 const fingerprint = "a".repeat(64);
 const snapshot = {
@@ -27,6 +48,14 @@ const snapshot = {
   untracked_files: [],
   diff: "diff --git a/src/index.ts b/src/index.ts",
 };
+
+test("editor detection supports explicit and terminal-host selection", () => {
+  assert.equal(withEditorEnvironment({ AHEAD_EDITOR: "zed" }, detectEditor), "zed");
+  assert.equal(withEditorEnvironment({ ZED: "1" }, detectEditor), "zed");
+  assert.equal(withEditorEnvironment({ AHEAD_EDITOR: "vscode" }, detectEditor), "vscode");
+  assert.equal(withEditorEnvironment({ TERM_PROGRAM: "vscode" }, detectEditor), "vscode");
+  assert.equal(withEditorEnvironment({ AHEAD_EDITOR: "none", ZED: "1" }, detectEditor), undefined);
+});
 
 test("review findings have stable identifiers and a snapshot-bound human template", () => {
   const findings = extractFindingIds("## AR-002\nissue\n## AR-001\nissue\nAR-002 repeated");

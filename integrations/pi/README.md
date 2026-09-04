@@ -127,7 +127,11 @@ INDEPENDENT HUMAN REVIEWS AND ACCEPTS
 
 A draft branch or draft PR may exist earlier. The handoff gate is requesting human review or marking the PR ready, not ordinary draft pushes.
 
-`/ahead-review` opens the first editor-neutral review workbench. It fingerprints the current Git changeset, shows the changed paths and diff in Pi, can open a selected path in VS Code when detected or configured with `AHEAD_EDITOR=vscode`, requests snapshot-bound AI findings, and opens the required human disposition or independent-review record. Any engineering change produces a new fingerprint and requires review again. `.ahead/**` evidence is excluded from that fingerprint so recording the review does not invalidate it.
+`/ahead-review` opens the first editor-neutral review workbench. It fingerprints the current Git changeset, shows the changed paths and diff in Pi, can open a selected path in VS Code or Zed when detected or configured with `AHEAD_EDITOR=vscode` or `AHEAD_EDITOR=zed`, requests snapshot-bound AI findings, and opens the required human disposition or independent-review record. Any engineering change produces a new fingerprint and requires review again. `.ahead/**` evidence is excluded from that fingerprint so recording the review does not invalidate it.
+
+VS Code is detected from its terminal environment. For a deterministic Zed terminal, add `"AHEAD_EDITOR": "zed"` under Zed's `terminal.env` settings; Zed's CLI must be installed. `AHEAD_EDITOR=none` disables external opening.
+
+Human-owned plans and other artifacts open in that detected editor as a temporary Markdown draft. Save your work, then close only that temporary tab; AHEAD copies the draft into `.ahead/runs/` after the tab closes and the form passes validation. The host editor stays open, and saving alone does not record the artifact.
 
 ## Human commands
 
