@@ -39,59 +39,11 @@ use lapce_rpc::ahead::{
 };
 use super::{policy::PolicyEvaluator, host::AheadSessionHost};
 
-/// What the built-in loop may ask Codex semantics to do on a turn.
-/// Mirrors the fork's `AskForApproval` vocabulary without depending on the
-/// fork's workspace (which we do not build): the host answers every
-/// approval from `PolicyEvaluator`, never from the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnApprovalPolicy {
-    /// Learn: read-only. Every mutation/execution approval is declined.
-    Never,
-    /// Assist: approvals routed to the human through proposal gates.
-    OnRequest,
-}
-
-impl TurnApprovalPolicy {
-    pub fn for_mode(mode: AssistanceMode) -> Self {
-        match mode {
-            AssistanceMode::Learn => Self::Never,
-            AssistanceMode::Assist => Self::OnRequest,
-        }
-    }
-
-    /// Fork wire value (`protocol/v2/shared.rs AskForApproval`).
-    pub fn codex_wire_value(&self) -> &'static str {
-        match self {
-            Self::Never => "never",
-            Self::OnRequest => "untrusted",
-        }
-    }
-}
-
-/// Sandbox mapping: Learn → `read-only`, Assist → `workspace-write`.
-/// `danger-full-access` is never emitted by a managed session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnSandbox {
-    ReadOnly,
-    WorkspaceWrite,
-}
-
-impl TurnSandbox {
-    pub fn for_mode(mode: AssistanceMode) -> Self {
-        match mode {
-            AssistanceMode::Learn => Self::ReadOnly,
-            AssistanceMode::Assist => Self::WorkspaceWrite,
-        }
-    }
-
-    /// Fork wire value (`protocol/v2/shared.rs SandboxMode`).
-    pub fn codex_wire_value(&self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
-        }
-    }
-}
+/// Shared vocabulary lives in the framework-agnostic viewmodel so shells,
+/// proxy, and future runtimes assemble identical turns. The proxy keeps
+/// its own `AgentTurnRequest` (superset with editor context + policy
+/// gates); approval/sandbox enums are re-exported aliases.
+pub use ahead_viewmodel::{ApprovalPolicy as TurnApprovalPolicy, Sandbox as TurnSandbox};
 
 /// One governed turn request assembled by the host for the built-in loop.
 /// Field names follow the fork's `turn/start` params where they overlap
@@ -171,36 +123,17 @@ impl AheadAgentLoop {
     }
 
     /// Serializes this turn the way the fork's `turn/start` params carry
-    /// it: `{thread_id, input:[{text}], cwd?, approvalPolicy?, sandboxPolicy?}`.
-    /// Used when the built-in loop hands a turn across the Codex-compatible
-    /// boundary (logging, future managed runtime); approvals still resolve
-    /// in the host.
+    /// it. Delegates to the shared viewmodel so shells assemble identical
+    /// turns; approvals still resolve in the host.
     pub fn to_codex_turn_params(&self, input: &AgentTurnRequest, mode: AssistanceMode) -> serde_json::Value {
-        let mut params = serde_json::Map::new();
-        params.insert("thread_id".to_string(), serde_json::Value::String(input.thread_id.clone()));
-        params.insert(
-            "input".to_string(),
-            serde_json::json!([{ "text": input.user_message }]),
-        );
-        if let Some(cwd) = &input.cwd {
-            params.insert(
-                "cwd".to_string(),
-                serde_json::Value::String(cwd.to_string_lossy().to_string()),
-            );
-        }
-        params.insert(
-            "approvalPolicy".to_string(),
-            serde_json::Value::String(
-                TurnApprovalPolicy::for_mode(mode).codex_wire_value().to_string(),
-            ),
-        );
-        params.insert(
-            "sandboxPolicy".to_string(),
-            serde_json::Value::String(
-                TurnSandbox::for_mode(mode).codex_wire_value().to_string(),
-            ),
-        );
-        serde_json::Value::Object(params)
+        ahead_viewmodel::codex_turn_params(
+            &ahead_viewmodel::TurnAssembly {
+                thread_id: input.thread_id.clone(),
+                user_message: input.user_message.clone(),
+                cwd: input.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+            },
+            mode,
+        )
     }
 
     fn run_learn_turn(
@@ -209,7 +142,6 @@ impl AheadAgentLoop {
         phase: &WorkflowPhase,
         _policy: &SessionPolicySnapshot,
     ) -> Result<AgentTurnOutput> {
-        // Learn mode is strictly Socratic & Explanatory: no edit proposals or code generation
         let message = format!(
             "In Learn mode: Let's investigate `{}` (line {}). What is the expected behavior and what invariants must hold here?",
             input.active_path,
@@ -333,28 +265,20 @@ impl AheadAgentLoop {
         })
     }
 
-    /// Answers a fork-style approval request from policy. Learn always
-    /// declines; Assist accepts only mechanical proposals inside an explicit
-    /// scope the human already approved. Unknown kinds fail closed.
+    /// Answers a fork-style approval request from policy. Delegates to the
+    /// shared viewmodel: Learn always declines; Assist accepts only
+    /// mechanical proposals inside an explicit approved scope.
     pub fn decide_approval(
         mode: AssistanceMode,
         kind: &str,
         is_mechanical: bool,
         in_approved_scope: bool,
     ) -> bool {
-        match mode {
-            AssistanceMode::Learn => false,
-            AssistanceMode::Assist => {
-                matches!(kind, "file_change" | "command_execution")
-                    && is_mechanical
-                    && in_approved_scope
-            }
-        }
+        ahead_viewmodel::decide_approval(mode, kind, is_mechanical, in_approved_scope)
     }
 }
 
 /// Side-task delegation to EXTERNAL agents over real ACP (stdio).
-///
 /// Used only for bounded side tasks (security audit, independent review,
 /// second opinion). Findings return as attributed text; the external agent
 /// never writes code, never sees credentials, and never inherits the
@@ -408,7 +332,7 @@ impl AcpDelegator {
     /// calls it from its tokio runtime via `block_on`.
     pub async fn run_external_task(task: AcpDelegatedTask) -> Result<AcpTaskResult> {
         use agent_client_protocol::{
-            AcpAgent, Client,
+            AcpAgent,
             schema::{
                 ProtocolVersion,
                 v1::{
@@ -460,7 +384,7 @@ impl AcpDelegator {
             .on_receive_request(
                 move |_request: RequestPermissionRequest, responder: agent_client_protocol::Responder<RequestPermissionResponse>, _connection| async move {
                     // Side tasks are read-only: decline everything.
-                    responder.respond(RequestPermissionResponse::new(
+                    let _ = responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
                     ));
                     Ok(())

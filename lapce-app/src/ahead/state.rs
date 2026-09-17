@@ -156,20 +156,28 @@ impl AheadState {
 
     /// Records a human-authored chat message locally. Agent replies arrive
     /// only via session-host notifications, never synthesized here.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn send_chat(&self, text: String) {
-        if text.trim().is_empty() {
-            return;
-        }
-        self.chat_messages.update(|msgs| {
-            msgs.push(AgentChatMessage {
-                id: format!("msg-{}", msgs.len() + 1),
-                sender: "Human".to_string(),
-                text: text.clone(),
+        let mut snapshot = ahead_viewmodel::SessionSnapshot {
+            chat: self.chat_messages.get_untracked().into_iter().map(|m| ahead_viewmodel::ChatMessage {
+                id: m.id,
+                sender: m.sender,
+                text: m.text,
+                is_challenge: m.is_challenge,
+            }).collect(),
+            ..Default::default()
+        };
+        if ahead_viewmodel::push_human_message(&mut snapshot, &text) {
+            let msgs: Vec<AgentChatMessage> = snapshot.chat.into_iter().map(|m| AgentChatMessage {
+                id: m.id,
+                sender: m.sender,
+                text: m.text,
                 timestamp: "Just now".to_string(),
-                is_challenge: false,
-            });
-        });
-        self.chat_input.set(String::new());
+                is_challenge: m.is_challenge,
+            }).collect();
+            self.chat_messages.set(msgs);
+            self.chat_input.set(String::new());
+        }
     }
 
     /// Drops a proposal from the pending list (local filter; host

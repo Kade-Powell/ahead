@@ -38,7 +38,7 @@ lapce-xi-rope     = { workspace = true }
 lapce-core        = { workspace = true }
 lapce-rpc         = { workspace = true }
 floem-editor-core = { workspace = true }
-
+ahead-viewmodel   = { path = "../ahead-viewmodel" }
 # proxy specific dependencies
 
 dyn-clone    = "1.0.16"
