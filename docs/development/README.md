@@ -9,6 +9,12 @@ This repository is **AHEAD, the editor**, a maintained fork of Lapce. The editor
 - [AHEAD Editor MVP](ahead-editor-mvp.md): The product specification and architecture proposal, including native collaboration, streaming voice, agent boundaries, contextual predictions, tracker integration, and delivery gates.
 - [Editor DTO draft](ahead-editor-contracts.ts): Self-contained, type-checkable editor contracts and protocol shapes for sessions, workflow state, anchors, voice events, predictions, and reviews.
 
+## Agent Guidance & UI Components
+
+See [AGENTS.md](../../AGENTS.md) for canonical agent instructions.
+All production UI is built using **GPUI** and **gpui-kit** (https://gpui-kit.com).
+Make sure to use **gpui-kit components whenever possible** (https://gpui-kit.com/component/); it provides pre-built dock areas, editor states, inputs, buttons, flex layouts, and dialogs.
+
 ## Upstream maintenance
 
 This repository preserves Lapce's Git ancestry, crate layout (`lapce-app`, `lapce-core`, `lapce-proxy`, `lapce-rpc`), and directory structure. AHEAD features are concentrated at explicit extension points:

@@ -8,17 +8,11 @@ rust-version = { workspace = true }
 default-run  = "ahead"
 
 [dependencies]
-ahead-app   = { path = "./ahead-app" }
-ahead-proxy = { path = "./ahead-proxy" }
+ahead-app = { path = "./ahead-app" }
 
 [[bin]]
 name = "ahead"
 path = "ahead-app/src/bin/ahead.rs"
-
-[[bin]]
-name = "ahead-proxy"
-path = "ahead-proxy/src/bin/ahead-proxy.rs"
-
 
 [workspace]
 members = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
@@ -117,7 +111,6 @@ authors      = ["Dongdong Zhou <dzhou121@gmail.com>"]
 
 [workspace.dependencies]
 anyhow            = { version = "1.0" }
-backtrace         = { version = "0.3" }
 chrono            = { version = "0.4" }
 clap              = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive"] }
 crossbeam-channel = { version = "0.5.12" }
@@ -125,8 +118,6 @@ directories       = { version = "4.0.1" }
 flate2            = { version = "1.0" }
 git2              = { version = "0.20.0", features = ["vendored-openssl"] }
 globset           = { version = "0.4.14" }
-hashbrown         = { version = "0.14.5", features = ["serde"] }
-im                = { version = "15.0.0", features = ["serde"] }
 include_dir       = { version = "0.7" }
 indexmap          = { version = "2.0", features = ["serde"] }
 interprocess      = { version = "1.2.1" }
@@ -134,21 +125,15 @@ itertools         = { version = "0.12.1" }
 notify            = { version = "5.2.0", features = ["serde"] }
 once_cell         = { version = "1.19" }
 parking_lot       = { version = "0.12.3" }
-rayon             = { version = "1.10.0" }
 regex             = { version = "1.10.5" }
-remain            = { version = "0.2" }
-semver            = { version = "1.0" }
 reqwest           = { version = "0.11", features = ["blocking", "json", "socks"] }
 serde             = { version = "1.0" }
 serde_json        = { version = "1.0" }
-smallvec          = { version = "1.15.1" }
 strum             = { version = "0.27.1" }
 strum_macros      = { version = "0.27.1" }
 tar               = { version = "0.4" }
-tempfile          = { version = "3.10.1" }
 thiserror         = { version = "1.0" }
 toml              = { version = "*" }
-toml_edit         = { version = "0.20.2", features = ["serde"] }
 url               = { version = "2.5.0" }
 zstd              = { version = "0.11.2" }                                                                         # follow same version wasmtime-cache in lockfile
 
@@ -157,12 +142,10 @@ psp-types = { git = "https://github.com/lapce/psp-types", rev = "f7fea28f59e7b2d
 
 lapce-xi-rope = { version = "0.3.2", features = ["serde"] }
 
-ahead-core  = { path = "./ahead-core" }
-ahead-rpc   = { path = "./ahead-rpc" }
-ahead-proxy = { path = "./ahead-proxy" }
+ahead-core = { path = "./ahead-core" }
+ahead-rpc  = { path = "./ahead-rpc" }
 
-floem = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56", features = ["editor", "serde", "default-image-formats", "rfd-async-std"] }
-# floem = { path = "../floem", features = ["editor", "serde", "default-image-formats", "rfd-async-std"] }
+gpui-kit = { version = "0.6", features = ["tree-sitter-rust"] }
 floem-editor-core = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56", features = ["serde"] }
 # floem-editor-core = { path = "../floem/editor-core/", features = ["serde"] }
 
@@ -186,23 +169,9 @@ git     = "https://github.com/tokio-rs/tracing"
 rev     = "908cc432a5994f6e17c8f36e13c217dc40085704"
 package = "tracing-log"
 
-[workspace.dependencies.tracing-subscriber]
-git     = "https://github.com/tokio-rs/tracing"
-rev     = "908cc432a5994f6e17c8f36e13c217dc40085704"
-package = "tracing-subscriber"
-
-[workspace.dependencies.tracing-appender]
-git     = "https://github.com/tokio-rs/tracing"
-rev     = "908cc432a5994f6e17c8f36e13c217dc40085704"
-package = "tracing-appender"
-
 [workspace.dependencies.alacritty_terminal]
 git = "https://github.com/alacritty/alacritty"
 rev = "cacdb5bb3b72bad2c729227537979d95af75978f"
-
-[workspace.dependencies.windows-sys]
-version  = "0"
-features = ["Win32_Foundation"]
 
 [profile.release-lto]
 inherits      = "release"

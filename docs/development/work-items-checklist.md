@@ -40,6 +40,19 @@
   linked from work items that referenced it. Part of session export and
   resume (a resumed session shows prior summaries first).
 
+## Threads Sidebar & Multi-Thread Collaboration (Overall Repo Goal)
+
+- **Threads Sidebar Component** (`ahead-app/src/threads_panel.rs`): Dedicated rightmost sidebar/dock panel displaying all active conversation threads grouped by workspace.
+- **Dual Thread Taxonomy**:
+  1. **AHEAD Work-Item Threads (Special / Collaborative)**:
+     - Each thread represents an active or running AHEAD work item.
+     - Fully collaborative: all invited workspace teammates can view, chat, and participate in the same thread.
+     - Carries live phase state, invariant checklists, code proposals, and review attestations.
+  2. **Delegated Task Threads (One-off / Subagent)**:
+     - Represents one-off delegated tasks spawned to other harnesses (e.g. background ACP subagents, external analyzers, or test runners).
+     - Returns attributed findings and review diffs without mutating shared collaborative session state.
+- **Interaction**: Top search input ("Search threads..."), "+ AHEAD Thread" and "+ Task" triggers, active thread selection switching the central Agent Pairing Feed.
+
 ## Retention and export
 
 - Nothing is deleted on close: messages, summaries, item events, and
