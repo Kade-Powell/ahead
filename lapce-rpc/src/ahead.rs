@@ -386,6 +386,9 @@ pub enum AheadRequest {
         session_id: Id,
         proposal_id: Id,
     },
+    AgentTurn {
+        request: AgentTurnRequestDto,
+    },
     RequestPrediction {
         request: PredictionRequest,
     },

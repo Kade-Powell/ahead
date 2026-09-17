@@ -127,6 +127,10 @@ impl AheadSessionHost {
                 let res = self.accept_proposal(&session_id, &proposal_id)?;
                 Ok(serde_json::to_value(res)?)
             }
+            AheadRequest::AgentTurn { request } => {
+                let out = self.agent_turn(request)?;
+                Ok(serde_json::to_value(out)?)
+            }
             AheadRequest::RequestPrediction { request } => {
                 let res = self.request_prediction(request, &[])?;
                 Ok(serde_json::to_value(res)?)
@@ -460,6 +464,94 @@ impl AheadSessionHost {
         PredictionEngine::predict_mechanical(&work, &request, open_buffers)
     }
 
+    /// Runs one governed agent turn through the built-in loop and persists
+    /// its effects: staged proposals go to the store, presentation cues are
+    /// returned for the UI to reveal. Agent replies are deterministic from
+    /// session state (no model call); the loop never writes code directly.
+    pub fn agent_turn(
+        &self,
+        dto: lapce_rpc::ahead::AgentTurnRequestDto,
+    ) -> Result<super::agent::AgentTurnOutput> {
+        use super::agent::{AgentTurnRequest, AheadAgentLoop};
+        use std::path::PathBuf;
+
+        let view = self.get_session(&dto.session_id)?
+            .context("Session not found")?;
+
+        let request = AgentTurnRequest {
+            session_id: dto.session_id.clone(),
+            thread_id: dto.thread_id.clone(),
+            user_message: dto.user_message.clone(),
+            active_path: dto.context.active_path.clone(),
+            caret: dto.context.caret,
+            selection: dto.context.selection,
+            file_content: dto.context.file_content.clone(),
+            invariants: dto.invariants.clone(),
+            cwd: dto.cwd.clone().map(PathBuf::from),
+            expected_policy_sha256: dto.expected_policy_sha256.clone(),
+            scope_id: dto.scope.as_ref().map(|s| s.scope_id.clone()),
+        };
+
+        // Scope allowlist check: Assist turns with a scope may only touch
+        // listed paths; Learn turns skip proposals entirely in the loop.
+        if let Some(scope) = &dto.scope {
+            if view.session.mode == AssistanceMode::Assist
+                && !scope.allowed_paths.iter().any(|p| request.active_path.starts_with(p.as_str()))
+                && !scope.allowed_paths.is_empty()
+            {
+                anyhow::bail!(
+                    "Active file {} is outside the approved mechanical scope",
+                    request.active_path
+                );
+            }
+        }
+
+        // The loop owns an Arc; reconstruct a lightweight handle around
+        // shared state via a fresh in-memory view is wrong — instead run
+        // the loop against this host through a scoped Arc dance: clone
+        // the underlying Arcs into a transient host reference.
+        // Simpler and correct: AheadAgentLoop only needs get_session, so
+        // run the turn logic inline through a temporary loop bound to a
+        // reference-counted self-clone is impossible on &self.
+        // Pragmatic path: duplicate the loop's dispatch here via a
+        // short-lived AheadAgentLoop built on an Arc clone of the store?
+        // No — cleanest: extract the loop call through a helper that takes
+        // &self. See run_turn_on_host below.
+        self.run_turn_on_host(request)
+    }
+
+    /// Helper so `agent_turn` can invoke the built-in loop against `&self`
+    /// without Arc gymnastics: mirrors `AheadAgentLoop::run_turn` dispatch
+    /// on the live host state.
+    fn run_turn_on_host(
+        &self,
+        input: super::agent::AgentTurnRequest,
+    ) -> Result<super::agent::AgentTurnOutput> {
+        use super::agent::AheadAgentLoop;
+        // AheadAgentLoop holds Arc<AheadSessionHost>; the host is behind
+        // parking_lot locks and Clone-safe Arcs, so a transient host value
+        // sharing the same Arcs is identical state. Build one cheaply.
+        let transient = AheadSessionHost {
+            store: self.store.clone(),
+            auth: self.auth.clone(),
+            active_sessions: self.active_sessions.clone(),
+            active_voice_sessions: self.active_voice_sessions.clone(),
+            workspace_participants: self.workspace_participants.clone(),
+        };
+        // Leak into an Arc for the loop's lifetime (freed with the output).
+        let shared = Arc::new(transient);
+        let agent_loop = AheadAgentLoop::new(shared);
+        let mut out = agent_loop.run_turn(input)?;
+        // Persist staged proposals so resume/reopen sees them.
+        if let Some(prop) = out.scaffold_proposal.clone() {
+            // Policy already authorized inside the loop; store failure
+            // (e.g. duplicate id on retry) surfaces instead of hiding.
+            let session_id = prop.session_id.clone();
+            self.propose_edit(&session_id, prop)?;
+        }
+        Ok(out)
+    }
+
     pub fn handle_voice_control(&self, control: VoiceControl) -> Result<()> {
         let voice_map = self.active_voice_sessions.read();
         for voice in voice_map.values() {
@@ -554,5 +646,103 @@ mod tests {
         };
         let learn_prop_res = host.propose_edit(&view.session.id, proposal_in_learn);
         assert!(learn_prop_res.is_err());
+    }
+
+    fn turn_dto(
+        session_id: &str,
+        msg: &str,
+        policy_sha: &str,
+    ) -> lapce_rpc::ahead::AgentTurnRequestDto {
+        lapce_rpc::ahead::AgentTurnRequestDto {
+            session_id: session_id.to_string(),
+            thread_id: "thread-test".to_string(),
+            user_message: msg.to_string(),
+            context: lapce_rpc::ahead::TurnEditorContext {
+                active_path: "src/retry.rs".to_string(),
+                caret: lapce_rpc::ahead::DisplayPosition { line: 10, col: 0 },
+                selection: None,
+                file_content: "pub fn retry() {}".to_string(),
+                visible_end: None,
+                attached_anchor_ids: Vec::new(),
+            },
+            invariants: Vec::new(),
+            cwd: None,
+            expected_policy_sha256: policy_sha.to_string(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_turn_assist_stages_proposal_and_cue_shape() {
+        let host = AheadSessionHost::in_memory().unwrap();
+        let view = host.start_work(
+            WorkKind::ProductChange,
+            AssistanceMode::Assist,
+            "Retries".to_string(),
+            "Need backoff".to_string(),
+            None,
+        ).unwrap();
+        host.advance_phase(&view.session.id, 1, "implement".to_string()).unwrap();
+        let policy_sha = view.session.policy.sha256.clone();
+
+        // Via typed host method.
+        let out = host.agent_turn(turn_dto(&view.session.id, "Please scaffold the retry boilerplate", &policy_sha)).unwrap();
+        assert!(!out.turn_id.is_empty());
+        assert!(out.scaffold_proposal.is_some());
+        assert!(out.message.contains("business logic"));
+
+        // Proposal persisted to the store.
+        let proposals = host.store.read().list_pending_proposals(&view.session.id).unwrap();
+        assert!(proposals.iter().any(|p| p.description.contains("ServiceConfig")));
+
+        // Via RPC dispatch (serde round-trip through AgentTurn variant).
+        let req = AheadRequest::AgentTurn {
+            request: turn_dto(&view.session.id, "scaffold more", &policy_sha),
+        };
+        let val = host.handle_request(req).unwrap();
+        let out2: super::super::agent::AgentTurnOutput = serde_json::from_value(val).unwrap();
+        assert!(!out2.turn_id.is_empty());
+    }
+
+    #[test]
+    fn test_agent_turn_learn_never_proposes() {
+        let host = AheadSessionHost::in_memory().unwrap();
+        let view = host.start_work(
+            WorkKind::Investigation,
+            AssistanceMode::Learn,
+            "Audit".to_string(),
+            "Starting".to_string(),
+            None,
+        ).unwrap();
+        let policy_sha = view.session.policy.sha256.clone();
+        let out = host.agent_turn(turn_dto(&view.session.id, "write it for me", &policy_sha)).unwrap();
+        assert!(out.scaffold_proposal.is_none());
+        assert!(out.presentation_cue.is_some());
+        assert_eq!(out.approval_policy, super::super::agent::TurnApprovalPolicy::Never);
+    }
+
+    #[test]
+    fn test_agent_turn_stale_policy_and_scope_reject() {
+        let host = AheadSessionHost::in_memory().unwrap();
+        let view = host.start_work(
+            WorkKind::ProductChange,
+            AssistanceMode::Assist,
+            "Retries".to_string(),
+            "Starting".to_string(),
+            None,
+        ).unwrap();
+        // Stale policy fails closed.
+        assert!(host.agent_turn(turn_dto(&view.session.id, "scaffold", "stale")).is_err());
+        // Out-of-scope active file rejected when scope allowlists other paths.
+        let policy_sha = view.session.policy.sha256.clone();
+        let mut dto = turn_dto(&view.session.id, "scaffold", &policy_sha);
+        dto.scope = Some(lapce_rpc::ahead::TurnMechanicalScope {
+            scope_id: "scope-1".to_string(),
+            instruction: "only lib".to_string(),
+            human_contract_artifact_id: "art-1".to_string(),
+            allowed_paths: vec!["src/lib/".to_string()],
+            approved_by: "owner".to_string(),
+        });
+        assert!(host.agent_turn(dto).is_err());
     }
 }

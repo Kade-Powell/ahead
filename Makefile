@@ -33,7 +33,16 @@ help: ## Print this help message
 	@grep -E '^[a-zA-Z._-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 dev: ## Run hot-recompiling dev loop with watchexec
-	watchexec -e rs,toml -w lapce-app -w lapce-proxy -w lapce-core -w lapce-rpc -r -- cargo run --bin ahead
+	watchexec -e rs,toml -w lapce-app -w lapce-proxy -w lapce-core -w lapce-rpc -w ahead-viewmodel -r -- cargo run --bin ahead
+
+bacon: ## Fast check loop (bacon default job)
+	bacon
+
+bacon-test: ## Test loop for proxy + viewmodel
+	bacon test
+
+bacon-run: ## Rebuild + relaunch the app on change (hot reload)
+	bacon run
 
 ubuntu-deps:
 	apt-get update -y

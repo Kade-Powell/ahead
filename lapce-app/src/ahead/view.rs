@@ -1600,7 +1600,9 @@ pub fn ahead_agent_panel(
                         .border_color(Color::from_rgb8(30, 41, 59))
                 }),
 
-                // 4. Agent Pairing Feed & Socratic / Scaffolding Stream
+                // 4. Agent Pairing Feed & Socratic / Scaffolding Stream.
+                // Turn output renders here: agent message + challenges as
+                // chat, cue as overlay, staged proposal in the gate list.
                 container(
                     stack((
                         label(|| "💬 AGENT PAIRING FEED".to_string()).style(|s| {
@@ -1609,7 +1611,28 @@ pub fn ahead_agent_panel(
                                 .color(Color::from_rgb8(148, 163, 184))
                                 .margin_bottom(8.0)
                         }),
-                        // Chat turns
+                        label(move || {
+                            if ahead_state.session_busy.get() {
+                                "Working… turn running in the session host.".to_string()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .style(move |s| {
+                            let busy = ahead_state.session_busy.get();
+                            s.font_size(11.0)
+                                .color(Color::from_rgb8(245, 158, 11))
+                                .margin_bottom(if busy { 6.0 } else { 0.0 })
+                                .display(if busy { Display::Flex } else { Display::None })
+                        }),
+                        label(move || ahead_state.session_error.get().unwrap_or_default())
+                            .style(move |s| {
+                                let has_err = ahead_state.session_error.get().is_some();
+                                s.font_size(11.0)
+                                    .margin_bottom(if has_err { 6.0 } else { 0.0 })
+                                    .color(Color::from_rgb8(248, 113, 113))
+                                    .display(if has_err { Display::Flex } else { Display::None })
+                            }),
                         dyn_stack(
                             move || ahead_state.chat_messages.get(),
                             |m: &crate::ahead::state::AgentChatMessage| m.id.clone(),
@@ -1774,21 +1797,26 @@ pub fn ahead_agent_panel(
                             },
                         ),
 
-                        // Quick prompt shortcuts
+                        // Quick prompt shortcuts (run through the built-in loop)
                         stack((
-                            quick_action_chip("🛡️ Edge Cases", ahead_state, "Challenge my edge cases for this phase"),
-                            quick_action_chip("📋 Invariants", ahead_state, "What invariants must hold here?"),
-                            quick_action_chip("⚡ Scaffold", ahead_state, "Scaffold boilerplate for the active task"),
+                            quick_action_chip("🛡️ Edge Cases", ahead_state, window_tab_data.clone(), "Challenge my edge cases for this phase"),
+                            quick_action_chip("📋 Invariants", ahead_state, window_tab_data.clone(), "What invariants must hold here?"),
+                            quick_action_chip("⚡ Scaffold", ahead_state, window_tab_data.clone(), "Scaffold boilerplate for the active task"),
                         ))
                         .style(|s| s.margin_top(8.0)),
 
-                        // User Chat Input Box (keyboard navigable; Enter sends)
+                        // User Chat Input Box (keyboard navigable; Enter sends
+                        // through the built-in loop with live editor context)
                         stack((
                             text_input(ahead_state.chat_input)
                                 .keyboard_navigable()
-                                .on_enter(move || {
-                                    let text = ahead_state.chat_input.get_untracked();
-                                    ahead_state.send_chat(text);
+                                .on_enter({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data.clone();
+                                    move || {
+                                        let text = ahead_state.chat_input.get_untracked();
+                                        ahead_state.send_chat_turn(text, &window_tab_data);
+                                    }
                                 })
                                 .style(move |s| {
                                     s.flex_grow(1.0)
@@ -1802,9 +1830,13 @@ pub fn ahead_agent_panel(
                                         .font_size(12.0)
                                 }),
                             label(|| "Send".to_string())
-                                .on_click_stop(move |_| {
-                                    let text = ahead_state.chat_input.get();
-                                    ahead_state.send_chat(text);
+                                .on_click_stop({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data.clone();
+                                    move |_| {
+                                        let text = ahead_state.chat_input.get();
+                                        ahead_state.send_chat_turn(text, &window_tab_data);
+                                    }
                                 })
                                 .style(|s| {
                                     s.background(Color::from_rgb8(37, 99, 235))
@@ -1951,11 +1983,12 @@ fn phase_step_chip(
 fn quick_action_chip(
     label_text: &'static str,
     ahead_state: AheadState,
+    window_tab_data: Rc<WindowTabData>,
     prompt: &'static str,
 ) -> impl View {
     label(move || label_text.to_string())
         .on_click_stop(move |_| {
-            ahead_state.send_chat(prompt.to_string());
+            ahead_state.send_chat_turn(prompt.to_string(), &window_tab_data);
         })
         .style(move |s| {
             s.background(Color::from_rgb8(30, 41, 59))

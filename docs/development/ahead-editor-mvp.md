@@ -40,6 +40,12 @@ The current checkout still contains the old implementation, eight pre-existing m
 
 Lapce's current workspace separates app, core, proxy, and RPC crates and uses Floem. Its document and editor code already expose diagnostics, inline completions, selections, rope deltas, and rendering facilities. These are useful attachment points for AHEAD. This is source inspection, not a successful build or a performance/accessibility evaluation. [Lapce workspace](https://github.com/lapce/lapce/blob/master/Cargo.toml), [document model](https://github.com/lapce/lapce/blob/master/lapce-app/src/doc.rs), [editor](https://github.com/lapce/lapce/blob/master/lapce-app/src/editor.rs).
 
+The production UI target is GPUI + gpui-kit; Floem is the migration shell.
+When GPUI behavior is unclear, use the [Zed source tree](https://github.com/zed-industries/zed)
+as the reference implementation for GPUI/editor patterns, while keeping Zed
+out of AHEAD's dependency and product scope. See [Decision 0003](decisions/0003-ui-port-max-reuse.md)
+for the comparison, migration sequence, and acceptance gates.
+
 Pin an upstream commit for the fork and demonstrate:
 
 1. A repeatable build and packaging path on the first supported OS.

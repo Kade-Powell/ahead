@@ -51,6 +51,21 @@ puts the UI in HTML rendered by a system WebView with Rust/JavaScript message
 passing; and [Vue's accessibility guidance](https://vuejs.org/guide/best-practices/accessibility)
 provides the conventional semantic HTML/ARIA path for the contingency shell.
 
+## Zed as the GPUI reference implementation
+
+Use the [Zed source tree](https://github.com/zed-industries/zed) as the first
+reference when GPUI work is unclear. Inspect its pinned source for application
+startup, windows and actions, entities/context, editor state and IME, dock and
+workspace layout, command palette, accessibility, platform integration, and
+performance/testing patterns before inventing AHEAD-specific equivalents.
+
+Zed is a reference implementation, not an AHEAD dependency or product
+compatibility target. Reuse concepts and compatible code only after checking
+the source revision and license/attribution requirements. Do not inherit Zed's
+cloud services, telemetry, product workflows, extension assumptions, or
+unrelated features. Record the Zed path and commit used when an adaptation is
+material to the port.
+
 ### Why GPUI wins
 
 GPUI reuses more of this fork than the Tauri alternatives for AHEAD's actual

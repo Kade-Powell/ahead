@@ -101,7 +101,131 @@ impl AheadState {
         }
     }
 
-    /// Adopts a durable session returned by the session host.
+    /// Sends chat through the built-in agent loop via AgentTurn RPC.
+    /// Captures live editor context (path, caret, selection, content),
+    /// records the human message immediately, then dispatches the turn.
+    /// Turn output renders as agent chat + challenges, presentation cue,
+    /// and staged proposal. All host-mediated; errors surface inline.
+    pub fn send_chat_turn(
+        &self,
+        text: String,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::reactive::{SignalGet, SignalUpdate};
+        use floem::ext_event::create_ext_action;
+        use lapce_rpc::ahead::{
+            AgentTurnRequestDto, TurnEditorContext,
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let view_opt = self.active_session.get_untracked();
+        let Some(view) = view_opt else {
+            self.session_error.set(Some("Start a session before chatting.".to_string()));
+            return;
+        };
+        // Capture live editor context: path, caret line/col, selection, content.
+        let (active_path, caret, selection, file_content) =
+            Self::capture_editor_context(window_tab);
+        let dto = AgentTurnRequestDto {
+            session_id: view.session.id.clone(),
+            thread_id: format!("thread-{}", view.session.id),
+            user_message: text.clone(),
+            context: TurnEditorContext {
+                active_path,
+                caret,
+                selection,
+                file_content,
+                visible_end: None,
+                attached_anchor_ids: Vec::new(),
+            },
+            invariants: Vec::new(),
+            cwd: None,
+            expected_policy_sha256: view.session.policy.sha256.clone(),
+            scope: None,
+        };
+        // Record human message now (viewmodel-validated).
+        self.send_chat(text);
+        self.session_busy.set(true);
+        self.session_error.set(None);
+        let scope = window_tab.scope;
+        let proxy = window_tab.common.proxy.clone();
+        let ahead = *self;
+        let send = create_ext_action(scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => match serde_json::from_value::<lapce_proxy::ahead::agent::AgentTurnOutput>(val) {
+                    Ok(out) => ahead.apply_turn_output(out),
+                    Err(_) => ahead.session_error.set(Some("Turn returned an unreadable response.".to_string())),
+                },
+                Err(e) => ahead.session_error.set(Some(format!("Turn failed: {}", e.message))),
+            }
+            ahead.session_busy.set(false);
+        });
+        proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::AgentTurn { request: dto },
+            move |res| send(res),
+        );
+    }
+
+    /// Captures (path, caret, selection, content) from the active editor.
+    /// Falls back to empty context when no editor is open.
+    fn capture_editor_context(
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) -> (String, lapce_rpc::ahead::DisplayPosition, Option<lapce_rpc::ahead::DisplayRange>, String) {
+        use floem::reactive::{SignalGet, SignalWith};
+        use lapce_core::buffer::rope_text::RopeText;
+        let fallback = (
+            String::new(),
+            lapce_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+            None,
+            String::new(),
+        );
+        let Some(editor) = window_tab.main_split.active_editor.get_untracked() else {
+            return fallback;
+        };
+        let doc = editor.doc();
+        let path = match doc.content.get_untracked() {
+            crate::doc::DocContent::File { path, .. } => {
+                // Workspace-relative when possible; else lossy absolute.
+                let ws_root = window_tab.workspace.path.clone().unwrap_or_default();
+                path.strip_prefix(&ws_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string())
+            }
+            _ => return fallback,
+        };
+        let offset = editor.cursor().get_untracked().offset();
+        let (caret, content) = doc.buffer.with_untracked(|b| {
+            let (line, col) = b.offset_to_line_col(offset);
+            let caret = lapce_rpc::ahead::DisplayPosition {
+                line: line as u32,
+                col: col as u32,
+            };
+            (caret, b.text().to_string())
+        });
+        (path, caret, None, content)
+    }
+
+    /// Renders turn output: agent message + challenges as chat, cue as
+    /// presentation overlay, staged proposal appended to the gate list.
+    pub fn apply_turn_output(&self, out: lapce_proxy::ahead::agent::AgentTurnOutput) {
+        use floem::reactive::SignalUpdate;
+        self.push_message("AHEAD Agent", out.message, false);
+        for challenge in out.edge_case_challenges {
+            self.push_message("Socratic Guide", challenge, true);
+        }
+        if let Some(cue) = out.presentation_cue {
+            self.presentation_cue.set(Some(cue));
+        }
+        if let Some(prop) = out.scaffold_proposal {
+            self.pending_proposals.update(|list| {
+                if !list.iter().any(|p| p.id == prop.id) {
+                    list.push(prop);
+                }
+            });
+        }
+    }
+
     /// Clears per-session conversation scaffolds so a reopened session
     /// never shows another session's chat, proposals, or transcripts.
     pub fn adopt_durable_session(&self, view: SessionView) {

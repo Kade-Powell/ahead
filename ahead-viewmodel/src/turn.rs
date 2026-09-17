@@ -10,7 +10,7 @@ use lapce_rpc::ahead::AssistanceMode;
 /// What the built-in loop may do on a turn. Mirrors the fork's
 /// `AskForApproval` vocabulary; the host answers every approval from
 /// `PolicyEvaluator`, never from the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApprovalPolicy {
     /// Learn: read-only. Every mutation/execution approval is declined.
     Never,
@@ -37,7 +37,7 @@ impl ApprovalPolicy {
 
 /// Sandbox mapping: Learn → `read-only`, Assist → `workspace-write`.
 /// `danger-full-access` is never emitted by a managed session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Sandbox {
     ReadOnly,
     WorkspaceWrite,

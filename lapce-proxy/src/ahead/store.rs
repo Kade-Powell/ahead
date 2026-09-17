@@ -501,6 +501,42 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn list_pending_proposals(&self, session_id: &str) -> Result<Vec<ChangeProposal>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT id, session_id, path, original_sha256, patch, is_mechanical, description, target_line, target_col
+                 FROM proposals WHERE session_id = ?1 AND status = 'pending' ORDER BY rowid ASC",
+                params![session_id],
+            ).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let id: String = row.get(0)?;
+                let s_id: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                let original_sha256: String = row.get(3)?;
+                let patch: String = row.get(4)?;
+                let is_mechanical: i64 = row.get(5)?;
+                let description: String = row.get(6)?;
+                let target_line: Option<i64> = row.get(7)?;
+                let target_col: Option<i64> = row.get(8)?;
+                out.push(ChangeProposal {
+                    id,
+                    session_id: s_id,
+                    path,
+                    original_sha256,
+                    patch,
+                    is_mechanical: is_mechanical != 0,
+                    description,
+                    recommended_cursor: match (target_line, target_col) {
+                        (Some(l), Some(c)) => Some(DisplayPosition { line: l as u32, col: c as u32 }),
+                        _ => None,
+                    },
+                });
+            }
+            Ok(out)
+        })
+    }
+
     pub fn accept_proposal(&mut self, proposal_id: &str) -> Result<()> {
         self.rt.block_on(async {
             let count = self.conn.execute(

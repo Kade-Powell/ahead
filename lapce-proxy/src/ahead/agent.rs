@@ -67,7 +67,7 @@ pub struct AgentTurnRequest {
 /// Backwards-compatible alias: existing callers build `AgentTurnInput`.
 pub type AgentTurnInput = AgentTurnRequest;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentTurnOutput {
     pub message: String,
     pub edge_case_challenges: Vec<String>,
