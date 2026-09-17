@@ -23,6 +23,9 @@ pub struct TrackerOutboxEntry {
     pub target: String,
     pub description: String,
     pub status: String,
+    /// Present when this entry maps to a host-side tracker outbox item
+    /// (staged from a work-item close-out or plan) and can publish live.
+    pub outbox_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +42,8 @@ pub struct AheadState {
     pub work_item_input: RwSignal<String>,
     pub work_item_error: RwSignal<Option<String>>,
     pub conversation_summaries: RwSignal<Vec<lapce_rpc::ahead::ConversationSummary>>,
+    pub review_snapshot: RwSignal<Option<lapce_rpc::ahead::ReviewSnapshotDto>>,
+    pub review_error: RwSignal<Option<String>>,
     pub saved_sessions: RwSignal<Vec<SessionView>>,
     pub session_error: RwSignal<Option<String>>,
     pub session_busy: RwSignal<bool>,
@@ -81,6 +86,8 @@ impl AheadState {
             work_item_input: create_rw_signal(String::new()),
             work_item_error: create_rw_signal(None),
             conversation_summaries: create_rw_signal(Vec::new()),
+            review_snapshot: create_rw_signal(None),
+            review_error: create_rw_signal(None),
             saved_sessions: create_rw_signal(Vec::new()),
             session_error: create_rw_signal(None),
             session_busy: create_rw_signal(false),
@@ -388,7 +395,8 @@ impl AheadState {
                                 id: format!("closeout-{}", closeout.item_id),
                                 target: closeout.issue_ref.clone().unwrap_or_else(|| "Issue (link on publish)".to_string()),
                                 description: closeout.summary_markdown.clone(),
-                                status: "Close-out draft (review before publish)".to_string(),
+                                status: "Close-out draft (stage on GitHub first)".to_string(),
+                                outbox_id: None,
                             });
                         });
                     }
@@ -407,9 +415,96 @@ impl AheadState {
             },
             move |res| send(res),
         );
+    }
+
+    /// Captures a frozen review snapshot for the active session. The tree
+    /// SHA should come from the actual working tree (caller-provided for
+    /// now); implementers list the proposal/code authors under review.
+    pub fn capture_review(
+        &self,
+        code_tree_sha: String,
+        implementer_ids: Vec<String>,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let Some(view) = self.active_session.get_untracked() else {
+            self.review_error.set(Some("Start a session before capturing review.".to_string()));
+            return;
+        };
+        let ahead = *self;
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => match serde_json::from_value::<lapce_rpc::ahead::ReviewSnapshotDto>(val) {
+                    Ok(snap) => {
+                        ahead.review_snapshot.set(Some(snap));
+                        ahead.review_error.set(None);
+                    }
+                    Err(_) => ahead.review_error.set(Some("Capture returned an unreadable snapshot.".to_string())),
+                },
+                Err(e) => ahead.review_error.set(Some(format!("Capture failed: {}", e.message))),
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::ReviewCapture {
+                session_id: view.session.id.clone(),
+                code_tree_sha,
+                implementer_ids,
+                findings: Vec::new(),
+            },
+            move |res| send(res),
+        );
+    }
+
+    /// Attests a review snapshot as an independent reviewer. The host
+    /// rejects self-approval by implementers; that error surfaces inline.
+    pub fn attest_review(
+        &self,
+        snapshot_id: String,
+        reviewer_id: String,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let ahead = *self;
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => match serde_json::from_value::<lapce_rpc::ahead::ReviewSnapshotDto>(val) {
+                    Ok(snap) => {
+                        ahead.review_snapshot.set(Some(snap));
+                        ahead.review_error.set(None);
+                    }
+                    Err(_) => ahead.review_error.set(Some("Attest returned an unreadable snapshot.".to_string())),
+                },
+                Err(e) => ahead.review_error.set(Some(format!("Attest failed (independence?): {}", e.message))),
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::ReviewAttest { snapshot_id, reviewer_id },
+            move |res| send(res),
+        );
+    }
+
+    /// Refreshes the latest review snapshot for the active session.
+    pub fn refresh_review(
+        &self,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let Some(view) = self.active_session.get_untracked() else {
+            return;
+        };
+        let ahead = *self;
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            if let Ok(val) = res {
+                if let Ok(snap) = serde_json::from_value::<Option<lapce_rpc::ahead::ReviewSnapshotDto>>(val) {
+                    ahead.review_snapshot.set(snap);
+                }
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::ReviewGet { session_id: view.session.id.clone() },
+            move |res| send(res),
+        );
      }
-    /// Clears per-session conversation scaffolds so a reopened session
-    /// never shows another session's chat, proposals, or transcripts.
     /// Delegates to the shared viewmodel (single source of truth).
     pub fn adopt_durable_session(&self, view: SessionView) {
         let mut snapshot = ahead_viewmodel::SessionSnapshot::default();
@@ -433,12 +528,12 @@ impl AheadState {
             is_challenge: m.is_challenge,
         }).collect();
         self.chat_messages.set(chat);
-        self.pending_proposals.set(snapshot.pending_proposals.clone());
         let tracker: Vec<TrackerOutboxEntry> = snapshot.tracker.iter().map(|t| TrackerOutboxEntry {
             id: t.id.clone(),
             target: t.target.clone(),
             description: t.description.clone(),
             status: t.status.clone(),
+            outbox_id: None,
         }).collect();
         self.tracker_outbox.set(tracker);
         self.voice_transcripts.set(snapshot.transcripts.clone());
@@ -583,11 +678,160 @@ impl AheadState {
                 target: t.target,
                 description: t.description,
                 status: t.status,
+                outbox_id: None,
             }).collect();
             self.tracker_outbox.set(items);
         }
     }
 
+    /// Stages a close-out draft on GitHub: parses `owner/repo#number`
+    /// from the draft target, stages the update, and authorizes it —
+    /// all before any network write. Publish stays a separate tap.
+    pub fn stage_tracker_draft(
+        &self,
+        id: &str,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let entry = self.tracker_outbox.get_untracked().into_iter().find(|t| t.id == id);
+        let Some(entry) = entry else {
+            self.session_error.set(Some("Draft no longer exists.".to_string()));
+            return;
+        };
+        let Some((owner, repo, number)) = Self::parse_issue_target(&entry.target) else {
+            self.session_error.set(Some("Draft target must look like owner/repo#123 to stage.".to_string()));
+            return;
+        };
+        let Some(view) = self.active_session.get_untracked() else {
+            self.session_error.set(Some("Start a session before staging.".to_string()));
+            return;
+        };
+        let ahead = *self;
+        let entry_id = entry.id.clone();
+        let description = entry.description.clone();
+        let scope = window_tab.scope;
+        let proxy = window_tab.common.proxy.clone();
+        let proxy2 = proxy.clone();
+        let send = create_ext_action(scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => {
+                    let outbox_id = val.get("outbox_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if outbox_id.is_empty() {
+                        ahead.session_error.set(Some("Stage returned no outbox id.".to_string()));
+                        return;
+                    }
+                    // Authorize immediately (explicit tap = authorization).
+                    let outbox_id2 = outbox_id.clone();
+                    let send2 = create_ext_action(scope, move |res2: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                        match res2 {
+                            Ok(_) => {
+                                ahead.tracker_outbox.update(|items| {
+                                    for item in items.iter_mut() {
+                                        if item.id == entry_id {
+                                            item.status = "Staged + authorized (tap Publish)".to_string();
+                                            item.outbox_id = Some(outbox_id2.clone());
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => ahead.session_error.set(Some(format!("Authorize failed: {}", e.message))),
+                        }
+                    });
+                    proxy2.ahead_request(
+                        lapce_rpc::ahead::AheadRequest::TrackerAuthorize { outbox_id },
+                        move |res| send2(res),
+                    );
+                }
+                Err(e) => ahead.session_error.set(Some(format!("Stage failed: {}", e.message))),
+            }
+        });
+        // Observed SHA unknown on first stage: empty means "create path";
+        // the host re-fetches remote before any write, so a concurrent
+        // edit still surfaces as Conflict at publish time.
+        let observed = String::new();
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::TrackerStage {
+                session_id: view.session.id.clone(),
+                issue: lapce_rpc::ahead::GithubIssueRef {
+                    host: "github.com".to_string(),
+                    owner,
+                    repo,
+                    issue_number: number,
+                    issue_node_id: String::new(),
+                    title: entry.target.clone(),
+                },
+                payload: lapce_rpc::ahead::TrackerPublishPayload {
+                    title: None,
+                    body_markdown: Some(description),
+                    state: None,
+                },
+                observed_body_sha: observed,
+            },
+            move |res| send(res),
+        );
+    }
+
+    /// Publishes a staged + authorized draft to GitHub. Conflict and
+    /// timeout outcomes surface inline; nothing overwrites silently.
+    pub fn publish_tracker_item(
+        &self,
+        id: &str,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let entry = self.tracker_outbox.get_untracked().into_iter().find(|t| t.id == id);
+        let Some(entry) = entry else {
+            self.session_error.set(Some("Draft no longer exists.".to_string()));
+            return;
+        };
+        let Some(outbox_id) = entry.outbox_id.clone() else {
+            self.session_error.set(Some("Stage the draft first (tap Stage).".to_string()));
+            return;
+        };
+        let ahead = *self;
+        let entry_id = entry.id.clone();
+        let scope = window_tab.scope;
+        let proxy = window_tab.common.proxy.clone();
+        let send = create_ext_action(scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => {
+                    let status_str = format!("{val:?}");
+                    ahead.tracker_outbox.update(|items| {
+                        for item in items.iter_mut() {
+                            if item.id == entry_id {
+                                if status_str.contains("Conflict") {
+                                    item.status = "Conflict: remote changed — review before retry".to_string();
+                                } else if status_str.contains("UnknownTimeout") {
+                                    item.status = "Unknown: timed out — reconcile before retry".to_string();
+                                } else {
+                                    item.status = "Published to GitHub ✓".to_string();
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => ahead.session_error.set(Some(format!("Publish failed: {}", e.message))),
+            }
+        });
+        proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::TrackerPublish { outbox_id },
+            move |res| send(res),
+        );
+    }
+
+    /// Parses `owner/repo#number` (also tolerates `owner/repo #number`).
+    fn parse_issue_target(target: &str) -> Option<(String, String, u64)> {
+        let (repo_part, num_part) = target.split_once('#')?;
+        let number: u64 = num_part.trim().parse().ok()?;
+        let repo_part = repo_part.trim().trim_end_matches('/');
+        let (owner, repo) = repo_part.split_once('/')?;
+        let owner = owner.trim().trim_start_matches('@').to_string();
+        let repo = repo.trim().to_string();
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner, repo, number))
+    }
     /// Next workflow phase for the given current phase id.
     /// Delegates to the shared viewmodel (single source of truth).
     pub fn next_phase(current: &str) -> (&'static str, &'static str) {

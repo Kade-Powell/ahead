@@ -929,6 +929,92 @@ impl SessionStore {
             Ok(out)
         })
     }
+
+    /// Direct row insert for export restore (bypasses id generation).
+    pub fn insert_work_item_row(&self, item: &WorkItem) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_items (id, session_id, title, status, position, created_by, created_at, closed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    item.id.clone(),
+                    item.session_id.clone(),
+                    item.title.clone(),
+                    Self::work_item_status_str(&item.status),
+                    item.position,
+                    item.created_by.clone(),
+                    item.created_at.clone(),
+                    item.closed_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    pub fn insert_work_item_event_row(&self, event: &WorkItemEvent) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_item_events (id, item_id, session_id, kind, body_markdown, actor_id, anchor_id, artifact_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    event.id.clone(),
+                    event.item_id.clone(),
+                    event.session_id.clone(),
+                    event.kind.clone(),
+                    event.body_markdown.clone(),
+                    event.actor_id.clone(),
+                    event.anchor_id.clone(),
+                    event.artifact_id.clone(),
+                    event.created_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    pub fn insert_work_item_closeout_row(&self, closeout: &WorkItemCloseout) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_item_closeouts (item_id, session_id, summary_markdown, issue_ref, follow_ups_json, conversation_summary_id, closed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(item_id) DO UPDATE SET summary_markdown = excluded.summary_markdown,
+                    issue_ref = excluded.issue_ref, follow_ups_json = excluded.follow_ups_json,
+                    conversation_summary_id = excluded.conversation_summary_id, closed_at = excluded.closed_at",
+                params![
+                    closeout.item_id.clone(),
+                    closeout.session_id.clone(),
+                    closeout.summary_markdown.clone(),
+                    closeout.issue_ref.clone(),
+                    closeout.follow_ups_json.clone(),
+                    closeout.conversation_summary_id.clone(),
+                    closeout.closed_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    pub fn insert_conversation_summary_row(&self, summary: &ConversationSummary) -> Result<()> {
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO conversation_summaries (id, session_id, phase, summary_markdown, message_id_range, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    summary.id.clone(),
+                    summary.session_id.clone(),
+                    summary.phase.clone(),
+                    summary.summary_markdown.clone(),
+                    summary.message_id_range.clone(),
+                    summary.created_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

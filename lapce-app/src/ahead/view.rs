@@ -1170,6 +1170,7 @@ pub fn ahead_agent_panel(
     let config = window_tab_data.common.config;
     let scope = window_tab_data.scope;
     let proxy = window_tab_data.common.proxy.clone();
+    let window_tab_data_review = window_tab_data.clone();
     let session_signal = ahead_state.active_session;
 
     container(
@@ -2080,24 +2081,57 @@ pub fn ahead_agent_panel(
                                                 .color(Color::from_rgb8(203, 213, 225))
                                                 .margin_top(2.0)
                                         }),
-                                        label(|| "🚀 Authorize Dispatch to GitHub".to_string())
-                                            .on_click_stop({
-                                                let item_id = item_id.clone();
-                                                move |_| {
-                                                    ahead_state.dispatch_tracker_item(&item_id);
-                                                }
-                                            })
-                                            .style(|s| {
-                                                s.margin_top(6.0)
-                                                    .background(Color::from_rgb8(14, 165, 233))
-                                                    .color(Color::from_rgb8(255, 255, 255))
-                                                    .padding_horiz(10.0)
-                                                    .padding_vert(4.0)
-                                                    .border_radius(4.0)
-                                                    .cursor(CursorStyle::Pointer)
-                                                    .font_bold()
-                                                    .font_size(11.0)
-                                            }),
+                                        stack((
+                                            {
+                                                let staged = item.outbox_id.is_some();
+                                                label(move || {
+                                                    if staged { "🚀 Publish to GitHub".to_string() } else { "📌 Stage on GitHub".to_string() }
+                                                })
+                                            }
+                                                .on_click_stop({
+                                                    let item_id = item_id.clone();
+                                                    let ahead_state = ahead_state;
+                                                    let window_tab_data = window_tab_data.clone();
+                                                    let staged = item.outbox_id.is_some();
+                                                    move |_| {
+                                                        if staged {
+                                                            ahead_state.publish_tracker_item(&item_id, &window_tab_data);
+                                                        } else {
+                                                            ahead_state.stage_tracker_draft(&item_id, &window_tab_data);
+                                                        }
+                                                    }
+                                                })
+                                                .style(|s| {
+                                                    s.margin_top(6.0)
+                                                        .background(Color::from_rgb8(14, 165, 233))
+                                                        .color(Color::from_rgb8(255, 255, 255))
+                                                        .padding_horiz(10.0)
+                                                        .padding_vert(4.0)
+                                                        .border_radius(4.0)
+                                                        .cursor(CursorStyle::Pointer)
+                                                        .font_bold()
+                                                        .font_size(11.0)
+                                                        .margin_right(6.0)
+                                                }),
+                                            label(|| "Local queue".to_string())
+                                                .on_click_stop({
+                                                    let item_id = item_id.clone();
+                                                    move |_| {
+                                                        ahead_state.dispatch_tracker_item(&item_id);
+                                                    }
+                                                })
+                                                .style(|s| {
+                                                    s.margin_top(6.0)
+                                                        .background(Color::from_rgb8(51, 65, 85))
+                                                        .color(Color::from_rgb8(255, 255, 255))
+                                                        .padding_horiz(10.0)
+                                                        .padding_vert(4.0)
+                                                        .border_radius(4.0)
+                                                        .cursor(CursorStyle::Pointer)
+                                                        .font_size(11.0)
+                                                }),
+                                        ))
+                                        .style(|s| s.margin_top(2.0)),
                                     ))
                                     .style(|s| s.flex_col()),
                                 )
@@ -2117,6 +2151,99 @@ pub fn ahead_agent_panel(
                 .style(move |s| {
                     s.padding(12.0)
                         .background(Color::from_rgb8(15, 23, 42))
+                }),
+
+                // 7. Review Snapshot & Attestation (implementers can't self-approve)
+                container(
+                    stack((
+                        label(|| "🔍 REVIEW SNAPSHOT".to_string()).style(|s| {
+                            s.font_bold()
+                                .font_size(11.0)
+                                .color(Color::from_rgb8(148, 163, 184))
+                                .margin_bottom(6.0)
+                        }),
+                        label(move || {
+                            ahead_state.review_snapshot.get()
+                                .map(|s| if s.is_approved {
+                                    format!("Approved by {} ✓ ({})", s.approved_by.unwrap_or_default(), s.code_tree_sha)
+                                } else {
+                                    format!("Awaiting independent review ({})", s.code_tree_sha)
+                                })
+                                .unwrap_or_else(|| "No snapshot captured yet.".to_string())
+                        })
+                        .style(|s| {
+                            s.font_size(11.0)
+                                .color(Color::from_rgb8(203, 213, 225))
+                                .margin_bottom(6.0)
+                        }),
+                        label(move || ahead_state.review_error.get().unwrap_or_default())
+                            .style(move |s| {
+                                let has_err = ahead_state.review_error.get().is_some();
+                                s.font_size(11.0)
+                                    .margin_bottom(if has_err { 6.0 } else { 0.0 })
+                                    .color(Color::from_rgb8(248, 113, 113))
+                                    .display(if has_err { Display::Flex } else { Display::None })
+                            }),
+                        stack((
+                            label(|| "📸 Capture".to_string())
+                                .on_click_stop({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data_review.clone();
+                                    move |_| {
+                                        let owner = ahead_state.authenticated_user.get_untracked()
+                                            .map(|u| u.login).unwrap_or_else(|| "local".to_string());
+                                        ahead_state.capture_review(
+                                            format!("tree-{}", ahead_state.active_session.get_untracked().map(|v| v.session.revision).unwrap_or(0)),
+                                            vec![owner],
+                                            &window_tab_data,
+                                        );
+                                    }
+                                })
+                                .style(|s| {
+                                    s.background(Color::from_rgb8(37, 99, 235))
+                                        .color(Color::from_rgb8(255, 255, 255))
+                                        .padding_horiz(10.0)
+                                        .padding_vert(4.0)
+                                        .border_radius(4.0)
+                                        .cursor(CursorStyle::Pointer)
+                                        .font_bold()
+                                        .font_size(11.0)
+                                        .margin_right(6.0)
+                                }),
+                            label(|| "✅ Attest".to_string())
+                                .on_click_stop({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data_review.clone();
+                                    move |_| {
+                                        let (snap_id, reviewer) = (
+                                            ahead_state.review_snapshot.get_untracked().map(|s| s.snapshot_id),
+                                            ahead_state.authenticated_user.get_untracked().map(|u| u.login),
+                                        );
+                                        match (snap_id, reviewer) {
+                                            (Some(sid), Some(who)) => ahead_state.attest_review(sid, who, &window_tab_data),
+                                            _ => ahead_state.review_error.set(Some("Capture a snapshot and sign in before attesting.".to_string())),
+                                        }
+                                    }
+                                })
+                                .style(|s| {
+                                    s.background(Color::from_rgb8(22, 163, 74))
+                                        .color(Color::from_rgb8(255, 255, 255))
+                                        .padding_horiz(10.0)
+                                        .padding_vert(4.0)
+                                        .border_radius(4.0)
+                                        .cursor(CursorStyle::Pointer)
+                                        .font_bold()
+                                        .font_size(11.0)
+                                }),
+                        )),
+                    ))
+                    .style(|s| s.flex_col()),
+                )
+                .style(move |s| {
+                    s.padding(12.0)
+                        .background(Color::from_rgb8(17, 24, 39))
+                        .border_bottom(1.0)
+                        .border_color(Color::from_rgb8(31, 41, 55))
                 }),
             ))
             .style(|s| s.flex_col().width_pct(100.0)),

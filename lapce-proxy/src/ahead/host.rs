@@ -14,9 +14,9 @@ use uuid::Uuid;
 use lapce_rpc::ahead::{
     AheadRequest, AssistanceMode, ChangeProposal, CodeAnchor,
     DisplayRange, GithubIssueRef, Id, Participant, PredictionRequest,
-    PredictionResult, RepoPath, Revision, SessionLifecycle, SessionParticipantRecord,
-    SessionPolicySnapshot, SessionRole, SessionView, VoiceControl, WorkKind,
-    WorkSession, WorkflowPhase, WorkflowState,
+    PredictionResult, RepoPath, Revision, SessionExportBundle, SessionLifecycle,
+    SessionParticipantRecord, SessionPolicySnapshot, SessionRole, SessionView,
+    VoiceControl, WorkKind, WorkSession, WorkflowPhase, WorkflowState,
 };
 
 use super::{
@@ -33,6 +33,8 @@ pub struct AheadSessionHost {
     active_sessions: Arc<RwLock<HashMap<Id, SessionView>>>,
     active_voice_sessions: Arc<RwLock<HashMap<Id, Arc<VoiceSession>>>>,
     workspace_participants: Arc<RwLock<Vec<SessionParticipantRecord>>>,
+    tracker: Arc<RwLock<super::tracker::TrackerAdapter>>,
+    review_snapshots: Arc<RwLock<HashMap<Id, super::collab::ReviewSnapshot>>>,
 }
 
 impl AheadSessionHost {
@@ -53,6 +55,8 @@ impl AheadSessionHost {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             active_voice_sessions: Arc::new(RwLock::new(HashMap::new())),
             workspace_participants: Arc::new(RwLock::new(vec![host_record])),
+            tracker: Arc::new(RwLock::new(super::tracker::TrackerAdapter::new())),
+            review_snapshots: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -161,6 +165,58 @@ impl AheadSessionHost {
             AheadRequest::ConversationList { session_id } => {
                 let summaries = self.store.read().list_conversation_summaries(&session_id)?;
                 Ok(serde_json::to_value(summaries)?)
+            }
+            AheadRequest::SessionExport { session_id } => {
+                let bundle = self.session_export(&session_id)?;
+                Ok(serde_json::to_value(bundle)?)
+            }
+            AheadRequest::SessionRestore { bundle } => {
+                let view = self.session_restore(bundle)?;
+                Ok(serde_json::to_value(view)?)
+            }
+            AheadRequest::ReviewCapture { session_id, code_tree_sha, implementer_ids, findings } => {
+                let snapshot = self.review_capture(&session_id, code_tree_sha, implementer_ids, findings)?;
+                Ok(serde_json::to_value(snapshot)?)
+            }
+            AheadRequest::ReviewAttest { snapshot_id, reviewer_id } => {
+                let snapshot = self.review_attest(&snapshot_id, &reviewer_id)?;
+                Ok(serde_json::to_value(snapshot)?)
+            }
+            AheadRequest::ReviewGet { session_id } => {
+                let snapshot = self.review_get(&session_id)?;
+                Ok(serde_json::to_value(snapshot)?)
+            }
+            AheadRequest::TrackerStage { session_id, issue, payload, observed_body_sha } => {
+                let outbox_id = self.tracker.write().stage_update(
+                    session_id,
+                    issue,
+                    super::tracker::TrackerUpdatePayload {
+                        title: payload.title,
+                        body_markdown: payload.body_markdown,
+                        labels: None,
+                        state: payload.state,
+                    },
+                    observed_body_sha,
+                )?;
+                Ok(serde_json::to_value(serde_json::json!({ "outbox_id": outbox_id }))?)
+            }
+            AheadRequest::TrackerAuthorize { outbox_id } => {
+                let authorizer = self.auth.read().get_active_user(None).login.clone();
+                self.tracker.write().authorize_update(&outbox_id, &authorizer)?;
+                Ok(serde_json::json!({ "status": "authorized" }))
+            }
+            AheadRequest::TrackerPublish { outbox_id } => {
+                let token = self.auth.read().get_access_token().map(str::to_string);
+                let Some(token) = token else {
+                    anyhow::bail!("Tracker publish needs a signed-in GitHub identity (token unavailable)");
+                };
+                let status = self.tracker.write().publish_to_github(&outbox_id, &token, "https://api.github.com")?;
+                Ok(serde_json::to_value(status)?)
+            }
+            AheadRequest::TrackerGet { outbox_id } => {
+                let item = self.tracker.read().get_item(&outbox_id).cloned()
+                    .context("Outbox item not found")?;
+                Ok(serde_json::to_value(item)?)
             }
             AheadRequest::RequestPrediction { request } => {
                 let res = self.request_prediction(request, &[])?;
@@ -575,13 +631,14 @@ impl AheadSessionHost {
         use super::agent::AheadAgentLoop;
         // AheadAgentLoop holds Arc<AheadSessionHost>; the host is behind
         // parking_lot locks and Clone-safe Arcs, so a transient host value
-        // sharing the same Arcs is identical state. Build one cheaply.
         let transient = AheadSessionHost {
             store: self.store.clone(),
             auth: self.auth.clone(),
             active_sessions: self.active_sessions.clone(),
             active_voice_sessions: self.active_voice_sessions.clone(),
             workspace_participants: self.workspace_participants.clone(),
+            tracker: self.tracker.clone(),
+            review_snapshots: self.review_snapshots.clone(),
         };
         // Leak into an Arc for the loop's lifetime (freed with the output).
         let shared = Arc::new(transient);
@@ -595,6 +652,136 @@ impl AheadSessionHost {
             self.propose_edit(&session_id, prop)?;
         }
         Ok(out)
+    }
+
+    /// Builds a full export bundle: session + workflow + participants +
+    /// anchors + pending proposals + work items/events/close-outs +
+    /// conversation summaries. Everything visible without the original DB.
+    pub fn session_export(&self, session_id: &str) -> Result<SessionExportBundle> {
+        let view = self.get_session(session_id)?
+            .context("Session not found")?;
+        let store = self.store.read();
+        let anchors = store.list_anchors(session_id)?;
+        let pending_proposals = store.list_pending_proposals(session_id)?;
+        let work_items = store.list_work_items(session_id)?;
+        let mut work_item_events = Vec::new();
+        for item in &work_items {
+            work_item_events.extend(store.list_work_item_events(&item.id)?);
+        }
+        let mut work_item_closeouts = Vec::new();
+        for item in &work_items {
+            if let Some(closeout) = store.get_work_item_closeout(&item.id)? {
+                work_item_closeouts.push(closeout);
+            }
+        }
+        let conversation_summaries = store.list_conversation_summaries(session_id)?;
+        Ok(SessionExportBundle {
+            format_version: "ahead.editor/v0-draft".to_string(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            session: view.session,
+            workflow: view.workflow,
+            participants: view.participants,
+            anchors,
+            pending_proposals,
+            work_items,
+            work_item_events,
+            work_item_closeouts,
+            conversation_summaries,
+            anchors_note: "Anchors carry path + range + quote hash; resolve against current tree, never trust line numbers blindly.".to_string(),
+        })
+    }
+
+    /// Restores a session from an export bundle into this store. Fails
+    /// closed on id collision (no silent overwrite); the caller picks a
+    /// fresh import (e.g. re-export with a new session id) instead.
+    pub fn session_restore(&self, bundle: SessionExportBundle) -> Result<SessionView> {
+        if bundle.format_version != "ahead.editor/v0-draft" {
+            anyhow::bail!("Unsupported export format: {}", bundle.format_version);
+        }
+        if self.get_session(&bundle.session.id)?.is_some() {
+            anyhow::bail!("Session id already exists; import needs a fresh id, refusing overwrite");
+        }
+        let view = SessionView {
+            session: bundle.session.clone(),
+            workflow: bundle.workflow.clone(),
+            participants: bundle.participants.clone(),
+        };
+        {
+            let mut store = self.store.write();
+            store.insert_session(&view)?;
+            for anchor in &bundle.anchors {
+                store.insert_anchor(anchor)?;
+            }
+            for prop in &bundle.pending_proposals {
+                // Re-stage as pending; accept flow re-runs explicitly.
+                let _ = store.insert_proposal(prop);
+            }
+            for item in &bundle.work_items {
+                store.insert_work_item_row(item)?;
+            }
+            for event in &bundle.work_item_events {
+                store.insert_work_item_event_row(event)?;
+            }
+            for closeout in &bundle.work_item_closeouts {
+                store.insert_work_item_closeout_row(closeout)?;
+            }
+            for summary in &bundle.conversation_summaries {
+                store.insert_conversation_summary_row(summary)?;
+            }
+        }
+        {
+            let mut active = self.active_sessions.write();
+            active.insert(view.session.id.clone(), view.clone());
+        }
+        Ok(view)
+    }
+
+    /// Captures a frozen review snapshot: code tree hash, implementer set,
+    /// and initial findings. Findings stay; approval is a separate
+    /// independence-checked attestation below.
+    pub fn review_capture(
+        &self,
+        session_id: &str,
+        code_tree_sha: String,
+        implementer_ids: Vec<Id>,
+        findings: Vec<String>,
+    ) -> Result<lapce_rpc::ahead::ReviewSnapshotDto> {
+        self.get_session(session_id)?.context("Session not found")?;
+        let mut snapshot = super::collab::ReviewSnapshot::new(
+            uuid::Uuid::new_v4().to_string(),
+            session_id.to_string(),
+            code_tree_sha,
+            implementer_ids,
+        );
+        snapshot.findings = findings;
+        let dto = snapshot.to_dto();
+        self.review_snapshots.write().insert(dto.snapshot_id.clone(), snapshot);
+        Ok(dto)
+    }
+
+    /// Records an attestation on a snapshot. Implementers cannot approve
+    /// their own work; a code change (new capture with a different tree
+    /// SHA) makes prior approval stale while preserving findings.
+    pub fn review_attest(
+        &self,
+        snapshot_id: &str,
+        reviewer_id: &str,
+    ) -> Result<lapce_rpc::ahead::ReviewSnapshotDto> {
+        let mut snapshots = self.review_snapshots.write();
+        let Some(snapshot) = snapshots.get_mut(snapshot_id) else {
+            anyhow::bail!("Review snapshot not found: {}", snapshot_id);
+        };
+        snapshot.record_approval(reviewer_id)?;
+        Ok(snapshot.to_dto())
+    }
+
+    pub fn review_get(&self, session_id: &str) -> Result<Option<lapce_rpc::ahead::ReviewSnapshotDto>> {
+        let snapshots = self.review_snapshots.read();
+        let latest = snapshots.values()
+            .filter(|s| s.session_id == session_id)
+            .max_by_key(|s| s.snapshot_id.clone())
+            .map(|s| s.to_dto());
+        Ok(latest)
     }
 
     pub fn handle_voice_control(&self, control: VoiceControl) -> Result<()> {
@@ -789,5 +976,93 @@ mod tests {
             approved_by: "owner".to_string(),
         });
         assert!(host.agent_turn(dto).is_err());
+    }
+
+    #[test]
+    fn test_export_restore_roundtrip_into_fresh_store() {
+        let host = AheadSessionHost::in_memory().unwrap();
+        let view = host.start_work(
+            WorkKind::ProductChange,
+            AssistanceMode::Assist,
+            "Export me".to_string(),
+            "Starting".to_string(),
+            None,
+        ).unwrap();
+        host.create_anchor(
+            &view.session.id,
+            "src/a.rs".to_string(),
+            lapce_rpc::ahead::DisplayRange {
+                start: lapce_rpc::ahead::DisplayPosition { line: 1, col: 0 },
+                end: lapce_rpc::ahead::DisplayPosition { line: 2, col: 0 },
+            },
+            "fn a() {}".to_string(),
+        ).unwrap();
+        let item = host.store.read().create_work_item(&view.session.id, "Ship it", "owner").unwrap();
+        host.store.read().save_conversation_summary(&view.session.id, "plan", "Agreed", "msg-1..msg-2").unwrap();
+
+        let bundle = host.session_export(&view.session.id).unwrap();
+        assert_eq!(bundle.session.id, view.session.id);
+        assert_eq!(bundle.anchors.len(), 1);
+        assert_eq!(bundle.work_items.len(), 1);
+        assert_eq!(bundle.conversation_summaries.len(), 1);
+
+        // Serde round-trip: clean-machine reconstruction path.
+        let json = serde_json::to_string(&bundle).unwrap();
+        let bundle2: lapce_rpc::ahead::SessionExportBundle = serde_json::from_str(&json).unwrap();
+
+        // Restore into a fresh host; id collision fails closed.
+        let fresh = AheadSessionHost::in_memory().unwrap();
+        let restored = fresh.session_restore(bundle2).unwrap();
+        assert_eq!(restored.session.id, view.session.id);
+        assert_eq!(restored.workflow.phase.id, view.workflow.phase.id);
+        let items = fresh.store.read().list_work_items(&view.session.id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item.id);
+        let summaries = fresh.store.read().list_conversation_summaries(&view.session.id).unwrap();
+        assert_eq!(summaries.len(), 1);
+
+        // Second restore of the same bundle refuses overwrite.
+        let bundle3 = host.session_export(&view.session.id).unwrap();
+        assert!(fresh.session_restore(bundle3).is_err());
+    }
+
+    #[test]
+    fn test_review_capture_attest_independence_and_rpc() {
+        let host = AheadSessionHost::in_memory().unwrap();
+        let view = host.start_work(
+            WorkKind::ProductChange,
+            AssistanceMode::Assist,
+            "Review me".to_string(),
+            "Starting".to_string(),
+            None,
+        ).unwrap();
+
+        // Capture via typed method.
+        let snap = host.review_capture(
+            &view.session.id,
+            "tree-sha-1".to_string(),
+            vec!["dev-impl".to_string()],
+            vec!["finding: check bounds".to_string()],
+        ).unwrap();
+        assert!(!snap.is_approved);
+        assert_eq!(snap.findings.len(), 1);
+
+        // Implementer cannot self-approve.
+        assert!(host.review_attest(&snap.snapshot_id, "dev-impl").is_err());
+        // Independent reviewer approves.
+        let approved = host.review_attest(&snap.snapshot_id, "reviewer-2").unwrap();
+        assert!(approved.is_approved);
+        assert_eq!(approved.approved_by.as_deref(), Some("reviewer-2"));
+
+        // Via RPC dispatch (serde round-trip).
+        let val = host.handle_request(AheadRequest::ReviewGet { session_id: view.session.id.clone() }).unwrap();
+        let got: Option<lapce_rpc::ahead::ReviewSnapshotDto> = serde_json::from_value(val).unwrap();
+        assert!(got.is_some());
+        let val = host.handle_request(AheadRequest::ReviewAttest {
+            snapshot_id: snap.snapshot_id.clone(),
+            reviewer_id: "reviewer-3".to_string(),
+        }).unwrap();
+        let reattested: lapce_rpc::ahead::ReviewSnapshotDto = serde_json::from_value(val).unwrap();
+        assert_eq!(reattested.approved_by.as_deref(), Some("reviewer-3"));
     }
 }

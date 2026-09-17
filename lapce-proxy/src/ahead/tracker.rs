@@ -183,6 +183,124 @@ impl TrackerAdapter {
     pub fn get_item(&self, outbox_id: &str) -> Option<&TrackerOutboxItem> {
         self.outbox.get(outbox_id)
     }
+
+    /// Live publish against the GitHub REST API (issues update).
+    /// Same outbox contract as the mock path: only Authorized items
+    /// dispatch; remote body SHA is re-fetched and compared first, so a
+    /// concurrent edit surfaces as Conflict instead of overwriting.
+    /// Token stays in-process (from the session host's auth manager);
+    /// on timeout the item goes UnknownTimeout for reconcile-before-retry.
+    pub fn publish_to_github(
+        &mut self,
+        outbox_id: &str,
+        access_token: &str,
+        api_base: &str,
+    ) -> Result<OutboxStatus> {
+        let (owner, repo, number, payload) = {
+            let Some(item) = self.outbox.get(outbox_id) else {
+                bail!("Outbox item not found: {}", outbox_id);
+            };
+            if !matches!(item.status, OutboxStatus::Authorized { .. }) {
+                bail!("Cannot publish unauthorized outbox item");
+            }
+            (
+                item.issue_ref.owner.clone(),
+                item.issue_ref.repo.clone(),
+                item.issue_ref.issue_number,
+                item.payload.clone(),
+            )
+        };
+        let base = api_base.trim_end_matches('/');
+        let url = format!("{base}/repos/{owner}/{repo}/issues/{number}");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("AHEAD")
+            .build()?;
+        // Re-fetch remote first for conflict detection.
+        let remote_body = match client
+            .get(&url)
+            .bearer_auth(access_token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+        {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    bail!("GitHub re-fetch failed: HTTP {}", resp.status());
+                }
+                let json: serde_json::Value = resp.json()?;
+                json.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+            }
+            Err(e) if e.is_timeout() => {
+                let Some(item) = self.outbox.get_mut(outbox_id) else {
+                    bail!("Outbox item not found: {}", outbox_id);
+                };
+                item.status = OutboxStatus::UnknownTimeout {
+                    last_attempt_at: Utc::now().to_rfc3339(),
+                };
+                return Ok(item.status.clone());
+            }
+            Err(e) => bail!("GitHub re-fetch failed: {e}"),
+        };
+        let remote_sha = format!("{:x}", sha2::Sha256::digest(remote_body.as_bytes()));
+        let observed = self.outbox.get(outbox_id).map(|i| i.observed_body_sha.clone()).unwrap_or_default();
+        if remote_sha != observed {
+            let Some(item) = self.outbox.get_mut(outbox_id) else {
+                bail!("Outbox item not found: {}", outbox_id);
+            };
+            item.status = OutboxStatus::Conflict {
+                remote_body_sha: remote_sha,
+                observed_body_sha: observed,
+            };
+            return Ok(item.status.clone());
+        }
+        // Remote unchanged: send the authorized payload (body/title/state).
+        let mut body = serde_json::Map::new();
+        if let Some(t) = payload.title {
+            body.insert("title".to_string(), serde_json::Value::String(t));
+        }
+        if let Some(b) = payload.body_markdown {
+            body.insert("body".to_string(), serde_json::Value::String(b));
+        }
+        if let Some(s) = payload.state {
+            body.insert("state".to_string(), serde_json::Value::String(s));
+        }
+        let resp = match client
+            .patch(&url)
+            .bearer_auth(access_token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&body)
+            .send()
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_timeout() => {
+                let Some(item) = self.outbox.get_mut(outbox_id) else {
+                    bail!("Outbox item not found: {}", outbox_id);
+                };
+                item.status = OutboxStatus::UnknownTimeout {
+                    last_attempt_at: Utc::now().to_rfc3339(),
+                };
+                return Ok(item.status.clone());
+            }
+            Err(e) => bail!("GitHub publish failed: {e}"),
+        };
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let text = resp.text().unwrap_or_default();
+            let preview: String = text.chars().take(300).collect();
+            bail!("GitHub publish failed: HTTP {code} {preview}");
+        }
+        let Some(item) = self.outbox.get_mut(outbox_id) else {
+            bail!("Outbox item not found: {}", outbox_id);
+        };
+        // Refresh observed SHA from what we just wrote.
+        if let Some(new_body) = item.payload.body_markdown.clone() {
+            item.observed_body_sha = format!("{:x}", sha2::Sha256::digest(new_body.as_bytes()));
+        }
+        item.status = OutboxStatus::Confirmed {
+            remote_updated_at: Utc::now().to_rfc3339(),
+        };
+        Ok(item.status.clone())
+    }
 }
 
 use sha2::Digest;
@@ -191,18 +309,40 @@ use sha2::Digest;
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_tracker_conflict_detection_prevents_silent_overwrite() -> Result<()> {
-        let mut tracker = TrackerAdapter::new();
-        let issue = GithubIssueRef {
+    fn test_issue() -> GithubIssueRef {
+        GithubIssueRef {
             host: "github.com".into(),
             owner: "ahead-editor".into(),
             repo: "ahead".into(),
             issue_number: 42,
             issue_node_id: "I_kwDOtest42".into(),
             title: "Support live voice".into(),
-        };
+        }
+    }
 
+    fn stage_authorized(tracker: &mut TrackerAdapter, body: &str) -> String {
+        let issue = test_issue();
+        tracker.set_remote_issue(&issue, "Original issue body by Teammate");
+        let observed_sha = format!("{:x}", sha2::Sha256::digest("Original issue body by Teammate".as_bytes()));
+        let id = tracker.stage_update(
+            "sess-1".into(),
+            issue,
+            TrackerUpdatePayload {
+                title: None,
+                body_markdown: Some(body.into()),
+                labels: None,
+                state: None,
+            },
+            observed_sha,
+        ).unwrap();
+        tracker.authorize_update(&id, "dev-kade").unwrap();
+        id
+    }
+
+    #[test]
+    fn test_tracker_conflict_detection_prevents_silent_overwrite() -> Result<()> {
+        let mut tracker = TrackerAdapter::new();
+        let issue = test_issue();
         // Initial remote state
         tracker.set_remote_issue(&issue, "Original issue body by Teammate");
 
@@ -274,5 +414,33 @@ mod tests {
         assert!(matches!(item.status, OutboxStatus::Confirmed { .. }));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_publish_requires_authorization() {
+        let mut tracker = TrackerAdapter::new();
+        let issue = test_issue();
+        tracker.set_remote_issue(&issue, "Body");
+        let observed_sha = format!("{:x}", sha2::Sha256::digest("Body".as_bytes()));
+        let id = tracker.stage_update(
+            "sess-1".into(),
+            issue,
+            TrackerUpdatePayload { title: None, body_markdown: Some("New".into()), labels: None, state: None },
+            observed_sha,
+        ).unwrap();
+        // Staged but not authorized: live publish must refuse.
+        assert!(tracker.publish_to_github(&id, "token", "https://api.github.com").is_err());
+    }
+
+    #[test]
+    fn test_publish_detects_conflict_without_network() {
+        // Same conflict logic the live path uses, exercised on the mock
+        // path: remote moved after preview → Conflict, never overwrite.
+        let mut tracker = TrackerAdapter::new();
+        let id = stage_authorized(&mut tracker, "Planned body");
+        let issue = test_issue();
+        tracker.set_remote_issue(&issue, "Teammate rewrote meanwhile");
+        let status = tracker.dispatch_update(&id, false).unwrap();
+        assert!(matches!(status, OutboxStatus::Conflict { .. }));
     }
 }

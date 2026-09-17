@@ -137,8 +137,34 @@ impl ReviewSnapshot {
             false
         }
     }
-}
 
+    /// Converts to the RPC DTO for host responses and UI rendering.
+    pub fn to_dto(&self) -> lapce_rpc::ahead::ReviewSnapshotDto {
+        lapce_rpc::ahead::ReviewSnapshotDto {
+            snapshot_id: self.snapshot_id.clone(),
+            session_id: self.session_id.clone(),
+            code_tree_sha: self.code_tree_sha.clone(),
+            implementer_ids: self.implementer_ids.iter().cloned().collect(),
+            findings: self.findings.clone(),
+            is_approved: self.is_approved,
+            approved_by: self.approved_by.clone(),
+            approved_at: self.approved_at.clone(),
+        }
+    }
+
+    pub fn from_dto(dto: lapce_rpc::ahead::ReviewSnapshotDto) -> Self {
+        Self {
+            snapshot_id: dto.snapshot_id,
+            session_id: dto.session_id,
+            code_tree_sha: dto.code_tree_sha,
+            implementer_ids: dto.implementer_ids.into_iter().collect(),
+            findings: dto.findings,
+            is_approved: dto.is_approved,
+            approved_by: dto.approved_by,
+            approved_at: dto.approved_at,
+        }
+    }
+}
 /// Central Collaboration Coordinator
 pub struct CollabSession {
     pub session_id: Id,
@@ -225,6 +251,43 @@ impl CollabSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two-client convergence: host and guest apply the same two edits
+    /// in opposite orders through the sticky index; both end at the
+    /// same anchor range and the comment stays attached.
+    #[test]
+    fn test_two_clients_converge_on_anchor_positions() {
+        let anchor = || CodeAnchor {
+            id: "comment-1".into(),
+            session_id: "sess-2c".into(),
+            path: "src/lib.rs".into(),
+            range: DisplayRange {
+                start: DisplayPosition { line: 20, col: 0 },
+                end: DisplayPosition { line: 24, col: 0 },
+            },
+            quote_hash: "q".into(),
+            surrounding_context: None,
+            created_at_commit: None,
+        };
+        // Host order: insert 3 lines at 5, then delete 2 at 30.
+        let mut host = StickyAnchorIndex::new();
+        host.insert(anchor());
+        host.apply_line_delta("src/lib.rs", 5, 3);
+        host.apply_line_delta("src/lib.rs", 30, -2);
+        // Guest order: delete 2 at 30 first, then insert 3 at 5.
+        // (Delete at 30 applies pre-insert coordinates on the guest that
+        // has not yet seen the insert; the index resolves both orders to
+        // the same range because the edits touch disjoint regions.)
+        let mut guest = StickyAnchorIndex::new();
+        guest.insert(anchor());
+        guest.apply_line_delta("src/lib.rs", 30, -2);
+        guest.apply_line_delta("src/lib.rs", 5, 3);
+        let h = host.get("comment-1").unwrap();
+        let g = guest.get("comment-1").unwrap();
+        assert_eq!(h.range, g.range);
+        assert_eq!(h.range.start.line, 23);
+        assert_eq!(h.range.end.line, 27);
+    }
 
     #[test]
     fn test_sticky_anchor_adjusts_during_concurrent_edits() {

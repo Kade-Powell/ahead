@@ -397,6 +397,27 @@ pub struct WorkItemCloseout {
     pub closed_at: Timestamp,
 }
 
+/// Tracker publish payload (issue update preview).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackerPublishPayload {
+    pub title: Option<String>,
+    pub body_markdown: Option<String>,
+    pub state: Option<String>,
+}
+
+/// Frozen review snapshot: code tree hash, implementers, findings,
+/// and an independence-checked attestation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSnapshotDto {
+    pub snapshot_id: Id,
+    pub session_id: Id,
+    pub code_tree_sha: Sha256,
+    pub implementer_ids: Vec<Id>,
+    pub findings: Vec<String>,
+    pub is_approved: bool,
+    pub approved_by: Option<Id>,
+    pub approved_at: Option<Timestamp>,
+}
 /// Retained phase conversation summary (messages are never deleted).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationSummary {
@@ -407,6 +428,27 @@ pub struct ConversationSummary {
     pub message_id_range: String,
     pub created_at: Timestamp,
 }
+
+/// Full session export bundle: everything needed to reconstruct the
+/// visible session (conversation, evidence, code versions, issue links)
+/// on a clean machine without the original database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExportBundle {
+    pub format_version: String,
+    pub exported_at: Timestamp,
+    pub session: WorkSession,
+    pub workflow: WorkflowState,
+    pub participants: Vec<SessionParticipantRecord>,
+    pub anchors: Vec<CodeAnchor>,
+    pub pending_proposals: Vec<ChangeProposal>,
+    pub work_items: Vec<WorkItem>,
+    pub work_item_events: Vec<WorkItemEvent>,
+    pub work_item_closeouts: Vec<WorkItemCloseout>,
+    pub conversation_summaries: Vec<ConversationSummary>,
+    pub anchors_note: String,
+}
+
+/// RPC requests from UI (lapce-app) to Session Host (lapce-proxy)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadRequest {
@@ -478,6 +520,40 @@ pub enum AheadRequest {
     },
     ConversationList {
         session_id: Id,
+    },
+    SessionExport {
+        session_id: Id,
+    },
+    SessionRestore {
+        bundle: SessionExportBundle,
+    },
+    ReviewCapture {
+        session_id: Id,
+        code_tree_sha: Sha256,
+        implementer_ids: Vec<Id>,
+        findings: Vec<String>,
+    },
+    ReviewAttest {
+        snapshot_id: Id,
+        reviewer_id: Id,
+    },
+    ReviewGet {
+        session_id: Id,
+    },
+    TrackerStage {
+        session_id: Id,
+        issue: GithubIssueRef,
+        payload: TrackerPublishPayload,
+        observed_body_sha: String,
+    },
+    TrackerAuthorize {
+        outbox_id: Id,
+    },
+    TrackerPublish {
+        outbox_id: Id,
+    },
+    TrackerGet {
+        outbox_id: Id,
     },
     RequestPrediction {
         request: PredictionRequest,
