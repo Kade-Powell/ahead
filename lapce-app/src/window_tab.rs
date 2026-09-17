@@ -1581,7 +1581,18 @@ impl WindowTabData {
                     editor_data.receive_char(DEFAULT_RUN_TOML);
                 }
             }
-
+            AheadStartWork => {
+                self.ahead.show_start_work_modal.update(|v| *v = !*v);
+            }
+            AheadToggleMode => {
+                self.ahead.toggle_mode();
+            }
+            AheadDismissCue => {
+                self.ahead.presentation_cue.set(None);
+            }
+            AheadVoiceBargeIn => {
+                self.ahead.voice_active.set(false);
+            }
         }
     }
 

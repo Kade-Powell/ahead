@@ -600,6 +600,22 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "add_run_debug_config")]
     #[strum(message = "Add Run Debug Config")]
     AddRunDebugConfig,
+
+    #[strum(serialize = "ahead_start_work")]
+    #[strum(message = "AHEAD: Start Work Session (Wizard)")]
+    AheadStartWork,
+
+    #[strum(serialize = "ahead_toggle_mode")]
+    #[strum(message = "AHEAD: Toggle Assistance Mode (Learn / Assist)")]
+    AheadToggleMode,
+
+    #[strum(serialize = "ahead_dismiss_cue")]
+    #[strum(message = "AHEAD: Dismiss Presentation Cue")]
+    AheadDismissCue,
+
+    #[strum(serialize = "ahead_voice_barge_in")]
+    #[strum(message = "AHEAD: Voice Barge-In / Cancel Audible Playback")]
+    AheadVoiceBargeIn,
 }
 
 #[derive(Clone, Debug)]
