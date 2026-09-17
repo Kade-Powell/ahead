@@ -558,7 +558,7 @@ pub fn presentation_cue_card(
             stack((
                 label(move || {
                     ahead_state.presentation_cue.get()
-                        .map(|c| format!("🎯 {} (pointing to {}:{})", c.label, c.anchor.path, c.anchor.range.start.line + 1))
+                        .map(|c| format!("🎯 {} (pointing to {}:{}–{})", c.label, c.anchor.path, c.anchor.range.start.line + 1, c.anchor.range.end.line + 1))
                         .unwrap_or_default()
                 })
                 .style(move |s| {
