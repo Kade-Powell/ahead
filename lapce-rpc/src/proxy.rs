@@ -34,7 +34,7 @@ use crate::{
     terminal::{TermId, TerminalProfile},
 };
 
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant, reason = "RPC envelope dominated by small variants; boxing the large one adds indirection on every message")]
 pub enum ProxyRpc {
     Request(RequestId, ProxyRequest),
     Notification(ProxyNotification),
@@ -56,6 +56,7 @@ pub struct SearchMatch {
     pub line_content: String,
 }
 
+#[expect(clippy::large_enum_variant, reason = "request envelope carries buffer/search payloads by value; consumed once per dispatch")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -225,6 +226,7 @@ pub enum ProxyRequest {
     },
 }
 
+#[expect(clippy::large_enum_variant, reason = "notification envelope carries init/plugin payloads by value; consumed once per dispatch")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -582,7 +584,7 @@ impl ProxyRpcHandler {
         request: ProxyRequest,
         f: impl ProxyCallback + 'static,
     ) {
-        self.request_common(request, ResponseHandler::Callback(Box::new(f)))
+        self.request_common(request, ResponseHandler::Callback(Box::new(f)));
     }
 
     pub fn handle_response(
@@ -693,7 +695,7 @@ impl ProxyRpcHandler {
     }
 
     pub fn new_terminal(&self, term_id: TermId, profile: TerminalProfile) {
-        self.notification(ProxyNotification::NewTerminal { term_id, profile })
+        self.notification(ProxyNotification::NewTerminal { term_id, profile });
     }
 
     pub fn terminal_close(&self, term_id: TermId) {
@@ -1135,7 +1137,7 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::DapStart {
             config,
             breakpoints,
-        })
+        });
     }
 
     pub fn dap_process_id(
@@ -1148,7 +1150,7 @@ impl ProxyRpcHandler {
             dap_id,
             process_id,
             term_id,
-        })
+        });
     }
 
     pub fn dap_restart(
@@ -1159,35 +1161,35 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::DapRestart {
             dap_id,
             breakpoints,
-        })
+        });
     }
 
     pub fn dap_continue(&self, dap_id: DapId, thread_id: ThreadId) {
-        self.notification(ProxyNotification::DapContinue { dap_id, thread_id })
+        self.notification(ProxyNotification::DapContinue { dap_id, thread_id });
     }
 
     pub fn dap_step_over(&self, dap_id: DapId, thread_id: ThreadId) {
-        self.notification(ProxyNotification::DapStepOver { dap_id, thread_id })
+        self.notification(ProxyNotification::DapStepOver { dap_id, thread_id });
     }
 
     pub fn dap_step_into(&self, dap_id: DapId, thread_id: ThreadId) {
-        self.notification(ProxyNotification::DapStepInto { dap_id, thread_id })
+        self.notification(ProxyNotification::DapStepInto { dap_id, thread_id });
     }
 
     pub fn dap_step_out(&self, dap_id: DapId, thread_id: ThreadId) {
-        self.notification(ProxyNotification::DapStepOut { dap_id, thread_id })
+        self.notification(ProxyNotification::DapStepOut { dap_id, thread_id });
     }
 
     pub fn dap_pause(&self, dap_id: DapId, thread_id: ThreadId) {
-        self.notification(ProxyNotification::DapPause { dap_id, thread_id })
+        self.notification(ProxyNotification::DapPause { dap_id, thread_id });
     }
 
     pub fn dap_stop(&self, dap_id: DapId) {
-        self.notification(ProxyNotification::DapStop { dap_id })
+        self.notification(ProxyNotification::DapStop { dap_id });
     }
 
     pub fn dap_disconnect(&self, dap_id: DapId) {
-        self.notification(ProxyNotification::DapDisconnect { dap_id })
+        self.notification(ProxyNotification::DapDisconnect { dap_id });
     }
 
     pub fn dap_set_breakpoints(
@@ -1200,7 +1202,7 @@ impl ProxyRpcHandler {
             dap_id,
             path,
             breakpoints,
-        })
+        });
     }
 
     pub fn dap_variable(

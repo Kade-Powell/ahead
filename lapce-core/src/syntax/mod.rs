@@ -434,6 +434,7 @@ impl LanguageLayer {
             .set_language(&self.config.language)
             .map_err(|_| Error::InvalidLanguage)?;
 
+        #[expect(unsafe_code, reason = "tree-sitter requires an unsafe raw-pointer cancellation flag; flag outlives the parse call below")]
         unsafe { parser.set_cancellation_flag(Some(cancellation_flag)) };
         let tree = parser
             .parse_with(
@@ -631,6 +632,7 @@ impl SyntaxLayers {
             // Safety: insert_no_grow is unsafe because it assumes that the table
             // has enough capacity to hold additional elements.
             // This is always the case as we reserved enough capacity above.
+            #[expect(unsafe_code, reason = "hashbrown insert_no_grow with capacity reserved above; documented safety comment retained")]
             unsafe { layers_table.insert_no_grow(hash, layer_id) };
         }
 
@@ -841,6 +843,7 @@ impl SyntaxLayers {
                 // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
                 // prevents them from being moved. But both of these values are really just
                 // pointers, so it's actually ok to move them.
+                #[expect(unsafe_code, reason = "lifetime extension of a locally owned QueryCursor for the captures iterator below; cursor is not used elsewhere during iteration")]
                 let cursor_ref = unsafe {
                     mem::transmute::<
                         &mut tree_sitter::QueryCursor,

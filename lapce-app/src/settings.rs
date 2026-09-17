@@ -130,7 +130,7 @@ impl VirtualVector<SettingsItem> for SettingsData {
 }
 
 impl SettingsData {
-    pub fn new(
+    pub(crate) fn new(
         cx: Scope,
         installed_plugin: RwSignal<IndexMap<VoltID, InstalledVoltData>>,
         common: Rc<CommonData>,

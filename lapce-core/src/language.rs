@@ -1895,6 +1895,7 @@ fn load_grammar(
     }
 
     event!(Level::DEBUG, "Loading grammar from user grammar dir");
+    #[expect(unsafe_code, reason = "dlopen of a grammar .so selected by validated path; symbol lookup below is the FFI boundary")]
     let library = match unsafe { libloading::Library::new(&library_path) } {
         Ok(v) => v,
         Err(e) => {
@@ -1910,6 +1911,7 @@ fn load_grammar(
         Level::DEBUG,
         "Loading grammar with address: '{language_fn_name}'"
     );
+    #[expect(unsafe_code, reason = "calling the grammar's own tree_sitter_* constructor through libloading; same dlopen boundary as above")]
     let language = unsafe {
         let language_fn: libloading::Symbol<
             unsafe extern "C" fn() -> tree_sitter::Language,

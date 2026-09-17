@@ -19,7 +19,7 @@ fn get_github_api(url: &str) -> Result<String> {
     Ok(resp.text()?)
 }
 
-pub fn find_grammar_release() -> Result<ReleaseInfo> {
+pub(super) fn find_grammar_release() -> Result<ReleaseInfo> {
     let releases: Vec<ReleaseInfo> = serde_json::from_str(&get_github_api(
         "https://api.github.com/repos/lapce/tree-sitter-grammars/releases?per_page=100",
     ).context("Failed to retrieve releases for tree-sitter-grammars")?)?;
@@ -61,7 +61,7 @@ pub fn find_grammar_release() -> Result<ReleaseInfo> {
     Ok(release.to_owned())
 }
 
-pub fn fetch_grammars(release: &ReleaseInfo) -> Result<bool> {
+pub(super) fn fetch_grammars(release: &ReleaseInfo) -> Result<bool> {
     let dir = Directory::grammars_directory()
         .ok_or_else(|| anyhow!("can't get grammars directory"))?;
 
@@ -74,7 +74,7 @@ pub fn fetch_grammars(release: &ReleaseInfo) -> Result<bool> {
     Ok(updated)
 }
 
-pub fn fetch_queries(release: &ReleaseInfo) -> Result<bool> {
+pub(super) fn fetch_queries(release: &ReleaseInfo) -> Result<bool> {
     let dir = Directory::queries_directory()
         .ok_or_else(|| anyhow!("can't get queries directory"))?;
 

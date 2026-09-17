@@ -280,8 +280,8 @@ fn debug_processes(
                         })
                     },
                     label(move || p.config.name.clone()).style(|s| {
-                        s.flex_grow(1.0)
-                            .flex_basis(0.0)
+                        s.flex_grow(1.0_f32)
+                            .flex_basis(0.0_f32)
                             .min_width(0.0)
                             .text_ellipsis()
                     }),
@@ -448,7 +448,7 @@ fn variables_view(window_tab_data: Rc<WindowTabData>) -> impl View {
         )
         .style(|s| s.absolute().size_full()),
     )
-    .style(|s| s.width_full().line_height(1.6).flex_grow(1.0).flex_basis(0))
+    .style(|s| s.width_full().line_height(1.6).flex_grow(1.0_f32).flex_basis(0))
 }
 
 fn debug_stack_frames(
@@ -617,8 +617,8 @@ fn debug_stack_traces(
     .style(|s| {
         s.width_pct(100.0)
             .line_height(1.6)
-            .flex_grow(1.0)
-            .flex_basis(0.0)
+            .flex_grow(1.0_f32)
+            .flex_basis(0.0_f32)
     })
 }
 
@@ -712,8 +712,8 @@ fn breakpoints_view(window_tab_data: Rc<WindowTabData>) -> impl View {
                         ),
                         text(folder).style(move |s| {
                             s.text_ellipsis()
-                                .flex_grow(1.0)
-                                .flex_basis(0.0)
+                                .flex_grow(1.0_f32)
+                                .flex_basis(0.0_f32)
                                 .color(config.get().color(AheadColor::EDITOR_DIM))
                                 .min_width(0.0)
                                 .margin_left(6.0)

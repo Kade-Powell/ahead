@@ -34,7 +34,7 @@ mod tests {
 
     // Scenario 1: Learn mode tool bypass defense
     #[test]
-    fn scenario_01_learn_mode_strictly_denies_all_mutations_and_bypasses() -> Result<()> {
+    fn scenario_01_learn_mode_strictly_denies_all_mutations_and_bypasses() {
         let policy = SessionPolicySnapshot::default();
         let phase = WorkflowPhase { id: "implement".into(), title: "Implement".into(), visit: 1 };
         let caps = PolicyEvaluator::effective_capabilities(&phase, AssistanceMode::Learn, &policy, SessionRole::Owner);
@@ -49,7 +49,6 @@ mod tests {
 
         // Predictions strictly denied
         assert!(!PolicyEvaluator::predictions_allowed(AssistanceMode::Learn, &policy));
-        Ok(())
     }
 
     // Scenario 2: Fabricated path or stale range rejected
@@ -236,7 +235,7 @@ mod tests {
 
     // Scenario 9: Review records implementers, requires independence, becomes stale on code change
     #[test]
-    fn scenario_09_review_independence_and_stale_invalidation() -> Result<()> {
+    fn scenario_09_review_independence_and_stale_invalidation() {
         let mut snapshot = ReviewSnapshot::new(
             "snap-9".into(),
             "sess-9".into(),
@@ -253,12 +252,11 @@ mod tests {
         // Code change marks approval stale
         assert!(snapshot.check_stale("code_tree_v2"));
         assert!(!snapshot.is_approved);
-        Ok(())
     }
 
     // Scenario 10: Voice overlapping input, barge-in <50ms, independent task cancellation
     #[test]
-    fn scenario_10_voice_barge_in_and_independent_task_cancellation() -> Result<()> {
+    fn scenario_10_voice_barge_in_and_independent_task_cancellation() {
         let voice = VoiceSession::new("sess-10".into(), "voice-10".into());
         voice.register_coding_task("task-100".into());
         voice.enqueue_audio(QueuedAudioFrame {
@@ -285,14 +283,15 @@ mod tests {
         // Explicit task cancellation cancels the coding task
         voice.handle_control(VoiceControl::CancelCodingTask { task_id: "task-100".into() });
         assert!(!voice.is_task_active("task-100"));
-        Ok(())
     }
 
     // Scenario 11: Local-only configuration prevents cloud fallback
     #[test]
     fn scenario_11_local_only_configuration_prevents_cloud_fallback() {
-        let mut policy = SessionPolicySnapshot::default();
-        policy.allowed_provider_ids = vec!["local-builtin".into()];
+        let policy = SessionPolicySnapshot {
+            allowed_provider_ids: vec!["local-builtin".into()],
+            ..SessionPolicySnapshot::default()
+        };
         assert_eq!(policy.allowed_provider_ids, vec!["local-builtin"]);
         assert!(!policy.allowed_provider_ids.contains(&"cloud-openai".to_string()));
     }
@@ -344,7 +343,7 @@ mod tests {
             path: "src/stream.rs".into(),
             cursor: DisplayPosition { line: 20, col: 0 },
             prefix: "pub fn ".into(),
-            suffix: "".into(),
+            suffix: String::new(),
             work_context: "ctx".into(),
         };
 

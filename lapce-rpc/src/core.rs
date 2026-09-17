@@ -40,6 +40,7 @@ pub enum FileChanged {
     Delete,
 }
 
+#[expect(clippy::large_enum_variant, reason = "completion/signature responses carry payloads by value; consumed once per notification")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -171,7 +172,7 @@ pub struct CoreRpcHandler {
     tx: Sender<CoreRpc>,
     rx: Receiver<CoreRpc>,
     id: Arc<AtomicU64>,
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity, reason = "message-map type alias would hide the channel triple; keep explicit")]
     pending: Arc<Mutex<HashMap<u64, Sender<Result<CoreResponse, RpcError>>>>>,
 }
 

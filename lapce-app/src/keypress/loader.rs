@@ -5,20 +5,20 @@ use tracing::{debug, error};
 
 use super::keymap::{KeyMap, KeyMapPress};
 
-pub struct KeyMapLoader {
+pub(crate) struct KeyMapLoader {
     keymaps: IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>,
     command_keymaps: IndexMap<String, Vec<KeyMap>>,
 }
 
 impl KeyMapLoader {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             keymaps: Default::default(),
             command_keymaps: Default::default(),
         }
     }
 
-    pub fn load_from_str<'a>(
+    pub(crate) fn load_from_str<'a>(
         &'a mut self,
         s: &str,
         modal: bool,
@@ -77,7 +77,7 @@ impl KeyMapLoader {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn finalize(
+    pub(crate) fn finalize(
         self,
     ) -> (
         IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>,

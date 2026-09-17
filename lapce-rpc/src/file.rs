@@ -238,7 +238,7 @@ impl Naming {
             }),
             Naming::Duplicating(d) if d.path == path => Some(FileNodeViewData {
                 kind: FileNodeViewKind::Duplicating {
-                    source: d.path.to_path_buf(),
+                    source: d.path.clone(),
                     err: d.state.err().map(ToString::to_string),
                 },
                 is_dir,
@@ -352,7 +352,7 @@ impl FileNodeItem {
             return None;
         };
 
-        #[allow(clippy::needless_collect)] // Ancestors is not reversible
+        #[expect(clippy::needless_collect, reason = "Ancestors is not reversible")] // Ancestors is not reversible
         let ancestors = path.ancestors().take(take).collect::<Vec<&Path>>();
         Some(ancestors.into_iter().rev())
     }

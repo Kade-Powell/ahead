@@ -449,6 +449,7 @@ pub struct SessionExportBundle {
 }
 
 /// RPC requests from UI (lapce-app) to Session Host (lapce-proxy)
+#[expect(clippy::large_enum_variant, reason = "AgentTurn/SessionRestore carry DTOs by value for zero-copy serde; boxing adds indirection per turn")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadRequest {
@@ -602,6 +603,7 @@ pub struct GitHubDeviceCodeResponse {
 
 
 /// RPC notifications from Session Host to UI
+#[expect(clippy::large_enum_variant, reason = "SessionUpdated carries SessionView by value; notifications are consumed once, boxing adds indirection")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadNotification {

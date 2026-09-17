@@ -6,7 +6,7 @@ use tracing::debug;
 use super::remote::Remote;
 use crate::{proxy::new_command, workspace::SshHost};
 
-pub struct SshRemote {
+pub(super) struct SshRemote {
     pub ssh: SshHost,
 }
 

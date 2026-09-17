@@ -133,7 +133,7 @@ pub enum DapEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant, reason = "DAP union dominated by small variants; review if a large payload variant is added")]
 pub enum DapPayload {
     Request(DapRequest),
     Response(DapResponse),

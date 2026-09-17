@@ -233,8 +233,8 @@ pub fn status(
         .style(|s| {
             s.height_pct(100.0)
                 .min_width(0.0)
-                .flex_basis(0.0)
-                .flex_grow(1.0)
+                .flex_basis(0.0_f32)
+                .flex_grow(1.0_f32)
                 .items_center()
         }),
         stack((
@@ -387,8 +387,8 @@ pub fn status(
         })
         .style(|s| {
             s.height_pct(100.0)
-                .flex_basis(0.0)
-                .flex_grow(1.0)
+                .flex_basis(0.0_f32)
+                .flex_grow(1.0_f32)
                 .justify_end()
         }),
     ))
@@ -404,8 +404,8 @@ pub fn status(
             .border_color(config.color(AheadColor::LAPCE_BORDER))
             .background(config.color(AheadColor::STATUS_BACKGROUND))
             .flex_basis(config.ui.status_height() as f32)
-            .flex_grow(0.0)
-            .flex_shrink(0.0)
+            .flex_grow(0.0_f32)
+            .flex_shrink(0.0_f32)
             .items_center()
     })
     .debug_name("Status/Bottom Bar")

@@ -143,6 +143,7 @@ impl Snippet {
             //   UTF-8 sequence boundaries, since we take the entire slice, with the
             //   exception of the first `$` char which is 1 byte in accordance with
             //   the UTF-8 standard.
+            #[expect(unsafe_code, reason = "regex-anchored ASCII prefix slice; existing SAFETY comment above documents bounds")]
             let n = unsafe {
                 matched.as_str().get_unchecked(1..).parse::<usize>().ok()?
             };
@@ -158,7 +159,7 @@ impl Snippet {
             // * The indices are within the bounds of the original slice and lie on UTF-8
             //   sequence boundaries, since we take the entire slice, with the exception
             //   of the first two `${` and last one `}` chars each of which is 1 byte in
-            //   accordance with the UTF-8 standard.
+            #[expect(unsafe_code, reason = "regex-anchored ASCII ${n} slice; existing SAFETY comment above documents bounds")]
             let n = unsafe {
                 matched
                     .get_unchecked(2..matched.len() - 1)

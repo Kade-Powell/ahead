@@ -43,6 +43,12 @@ impl RpcObject {
         }
     }
 
+    /// Splits a response object into its result or error payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the object is not a JSON object (protocol violation that
+    /// `into_call` already rejects for well-formed inputs).
     pub fn into_response(mut self) -> Result<Result<Value, Value>, String> {
         let _ = self
             .get_id()
@@ -57,14 +63,14 @@ impl RpcObject {
 
         match result {
             Some(r) => Ok(Ok(r)),
-            None => {
-                let error = self
-                    .0
-                    .as_object_mut()
-                    .and_then(|obj| obj.remove("error"))
-                    .unwrap();
-                Ok(Err(error))
-            }
+            None => match self
+                .0
+                .as_object_mut()
+                .and_then(|obj| obj.remove("error"))
+            {
+                Some(error) => Ok(Err(error)),
+                None => Err("RPC response is neither result nor error.".to_string()),
+            },
         }
     }
 }

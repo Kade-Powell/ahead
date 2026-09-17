@@ -88,25 +88,20 @@ impl AheadSessionHost {
                 let session = self.get_session(&session_id)?;
                 Ok(serde_json::to_value(session)?)
             }
-            AheadRequest::ListSessions => {
-                let sessions = self.list_sessions()?;
-                Ok(serde_json::to_value(sessions)?)
-            }
+            AheadRequest::ListSessions => Ok(serde_json::to_value(self.list_sessions()?)?),
             AheadRequest::SetMode { session_id, mode } => {
-                let session = self.set_mode(&session_id, mode)?;
-                Ok(serde_json::to_value(session)?)
+                Ok(serde_json::to_value(self.set_mode(&session_id, mode)?)?)
             }
             AheadRequest::AdvancePhase {
                 session_id,
                 expected_revision,
                 target_phase_id,
             } => {
-                let session = self.advance_phase(
+                Ok(serde_json::to_value(self.advance_phase(
                     &session_id,
                     expected_revision,
                     target_phase_id,
-                )?;
-                Ok(serde_json::to_value(session)?)
+                )?)?)
             }
             AheadRequest::CreateAnchor {
                 session_id,
@@ -114,29 +109,26 @@ impl AheadSessionHost {
                 range,
                 quote,
             } => {
-                let anchor = self.create_anchor(&session_id, path, range, quote)?;
-                Ok(serde_json::to_value(anchor)?)
+                Ok(serde_json::to_value(self.create_anchor(&session_id, path, range, quote)?)?)
             }
             AheadRequest::ProposeEdit {
                 session_id,
                 proposal,
             } => {
-                let res = self.propose_edit(&session_id, proposal)?;
-                Ok(serde_json::to_value(res)?)
+                Ok(serde_json::to_value(self.propose_edit(&session_id, proposal)?)?)
             }
             AheadRequest::AcceptProposal {
                 session_id,
                 proposal_id,
             } => {
-                let res = self.accept_proposal(&session_id, &proposal_id)?;
-                Ok(serde_json::to_value(res)?)
+                Ok(serde_json::to_value(self.accept_proposal(&session_id, &proposal_id)?)?)
             }
             AheadRequest::AgentTurn { request } => {
                 let out = self.agent_turn(request)?;
                 Ok(serde_json::to_value(out)?)
             }
             AheadRequest::WorkItemCreate { session_id, title } => {
-                let owner = self.auth.read().get_active_user(None).login.clone();
+                let owner = self.auth.read().get_active_user(None).login;
                 let item = self.store.read().create_work_item(&session_id, &title, &owner)?;
                 Ok(serde_json::to_value(item)?)
             }
@@ -149,7 +141,7 @@ impl AheadSessionHost {
                 Ok(serde_json::to_value(item)?)
             }
             AheadRequest::WorkItemNote { item_id, kind, body_markdown } => {
-                let owner = self.auth.read().get_active_user(None).login.clone();
+                let owner = self.auth.read().get_active_user(None).login;
                 let session_id = self.work_item_session(&item_id)?.unwrap_or_default();
                 let event = self.store.read().add_work_item_event(&item_id, &session_id, &kind, &body_markdown, &owner)?;
                 Ok(serde_json::to_value(event)?)
@@ -201,7 +193,7 @@ impl AheadSessionHost {
                 Ok(serde_json::to_value(serde_json::json!({ "outbox_id": outbox_id }))?)
             }
             AheadRequest::TrackerAuthorize { outbox_id } => {
-                let authorizer = self.auth.read().get_active_user(None).login.clone();
+                let authorizer = self.auth.read().get_active_user(None).login;
                 self.tracker.write().authorize_update(&outbox_id, &authorizer)?;
                 Ok(serde_json::json!({ "status": "authorized" }))
             }
@@ -228,7 +220,7 @@ impl AheadSessionHost {
             }
             AheadRequest::GitHubAuthStart => {
                 let device_code = format!("{:x}", sha2::Sha256::digest(Uuid::new_v4().as_bytes()));
-                let user_code = format!("{}-{}", &device_code[0..4].to_uppercase(), &device_code[4..8].to_uppercase());
+                let user_code = format!("{}-{}", device_code[0..4].to_uppercase(), device_code[4..8].to_uppercase());
                 let resp = lapce_rpc::ahead::GitHubDeviceCodeResponse {
                     device_code,
                     user_code,
@@ -300,7 +292,7 @@ impl AheadSessionHost {
                 participant: Participant::Human {
                     id: handle.clone(),
                     subject: handle.clone(),
-                    display_name: format!("@{}", handle),
+                    display_name: format!("@{handle}"),
                 },
                 role,
             });
@@ -360,6 +352,7 @@ impl AheadSessionHost {
         };
 
         let user = self.auth.read().get_active_user(None);
+        let owner_id = user.login;
         let session = WorkSession {
             id: session_id.clone(),
             project_id: "project-local".to_string(),
@@ -367,7 +360,7 @@ impl AheadSessionHost {
             work_kind,
             mode,
             title,
-            owner_id: user.login.clone(),
+            owner_id: owner_id.clone(),
             lifecycle: SessionLifecycle::Active,
             policy: SessionPolicySnapshot::default(),
             revision: 1,
@@ -388,7 +381,7 @@ impl AheadSessionHost {
             participant: Participant::Ai {
                 id: "ai-assistant".to_string(),
                 backend_id: "codex-loop".to_string(),
-                on_behalf_of: user.login.clone(),
+                on_behalf_of: owner_id,
                 display_name: "AHEAD Pair".to_string(),
             },
             role: SessionRole::Editor,
@@ -412,7 +405,7 @@ impl AheadSessionHost {
 
         // Initialize voice session
         {
-            let voice_id = format!("voice-{}", session_id);
+            let voice_id = format!("voice-{session_id}");
             let voice = Arc::new(VoiceSession::new(session_id.clone(), voice_id));
             let mut voice_map = self.active_voice_sessions.write();
             voice_map.insert(session_id, voice);
@@ -463,9 +456,10 @@ impl AheadSessionHost {
         expected_revision: Revision,
         target_phase_id: String,
     ) -> Result<WorkflowState> {
+        let title = format!("Phase {target_phase_id}");
         let new_phase = WorkflowPhase {
-            id: target_phase_id.clone(),
-            title: format!("Phase {}", target_phase_id),
+            id: target_phase_id,
+            title,
             visit: 1,
         };
 
@@ -714,7 +708,7 @@ impl AheadSessionHost {
             }
             for prop in &bundle.pending_proposals {
                 // Re-stage as pending; accept flow re-runs explicitly.
-                let _ = store.insert_proposal(prop);
+                drop(store.insert_proposal(prop));
             }
             for item in &bundle.work_items {
                 store.insert_work_item_row(item)?;
@@ -1055,11 +1049,11 @@ mod tests {
         assert_eq!(approved.approved_by.as_deref(), Some("reviewer-2"));
 
         // Via RPC dispatch (serde round-trip).
-        let val = host.handle_request(AheadRequest::ReviewGet { session_id: view.session.id.clone() }).unwrap();
+        let val = host.handle_request(AheadRequest::ReviewGet { session_id: view.session.id }).unwrap();
         let got: Option<lapce_rpc::ahead::ReviewSnapshotDto> = serde_json::from_value(val).unwrap();
         assert!(got.is_some());
         let val = host.handle_request(AheadRequest::ReviewAttest {
-            snapshot_id: snap.snapshot_id.clone(),
+            snapshot_id: snap.snapshot_id,
             reviewer_id: "reviewer-3".to_string(),
         }).unwrap();
         let reattested: lapce_rpc::ahead::ReviewSnapshotDto = serde_json::from_value(val).unwrap();

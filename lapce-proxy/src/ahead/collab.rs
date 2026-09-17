@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
 use lapce_rpc::ahead::{
     CodeAnchor, DisplayPosition, DisplayRange, Id, Sha256, Timestamp,
 };
@@ -31,15 +30,14 @@ pub struct CollabParticipant {
 
 /// Sticky anchor index tracking relative anchor offsets during edits
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct StickyAnchorIndex {
     anchors: HashMap<Id, CodeAnchor>,
 }
 
 impl StickyAnchorIndex {
     pub fn new() -> Self {
-        Self {
-            anchors: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn insert(&mut self, anchor: CodeAnchor) {
@@ -59,7 +57,7 @@ impl StickyAnchorIndex {
 
             if line_delta > 0 {
                 // Lines inserted
-                let delta = line_delta as u32;
+                let delta = line_delta.cast_unsigned();
                 if anchor.range.start.line >= at_line {
                     anchor.range.start.line += delta;
                     anchor.range.end.line += delta;
@@ -68,7 +66,7 @@ impl StickyAnchorIndex {
                 }
             } else if line_delta < 0 {
                 // Lines deleted
-                let delta = (-line_delta) as u32;
+                let delta = (-line_delta).cast_unsigned();
                 if anchor.range.start.line >= at_line + delta {
                     anchor.range.start.line = anchor.range.start.line.saturating_sub(delta);
                     anchor.range.end.line = anchor.range.end.line.saturating_sub(delta);
@@ -127,15 +125,14 @@ impl ReviewSnapshot {
 
     /// Scenario 9: Approval becomes stale upon code changes
     pub fn check_stale(&mut self, current_tree_sha: &str) -> bool {
-        if current_tree_sha != self.code_tree_sha {
-            // Code changed! Invalidate approval while preserving discussion findings
-            self.is_approved = false;
-            self.approved_by = None;
-            self.approved_at = None;
-            true
-        } else {
-            false
+        if current_tree_sha == self.code_tree_sha {
+            return false;
         }
+        // Code changed! Invalidate approval while preserving discussion findings
+        self.is_approved = false;
+        self.approved_by = None;
+        self.approved_at = None;
+        true
     }
 
     /// Converts to the RPC DTO for host responses and UI rendering.
@@ -338,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_review_independence_and_stale_invalidation() -> Result<()> {
+    fn test_review_independence_and_stale_invalidation() {
         let mut snapshot = ReviewSnapshot::new(
             "snap-1".into(),
             "sess-1".into(),
@@ -358,7 +355,5 @@ mod tests {
         let is_stale = snapshot.check_stale("tree_sha_modified");
         assert!(is_stale);
         assert!(!snapshot.is_approved, "Approval must become stale upon code changes");
-
-        Ok(())
     }
 }

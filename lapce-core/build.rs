@@ -15,8 +15,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DISTRIBUTION");
     println!("cargo:rerun-if-env-changed=RELEASE_TAG_NAME");
 
-    let release_info = get_info()?;
-
+    let release_info = get_info();
     // Print info to terminal during compilation
     println!("cargo::warning=Compiling meta: {release_info:?}");
 
@@ -36,44 +35,40 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_info() -> Result<ReleaseInfo> {
+fn get_info() -> ReleaseInfo {
     // CARGO_PKG_* are always available, even in build scripts
     let cargo_tag = env!("CARGO_PKG_VERSION");
 
     // For any downstream that complains about us doing magic
     if env::var("CARGO_FEATURE_DISTRIBUTION").is_ok() {
-        return Ok(ReleaseInfo {
+        return ReleaseInfo {
             version: cargo_tag.to_string(),
             branch: String::from("Stable"),
-        });
+        };
     }
 
-    let release_info = {
-        let release_tag = env::var("RELEASE_TAG_NAME").unwrap_or_default();
+    let release_tag = env::var("RELEASE_TAG_NAME").unwrap_or_default();
 
-        if release_tag.starts_with('v') {
-            ReleaseInfo {
-                version: cargo_tag.to_string(),
-                branch: "Stable".to_string(),
-            }
-        } else {
-            #[cfg(not(debug_assertions))]
-            let release = "Nightly";
-            #[cfg(debug_assertions)]
-            let release = "Debug";
-
-            let tag = format!(
-                "{cargo_tag}+{release}.{}",
-                get_head().unwrap_or("unknown".to_string())
-            );
-            ReleaseInfo {
-                version: tag,
-                branch: release.to_string(),
-            }
+    if release_tag.starts_with('v') {
+        ReleaseInfo {
+            version: cargo_tag.to_string(),
+            branch: "Stable".to_string(),
         }
-    };
+    } else {
+        #[cfg(not(debug_assertions))]
+        let release = "Nightly";
+        #[cfg(debug_assertions)]
+        let release = "Debug";
 
-    Ok(release_info)
+        let tag = format!(
+            "{cargo_tag}+{release}.{}",
+            get_head().unwrap_or_else(|| "unknown".to_string())
+        );
+        ReleaseInfo {
+            version: tag,
+            branch: release.to_string(),
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

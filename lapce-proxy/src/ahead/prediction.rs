@@ -39,19 +39,19 @@ impl PredictionEngine {
         }
 
         let mut prompt = String::new();
-        prompt.push_str(&format!("# AHEAD Prediction Context\n"));
+        prompt.push_str("# AHEAD Prediction Context\n");
         prompt.push_str(&format!("Mode: {:?}\n", work.mode));
         prompt.push_str(&format!("Work Kind: {}\n", work.work_kind.display_name()));
         prompt.push_str(&format!("Phase: {}\n", work.phase_title));
 
         if let Some(ref issue) = work.primary_issue {
-            prompt.push_str(&format!("Issue: {}\n", issue));
+            prompt.push_str(&format!("Issue: {issue}\n"));
         }
 
         if !work.active_invariants.is_empty() {
             prompt.push_str("Invariants:\n");
             for inv in &work.active_invariants {
-                prompt.push_str(&format!("- {}\n", inv));
+                prompt.push_str(&format!("- {inv}\n"));
             }
         }
 
@@ -153,8 +153,8 @@ mod tests {
             session_id: "sess-2".to_string(),
             path: "src/lib.rs".to_string(),
             cursor: DisplayPosition { line: 1, col: 0 },
-            prefix: "".to_string(),
-            suffix: "".to_string(),
+            prefix: String::new(),
+            suffix: String::new(),
             work_context: String::new(),
         };
 

@@ -403,7 +403,7 @@ impl HighlightIterLayer<'_> {
     // First, sort scope boundaries by their byte offset in the document. At a
     // given position, emit scope endings before scope beginnings. Finally, emit
     // scope boundaries from deeper layers first.
-    pub fn sort_key(&self) -> Option<(usize, bool, isize)> {
+    pub(crate) fn sort_key(&self) -> Option<(usize, bool, isize)> {
         let depth = -(self.depth as isize);
         let next_start = self
             .captures

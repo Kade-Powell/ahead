@@ -266,8 +266,8 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
             }),
             label(move || folder.clone()).style(move |s| {
                 s.text_ellipsis()
-                    .flex_grow(1.0)
-                    .flex_basis(0.0)
+                    .flex_grow(1.0_f32)
+                    .flex_basis(0.0_f32)
                     .color(config.get().color(AheadColor::EDITOR_DIM))
                     .min_width(0.0)
                     .selectable(false)

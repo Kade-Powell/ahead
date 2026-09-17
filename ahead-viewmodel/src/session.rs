@@ -122,7 +122,7 @@ pub fn drop_proposal(snapshot: &mut SessionSnapshot, id: &str) -> bool {
 
 /// Marks a tracker entry dispatched. Local-only until GitHub publish lands.
 pub fn queue_tracker_dispatch(snapshot: &mut SessionSnapshot, id: &str) -> bool {
-    for item in snapshot.tracker.iter_mut() {
+    for item in &mut snapshot.tracker {
         if item.id == id {
             item.status = "Queued locally (GitHub publish not wired yet)".to_string();
             return true;

@@ -15,7 +15,7 @@ pub(crate) enum KeyInput {
 }
 
 impl KeyInput {
-    pub fn keymap_key(&self) -> Option<KeyMapKey> {
+    pub(crate) fn keymap_key(&self) -> Option<KeyMapKey> {
         if let KeyInput::Keyboard {
             repeat, logical, ..
         } = self

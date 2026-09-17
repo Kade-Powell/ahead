@@ -248,7 +248,7 @@ impl SessionStore {
                     session.owner_id.clone(),
                     lifecycle_json,
                     policy_json,
-                    session.revision as i64,
+                    session.revision.cast_signed(),
                     session.created_at.clone(),
                 ],
             ).await?;
@@ -258,11 +258,11 @@ impl SessionStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session.id.clone(),
-                    wf.revision as i64,
+                    wf.revision.cast_signed(),
                     wf.definition_version.clone(),
                     wf.phase.id.clone(),
                     wf.phase.title.clone(),
-                    wf.phase.visit as i64,
+                    i64::from(wf.phase.visit),
                     item_json,
                     artifacts_json,
                     approvals_json,
@@ -307,7 +307,7 @@ impl SessionStore {
             let revision: i64 = row.get(9)?;
             let created_at: String = row.get(10)?;
 
-            let work_kind: WorkKind = serde_json::from_str(&format!("\"{}\"", work_kind_str))?;
+            let work_kind: WorkKind = serde_json::from_str(&format!("\"{work_kind_str}\""))?;
             let mode = match mode_str.as_str() {
                 "learn" => AssistanceMode::Learn,
                 _ => AssistanceMode::Assist,
@@ -325,7 +325,7 @@ impl SessionStore {
                 owner_id,
                 lifecycle,
                 policy,
-                revision: revision as u64,
+                revision: revision.cast_unsigned(),
                 created_at,
             };
 
@@ -353,12 +353,12 @@ impl SessionStore {
             let approvals: Vec<ApprovalRecord> = serde_json::from_str(&approvals_json)?;
 
             let workflow = WorkflowState {
-                revision: wf_rev as u64,
+                revision: wf_rev.cast_unsigned(),
                 definition_version: def_ver,
                 phase: WorkflowPhase {
                     id: phase_id,
                     title: phase_title,
-                    visit: phase_visit as u32,
+                    visit: u32::try_from(phase_visit).unwrap_or(u32::MAX),
                 },
                 primary_work_item,
                 current_artifact_ids,
@@ -375,7 +375,7 @@ impl SessionStore {
                 let p_json: String = p_row.get(0)?;
                 let role_str: String = p_row.get(1)?;
                 let participant: Participant = serde_json::from_str(&p_json)?;
-                let role: SessionRole = serde_json::from_str(&format!("\"{}\"", role_str))?;
+                let role: SessionRole = serde_json::from_str(&format!("\"{role_str}\""))?;
                 participants.push(SessionParticipantRecord { participant, role });
             }
 
@@ -413,7 +413,7 @@ impl SessionStore {
             let artifacts_json: String = row.get(3)?;
             let approvals_json: String = row.get(4)?;
 
-            if (cur_rev as u64) != expected_revision {
+            if (cur_rev.cast_unsigned()) != expected_revision {
                 self.conn.execute("ROLLBACK", ()).await?;
                 bail!("Revision mismatch: expected {}, found {}", expected_revision, cur_rev);
             }
@@ -422,7 +422,7 @@ impl SessionStore {
 
             self.conn.execute(
                 "UPDATE workflow_state SET revision = ?1, phase_id = ?2, phase_title = ?3, phase_visit = ?4 WHERE session_id = ?5",
-                params![next_rev, new_phase.id.clone(), new_phase.title.clone(), new_phase.visit as i64, session_id],
+                params![next_rev, new_phase.id.clone(), new_phase.title.clone(), i64::from(new_phase.visit), session_id],
             ).await?;
 
             self.conn.execute(
@@ -437,7 +437,7 @@ impl SessionStore {
             self.conn.execute("COMMIT", ()).await?;
 
             Ok(WorkflowState {
-                revision: next_rev as u64,
+                revision: next_rev.cast_unsigned(),
                 definition_version: def_ver,
                 phase: new_phase,
                 primary_work_item,
@@ -471,10 +471,10 @@ impl SessionStore {
                     anchor.id.clone(),
                     anchor.session_id.clone(),
                     anchor.path.clone(),
-                    anchor.range.start.line as i64,
-                    anchor.range.start.col as i64,
-                    anchor.range.end.line as i64,
-                    anchor.range.end.col as i64,
+                    i64::from(anchor.range.start.line),
+                    i64::from(anchor.range.start.col),
+                    i64::from(anchor.range.end.line),
+                    i64::from(anchor.range.end.col),
                     anchor.quote_hash.clone(),
                     anchor.surrounding_context.clone(),
                     anchor.created_at_commit.clone(),
@@ -511,8 +511,8 @@ impl SessionStore {
                     session_id: s_id,
                     path,
                     range: DisplayRange {
-                        start: DisplayPosition { line: start_line as u32, col: start_col as u32 },
-                        end: DisplayPosition { line: end_line as u32, col: end_col as u32 },
+                        start: DisplayPosition { line: u32::try_from(start_line).unwrap_or(u32::MAX), col: u32::try_from(start_col).unwrap_or(u32::MAX) },
+                        end: DisplayPosition { line: u32::try_from(end_line).unwrap_or(u32::MAX), col: u32::try_from(end_col).unwrap_or(u32::MAX) },
                     },
                     quote_hash,
                     surrounding_context,
@@ -525,7 +525,7 @@ impl SessionStore {
 
     pub fn insert_proposal(&mut self, proposal: &ChangeProposal) -> Result<()> {
         let (target_line, target_col) = match proposal.recommended_cursor {
-            Some(pos) => (Some(pos.line as i64), Some(pos.col as i64)),
+            Some(pos) => (Some(i64::from(pos.line)), Some(i64::from(pos.col))),
             None => (None, None),
         };
         self.rt.block_on(async {
@@ -576,7 +576,7 @@ impl SessionStore {
                     is_mechanical: is_mechanical != 0,
                     description,
                     recommended_cursor: match (target_line, target_col) {
-                        (Some(l), Some(c)) => Some(DisplayPosition { line: l as u32, col: c as u32 }),
+                        (Some(l), Some(c)) => Some(DisplayPosition { line: u32::try_from(l).unwrap_or(u32::MAX), col: u32::try_from(c).unwrap_or(u32::MAX) }),
                         _ => None,
                     },
                 });
@@ -598,7 +598,7 @@ impl SessionStore {
         })
     }
 
-    fn work_item_status_str(status: &WorkItemStatus) -> &'static str {
+    fn work_item_status_str(status: WorkItemStatus) -> &'static str {
         match status {
             WorkItemStatus::Open => "open",
             WorkItemStatus::InProgress => "in_progress",
@@ -681,13 +681,13 @@ impl SessionStore {
     pub fn set_work_item_status(&self, item_id: &str, status: WorkItemStatus) -> Result<WorkItem> {
         let now = chrono::Utc::now().to_rfc3339();
         let closed: Option<String> = match status {
-            WorkItemStatus::Done | WorkItemStatus::Dropped => Some(now.clone()),
+            WorkItemStatus::Done | WorkItemStatus::Dropped => Some(now),
             _ => None,
         };
         self.rt.block_on(async {
             let count = self.conn.execute(
                 "UPDATE work_items SET status = ?1, closed_at = COALESCE(?2, closed_at) WHERE id = ?3",
-                params![Self::work_item_status_str(&status), closed.clone(), item_id],
+                params![Self::work_item_status_str(status), closed, item_id],
             ).await?;
             if count == 0 {
                 bail!("Work item not found: {}", item_id);
@@ -805,7 +805,7 @@ impl SessionStore {
         let summary = summary_markdown.trim();
         let effective_summary = if summary.is_empty() {
             match skip_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(reason) => format!("Close-out skipped: {}", reason),
+                Some(reason) => format!("Close-out skipped: {reason}"),
                 None => bail!("Closing requires a summary or an explicit skip reason"),
             }
         } else {
@@ -940,7 +940,7 @@ impl SessionStore {
                     item.id.clone(),
                     item.session_id.clone(),
                     item.title.clone(),
-                    Self::work_item_status_str(&item.status),
+                    Self::work_item_status_str(item.status),
                     item.position,
                     item.created_by.clone(),
                     item.created_at.clone(),

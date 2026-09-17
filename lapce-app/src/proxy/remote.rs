@@ -54,7 +54,7 @@ enum HostArchitecture {
     ARM32v6,
 }
 
-pub trait Remote: Sized {
+pub(super) trait Remote: Sized {
     #[allow(unused)]
     fn home_dir(&self) -> Result<String> {
         let cmd = self
@@ -73,7 +73,7 @@ pub trait Remote: Sized {
     fn command_builder(&self) -> Command;
 }
 
-pub fn start_remote(
+pub(super) fn start_remote(
     remote: impl Remote,
     core_rpc: CoreRpcHandler,
     proxy_rpc: ProxyRpcHandler,

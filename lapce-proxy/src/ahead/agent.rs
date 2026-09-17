@@ -113,8 +113,8 @@ impl AheadAgentLoop {
         let policy = &view.session.policy;
 
         let mut out = match mode {
-            AssistanceMode::Learn => self.run_learn_turn(&input, phase, policy)?,
-            AssistanceMode::Assist => self.run_assist_turn(&input, phase, policy)?,
+            AssistanceMode::Learn => Self::run_learn_turn(&input, phase),
+            AssistanceMode::Assist => Self::run_assist_turn(&input, phase, policy),
         };
         out.turn_id = uuid::Uuid::new_v4().to_string();
         out.approval_policy = TurnApprovalPolicy::for_mode(mode);
@@ -137,15 +137,13 @@ impl AheadAgentLoop {
     }
 
     fn run_learn_turn(
-        &self,
         input: &AgentTurnRequest,
         phase: &WorkflowPhase,
-        _policy: &SessionPolicySnapshot,
-    ) -> Result<AgentTurnOutput> {
+    ) -> AgentTurnOutput {
+        let path = &input.active_path;
+        let line = input.caret.line + 1;
         let message = format!(
-            "In Learn mode: Let's investigate `{}` (line {}). What is the expected behavior and what invariants must hold here?",
-            input.active_path,
-            input.caret.line + 1
+            "In Learn mode: Let's investigate `{path}` (line {line}). What is the expected behavior and what invariants must hold here?"
         );
 
         let cue = PresentationCue {
@@ -168,7 +166,7 @@ impl AheadAgentLoop {
             display_duration_ms: Some(8000),
         };
 
-        Ok(AgentTurnOutput {
+        AgentTurnOutput {
             message,
             edge_case_challenges: vec![
                 "Consider: How does this function handle unexpected network dropouts?".to_string(),
@@ -179,21 +177,20 @@ impl AheadAgentLoop {
             turn_id: String::new(),
             approval_policy: TurnApprovalPolicy::Never,
             sandbox: TurnSandbox::ReadOnly,
-        })
+        }
     }
 
     fn run_assist_turn(
-        &self,
         input: &AgentTurnRequest,
         phase: &WorkflowPhase,
         policy: &SessionPolicySnapshot,
-    ) -> Result<AgentTurnOutput> {
+    ) -> AgentTurnOutput {
         let mut challenges = Vec::new();
 
         // 1. Generate edge-case considerations
         if !input.invariants.is_empty() {
             for inv in &input.invariants {
-                challenges.push(format!("Invariant constraint: Verify '{}' holds under concurrent access.", inv));
+                challenges.push(format!("Invariant constraint: Verify '{inv}' holds under concurrent access."));
             }
         }
         challenges.push("Edge case: Empty payload or malformed headers handling.".to_string());
@@ -204,8 +201,7 @@ impl AheadAgentLoop {
         let user_lower = input.user_message.to_lowercase();
 
         if user_lower.contains("scaffold") || user_lower.contains("boilerplate") || user_lower.contains("implement") {
-            let scaffold_patch = format!(
-                "// --- AHEAD Mechanical Boilerplate Scaffolding ---\n\
+            let scaffold_patch = "// --- AHEAD Mechanical Boilerplate Scaffolding ---\n\
                  #[derive(Debug, Clone)]\n\
                  pub struct ServiceConfig {{\n\
                      pub max_retries: u32,\n\
@@ -219,7 +215,8 @@ impl AheadAgentLoop {
                          }}\n\
                      }}\n\
                  }}\n"
-            );
+            .to_string();
+
 
             // Recommend cursor positioned where the human engineer will write the actual logic
             let recommended_cursor = Some(DisplayPosition {
@@ -250,11 +247,9 @@ impl AheadAgentLoop {
             }
         }
 
-        let message = format!(
-            "I've analyzed the problem. The human engineer owns the core business logic, but I've prepared boilerplate scaffolding and positioned the cursor for your implementation. Please check the edge-case challenges below."
-        );
+        let message = "I've analyzed the problem. The human engineer owns the core business logic, but I've prepared boilerplate scaffolding and positioned the cursor for your implementation. Please check the edge-case challenges below.".to_string();
 
-        Ok(AgentTurnOutput {
+        AgentTurnOutput {
             message,
             edge_case_challenges: challenges,
             scaffold_proposal: proposal,
@@ -262,7 +257,7 @@ impl AheadAgentLoop {
             turn_id: String::new(),
             approval_policy: TurnApprovalPolicy::OnRequest,
             sandbox: TurnSandbox::WorkspaceWrite,
-        })
+        }
     }
 
     /// Answers a fork-style approval request from policy. Delegates to the
@@ -382,16 +377,16 @@ impl AcpDelegator {
                 agent_client_protocol::on_receive_notification!(),
             )
             .on_receive_request(
-                move |_request: RequestPermissionRequest, responder: agent_client_protocol::Responder<RequestPermissionResponse>, _connection| async move {
+                async move |_request: RequestPermissionRequest, responder: agent_client_protocol::Responder<RequestPermissionResponse>, _connection| {
                     // Side tasks are read-only: decline everything.
-                    let _ = responder.respond(RequestPermissionResponse::new(
+                    drop(responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
-                    ));
+                    )));
                     Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
-            .connect_with(agent, |connection: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| async move {
+            .connect_with(agent, async |connection: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>| {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
@@ -411,7 +406,6 @@ impl AcpDelegator {
             })
             .await
             .map_err(|e| anyhow::anyhow!("ACP side task failed: {e}"))?;
-
         let findings = std::mem::take(&mut *findings.lock());
         Ok(AcpTaskResult {
             task_id,

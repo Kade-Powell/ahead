@@ -30,6 +30,12 @@ pub struct GitHubAuthManager {
     access_token: Option<String>,
 }
 
+impl Default for GitHubAuthManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GitHubAuthManager {
     pub fn new() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -39,7 +45,7 @@ impl GitHubAuthManager {
             current_user: None,
             access_token: None,
         };
-        let _ = mgr.load_saved_auth();
+        drop(mgr.load_saved_auth());
         mgr
     }
 
@@ -49,7 +55,7 @@ impl GitHubAuthManager {
             current_user: None,
             access_token: None,
         };
-        let _ = mgr.load_saved_auth();
+        drop(mgr.load_saved_auth());
         mgr
     }
 
@@ -74,7 +80,7 @@ impl GitHubAuthManager {
         }
         let user_json = String::from_utf8_lossy(&api_output.stdout);
         let user = Self::parse_user_profile(&user_json)?;
-        let _ = self.save_auth(token, user.clone());
+        drop(self.save_auth(token, user.clone()));
         Ok(user)
     }
 
@@ -88,7 +94,7 @@ impl GitHubAuthManager {
             .args([
                 "-sSL",
                 "-H", "User-Agent: AHEAD",
-                "-H", &format!("Authorization: Bearer {}", token),
+                "-H", &format!("Authorization: Bearer {token}"),
                 "-H", "Accept: application/vnd.github+json",
                 "https://api.github.com/user",
             ])
@@ -124,7 +130,7 @@ impl GitHubAuthManager {
         self.access_token = None;
         let auth_path = self.config_dir.join("auth.json");
         if auth_path.exists() {
-            let _ = std::fs::remove_file(auth_path);
+            drop(std::fs::remove_file(auth_path));
         }
         Ok(())
     }
@@ -147,7 +153,7 @@ impl GitHubAuthManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
+            drop(std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)));
         }
 
         self.access_token = Some(token);
@@ -171,14 +177,14 @@ impl GitHubAuthManager {
 
     /// Resolves author identity from local Git configuration when offline or unauthenticated
     pub fn resolve_local_git_fallback(&self, workspace_path: Option<&Path>) -> GitHubUser {
-        let name = self.read_git_config("user.name", workspace_path)
+        let name = Self::read_git_config("user.name", workspace_path)
             .unwrap_or_else(|| {
                 std::env::var("USER")
                     .or_else(|_| std::env::var("USERNAME"))
                     .unwrap_or_else(|_| "ahead-developer".into())
             });
 
-        let email = self.read_git_config("user.email", workspace_path);
+        let email = Self::read_git_config("user.email", workspace_path);
 
         GitHubUser {
             login: name.clone().replace(' ', "-").to_lowercase(),
@@ -190,7 +196,7 @@ impl GitHubAuthManager {
         }
     }
 
-    fn read_git_config(&self, key: &str, workspace_path: Option<&Path>) -> Option<String> {
+    fn read_git_config(key: &str, workspace_path: Option<&Path>) -> Option<String> {
         let mut cmd = std::process::Command::new("git");
         cmd.args(["config", "--get", key]);
         if let Some(dir) = workspace_path {
@@ -232,7 +238,7 @@ impl GitHubAuthManager {
     /// Parses raw response from https://github.com/login/oauth/access_token
     pub fn parse_access_token_response(json: &str) -> Result<PollTokenResult> {
         #[derive(Deserialize)]
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "success/error variants share the OAuth response shape; both kept for parsing")]
         struct TokenSuccess {
             access_token: String,
             #[serde(default)]
@@ -386,7 +392,7 @@ mod tests {
             is_authenticated: true,
         };
 
-        mgr.save_auth("ghu_test_token".into(), user.clone())?;
+        mgr.save_auth("ghu_test_token".into(), user)?;
         assert!(mgr.is_authenticated());
         assert_eq!(mgr.get_access_token(), Some("ghu_test_token"));
 
@@ -404,14 +410,14 @@ mod tests {
         assert!(!mgr3.is_authenticated());
         assert_eq!(mgr3.get_access_token(), None);
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        drop(std::fs::remove_dir_all(&temp_dir));
         Ok(())
     }
 
     #[test]
     fn test_local_git_fallback_when_unauthenticated() {
         let temp_dir = std::env::temp_dir().join(format!("ahead-test-git-{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+        drop(std::fs::create_dir_all(&temp_dir));
         let mgr = GitHubAuthManager::with_custom_dir(temp_dir.clone());
 
         let fallback_user = mgr.get_active_user(None);
@@ -419,7 +425,7 @@ mod tests {
         assert!(!fallback_user.login.is_empty());
         assert_eq!(fallback_user.id, 0);
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        drop(std::fs::remove_dir_all(&temp_dir));
     }
 }
 

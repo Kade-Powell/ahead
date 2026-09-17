@@ -130,8 +130,8 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                             .style(|s| s.padding_horiz(10.0).padding_vert(12.0)),
                             label(title).style(|s| {
                                 s.min_width(0.0)
-                                    .flex_basis(0.0)
-                                    .flex_grow(1.0)
+                                    .flex_basis(0.0_f32)
+                                    .flex_grow(1.0_f32)
                                     .text_ellipsis()
                                     .selectable(false)
                             }),

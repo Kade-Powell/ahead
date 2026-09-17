@@ -1,6 +1,6 @@
 # AHEAD Editor: product and architecture proposal
 
-Status: editor/repository direction confirmed by the user; architecture details remain a draft, not an implementation.
+Status: editor/repository direction and Zed extension ecosystem target confirmed by the user; architecture details remain a draft, not an implementation.
 Prepared: 2026-09-17.
 Audience: AHEAD maintainers.
 Companion: [proposed DTOs](ahead-editor-contracts.ts).
@@ -11,11 +11,11 @@ Build a native editor for engineers who want to remain responsible for the think
 
 The differentiator should be the quality of working together: an agent can show the relevant code, listen while the engineer reasons aloud, ask a useful question, prepare repetitive work within a stated boundary, and retain the reasoning for the next person. Measure that experience before optimizing autonomous task throughput.
 
-This repository becomes **AHEAD, the editor**, as a maintained fork of Lapce. Replace the existing framework, workflow engine, Pi/VS Code integrations, generated policy and release tooling; no legacy runtime or data compatibility is required. Carry forward the human-led engineering principles through native editor behavior. Derive a separately versioned agent runtime from Codex app-server and keep ACP as a second backend. Treat DeltaDB as a dependency requiring verification, with a concrete Yrs-based collaboration fallback. Lapce provides native plugins and LSP, not general VS Code extension compatibility.
+This repository becomes **AHEAD, the editor**, as a maintained fork of Lapce. Replace the existing framework, workflow engine, Pi/VS Code integrations, generated policy and release tooling; no legacy runtime or data compatibility is required. Carry forward the human-led engineering principles through native editor behavior. Derive a separately versioned agent runtime from Codex app-server and keep ACP as a second backend. Treat DeltaDB as a dependency requiring verification, with a concrete Yrs-based collaboration fallback. AHEAD's ecosystem compatibility target is Zed extensions for general language and tooling support; general VS Code extension compatibility is not a target.
 
 Confirmed requirements: the first usable editor has **streamed, full-duplex voice**, including listening during speech playback and ongoing coding work. Predictions receive the active AHEAD work and mode, current unsaved code, relevant other open files and recent edits. These are foundation requirements, not later enhancements.
 
-The user has selected the repository replacement, Lapce fork, full-duplex streaming voice and contextual predictions. Remaining policy and DTO choices below are AI-authored proposals, not accepted workflow gates. The open authority question is whether Assist must retain Maieutic's strict prohibition on agent-written business logic. This draft assumes it does; deleting the old implementation does not settle that policy question.
+The user has selected the repository replacement, Lapce fork, Zed extension ecosystem compatibility, full-duplex streaming voice and contextual predictions. Remaining policy and DTO choices below are AI-authored proposals, not accepted workflow gates. The open authority question is whether Assist must retain Maieutic's strict prohibition on agent-written business logic. This draft assumes it does; deleting the old implementation does not settle that policy question.
 
 ## 2. Principles retained; implementation replaced
 
@@ -77,7 +77,15 @@ The fork decision stands; “users can run VS Code extensions today” is not a 
 
 A VSIX is packaging, not a compatibility layer. Do not build a general VS Code API shim for the MVP. Use licensed publisher downloads, an approved registry such as Open VSX after checking availability, and native Lapce plugins. Microsoft's FAQ explicitly excludes alternative products from accessing its Marketplace; source licenses and extension distribution rights must be checked independently. [Marketplace restrictions](https://code.visualstudio.com/docs/supporting/faq#i-cant-access-the-visual-studio-marketplace-from-product--fill-in-the-blank--why-not).
 
-### 3.3 Own the policy boundary; reuse the agent machinery
+### 3.3 Zed extension ecosystem: the compatibility target
+
+AHEAD will support the existing Zed extension ecosystem for general editor language and tooling support. Zed extensions are Git repositories with an `extension.toml` manifest and can provide languages, Tree-sitter grammars and queries, language servers, snippets, themes, icon themes and debuggers. [Zed extension development](https://zed.dev/docs/extensions/developing-extensions), [language extensions](https://zed.dev/docs/extensions/languages)
+
+The initial compatibility target is to discover and install existing Zed extensions, consume their declarative assets, and connect their language servers through AHEAD's native LSP path. The first acceptance slice is one installed language extension providing its language definition, grammar, queries, snippets and working LSP; themes and icons follow the same packaging path. Debuggers are a later extension of the target.
+
+Zed's Rust/WASM extension API is an explicit compatibility boundary, not a reason to implement the whole Zed runtime. Add only the host capabilities required by useful extensions, with capability checks and an explicit unsupported result for extensions that require unimplemented APIs. Do not target Zed-specific UI customization, deprecated agent/slash-command extensions or arbitrary extension behavior in the initial editor MVP. AHEAD's sessions, agent integrations and policy controls remain native.
+
+### 3.4 Own the policy boundary; reuse the agent machinery
 
 Codex app-server is intended for rich product integrations and exposes conversations, streamed turns, approvals, and lifecycle control. Start with its local stdio boundary and generated schema. Pin the runtime revision and protocol; do not couple the editor to unversioned internal Rust structures. [Codex app-server](https://learn.chatgpt.com/docs/app-server).
 
@@ -95,7 +103,7 @@ Codex's current official configuration documents already include local Ollama/LM
 
 Both Lapce and the public Codex repository are Apache-2.0 licensed. Preserve license/NOTICE material, attribution, and notices of modifications; check bundled dependencies separately. That license does not grant access to hosted services or brand rights. The public Codex repository is not a blanket license to copy every feature of the desktop product. Retain applicable MIT notices for any Maieutic/AHEAD material actually carried into the editor. [Codex license](https://github.com/openai/codex/blob/main/LICENSE), [Lapce license](https://github.com/lapce/lapce/blob/master/LICENSE).
 
-### 3.4 ACP is a backend option, not a competing product architecture
+### 3.5 ACP is a backend option, not a competing product architecture
 
 AHEAD owns sessions, modes, code anchors, human gates and presentation regardless of agent. Initially ship one managed runtime and one tested ACP backend. Use ACP's initialization, prompting, cancellation, updates, permissions and filesystem support where available; AHEAD-specific presentation can be an optional tool surface.
 
@@ -103,7 +111,7 @@ ACP filesystem requests can access unsaved client text. Its advertised capabilit
 
 Managed Assist requires tested mediation and sandboxing. An arbitrary external ACP process may be offered as an explicitly external integration later, but cannot claim AHEAD's enforcement guarantees. Switching backends creates a new backend conversation with an explicit evidence/handoff package; raw hidden state and provider-specific tool history are not assumed portable.
 
-### 3.5 DeltaDB is desirable; availability remains a gate
+### 3.6 DeltaDB is desirable; availability remains a gate
 
 Delta's August announcement describes synchronizing conversation and worktrees, with comments following evolving code. Its September 16 public-beta announcement confirms that the product is now available and works alongside Git. Public availability of the application does not prove that DeltaDB is available as an embeddable dependency. [Introducing Delta](https://zed.dev/blog/introducing-delta), [public beta](https://zed.dev/blog/delta-public-beta).
 

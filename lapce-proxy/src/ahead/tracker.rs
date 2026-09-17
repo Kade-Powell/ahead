@@ -47,6 +47,7 @@ pub struct TrackerOutboxItem {
     pub created_at: Timestamp,
 }
 
+#[derive(Default)]
 pub struct TrackerAdapter {
     outbox: HashMap<Id, TrackerOutboxItem>,
     remote_mock_state: HashMap<String, (String, String)>, // key -> (body, sha)
@@ -54,10 +55,7 @@ pub struct TrackerAdapter {
 
 impl TrackerAdapter {
     pub fn new() -> Self {
-        Self {
-            outbox: HashMap::new(),
-            remote_mock_state: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Sets up initial remote issue state for testing/mocking

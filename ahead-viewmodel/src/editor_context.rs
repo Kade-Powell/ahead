@@ -36,7 +36,10 @@ pub fn offset_to_display(
     utf16_col: impl FnOnce(usize) -> usize,
 ) -> DisplayPosition {
     let (line, _utf8_col) = line_col(offset);
-    DisplayPosition { line: line as u32, col: utf16_col(offset) as u32 }
+    DisplayPosition {
+        line: u32::try_from(line).unwrap_or(u32::MAX),
+        col: u32::try_from(utf16_col(offset)).unwrap_or(u32::MAX),
+    }
 }
 
 /// Assembles an optional selection range from anchor + head positions.
