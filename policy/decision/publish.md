@@ -1,1 +1,0 @@
-The human makes the decision durable and understandable to affected people, links downstream work, and defines a review trigger or revisit date. AI may improve clarity and traceability, but may not communicate externally or close the run without the human's authorization and gate acceptance.

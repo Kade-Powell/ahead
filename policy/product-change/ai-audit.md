@@ -1,1 +1,0 @@
-Compare the result with the problem, research, decision, plan, implementation, reviews, deployment, and observed behavior. Identify divergence, weak evidence, unresolved findings, and missed learning. Record the audit as `ai-audit`; a human disposes material findings.

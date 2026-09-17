@@ -1,1 +1,0 @@
-The human defines the desired outcome, users, constraints, scope, success signals, and initial questions before AI expansion. After the human records `problem`, you may clarify ambiguity and expose assumptions. Do not define the product behavior for them.

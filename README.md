@@ -1,62 +1,61 @@
-<p align="center">
-  <img src="./integrations/vscode/resources/ahead-wordmark.svg" alt="AHEAD — Human-led engineering, amplified by AI." width="680">
-</p>
+<h1 align="center">
+  <a href="https://lapce.dev" target="_blank">
+  <img src="extra/images/logo.png" width=200 height=200/><br>
+  Lapce
+  </a>
+</h1>
 
-# AHEAD
+<h4 align="center">Lightning-fast And Powerful Code Editor</h4>
 
-**Assisted Human Engineering and Development**
+<div align="center">
+  <a href="https://github.com/lapce/lapce/actions/workflows/ci.yml" target="_blank">
+    <img src="https://github.com/lapce/lapce/actions/workflows/ci.yml/badge.svg" />
+  </a>
+  <a href="https://discord.gg/n8tGJ6Rn6D" target="_blank">
+    <img src="https://img.shields.io/discord/946858761413328946?logo=discord" />
+  </a>
+  <a href="https://docs.lapce.dev" target="_blank">
+      <img src="https://img.shields.io/static/v1?label=Docs&message=docs.lapce.dev&color=blue" alt="Lapce Docs">
+  </a>
+</div>
+<br/>
 
-> Human-led engineering, amplified by AI.
 
-AHEAD is a methodology for using AI in software engineering without transferring understanding, judgment, or accountability away from humans.
+Lapce (IPA: /læps/) is written in pure Rust, with a UI in [Floem](https://github.com/lapce/floem). It is designed with [Rope Science](https://xi-editor.io/docs/rope_science_00.html) from the [Xi-Editor](https://github.com/xi-editor/xi-editor), enabling lightning-fast computation, and leverages [wgpu](https://github.com/gfx-rs/wgpu) for rendering. More information about the features of Lapce can be found on the [main website](https://lapce.dev) and user documentation can be found on [GitBook](https://docs.lapce.dev/).
 
-Its core loop is:
+![](https://github.com/lapce/lapce/blob/master/extra/images/screenshot.png?raw=true)
 
-> Human thinks first → AI amplifies and challenges → Human decides.
+## Features
 
-AHEAD is being designed for several kinds of engineering work, including features, bugs, operational issues, incidents, refactoring, architecture decisions, technical debt, security issues, and investigations. These work types share principles, but they do not have to share one rigid workflow.
+* Built-in LSP ([Language Server Protocol](https://microsoft.github.io/language-server-protocol/)) support to give you intelligent code features such as: completion, diagnostics and code actions
+* Modal editing support as first class citizen (Vim-like, and toggleable)
+* Built-in remote development support inspired by [VSCode Remote Development](https://code.visualstudio.com/docs/remote/remote-overview). Enjoy the benefits of a "local" experience, and seamlessly gain the full power of a remote system. We also have [Lapdev](https://lap.dev/) which can help manage your remote dev environments. 
+* Plugins can be written in programming languages that can compile to the [WASI](https://wasi.dev/) format (C, Rust, [AssemblyScript](https://www.assemblyscript.org/))
+* Built-in terminal, so you can execute commands in your workspace, without leaving Lapce.
 
-## Use AHEAD
+## Installation
 
-- [Practitioner guide](docs/guide/README.md) is the starting point for applying the framework.
-- [Constitution](CONSTITUTION.md) records AHEAD's non-negotiable principles.
-- [Pilot workflows](docs/guide/workflows/README.md) provide the six diagrammed flows.
-- [AHEAD for Pi](integrations/pi/README.md) installs and operates the first dogfood integration.
-- [AHEAD for VS Code](integrations/vscode/README.md) provides the editor workflow UI and Copilot integration.
+You can find pre-built releases for Windows, Linux and macOS [here](https://github.com/lapce/lapce/releases), or [installing with a package manager](docs/installing-with-package-manager.md).
+If you'd like to compile from source, you can find the [guide](docs/building-from-source.md).
 
-## Evidence and provenance
+## Contributing
 
-- [Evidence library](docs/evidence/README.md) separates empirical evidence, standards, established practice, design hypotheses, and submitted source notes.
+<a href="https://ws.lap.dev/#https://github.com/lapce/lapce" target="_blank">
+      <img src="https://lap.dev/images/open-in-lapdev.svg?version=8" alt="Open in Lapdev">
+</a>
 
-## Develop AHEAD
+[Lapdev](https://lap.dev/), developed by the Lapce team, is a cloud dev env service similar to GitHub Codespaces. By clicking the button above, you'll be taken to a fully set up Lapce dev env where you can browse the code and start developing. All dependencies are pre-installed, so you can get straight to code.
 
-- [Development guide](docs/development/README.md) is the starting point for changing the methodology, workflow engine, generated policy, integrations, or publishing path.
+Guidelines for contributing to Lapce can be found in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-The Constitution and practitioner guide are packaged as Pi framework references. Evidence is available on demand. AHEAD-owned research, ticket-decomposition, and debugging skills are bundled for progressive disclosure. Development documents remain repository-only and are not placed in ordinary practitioner or agent context.
+## Feedback & Contact
 
-## Status
+The most popular place for Lapce developers and users is on the [Discord server](https://discord.gg/n8tGJ6Rn6D).
 
-AHEAD has six minimal workflow profiles encoded as executable workflow definitions: Product Change, Corrective Debugging, Operational Stabilization, Decision, Investigation, and Internal Improvement. The deterministic Rust core compiles to WebAssembly; the Pi integration lets a human select a flow, provides a persistent guided mode, injects a compact agent profile plus active-phase policy, enforces human/AI actor boundaries and tool capabilities, exposes human gates, packages the framework Markdown for workflow-aware human or AI reference, and supplies thin AHEAD-owned skills for research, ticket decomposition, and disciplined bug diagnosis.
+Or, join the discussion on [Reddit](https://www.reddit.com/r/lapce/) where we are just getting started.
 
-The current priority is to dogfood all six flows and refine their shared state model and workflow-specific gates. GitHub/CI enforcement is not implemented yet.
+There is also a [Matrix Space](https://matrix.to/#/#lapce-editor:matrix.org), which is linked to the content from the Discord server.
 
-Zed support is planned, but its current extension API cannot provide the dynamic tool controls, persistent workflow UI, and human gate/review integration needed for AHEAD parity. We will revisit it as those APIs mature.
+## License
 
-No complete AHEAD workflow has yet been experimentally validated. The methodology distinguishes direct empirical support, adjacent evidence, standards, established practice, and AHEAD design hypotheses rather than presenting them as equally certain.
-
-## What AHEAD is not
-
-AHEAD is not:
-
-```text
-Prompt → AI designs → AI codes → human reviews AI output
-```
-
-It is:
-
-```text
-Human defines → AI researches → Human understands
-→ AI expands and challenges → Human decides → Human plans
-→ Engineer implements with AI assistance
-→ AI reviews → Human reviews → Team learns
-```
+Lapce is released under the Apache License Version 2, which is an open source license. You may contribute to this project, or use the code as you please as long as you adhere to its conditions. You can find a copy of the license text here: [`LICENSE`](LICENSE).

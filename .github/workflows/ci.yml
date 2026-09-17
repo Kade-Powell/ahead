@@ -1,66 +1,105 @@
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - lapce-**
+      - .github/wofklows/ci.yml
+  workflow_dispatch:
+
 name: CI
 
-on:
-  pull_request:
-  push:
-    branches: [main]
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
 
-permissions:
-  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
-  rust:
-    name: Rust core
-    runs-on: ubuntu-latest
+  build:
+    name: Rust on ${{ matrix.os }}
+    if: github.event.pull_request.draft == false
+    needs: [fmt, clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --all-features --locked
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo doc --workspace --all-features --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - run: cargo build --locked --release --target wasm32-unknown-unknown -p ahead-wasm
+      - uses: actions/checkout@v4
 
-  pi:
-    name: Pi integration
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: integrations/pi/package-lock.json
-      - run: npm ci
-        working-directory: integrations/pi
-      - run: npm test
-        working-directory: integrations/pi
-      - run: git diff --exit-code -- integrations/pi/generated
+      - name: Install dependencies on Ubuntu
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo make ubuntu-deps
 
-  vscode:
-    name: VS Code integration
+      - name: Update toolchain & add llvm-tools
+        run: |
+          rustup update --no-self-update
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Build
+        run: cargo build --frozen
+
+      - name: Build as portable
+        if: startsWith(matrix.os, 'windows')
+        run: cargo build --frozen --features lapce-app/portable
+
+      - name: Free space on Windows
+        if: startsWith(matrix.os, 'windows')
+        run: cargo clean
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+  fmt:
+    name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: integrations/vscode/package-lock.json
-      - run: npm ci
-        working-directory: integrations/vscode
-      - run: npm test
-        working-directory: integrations/vscode
-      - run: git diff --exit-code -- integrations/pi/generated
+      - uses: actions/checkout@v4
+
+      - name: Update toolchain & add rustfmt
+        run: |
+          rustup update
+          rustup component add rustfmt
+
+      - name: Run rustfmt
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update toolchain & add clippy
+        run: |
+          rustup update --no-self-update
+          rustup component add clippy
+
+      - name: Install dependencies on Ubuntu
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo make ubuntu-deps
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Run clippy
+        run: cargo clippy

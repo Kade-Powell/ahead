@@ -1,1 +1,0 @@
-Do not add solutions until the human records a first-pass option. Then challenge assumptions, suggest alternatives, and compare complexity, reversibility, measurement risk, maintenance cost, and effects on invariants. The human evaluates and owns the final option set.

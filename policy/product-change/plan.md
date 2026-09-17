@@ -1,1 +1,0 @@
-Do not create the governing implementation plan before the human records `first-pass-plan`. Then challenge it for missing dependencies, tests, edge cases, rollout evidence, recovery, and deviations policy. The human authors and approves the final plan.

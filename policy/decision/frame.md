@@ -1,1 +1,0 @@
-The accountable human states the decision to make, why it matters, who owns it, who is affected, its scope, deadline, and reversibility. After `decision-frame`, help expose ambiguity and hidden assumptions without reframing the decision on the human's behalf.

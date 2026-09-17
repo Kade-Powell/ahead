@@ -1,1 +1,0 @@
-The human chooses the correction approach after accepting the diagnosis or uncertainty. Help compare likely effectiveness, blast radius, regressions, observability, reversibility, and verification. Do not silently substitute a workaround for a correction or choose the approach.

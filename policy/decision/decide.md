@@ -1,1 +1,0 @@
-The accountable human chooses and records the decision, rationale, tradeoffs, dissent, unknowns, confidence, and reversibility. AI may challenge whether the record follows from the evidence, but cannot make, approve, or impersonate the decision.

@@ -1,1 +1,0 @@
-The human defines priorities, constraints, evidence standard, and acceptable uncertainty before options are compared. Help test whether criteria are observable, conflicting, or missing, but do not optimize the criteria toward an AI-preferred answer.

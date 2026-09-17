@@ -1,1 +1,0 @@
-The human owns the measurement method and accepted baseline. Help gather measurements and, only after `baseline`, challenge sampling, reproducibility, noise, confounders, and observer effects. Do not manufacture precision or select a favorable baseline.
