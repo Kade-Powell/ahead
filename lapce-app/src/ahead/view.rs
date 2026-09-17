@@ -1861,7 +1861,191 @@ pub fn ahead_agent_panel(
                         .border_color(Color::from_rgb8(31, 41, 55))
                 }),
 
-                // 5. Tracker Outbox & GitHub Synchronization Section
+                // 5. Work Items Checklist (close-out docs feed the tracker below)
+                container(
+                    stack((
+                        stack((
+                            label(|| "✅ WORK ITEMS".to_string()).style(|s| {
+                                s.font_bold()
+                                    .font_size(11.0)
+                                    .color(Color::from_rgb8(148, 163, 184))
+                            }),
+                            label(move || {
+                                let items = ahead_state.work_items.get();
+                                let open = items.iter().filter(|r| matches!(r.item.status, lapce_rpc::ahead::WorkItemStatus::Open | lapce_rpc::ahead::WorkItemStatus::InProgress)).count();
+                                format!("{open} open / {} total", items.len())
+                            })
+                            .style(|s| {
+                                s.font_size(10.0)
+                                    .color(Color::from_rgb8(100, 116, 139))
+                                    .margin_left(8.0)
+                            }),
+                        ))
+                        .style(|s| s.items_center().margin_bottom(6.0)),
+                        // Inline add box (Enter creates)
+                        stack((
+                            text_input(ahead_state.work_item_input)
+                                .keyboard_navigable()
+                                .placeholder("Add a work item…")
+                                .on_enter({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data.clone();
+                                    move || ahead_state.create_work_item(&window_tab_data)
+                                })
+                                .style(move |s| {
+                                    s.flex_grow(1.0)
+                                        .padding_horiz(8.0)
+                                        .padding_vert(6.0)
+                                        .background(Color::from_rgb8(15, 23, 42))
+                                        .color(Color::from_rgb8(255, 255, 255))
+                                        .border(1.0)
+                                        .border_color(Color::from_rgb8(51, 65, 85))
+                                        .border_radius(4.0)
+                                        .font_size(12.0)
+                                }),
+                            label(|| "+ Add".to_string())
+                                .on_click_stop({
+                                    let ahead_state = ahead_state;
+                                    let window_tab_data = window_tab_data.clone();
+                                    move |_| ahead_state.create_work_item(&window_tab_data)
+                                })
+                                .style(|s| {
+                                    s.background(Color::from_rgb8(22, 163, 74))
+                                        .color(Color::from_rgb8(255, 255, 255))
+                                        .padding_horiz(12.0)
+                                        .padding_vert(6.0)
+                                        .border_radius(4.0)
+                                        .margin_left(6.0)
+                                        .cursor(CursorStyle::Pointer)
+                                        .font_bold()
+                                        .font_size(11.0)
+                                }),
+                        ))
+                        .style(|s| s.margin_bottom(6.0).items_center()),
+                        label(move || ahead_state.work_item_error.get().unwrap_or_default())
+                            .style(move |s| {
+                                let has_err = ahead_state.work_item_error.get().is_some();
+                                s.font_size(11.0)
+                                    .margin_bottom(if has_err { 6.0 } else { 0.0 })
+                                    .color(Color::from_rgb8(248, 113, 113))
+                                    .display(if has_err { Display::Flex } else { Display::None })
+                            }),
+                        dyn_stack(
+                            move || ahead_state.work_items.get(),
+                            |row: &crate::ahead::state::WorkItemRow| row.item.id.clone(),
+                            {
+                                let ahead_state = ahead_state;
+                                let window_tab_data = window_tab_data.clone();
+                                move |row: crate::ahead::state::WorkItemRow| {
+                                    let item_id = row.item.id.clone();
+                                    let status = row.item.status;
+                                    let (pill, bg) = match status {
+                                        lapce_rpc::ahead::WorkItemStatus::Open => ("○ Open", Color::from_rgb8(51, 65, 85)),
+                                        lapce_rpc::ahead::WorkItemStatus::InProgress => ("◐ Doing", Color::from_rgb8(37, 99, 235)),
+                                        lapce_rpc::ahead::WorkItemStatus::Done => ("● Done", Color::from_rgb8(22, 163, 74)),
+                                        lapce_rpc::ahead::WorkItemStatus::Dropped => ("✕ Dropped", Color::from_rgb8(100, 116, 139)),
+                                    };
+                                    container(
+                                        stack((
+                                            stack((
+                                                label(move || row.item.title.clone()).style(|s| {
+                                                    s.font_size(12.0)
+                                                        .color(Color::from_rgb8(241, 245, 249))
+                                                        .flex_grow(1.0)
+                                                }),
+                                                label(move || pill.to_string())
+                                                    .on_click_stop({
+                                                        let ahead_state = ahead_state;
+                                                        let window_tab_data = window_tab_data.clone();
+                                                        move |_| ahead_state.cycle_work_item_status(item_id.clone(), status, &window_tab_data)
+                                                    })
+                                                    .style(move |s| {
+                                                        s.background(bg)
+                                                            .color(Color::from_rgb8(255, 255, 255))
+                                                            .padding_horiz(8.0)
+                                                            .padding_vert(3.0)
+                                                            .border_radius(4.0)
+                                                            .cursor(CursorStyle::Pointer)
+                                                            .font_size(10.0)
+                                                            .font_bold()
+                                                    }),
+                                            ))
+                                            .style(|s| s.items_center()),
+                                            {
+                                                let has_closeout = row.closeout.is_some();
+                                                let summary = row.closeout.clone()
+                                                    .map(|c| format!("Close-out: {}", c.summary_markdown))
+                                                    .unwrap_or_default();
+                                                label(move || summary.clone())
+                                                    .style(move |s| {
+                                                        s.font_size(10.0)
+                                                            .color(Color::from_rgb8(148, 163, 184))
+                                                            .margin_top(2.0)
+                                                            .display(if has_closeout { Display::Flex } else { Display::None })
+                                                    })
+                                            },
+                                        ))
+                                        .style(|s| s.flex_col()),
+                                    )
+                                    .style(|s| {
+                                        s.padding(8.0)
+                                            .margin_vert(3.0)
+                                            .background(Color::from_rgb8(15, 23, 42))
+                                            .border(1.0)
+                                            .border_color(Color::from_rgb8(30, 41, 59))
+                                            .border_radius(6.0)
+                                    })
+                                }
+                            },
+                        ),
+                        // Conversation summaries retained per phase.
+                        label(|| "💬 Conversation summaries (retained)".to_string()).style(|s| {
+                            s.font_size(10.0)
+                                .font_bold()
+                                .color(Color::from_rgb8(100, 116, 139))
+                                .margin_top(8.0)
+                                .margin_bottom(4.0)
+                        }),
+                        dyn_stack(
+                            move || ahead_state.conversation_summaries.get(),
+                            |sm: &lapce_rpc::ahead::ConversationSummary| sm.id.clone(),
+                            |sm: lapce_rpc::ahead::ConversationSummary| {
+                                container(
+                                    stack((
+                                        label(move || format!("{} · {}", sm.phase.clone(), sm.message_id_range.clone())).style(|s| {
+                                            s.font_size(10.0)
+                                                .font_bold()
+                                                .color(Color::from_rgb8(56, 189, 248))
+                                        }),
+                                        label(move || sm.summary_markdown.clone()).style(|s| {
+                                            s.font_size(11.0)
+                                                .color(Color::from_rgb8(203, 213, 225))
+                                                .margin_top(2.0)
+                                        }),
+                                    ))
+                                    .style(|s| s.flex_col()),
+                                )
+                                .style(|s| {
+                                    s.padding(8.0)
+                                        .margin_vert(3.0)
+                                        .background(Color::from_rgb8(15, 23, 42))
+                                        .border(1.0)
+                                        .border_color(Color::from_rgb8(30, 41, 59))
+                                        .border_radius(6.0)
+                                })
+                            },
+                        ),
+                    ))
+                    .style(|s| s.flex_col()),
+                )
+                .style(move |s| {
+                    s.padding(12.0)
+                        .background(Color::from_rgb8(17, 24, 39))
+                        .border_bottom(1.0)
+                        .border_color(Color::from_rgb8(31, 41, 55))
+                }),
+
+                // 6. Tracker Outbox & GitHub Synchronization Section
                 container(
                     stack((
                         label(|| "📦 TRACKER OUTBOX (GITHUB ISSUE SYNC)".to_string()).style(|s| {

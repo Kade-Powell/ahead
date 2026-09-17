@@ -8,10 +8,11 @@
 use std::{path::Path, sync::Arc};
 use anyhow::{Context, Result, bail};
 use lapce_rpc::ahead::{
-    ApprovalRecord, CodeAnchor, DisplayPosition, DisplayRange, GithubIssueRef, Id,
-    Revision, SessionLifecycle, SessionPolicySnapshot,
-    SessionView, WorkKind, WorkSession, WorkflowPhase, WorkflowState,
-    AssistanceMode, ChangeProposal, Participant, SessionRole, SessionParticipantRecord,
+    ApprovalRecord, CodeAnchor, ConversationSummary, DisplayPosition, DisplayRange,
+    GithubIssueRef, Id, Revision, SessionLifecycle, SessionPolicySnapshot,
+    SessionView, WorkItem, WorkItemCloseout, WorkItemEvent, WorkItemStatus, WorkKind,
+    WorkSession, WorkflowPhase, WorkflowState, AssistanceMode, ChangeProposal,
+    Participant, SessionRole, SessionParticipantRecord,
 };
 use libsql::{params, Connection, Builder};
 
@@ -136,8 +137,55 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_events_session_seq ON session_events(session_id, sequence);
-                CREATE INDEX IF NOT EXISTS idx_anchors_session ON anchors(session_id);
+                CREATE TABLE IF NOT EXISTS work_items (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_item_events (
+                    id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body_markdown TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    anchor_id TEXT,
+                    artifact_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_item_closeouts (
+                    item_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    summary_markdown TEXT NOT NULL,
+                    issue_ref TEXT,
+                    follow_ups_json TEXT NOT NULL,
+                    conversation_summary_id TEXT,
+                    closed_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    summary_markdown TEXT NOT NULL,
+                    message_id_range TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_items_session ON work_items(session_id, position);
+                CREATE INDEX IF NOT EXISTS idx_item_events ON work_item_events(item_id);
+                CREATE INDEX IF NOT EXISTS idx_summaries_session ON conversation_summaries(session_id);
                 "
             ).await
         }).context("Failed to initialize AHEAD Turso/libsql schema")?;
@@ -549,6 +597,338 @@ impl SessionStore {
             Ok(())
         })
     }
+
+    fn work_item_status_str(status: &WorkItemStatus) -> &'static str {
+        match status {
+            WorkItemStatus::Open => "open",
+            WorkItemStatus::InProgress => "in_progress",
+            WorkItemStatus::Done => "done",
+            WorkItemStatus::Dropped => "dropped",
+        }
+    }
+
+    fn parse_work_item_status(raw: &str) -> Result<WorkItemStatus> {
+        match raw {
+            "open" => Ok(WorkItemStatus::Open),
+            "in_progress" => Ok(WorkItemStatus::InProgress),
+            "done" => Ok(WorkItemStatus::Done),
+            "dropped" => Ok(WorkItemStatus::Dropped),
+            other => bail!("Unknown work item status: {}", other),
+        }
+    }
+
+    pub fn create_work_item(&self, session_id: &str, title: &str, created_by: &str) -> Result<WorkItem> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("Work item title cannot be empty");
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+        let position: i64 = self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT COALESCE(MAX(position), -1) FROM work_items WHERE session_id = ?1",
+                params![session_id],
+            ).await?;
+            let row = rows.next().await?.context("Missing max(position) row")?;
+            let max: i64 = row.get(0)?;
+            Ok::<i64, anyhow::Error>(max + 1)
+        })?;
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_items (id, session_id, title, status, position, created_by, created_at, closed_at)
+                 VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
+                params![id.clone(), session_id, title.to_string(), position, created_by, now.clone()],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(WorkItem {
+            id,
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            status: WorkItemStatus::Open,
+            position,
+            created_by: created_by.to_string(),
+            created_at: now,
+            closed_at: None,
+        })
+    }
+
+    pub fn list_work_items(&self, session_id: &str) -> Result<Vec<WorkItem>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT id, session_id, title, status, position, created_by, created_at, closed_at
+                 FROM work_items WHERE session_id = ?1 ORDER BY position ASC",
+                params![session_id],
+            ).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let status_raw: String = row.get(3)?;
+                out.push(WorkItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    title: row.get(2)?,
+                    status: Self::parse_work_item_status(&status_raw)?,
+                    position: row.get(4)?,
+                    created_by: row.get(5)?,
+                    created_at: row.get(6)?,
+                    closed_at: row.get(7)?,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn set_work_item_status(&self, item_id: &str, status: WorkItemStatus) -> Result<WorkItem> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let closed: Option<String> = match status {
+            WorkItemStatus::Done | WorkItemStatus::Dropped => Some(now.clone()),
+            _ => None,
+        };
+        self.rt.block_on(async {
+            let count = self.conn.execute(
+                "UPDATE work_items SET status = ?1, closed_at = COALESCE(?2, closed_at) WHERE id = ?3",
+                params![Self::work_item_status_str(&status), closed.clone(), item_id],
+            ).await?;
+            if count == 0 {
+                bail!("Work item not found: {}", item_id);
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+        // Reopening clears a stale closed_at.
+        if matches!(status, WorkItemStatus::Open | WorkItemStatus::InProgress) {
+            self.rt.block_on(async {
+                self.conn.execute(
+                    "UPDATE work_items SET closed_at = NULL WHERE id = ?1",
+                    params![item_id],
+                ).await?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        self.get_work_item(item_id)?.context("Work item vanished after update")
+    }
+
+    fn get_work_item(&self, item_id: &str) -> Result<Option<WorkItem>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT id, session_id, title, status, position, created_by, created_at, closed_at
+                 FROM work_items WHERE id = ?1",
+                params![item_id],
+            ).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let status_raw: String = row.get(3)?;
+            Ok(Some(WorkItem {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                title: row.get(2)?,
+                status: Self::parse_work_item_status(&status_raw)?,
+                position: row.get(4)?,
+                created_by: row.get(5)?,
+                created_at: row.get(6)?,
+                closed_at: row.get(7)?,
+            }))
+        })
+    }
+
+    pub fn add_work_item_event(
+        &self,
+        item_id: &str,
+        session_id: &str,
+        kind: &str,
+        body_markdown: &str,
+        actor_id: &str,
+    ) -> Result<WorkItemEvent> {
+        let event = WorkItemEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            item_id: item_id.to_string(),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            body_markdown: body_markdown.to_string(),
+            actor_id: actor_id.to_string(),
+            anchor_id: None,
+            artifact_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_item_events (id, item_id, session_id, kind, body_markdown, actor_id, anchor_id, artifact_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+                params![
+                    event.id.clone(),
+                    event.item_id.clone(),
+                    event.session_id.clone(),
+                    event.kind.clone(),
+                    event.body_markdown.clone(),
+                    event.actor_id.clone(),
+                    event.created_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(event)
+    }
+
+    pub fn list_work_item_events(&self, item_id: &str) -> Result<Vec<WorkItemEvent>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT id, item_id, session_id, kind, body_markdown, actor_id, anchor_id, artifact_id, created_at
+                 FROM work_item_events WHERE item_id = ?1 ORDER BY created_at ASC",
+                params![item_id],
+            ).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(WorkItemEvent {
+                    id: row.get(0)?,
+                    item_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    body_markdown: row.get(4)?,
+                    actor_id: row.get(5)?,
+                    anchor_id: row.get(6)?,
+                    artifact_id: row.get(7)?,
+                    created_at: row.get(8)?,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn close_work_item(
+        &self,
+        item_id: &str,
+        summary_markdown: &str,
+        issue_ref: Option<String>,
+        follow_ups_json: Option<String>,
+        skip_reason: Option<String>,
+    ) -> Result<WorkItemCloseout> {
+        let summary = summary_markdown.trim();
+        let effective_summary = if summary.is_empty() {
+            match skip_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(reason) => format!("Close-out skipped: {}", reason),
+                None => bail!("Closing requires a summary or an explicit skip reason"),
+            }
+        } else {
+            summary.to_string()
+        };
+        let Some(item) = self.get_work_item(item_id)? else {
+            bail!("Work item not found: {}", item_id);
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let closeout = WorkItemCloseout {
+            item_id: item.id.clone(),
+            session_id: item.session_id.clone(),
+            summary_markdown: effective_summary,
+            issue_ref,
+            follow_ups_json: follow_ups_json.unwrap_or_else(|| "[]".to_string()),
+            conversation_summary_id: None,
+            closed_at: now.clone(),
+        };
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO work_item_closeouts (item_id, session_id, summary_markdown, issue_ref, follow_ups_json, conversation_summary_id, closed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+                 ON CONFLICT(item_id) DO UPDATE SET summary_markdown = excluded.summary_markdown,
+                    issue_ref = excluded.issue_ref, follow_ups_json = excluded.follow_ups_json,
+                    closed_at = excluded.closed_at",
+                params![
+                    closeout.item_id.clone(),
+                    closeout.session_id.clone(),
+                    closeout.summary_markdown.clone(),
+                    closeout.issue_ref.clone(),
+                    closeout.follow_ups_json.clone(),
+                    closeout.closed_at.clone(),
+                ],
+            ).await?;
+            self.conn.execute(
+                "UPDATE work_items SET status = 'done', closed_at = ?1 WHERE id = ?2",
+                params![now, item_id],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        self.add_work_item_event(&item.id, &item.session_id, "close", &closeout.summary_markdown, "host")?;
+        Ok(closeout)
+    }
+
+    pub fn get_work_item_closeout(&self, item_id: &str) -> Result<Option<WorkItemCloseout>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT item_id, session_id, summary_markdown, issue_ref, follow_ups_json, conversation_summary_id, closed_at
+                 FROM work_item_closeouts WHERE item_id = ?1",
+                params![item_id],
+            ).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            Ok(Some(WorkItemCloseout {
+                item_id: row.get(0)?,
+                session_id: row.get(1)?,
+                summary_markdown: row.get(2)?,
+                issue_ref: row.get(3)?,
+                follow_ups_json: row.get(4)?,
+                conversation_summary_id: row.get(5)?,
+                closed_at: row.get(6)?,
+            }))
+        })
+    }
+
+    pub fn save_conversation_summary(
+        &self,
+        session_id: &str,
+        phase: &str,
+        summary_markdown: &str,
+        message_id_range: &str,
+    ) -> Result<ConversationSummary> {
+        if summary_markdown.trim().is_empty() {
+            bail!("Conversation summary cannot be empty");
+        }
+        let summary = ConversationSummary {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            phase: phase.to_string(),
+            summary_markdown: summary_markdown.to_string(),
+            message_id_range: message_id_range.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.rt.block_on(async {
+            self.conn.execute(
+                "INSERT INTO conversation_summaries (id, session_id, phase, summary_markdown, message_id_range, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    summary.id.clone(),
+                    summary.session_id.clone(),
+                    summary.phase.clone(),
+                    summary.summary_markdown.clone(),
+                    summary.message_id_range.clone(),
+                    summary.created_at.clone(),
+                ],
+            ).await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(summary)
+    }
+
+    pub fn list_conversation_summaries(&self, session_id: &str) -> Result<Vec<ConversationSummary>> {
+        self.rt.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT id, session_id, phase, summary_markdown, message_id_range, created_at
+                 FROM conversation_summaries WHERE session_id = ?1 ORDER BY created_at ASC",
+                params![session_id],
+            ).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(ConversationSummary {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    phase: row.get(2)?,
+                    summary_markdown: row.get(3)?,
+                    message_id_range: row.get(4)?,
+                    created_at: row.get(5)?,
+                });
+            }
+            Ok(out)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +1037,34 @@ mod tests {
         };
         store.insert_proposal(&proposal)?;
         store.accept_proposal("prop-1")?;
+
+        // Work item lifecycle: create, order, note, close with summary.
+        let item_a = store.create_work_item("sess-turso-1", "Fix retry backoff", "dev-42")?;
+        let item_b = store.create_work_item("sess-turso-1", "Add regression test", "dev-42")?;
+        assert!(item_a.position < item_b.position);
+        let items = store.list_work_items("sess-turso-1")?;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, item_a.id);
+        assert!(store.create_work_item("sess-turso-1", "   ", "dev-42").is_err());
+        store.add_work_item_event(&item_a.id, "sess-turso-1", "note", "Reproduced locally", "dev-42")?;
+        let events = store.list_work_item_events(&item_a.id)?;
+        assert_eq!(events.len(), 1);
+        // Close requires summary or explicit skip.
+        assert!(store.close_work_item(&item_a.id, "", None, None, None).is_err());
+        let closeout = store.close_work_item(&item_a.id, "Fixed backoff; verified with retry test", Some("owner/repo#142".to_string()), None, None)?;
+        assert!(closeout.summary_markdown.contains("Fixed backoff"));
+        let stored = store.get_work_item_closeout(&item_a.id)?.expect("closeout stored");
+        assert_eq!(stored.issue_ref.as_deref(), Some("owner/repo#142"));
+        let updated = store.set_work_item_status(&item_b.id, WorkItemStatus::InProgress)?;
+        assert_eq!(updated.status, WorkItemStatus::InProgress);
+
+        // Conversation summaries retained alongside messages.
+        let summary = store.save_conversation_summary("sess-turso-1", "plan", "Agreed on backoff invariant", "msg-1..msg-4")?;
+        assert!(!summary.id.is_empty());
+        let summaries = store.list_conversation_summaries("sess-turso-1")?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].phase, "plan");
+        assert!(store.save_conversation_summary("sess-turso-1", "plan", "  ", "msg-1").is_err());
 
         Ok(())
     }

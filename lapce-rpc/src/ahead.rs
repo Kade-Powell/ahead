@@ -348,7 +348,65 @@ pub struct ChangeProposal {
     pub recommended_cursor: Option<DisplayPosition>,
 }
 
-/// RPC requests from UI (lapce-app) to Session Host (lapce-proxy)
+/// Work-item status in the side-panel checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemStatus {
+    Open,
+    InProgress,
+    Done,
+    Dropped,
+}
+
+/// A checklist item owned by a session. Accumulates close-out docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub id: Id,
+    pub session_id: Id,
+    pub title: String,
+    pub status: WorkItemStatus,
+    pub position: i64,
+    pub created_by: Id,
+    pub created_at: Timestamp,
+    pub closed_at: Option<Timestamp>,
+}
+
+/// Append-only event on a work item (note, decision, artifact link, close).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItemEvent {
+    pub id: Id,
+    pub item_id: Id,
+    pub session_id: Id,
+    pub kind: String,
+    pub body_markdown: String,
+    pub actor_id: Id,
+    pub anchor_id: Option<Id>,
+    pub artifact_id: Option<Id>,
+    pub created_at: Timestamp,
+}
+
+/// Close-out doc required (or explicitly skipped with reason) at close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItemCloseout {
+    pub item_id: Id,
+    pub session_id: Id,
+    pub summary_markdown: String,
+    pub issue_ref: Option<String>,
+    pub follow_ups_json: String,
+    pub conversation_summary_id: Option<Id>,
+    pub closed_at: Timestamp,
+}
+
+/// Retained phase conversation summary (messages are never deleted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub id: Id,
+    pub session_id: Id,
+    pub phase: String,
+    pub summary_markdown: String,
+    pub message_id_range: String,
+    pub created_at: Timestamp,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadRequest {
@@ -388,6 +446,38 @@ pub enum AheadRequest {
     },
     AgentTurn {
         request: AgentTurnRequestDto,
+    },
+    WorkItemCreate {
+        session_id: Id,
+        title: String,
+    },
+    WorkItemList {
+        session_id: Id,
+    },
+    WorkItemSetStatus {
+        item_id: Id,
+        status: WorkItemStatus,
+    },
+    WorkItemNote {
+        item_id: Id,
+        kind: String,
+        body_markdown: String,
+    },
+    WorkItemClose {
+        item_id: Id,
+        summary_markdown: String,
+        issue_ref: Option<String>,
+        follow_ups_json: Option<String>,
+        skip_reason: Option<String>,
+    },
+    ConversationSummarize {
+        session_id: Id,
+        phase: String,
+        summary_markdown: String,
+        message_id_range: String,
+    },
+    ConversationList {
+        session_id: Id,
     },
     RequestPrediction {
         request: PredictionRequest,

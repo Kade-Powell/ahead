@@ -25,9 +25,20 @@ pub struct TrackerOutboxEntry {
     pub status: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkItemRow {
+    pub item: lapce_rpc::ahead::WorkItem,
+    pub events: Vec<lapce_rpc::ahead::WorkItemEvent>,
+    pub closeout: Option<lapce_rpc::ahead::WorkItemCloseout>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AheadState {
     pub active_session: RwSignal<Option<SessionView>>,
+    pub work_items: RwSignal<Vec<WorkItemRow>>,
+    pub work_item_input: RwSignal<String>,
+    pub work_item_error: RwSignal<Option<String>>,
+    pub conversation_summaries: RwSignal<Vec<lapce_rpc::ahead::ConversationSummary>>,
     pub saved_sessions: RwSignal<Vec<SessionView>>,
     pub session_error: RwSignal<Option<String>>,
     pub session_busy: RwSignal<bool>,
@@ -66,6 +77,10 @@ impl AheadState {
     pub fn new() -> Self {
         Self {
             active_session: create_rw_signal(None),
+            work_items: create_rw_signal(Vec::new()),
+            work_item_input: create_rw_signal(String::new()),
+            work_item_error: create_rw_signal(None),
+            conversation_summaries: create_rw_signal(Vec::new()),
             saved_sessions: create_rw_signal(Vec::new()),
             session_error: create_rw_signal(None),
             session_busy: create_rw_signal(false),
@@ -230,6 +245,169 @@ impl AheadState {
         }
     }
 
+    /// Refreshes the checklist + summaries for a session from the host.
+    /// Called on session adopt/resume and after every item mutation.
+    pub fn refresh_work_items(
+        &self,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let Some(view) = self.active_session.get_untracked() else {
+            return;
+        };
+        let session_id = view.session.id.clone();
+        let ahead = *self;
+        let proxy = window_tab.common.proxy.clone();
+        let scope = window_tab.scope;
+        let send = create_ext_action(scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => match serde_json::from_value::<Vec<lapce_rpc::ahead::WorkItem>>(val) {
+                    Ok(items) => {
+                        ahead.work_items.set(items.into_iter().map(|item| WorkItemRow {
+                            item,
+                            events: Vec::new(),
+                            closeout: None,
+                        }).collect());
+                        ahead.work_item_error.set(None);
+                    }
+                    Err(_) => ahead.work_item_error.set(Some("Checklist returned an unreadable list.".to_string())),
+                },
+                Err(e) => ahead.work_item_error.set(Some(format!("Checklist refresh failed: {}", e.message))),
+            }
+        });
+        proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::WorkItemList { session_id: session_id.clone() },
+            move |res| send(res),
+        );
+        let ahead2 = *self;
+        let proxy2 = window_tab.common.proxy.clone();
+        let send2 = create_ext_action(scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            if let Ok(val) = res {
+                if let Ok(summaries) = serde_json::from_value::<Vec<lapce_rpc::ahead::ConversationSummary>>(val) {
+                    ahead2.conversation_summaries.set(summaries);
+                }
+            }
+        });
+        proxy2.ahead_request(
+            lapce_rpc::ahead::AheadRequest::ConversationList { session_id },
+            move |res| send2(res),
+        );
+    }
+
+    /// Creates a checklist item from the inline add box.
+    pub fn create_work_item(
+        &self,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let title = self.work_item_input.get_untracked().trim().to_string();
+        if title.is_empty() {
+            self.work_item_error.set(Some("Give the work item a title first.".to_string()));
+            return;
+        }
+        let Some(view) = self.active_session.get_untracked() else {
+            self.work_item_error.set(Some("Start a session before adding items.".to_string()));
+            return;
+        };
+        let ahead = *self;
+        let wt = window_tab.clone();
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(_) => {
+                    ahead.work_item_input.set(String::new());
+                    ahead.work_item_error.set(None);
+                    ahead.refresh_work_items(&wt);
+                }
+                Err(e) => ahead.work_item_error.set(Some(format!("Add failed: {}", e.message))),
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::WorkItemCreate { session_id: view.session.id.clone(), title },
+            move |res| send(res),
+        );
+    }
+
+    /// Cycles an item's status open → in_progress → done (with close-out)
+    /// → open. Done requires the close-out summary; use the expander.
+    pub fn cycle_work_item_status(
+        &self,
+        item_id: String,
+        current: lapce_rpc::ahead::WorkItemStatus,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        use lapce_rpc::ahead::WorkItemStatus;
+        let next = match current {
+            WorkItemStatus::Open => WorkItemStatus::InProgress,
+            WorkItemStatus::InProgress => WorkItemStatus::Done,
+            WorkItemStatus::Done => WorkItemStatus::Open,
+            WorkItemStatus::Dropped => WorkItemStatus::Open,
+        };
+        // Done via cycle still needs a close-out: route through close with
+        // an explicit auto summary so nothing closes silently undocumented.
+        if matches!(next, WorkItemStatus::Done) {
+            self.close_work_item(item_id, String::new(), None, window_tab);
+            return;
+        }
+        let ahead = *self;
+        let wt = window_tab.clone();
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(_) => ahead.refresh_work_items(&wt),
+                Err(e) => ahead.work_item_error.set(Some(format!("Status change failed: {}", e.message))),
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::WorkItemSetStatus { item_id, status: next },
+            move |res| send(res),
+        );
+    }
+
+    /// Closes an item with its close-out summary (required unless skipped
+    /// with an explicit reason). The summary becomes the issue-closing
+    /// draft via the tracker outbox flow.
+    pub fn close_work_item(
+        &self,
+        item_id: String,
+        summary_markdown: String,
+        issue_ref: Option<String>,
+        window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
+    ) {
+        use floem::ext_event::create_ext_action;
+        let ahead = *self;
+        let wt = window_tab.clone();
+        let send = create_ext_action(window_tab.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            match res {
+                Ok(val) => match serde_json::from_value::<lapce_rpc::ahead::WorkItemCloseout>(val) {
+                    Ok(closeout) => {
+                        ahead.work_item_error.set(None);
+                        ahead.refresh_work_items(&wt);
+                        // Stage the close-out as the issue-closing draft.
+                        ahead.tracker_outbox.update(|items| {
+                            items.push(TrackerOutboxEntry {
+                                id: format!("closeout-{}", closeout.item_id),
+                                target: closeout.issue_ref.clone().unwrap_or_else(|| "Issue (link on publish)".to_string()),
+                                description: closeout.summary_markdown.clone(),
+                                status: "Close-out draft (review before publish)".to_string(),
+                            });
+                        });
+                    }
+                    Err(_) => ahead.work_item_error.set(Some("Close returned an unreadable close-out.".to_string())),
+                },
+                Err(e) => ahead.work_item_error.set(Some(format!("Close failed (summary or skip reason required): {}", e.message))),
+            }
+        });
+        window_tab.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::WorkItemClose {
+                item_id,
+                summary_markdown,
+                issue_ref,
+                follow_ups_json: None,
+                skip_reason: None,
+            },
+            move |res| send(res),
+        );
+     }
     /// Clears per-session conversation scaffolds so a reopened session
     /// never shows another session's chat, proposals, or transcripts.
     /// Delegates to the shared viewmodel (single source of truth).

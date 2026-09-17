@@ -131,6 +131,37 @@ impl AheadSessionHost {
                 let out = self.agent_turn(request)?;
                 Ok(serde_json::to_value(out)?)
             }
+            AheadRequest::WorkItemCreate { session_id, title } => {
+                let owner = self.auth.read().get_active_user(None).login.clone();
+                let item = self.store.read().create_work_item(&session_id, &title, &owner)?;
+                Ok(serde_json::to_value(item)?)
+            }
+            AheadRequest::WorkItemList { session_id } => {
+                let items = self.store.read().list_work_items(&session_id)?;
+                Ok(serde_json::to_value(items)?)
+            }
+            AheadRequest::WorkItemSetStatus { item_id, status } => {
+                let item = self.store.read().set_work_item_status(&item_id, status)?;
+                Ok(serde_json::to_value(item)?)
+            }
+            AheadRequest::WorkItemNote { item_id, kind, body_markdown } => {
+                let owner = self.auth.read().get_active_user(None).login.clone();
+                let session_id = self.work_item_session(&item_id)?.unwrap_or_default();
+                let event = self.store.read().add_work_item_event(&item_id, &session_id, &kind, &body_markdown, &owner)?;
+                Ok(serde_json::to_value(event)?)
+            }
+            AheadRequest::WorkItemClose { item_id, summary_markdown, issue_ref, follow_ups_json, skip_reason } => {
+                let closeout = self.store.read().close_work_item(&item_id, &summary_markdown, issue_ref, follow_ups_json, skip_reason)?;
+                Ok(serde_json::to_value(closeout)?)
+            }
+            AheadRequest::ConversationSummarize { session_id, phase, summary_markdown, message_id_range } => {
+                let summary = self.store.read().save_conversation_summary(&session_id, &phase, &summary_markdown, &message_id_range)?;
+                Ok(serde_json::to_value(summary)?)
+            }
+            AheadRequest::ConversationList { session_id } => {
+                let summaries = self.store.read().list_conversation_summaries(&session_id)?;
+                Ok(serde_json::to_value(summaries)?)
+            }
             AheadRequest::RequestPrediction { request } => {
                 let res = self.request_prediction(request, &[])?;
                 Ok(serde_json::to_value(res)?)
@@ -394,6 +425,20 @@ impl AheadSessionHost {
         }
 
         Ok(next_wf)
+    }
+
+    /// Resolves a work item's owning session for event attribution.
+    /// Scan is fine at checklist scale; items are per-session small.
+    pub fn work_item_session(&self, item_id: &str) -> Result<Option<String>> {
+        let store = self.store.read();
+        for view in store.list_sessions()? {
+            for item in store.list_work_items(&view.session.id)? {
+                if item.id == item_id {
+                    return Ok(Some(item.session_id));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn create_anchor(
