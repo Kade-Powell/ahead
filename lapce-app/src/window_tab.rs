@@ -1593,6 +1593,28 @@ impl WindowTabData {
             AheadVoiceBargeIn => {
                 self.ahead.voice_active.set(false);
             }
+            AheadSignInGitHub => {
+                self.ahead.show_auth_modal.set(true);
+                let ahead_state = self.ahead;
+                let send = create_ext_action(self.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                    if let Ok(val) = res {
+                        if let Ok(code_resp) = serde_json::from_value::<lapce_rpc::ahead::GitHubDeviceCodeResponse>(val) {
+                            ahead_state.pending_device_code.set(Some(code_resp));
+                        }
+                    }
+                });
+                self.common.proxy.ahead_request(
+                    lapce_rpc::ahead::AheadRequest::GitHubAuthStart,
+                    move |res| {
+                        send(res);
+                    },
+                );
+            }
+            AheadSignOutGitHub => {
+                self.ahead.authenticated_user.set(None);
+                self.ahead.pending_device_code.set(None);
+                self.ahead.show_auth_modal.set(false);
+            }
         }
     }
 

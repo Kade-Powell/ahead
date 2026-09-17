@@ -135,5 +135,8 @@ codegen-units = 1
 [profile.fastdev.package."*"]
 opt-level = 3
 
+[profile.dev]
+debug = 1
+
 [profile.fastdev]
 inherits = "dev"

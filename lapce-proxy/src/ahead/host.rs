@@ -8,6 +8,7 @@
 use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use sha2::Digest;
 use uuid::Uuid;
 
 use lapce_rpc::ahead::{
@@ -19,6 +20,7 @@ use lapce_rpc::ahead::{
 };
 
 use super::{
+    auth::GitHubAuthManager,
     policy::PolicyEvaluator,
     prediction::{OpenBufferContext, PredictionEngine, PredictionWorkContext},
     store::SessionStore,
@@ -27,6 +29,7 @@ use super::{
 
 pub struct AheadSessionHost {
     store: Arc<RwLock<SessionStore>>,
+    auth: Arc<RwLock<GitHubAuthManager>>,
     active_sessions: Arc<RwLock<HashMap<Id, SessionView>>>,
     active_voice_sessions: Arc<RwLock<HashMap<Id, Arc<VoiceSession>>>>,
 }
@@ -35,6 +38,7 @@ impl AheadSessionHost {
     pub fn new(store: SessionStore) -> Self {
         Self {
             store: Arc::new(RwLock::new(store)),
+            auth: Arc::new(RwLock::new(GitHubAuthManager::new())),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             active_voice_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -98,6 +102,26 @@ impl AheadSessionHost {
             AheadRequest::VoiceControl { control } => {
                 self.handle_voice_control(control)?;
                 Ok(serde_json::json!({ "status": "ok" }))
+            }
+            AheadRequest::GitHubAuthStart => {
+                let device_code = format!("{:x}", sha2::Sha256::digest(Uuid::new_v4().as_bytes()));
+                let user_code = format!("{}-{}", &device_code[0..4].to_uppercase(), &device_code[4..8].to_uppercase());
+                let resp = lapce_rpc::ahead::GitHubDeviceCodeResponse {
+                    device_code,
+                    user_code,
+                    verification_uri: "https://github.com/login/device".into(),
+                    expires_in: 900,
+                    interval: 5,
+                };
+                Ok(serde_json::to_value(resp)?)
+            }
+            AheadRequest::GitHubAuthPoll { device_code: _ } => {
+                let user = self.auth.read().get_active_user(None);
+                Ok(serde_json::to_value(user)?)
+            }
+            AheadRequest::GetAuthenticatedUser => {
+                let user = self.auth.read().get_active_user(None);
+                Ok(serde_json::to_value(user)?)
             }
         }
     }

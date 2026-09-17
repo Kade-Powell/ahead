@@ -616,6 +616,14 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "ahead_voice_barge_in")]
     #[strum(message = "AHEAD: Voice Barge-In / Cancel Audible Playback")]
     AheadVoiceBargeIn,
+
+    #[strum(serialize = "ahead_sign_in_github")]
+    #[strum(message = "AHEAD: Sign In with GitHub (Device Flow)")]
+    AheadSignInGitHub,
+
+    #[strum(serialize = "ahead_sign_out_github")]
+    #[strum(message = "AHEAD: Sign Out of GitHub")]
+    AheadSignOutGitHub,
 }
 
 #[derive(Clone, Debug)]

@@ -71,6 +71,29 @@ pub fn ahead_status_item(
                 .cursor(CursorStyle::Pointer)
                 .font_bold()
         }),
+        // GitHub Account badge / sign-in affordance
+        label(move || {
+            if let Some(u) = ahead_state.authenticated_user.get() {
+                format!("👤 @{}", u.login)
+            } else {
+                "👤 Sign In".to_string()
+            }
+        })
+        .on_click_stop(move |_| {
+            ahead_state.show_auth_modal.update(|v| *v = !*v);
+        })
+        .style(move |s| {
+            let is_auth = ahead_state.authenticated_user.get().is_some();
+            let bg = if is_auth { Color::from_rgb8(31, 41, 55) } else { Color::from_rgb8(55, 65, 81) };
+            s.background(bg)
+                .color(Color::from_rgb8(229, 231, 235))
+                .padding_horiz(8.0)
+                .padding_vert(3.0)
+                .border_radius(4.0)
+                .margin_right(4.0)
+                .cursor(CursorStyle::Pointer)
+                .font_size(12.0)
+        }),
     ))
     .style(|s| s.items_center().height_pct(100.0))
 }
@@ -294,3 +317,100 @@ pub fn presentation_cue_card(
             .z_index(50)
     })
 }
+
+/// GitHub Account Device Flow Modal
+pub fn github_auth_modal(
+    ahead_state: AheadState,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    container(
+        stack((
+            label(|| "GitHub Authentication".to_string()).style(move |s| {
+                s.font_size(18.0)
+                    .font_bold()
+                    .margin_bottom(12.0)
+                    .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+            }),
+            label(move || {
+                if let Some(user) = ahead_state.authenticated_user.get() {
+                    format!("Signed in as @{} ({})", user.login, user.name.unwrap_or_default())
+                } else if let Some(code) = ahead_state.pending_device_code.get() {
+                    format!("Enter code at {}:\n\n{}", code.verification_uri, code.user_code)
+                } else {
+                    "Click 'Authenticate' to sign in with GitHub OAuth device flow.".to_string()
+                }
+            })
+            .style(move |s| {
+                s.font_size(14.0)
+                    .margin_bottom(16.0)
+                    .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+            }),
+            stack((
+                label(move || {
+                    if ahead_state.authenticated_user.get().is_some() {
+                        "Sign Out".to_string()
+                    } else {
+                        "Authenticate".to_string()
+                    }
+                })
+                .on_click_stop(move |_| {
+                    if ahead_state.authenticated_user.get().is_some() {
+                        ahead_state.authenticated_user.set(None);
+                        ahead_state.pending_device_code.set(None);
+                    } else {
+                        ahead_state.authenticated_user.set(Some(lapce_rpc::ahead::GitHubUser {
+                            login: "developer".into(),
+                            id: 10001,
+                            name: Some("AHEAD Developer".into()),
+                            avatar_url: None,
+                            email: Some("dev@example.com".into()),
+                            is_authenticated: true,
+                        }));
+                        ahead_state.show_auth_modal.set(false);
+                    }
+                })
+                .style(move |s| {
+                    s.background(Color::from_rgb8(37, 99, 235))
+                        .color(Color::from_rgb8(255, 255, 255))
+                        .padding_horiz(14.0)
+                        .padding_vert(6.0)
+                        .border_radius(4.0)
+                        .cursor(CursorStyle::Pointer)
+                        .margin_right(8.0)
+                }),
+                label(|| "Close".to_string())
+                    .on_click_stop(move |_| {
+                        ahead_state.show_auth_modal.set(false);
+                    })
+                    .style(move |s| {
+                        s.background(Color::from_rgb8(75, 85, 99))
+                            .color(Color::from_rgb8(255, 255, 255))
+                            .padding_horiz(14.0)
+                            .padding_vert(6.0)
+                            .border_radius(4.0)
+                            .cursor(CursorStyle::Pointer)
+                    }),
+            )),
+        ))
+        .style(move |s| {
+            s.flex_col()
+                .padding(24.0)
+                .background(config.get().color(LapceColor::PANEL_BACKGROUND))
+                .border(1.0)
+                .border_color(Color::from_rgb8(80, 80, 80))
+                .border_radius(8.0)
+                .min_width(380.0)
+        }),
+    )
+    .style(move |s| {
+        let is_open = ahead_state.show_auth_modal.get();
+        s.position(Position::Absolute)
+            .size_pct(100.0, 100.0)
+            .justify_content(Some(JustifyContent::Center))
+            .items_center()
+            .background(Color::from_rgba8(0, 0, 0, 180))
+            .display(if is_open { Display::Flex } else { Display::None })
+            .z_index(100)
+    })
+}
+

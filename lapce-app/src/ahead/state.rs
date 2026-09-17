@@ -14,6 +14,9 @@ pub struct AheadState {
     pub presentation_cue: RwSignal<Option<PresentationCue>>,
     pub show_start_work_modal: RwSignal<bool>,
     pub voice_active: RwSignal<bool>,
+    pub authenticated_user: RwSignal<Option<lapce_rpc::ahead::GitHubUser>>,
+    pub show_auth_modal: RwSignal<bool>,
+    pub pending_device_code: RwSignal<Option<lapce_rpc::ahead::GitHubDeviceCodeResponse>>,
 }
 
 impl AheadState {
@@ -23,6 +26,9 @@ impl AheadState {
             presentation_cue: create_rw_signal(None),
             show_start_work_modal: create_rw_signal(false),
             voice_active: create_rw_signal(false),
+            authenticated_user: create_rw_signal(None),
+            show_auth_modal: create_rw_signal(false),
+            pending_device_code: create_rw_signal(None),
         }
     }
 

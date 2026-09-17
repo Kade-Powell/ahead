@@ -352,7 +352,32 @@ pub enum AheadRequest {
     VoiceControl {
         control: VoiceControl,
     },
+    GitHubAuthStart,
+    GitHubAuthPoll {
+        device_code: String,
+    },
+    GetAuthenticatedUser,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubUser {
+    pub login: String,
+    pub id: u64,
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub email: Option<String>,
+    pub is_authenticated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubDeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
 
 /// RPC notifications from Session Host to UI
 #[derive(Debug, Clone, Serialize, Deserialize)]
