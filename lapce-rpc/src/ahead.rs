@@ -323,6 +323,7 @@ pub enum AheadRequest {
     GetSession {
         session_id: Id,
     },
+    ListSessions,
     SetMode {
         session_id: Id,
         mode: AssistanceMode,

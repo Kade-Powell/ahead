@@ -84,6 +84,10 @@ impl AheadSessionHost {
                 let session = self.get_session(&session_id)?;
                 Ok(serde_json::to_value(session)?)
             }
+            AheadRequest::ListSessions => {
+                let sessions = self.list_sessions()?;
+                Ok(serde_json::to_value(sessions)?)
+            }
             AheadRequest::SetMode { session_id, mode } => {
                 let session = self.set_mode(&session_id, mode)?;
                 Ok(serde_json::to_value(session)?)
@@ -169,7 +173,7 @@ impl AheadSessionHost {
                 Ok(serde_json::to_value(parts)?)
             }
             AheadRequest::AddWorkspaceParticipant { user_handle, role } => {
-                let parts = self.add_workspace_participant(user_handle, role);
+                let parts = self.add_workspace_participant(user_handle, role)?;
                 Ok(serde_json::to_value(parts)?)
             }
             AheadRequest::RevokeWorkspaceParticipant { user_handle } => {
@@ -192,22 +196,25 @@ impl AheadSessionHost {
         parts
     }
 
-    pub fn add_workspace_participant(&self, user_handle: String, role: SessionRole) -> Vec<SessionParticipantRecord> {
-        let mut parts = self.workspace_participants.write();
+    pub fn add_workspace_participant(&self, user_handle: String, role: SessionRole) -> Result<Vec<SessionParticipantRecord>> {
         let handle = user_handle.trim().trim_start_matches('@').to_string();
+        if handle.is_empty() || handle.contains('@') || handle.contains(' ') || handle.contains('/') {
+            anyhow::bail!("Enter a GitHub username (e.g. octocat), not an email address");
+        }
+        let mut parts = self.workspace_participants.write();
         if let Some(existing) = parts.iter_mut().find(|p| p.participant.id() == handle) {
             existing.role = role;
         } else {
             parts.push(SessionParticipantRecord {
                 participant: Participant::Human {
                     id: handle.clone(),
-                    subject: format!("{}@github.com", handle),
-                    display_name: handle,
+                    subject: handle.clone(),
+                    display_name: format!("@{}", handle),
                 },
                 role,
             });
         }
-        parts.clone()
+        Ok(parts.clone())
     }
 
     pub fn revoke_workspace_participant(&self, user_handle: &str) -> Result<Vec<SessionParticipantRecord>> {
@@ -332,6 +339,18 @@ impl AheadSessionHost {
         }
         let store = self.store.read();
         store.get_session(session_id)
+    }
+    pub fn list_sessions(&self) -> Result<Vec<SessionView>> {
+        let mut views = self.store.read().list_sessions()?;
+        let active = self.active_sessions.read();
+        for (id, view) in active.iter() {
+            if let Some(existing) = views.iter_mut().find(|v| v.session.id == *id) {
+                *existing = view.clone();
+            } else {
+                views.push(view.clone());
+            }
+        }
+        Ok(views)
     }
 
     pub fn set_mode(&self, session_id: &str, mode: AssistanceMode) -> Result<()> {

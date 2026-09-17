@@ -672,6 +672,18 @@ impl WindowTabData {
                 move |res| send_user(res),
             );
 
+            let ahead_for_sessions = ahead_state;
+            let send_sessions = create_ext_action(cx, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                if let Ok(val) = res {
+                    if let Ok(views) = serde_json::from_value::<Vec<lapce_rpc::ahead::SessionView>>(val) {
+                        ahead_for_sessions.saved_sessions.set(views);
+                    }
+                }
+            });
+            window_tab_data.common.proxy.ahead_request(
+                lapce_rpc::ahead::AheadRequest::ListSessions,
+                move |res| send_sessions(res),
+            );
             let send_parts = create_ext_action(cx, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
                 if let Ok(val) = res {
                     if let Ok(parts) = serde_json::from_value::<Vec<lapce_rpc::ahead::SessionParticipantRecord>>(val) {
@@ -688,6 +700,20 @@ impl WindowTabData {
         window_tab_data
     }
 
+    pub fn refresh_saved_sessions(&self) {
+        let ahead_state = self.ahead;
+        let send = create_ext_action(self.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+            if let Ok(val) = res {
+                if let Ok(views) = serde_json::from_value::<Vec<lapce_rpc::ahead::SessionView>>(val) {
+                    ahead_state.saved_sessions.set(views);
+                }
+            }
+        });
+        self.common.proxy.ahead_request(
+            lapce_rpc::ahead::AheadRequest::ListSessions,
+            move |res| send(res),
+        );
+    }
     pub fn reload_config(&self) {
         let db: Arc<LapceDb> = use_context().unwrap();
 
@@ -1643,9 +1669,13 @@ impl WindowTabData {
             }
             AheadStartWork => {
                 self.ahead.show_start_work_modal.update(|v| *v = !*v);
+                if self.ahead.show_start_work_modal.get_untracked() {
+                    self.refresh_saved_sessions();
+                }
             }
             AheadToggleMode => {
-                self.ahead.toggle_mode();
+                self.show_panel(crate::panel::kind::PanelKind::AheadAgent);
+                self.ahead.session_error.set(Some("Use the explicit mode switch in the AHEAD panel; the status chip never changes policy.".to_string()));
             }
             AheadDismissCue => {
                 self.ahead.presentation_cue.set(None);

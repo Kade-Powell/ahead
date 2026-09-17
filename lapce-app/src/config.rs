@@ -316,10 +316,12 @@ impl LapceConfig {
 
         let (name, theme) =
             Self::load_color_theme_from_str(DEFAULT_LIGHT_THEME).unwrap();
-        themes.insert(name.to_lowercase(), (name, theme));
+        themes.insert(name.to_lowercase(), (name.clone(), theme.clone()));
+        themes.insert("lapce light".to_string(), (name, theme));
         let (name, theme) =
             Self::load_color_theme_from_str(DEFAULT_DARK_THEME).unwrap();
-        themes.insert(name.to_lowercase(), (name, theme));
+        themes.insert(name.to_lowercase(), (name.clone(), theme.clone()));
+        themes.insert("lapce dark".to_string(), (name, theme));
 
         themes
     }
