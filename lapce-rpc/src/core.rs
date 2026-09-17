@@ -146,6 +146,9 @@ pub enum CoreNotification {
         path: PathBuf,
         breakpoints: Vec<dap_types::Breakpoint>,
     },
+    AheadNotification {
+        notification: crate::ahead::AheadNotification,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +404,10 @@ impl CoreRpcHandler {
 
     pub fn home_dir(&self, path: PathBuf) {
         self.notification(CoreNotification::HomeDir { path });
+    }
+
+    pub fn ahead_notification(&self, notification: crate::ahead::AheadNotification) {
+        self.notification(CoreNotification::AheadNotification { notification });
     }
 }
 

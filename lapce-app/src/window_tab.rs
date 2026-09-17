@@ -2326,6 +2326,21 @@ impl WindowTabData {
             CoreNotification::WorkspaceFileChange => {
                 self.file_explorer.reload();
             }
+            CoreNotification::AheadNotification { notification } => {
+                use lapce_rpc::ahead::AheadNotification::*;
+                match notification {
+                    SessionUpdated { view } => {
+                        self.ahead.active_session.set(Some(view.clone()));
+                    }
+                    PresentationCueRevealed { cue } => {
+                        self.ahead.presentation_cue.set(Some(cue.clone()));
+                    }
+                    PresentationCueDismissed { .. } => {
+                        self.ahead.presentation_cue.set(None);
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }

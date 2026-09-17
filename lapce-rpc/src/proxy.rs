@@ -220,6 +220,9 @@ pub enum ProxyRequest {
     ReferencesResolve {
         items: Vec<Location>,
     },
+    AheadRequest {
+        request: crate::ahead::AheadRequest,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +354,9 @@ pub enum ProxyNotification {
         path: PathBuf,
         breakpoints: Vec<SourceBreakpoint>,
     },
+    AheadNotification {
+        notification: crate::ahead::AheadNotification,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +473,9 @@ pub enum ProxyResponse {
     SaveResponse {},
     ReferencesResolveResponse {
         items: Vec<FileLine>,
+    },
+    AheadResponse {
+        response: serde_json::Value,
     },
 }
 
@@ -1210,6 +1219,25 @@ impl ProxyRpcHandler {
         f: impl ProxyCallback + 'static,
     ) {
         self.request_async(ProxyRequest::DapGetScopes { dap_id, frame_id }, f);
+    }
+
+    pub fn ahead_request(
+        &self,
+        request: crate::ahead::AheadRequest,
+        f: impl FnOnce(Result<serde_json::Value, RpcError>) + Send + 'static,
+    ) {
+        self.request_async(ProxyRequest::AheadRequest { request }, move |res| match res {
+            Ok(ProxyResponse::AheadResponse { response }) => f(Ok(response)),
+            Ok(_) => f(Err(RpcError {
+                code: 0,
+                message: "Unexpected response variant for AheadRequest".into(),
+            })),
+            Err(err) => f(Err(err)),
+        });
+    }
+
+    pub fn ahead_notification(&self, notification: crate::ahead::AheadNotification) {
+        self.notification(ProxyNotification::AheadNotification { notification });
     }
 }
 

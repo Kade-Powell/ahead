@@ -62,6 +62,7 @@ pub struct Dispatcher {
     file_watcher: FileWatcher,
     window_id: usize,
     tab_id: usize,
+    pub ahead_host: Option<Arc<parking_lot::RwLock<crate::ahead::host::AheadSessionHost>>>,
 }
 
 impl ProxyHandler for Dispatcher {
@@ -101,6 +102,20 @@ impl ProxyHandler for Dispatcher {
                     );
                     plugin_rpc.mainloop(&mut plugin);
                 });
+
+                let session_store = if let Some(ws) = self.workspace.as_ref() {
+                    let ahead_dir = ws.join(".ahead");
+                    let _ = std::fs::create_dir_all(&ahead_dir);
+                    let db_path = ahead_dir.join("session.db");
+                    crate::ahead::store::SessionStore::open(&db_path)
+                        .unwrap_or_else(|_| crate::ahead::store::SessionStore::in_memory().unwrap())
+                } else {
+                    crate::ahead::store::SessionStore::in_memory().unwrap()
+                };
+                self.ahead_host = Some(Arc::new(parking_lot::RwLock::new(
+                    crate::ahead::host::AheadSessionHost::new(session_store),
+                )));
+
                 self.core_rpc.notification(CoreNotification::ProxyStatus {
                     status: lapce_rpc::proxy::ProxyStatus::Connected,
                 });
@@ -398,12 +413,32 @@ impl ProxyHandler for Dispatcher {
                     false,
                 );
             }
+            AheadNotification { notification } => {
+                self.core_rpc.ahead_notification(notification);
+            }
         }
     }
 
     fn handle_request(&mut self, id: RequestId, rpc: ProxyRequest) {
         use ProxyRequest::*;
         match rpc {
+            AheadRequest { request } => {
+                let resp = if let Some(host) = self.ahead_host.as_ref() {
+                    match host.read().handle_request(request) {
+                        Ok(val) => Ok(ProxyResponse::AheadResponse { response: val }),
+                        Err(e) => Err(RpcError {
+                            code: 0,
+                            message: e.to_string(),
+                        }),
+                    }
+                } else {
+                    Err(RpcError {
+                        code: 0,
+                        message: "Ahead session host not initialized".to_string(),
+                    })
+                };
+                self.respond_rpc(id, resp);
+            }
             NewBuffer { buffer_id, path } => {
                 let buffer = Buffer::new(buffer_id, path.clone());
                 let content = buffer.rope.to_string();
@@ -631,15 +666,66 @@ impl ProxyHandler for Dispatcher {
                 trigger_kind,
             } => {
                 let proxy_rpc = self.proxy_rpc.clone();
+                let ahead_host = self.ahead_host.clone();
+                let buffer_content = self.buffers.get(&path).map(|b| b.rope.to_string());
+                let path_buf = path.clone();
                 self.catalog_rpc.get_inline_completions(
                     &path,
                     position,
                     trigger_kind,
                     move |_, result| {
-                        let result = result.map(|completions| {
-                            ProxyResponse::GetInlineCompletions { completions }
+                        let mut completions_opt = result.ok();
+                        let has_items = completions_opt.as_ref().map(|c| match c {
+                            lsp_types::InlineCompletionResponse::Array(arr) => !arr.is_empty(),
+                            lsp_types::InlineCompletionResponse::List(l) => !l.items.is_empty(),
+                        }).unwrap_or(false);
+
+                        if !has_items {
+                            if let Some(host_lock) = ahead_host {
+                                let host = host_lock.read();
+                                let path_str = path_buf.to_string_lossy().to_string();
+                                let (prefix, suffix) = if let Some(ref text) = buffer_content {
+                                    let lines: Vec<&str> = text.lines().collect();
+                                    let line_idx = position.line as usize;
+                                    if line_idx < lines.len() {
+                                        let col_idx = (position.character as usize).min(lines[line_idx].len());
+                                        let (p, s) = lines[line_idx].split_at(col_idx);
+                                        (p.to_string(), s.to_string())
+                                    } else {
+                                        (String::new(), String::new())
+                                    }
+                                } else {
+                                    (String::new(), String::new())
+                                };
+
+                                let req = lapce_rpc::ahead::PredictionRequest {
+                                    request_id: uuid::Uuid::new_v4().to_string(),
+                                    session_id: "active".to_string(),
+                                    path: path_str,
+                                    cursor: lapce_rpc::ahead::DisplayPosition { line: position.line, col: position.character },
+                                    prefix,
+                                    suffix,
+                                    work_context: "ahead-editor-flow".to_string(),
+                                };
+                                if let Ok(pred) = host.request_prediction(req, &[]) {
+                                    let item = lsp_types::InlineCompletionItem {
+                                        insert_text: pred.replacement,
+                                        filter_text: None,
+                                        range: None,
+                                        command: None,
+                                        insert_text_format: None,
+                                    };
+                                    completions_opt = Some(lsp_types::InlineCompletionResponse::Array(vec![item]));
+                                }
+                            }
+                        }
+
+                        let final_result = Ok(ProxyResponse::GetInlineCompletions {
+                            completions: completions_opt.unwrap_or_else(|| {
+                                lsp_types::InlineCompletionResponse::Array(Vec::new())
+                            }),
                         });
-                        proxy_rpc.handle_response(id, result);
+                        proxy_rpc.handle_response(id, final_result);
                     },
                 );
             }
@@ -1225,6 +1311,7 @@ impl Dispatcher {
             file_watcher,
             window_id: 1,
             tab_id: 1,
+            ahead_host: None,
         }
     }
 

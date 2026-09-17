@@ -5,7 +5,7 @@
 //! recent edits, and diagnostics without requiring repository-wide agent invocations.
 
 use lapce_rpc::ahead::{
-    AssistanceMode, DisplayPosition, PredictionRequest, PredictionResult,
+    AssistanceMode, PredictionRequest, PredictionResult,
     RepoPath, WorkKind,
 };
 use anyhow::{bail, Result};
@@ -100,6 +100,7 @@ impl PredictionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lapce_rpc::ahead::DisplayPosition;
 
     #[test]
     fn test_assemble_context_includes_invariants_and_buffers() {
