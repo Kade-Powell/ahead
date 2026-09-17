@@ -3,7 +3,7 @@
 //! Both shells must produce identical governed-turn context
 //! (workspace-relative path, UTF-16 caret line/col, selection, content)
 //! from different buffer primitives. This module owns the conversions:
-//! - Floem/lapce path: UTF-8 byte offset → UTF-16 line/col via
+//! - Floem shell path: UTF-8 byte offset → UTF-16 line/col via
 //!   `lapce_core::rope_text_pos::RopeTextPosition` (implemented in
 //!   `lapce-app`, which owns the Floem dependency).
 //! - GPUI path: ropey byte offset → `Point{row,column}` via
