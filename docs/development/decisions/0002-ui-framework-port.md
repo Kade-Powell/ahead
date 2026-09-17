@@ -75,3 +75,26 @@ for **full GPUI port**, against Tauri + Leptos/Dioxus/Vue:
   edit+save through the proxy buffer path, one LSP completion round-trip,
   keyboard-only traversal + screen-reader narration, one `gpui-shell` JS
   panel under a test capability grant.
+
+## Amendment 2026-09-17 (superseding): port REJECTED on reuse grounds
+
+The user reframed the objective: port to whatever reuses the MOST existing
+fork code. Measured in this repo that day:
+
+- `lapce-proxy` (~13k LOC), `lapce-rpc` (~4k), `lapce-core` (~5k): zero
+  Floem. Portable anywhere, including staying put.
+- `lapce-app` (~51k): 31 files Floem-free; 71 Floem-coupled, but only 13
+  touch `views::editor` deeply (editor widget, doc, main_split, terminal
+  view, completion, hover). The rest use Floem for reactive signals and
+  view scaffolding — mechanical rewrites, not redesigns.
+- GPUI/Tauri/Iced all rewrite the 71 coupled files against new APIs; the
+  spike confirmed GPUI's editor model (`InputBaseState<EditorMode>`,
+  entity/context) shares nothing with `floem::views::editor`. Reuse there
+  is concepts, not code.
+
+Verdict: **stay on Floem**, pinned at `e0dd862`. The vertical-slice work
+(merged to main) lands directly with no translation layer. Extension
+answer stays: native volts + standalone LSP now, Zed-style declarative
+layer as first extensibility epic, no VSIX host. Spike branch
+`spike/gpui-kit` + `../ahead-spike-gpui` kept as evidence (window opened,
+file loaded/highlighted, save wired, screenshot-verified).
