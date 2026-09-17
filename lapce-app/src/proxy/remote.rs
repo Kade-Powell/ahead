@@ -113,8 +113,8 @@ pub fn start_remote(
     };
 
     let remote_proxy_file = match platform {
-        Windows => format!("{remote_proxy_path}\\lapce.exe"),
-        _ => format!("{remote_proxy_path}/lapce"),
+        Windows => format!("{remote_proxy_path}\\ahead.exe"),
+        _ => format!("{remote_proxy_path}/ahead"),
     };
 
     if !remote
@@ -123,10 +123,10 @@ pub fn start_remote(
         .output()
         .map(|output| {
             if meta::RELEASE == ReleaseType::Debug {
-                String::from_utf8_lossy(&output.stdout).starts_with("Lapce-proxy")
+                String::from_utf8_lossy(&output.stdout).starts_with("Ahead-proxy")
             } else {
                 String::from_utf8_lossy(&output.stdout).trim()
-                    == format!("Lapce-proxy {}", meta::VERSION)
+                    == format!("Ahead-proxy {}", meta::VERSION)
             }
         })
         .unwrap_or(false)

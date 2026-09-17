@@ -6,9 +6,9 @@ use structdesc::FieldNames;
 pub struct CoreConfig {
     #[field_names(desc = "Enable modal editing (Vim like)")]
     pub modal: bool,
-    #[field_names(desc = "Set the color theme of Lapce")]
+    #[field_names(desc = "Set the color theme of Ahead")]
     pub color_theme: String,
-    #[field_names(desc = "Set the icon theme of Lapce")]
+    #[field_names(desc = "Set the icon theme of Ahead")]
     pub icon_theme: String,
     #[field_names(
         desc = "Enable customised titlebar and disable OS native one (Linux, BSD, Windows)"

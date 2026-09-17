@@ -268,7 +268,7 @@ pub fn load_all_volts(
 }
 
 /// Find all installed volts.  
-/// `plugin_dev_path` allows launching Lapce with a plugin on your local system for testing
+/// `plugin_dev_path` allows launching Ahead with a plugin on your local system for testing
 /// purposes.  
 /// As well, this function skips any volt in the typical plugin directory that match the name
 /// of the dev plugin so as to support developing a plugin you actively use.

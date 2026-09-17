@@ -58,7 +58,7 @@ pub struct WindowCommonData {
 /// `WindowData` is the application model for a top-level window.
 ///
 /// A top-level window can be independently moved around and
-/// resized using your window manager. Normally Lapce has only one
+/// resized using your window manager. Normally Ahead has only one
 /// top-level window, but new ones can be created using the "New Window"
 /// command.
 ///

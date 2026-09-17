@@ -404,7 +404,7 @@ fn completion_lens_text(
     // If the text does not include a prefix in the expected position, then we do not display it.
     let item = item.as_ref().strip_prefix(&completion.input)?;
 
-    // Get only the first line of text, because Lapce does not currently support
+    // Get only the first line of text, because Ahead does not currently support
     // multi-line phantom text.
     let item = item.lines().next().unwrap_or(item);
 

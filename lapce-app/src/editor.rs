@@ -514,7 +514,7 @@ impl EditorData {
         let doc = self.doc();
         let config = self.common.config.get_untracked();
 
-        // This is currently special-cased in Lapce because floem editor does not have 'find'
+        // This is currently special-cased in Ahead because floem editor does not have 'find'
         match cmd {
             MultiSelectionCommand::SelectAllCurrent => {
                 if let CursorMode::Insert(mut selection) = cursor.mode.clone() {

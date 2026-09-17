@@ -3800,7 +3800,7 @@ pub fn launch() {
     }
 
     // If the cli is not requesting a new window, and we're not developing a plugin, we try to open
-    // in the existing Lapce process
+    // in the existing Ahead process
     if !cli.new {
         match get_socket() {
             Ok(socket) => {

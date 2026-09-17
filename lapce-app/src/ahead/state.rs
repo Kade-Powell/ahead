@@ -1,4 +1,4 @@
-//! AHEAD Reactive State for Lapce App UI
+//! AHEAD Reactive State for the Ahead App UI
 //!
 //! Grounded in Sections 4.2, 4.4, 4.5, and 8.2 of `ahead-editor-mvp.md`.
 
