@@ -228,54 +228,92 @@ impl AheadState {
 
     /// Clears per-session conversation scaffolds so a reopened session
     /// never shows another session's chat, proposals, or transcripts.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn adopt_durable_session(&self, view: SessionView) {
-        self.active_session.set(Some(view));
-        self.chat_messages.set(Vec::new());
-        self.pending_proposals.set(Vec::new());
-        self.tracker_outbox.set(Vec::new());
-        self.voice_transcripts.set(Vec::new());
+        let mut snapshot = ahead_viewmodel::SessionSnapshot::default();
+        ahead_viewmodel::adopt_session(&mut snapshot, view);
+        self.apply_snapshot_shape(&snapshot);
+        self.active_session.set(snapshot.active);
         self.voice_active.set(false);
         self.voice_listening.set(false);
         self.voice_speaking.set(false);
         self.presentation_cue.set(None);
+        self.show_start_work_modal.set(false);
+    }
+
+    /// Applies a viewmodel snapshot's list shapes to Floem signals.
+    fn apply_snapshot_shape(&self, snapshot: &ahead_viewmodel::SessionSnapshot) {
+        let chat: Vec<AgentChatMessage> = snapshot.chat.iter().map(|m| AgentChatMessage {
+            id: m.id.clone(),
+            sender: m.sender.clone(),
+            text: m.text.clone(),
+            timestamp: "Just now".to_string(),
+            is_challenge: m.is_challenge,
+        }).collect();
+        self.chat_messages.set(chat);
+        self.pending_proposals.set(snapshot.pending_proposals.clone());
+        let tracker: Vec<TrackerOutboxEntry> = snapshot.tracker.iter().map(|t| TrackerOutboxEntry {
+            id: t.id.clone(),
+            target: t.target.clone(),
+            description: t.description.clone(),
+            status: t.status.clone(),
+        }).collect();
+        self.tracker_outbox.set(tracker);
+        self.voice_transcripts.set(snapshot.transcripts.clone());
         self.session_error.set(None);
         self.session_busy.set(false);
-        self.show_start_work_modal.set(false);
     }
 
     /// Requests a host-backed mode change. Local state only updates when the
     /// session host acknowledges, so the chip never diverges from durable state.
     pub fn apply_remote_mode(&self, view: SessionView) {
-        self.active_session.set(Some(view));
+        let mut snapshot = ahead_viewmodel::SessionSnapshot::default();
+        ahead_viewmodel::apply_mode(&mut snapshot, view);
+        self.active_session.set(snapshot.active);
         self.session_error.set(None);
         self.session_busy.set(false);
     }
 
     /// Applies a workflow state acknowledged by the host after AdvancePhase.
     pub fn apply_remote_workflow(&self, session_id: &str, workflow: SessionView) {
-        debug_assert_eq!(workflow.session.id, session_id);
-        self.active_session.set(Some(workflow));
+        let mut snapshot = ahead_viewmodel::SessionSnapshot::default();
+        ahead_viewmodel::apply_workflow(&mut snapshot, session_id, workflow);
+        self.active_session.set(snapshot.active);
         self.session_error.set(None);
         self.session_busy.set(false);
     }
 
     /// Local mic toggle. Tracks intent only; no audio capture exists yet, so
     /// this MUST NOT append fabricated transcripts.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn toggle_voice(&self) {
-        let next = !self.voice_active.get();
-        self.voice_active.set(next);
-        self.voice_listening.set(next);
-        if !next {
-            self.voice_speaking.set(false);
-        }
+        let mut intent = ahead_viewmodel::VoiceIntent {
+            active: self.voice_active.get_untracked(),
+            listening: self.voice_listening.get_untracked(),
+            speaking: self.voice_speaking.get_untracked(),
+            mic_muted: self.voice_mic_muted.get_untracked(),
+            generation: self.voice_generation.get_untracked(),
+        };
+        ahead_viewmodel::voice::toggle(&mut intent);
+        self.voice_active.set(intent.active);
+        self.voice_listening.set(intent.listening);
+        self.voice_speaking.set(intent.speaking);
     }
 
     /// Full-duplex barge-in: preempts playing audio within <50ms by bumping
     /// the output generation. Input capture and coding tasks continue.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn interrupt_voice_playback(&self) {
-        let next_gen = self.voice_generation.get() + 1;
+        let mut intent = ahead_viewmodel::VoiceIntent {
+            active: self.voice_active.get_untracked(),
+            listening: self.voice_listening.get_untracked(),
+            speaking: self.voice_speaking.get_untracked(),
+            mic_muted: self.voice_mic_muted.get_untracked(),
+            generation: self.voice_generation.get_untracked(),
+        };
+        let next_gen = ahead_viewmodel::voice::barge_in(&mut intent);
         self.voice_generation.set(next_gen);
-        self.voice_speaking.set(false);
+        self.voice_speaking.set(intent.speaking);
     }
 
     /// Records a human-authored chat message locally. Agent replies arrive
@@ -306,47 +344,72 @@ impl AheadState {
 
     /// Drops a proposal from the pending list (local filter; host
     /// acceptance flows through AcceptProposal RPC in the panel view).
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn drop_proposal(&self, id: &str) {
-        self.pending_proposals.update(|props| {
-            props.retain(|p| p.id != id);
-        });
+        let mut snapshot = ahead_viewmodel::SessionSnapshot {
+            pending_proposals: self.pending_proposals.get_untracked(),
+            ..Default::default()
+        };
+        if ahead_viewmodel::drop_proposal(&mut snapshot, id) {
+            self.pending_proposals.set(snapshot.pending_proposals);
+        }
     }
 
     /// Appends an agent/system message to the pairing feed.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn push_message(&self, sender: &str, text: String, is_challenge: bool) {
-        self.chat_messages.update(|msgs| {
-            msgs.push(AgentChatMessage {
-                id: format!("msg-{}", msgs.len() + 1),
-                sender: sender.to_string(),
-                text,
-                timestamp: "Just now".to_string(),
-                is_challenge,
-            });
+        let mut snapshot = ahead_viewmodel::SessionSnapshot {
+            chat: self.chat_messages.get_untracked().into_iter().map(|m| ahead_viewmodel::ChatMessage {
+                id: m.id,
+                sender: m.sender,
+                text: m.text,
+                is_challenge: m.is_challenge,
+            }).collect(),
+            ..Default::default()
+        };
+        ahead_viewmodel::push_agent_message(&mut snapshot, ahead_viewmodel::AgentMessage {
+            sender: sender.to_string(),
+            text,
+            is_challenge,
         });
+        let msgs: Vec<AgentChatMessage> = snapshot.chat.into_iter().map(|m| AgentChatMessage {
+            id: m.id,
+            sender: m.sender,
+            text: m.text,
+            timestamp: "Just now".to_string(),
+            is_challenge: m.is_challenge,
+        }).collect();
+        self.chat_messages.set(msgs);
     }
 
     /// Marks a tracker outbox entry dispatched. Local-only until the
     /// GitHub publish flow lands; status text says so explicitly.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn dispatch_tracker_item(&self, id: &str) {
-        self.tracker_outbox.update(|items| {
-            for item in items.iter_mut() {
-                if item.id == id {
-                    item.status = "Queued locally (GitHub publish not wired yet)".to_string();
-                }
-            }
-        });
+        let mut snapshot = ahead_viewmodel::SessionSnapshot {
+            tracker: self.tracker_outbox.get_untracked().into_iter().map(|t| ahead_viewmodel::TrackerEntry {
+                id: t.id,
+                target: t.target,
+                description: t.description,
+                status: t.status,
+            }).collect(),
+            ..Default::default()
+        };
+        if ahead_viewmodel::queue_tracker_dispatch(&mut snapshot, id) {
+            let items: Vec<TrackerOutboxEntry> = snapshot.tracker.into_iter().map(|t| TrackerOutboxEntry {
+                id: t.id,
+                target: t.target,
+                description: t.description,
+                status: t.status,
+            }).collect();
+            self.tracker_outbox.set(items);
+        }
     }
 
     /// Next workflow phase for the given current phase id.
+    /// Delegates to the shared viewmodel (single source of truth).
     pub fn next_phase(current: &str) -> (&'static str, &'static str) {
-        match current {
-            "plan" | "hypothesize" => ("invariants", "Invariants"),
-            "invariants" => ("implement", "Implementation"),
-            "implement" => ("verify", "Verification"),
-            "verify" => ("review", "Review & Signoff"),
-            "review" => ("complete", "Completed"),
-            _ => ("plan", "Planning"),
-        }
+        ahead_viewmodel::next_phase(current)
     }
 }
 
