@@ -192,6 +192,7 @@ pub struct WindowTabData {
     pub update_in_progress: RwSignal<bool>,
     pub progresses: RwSignal<IndexMap<ProgressToken, WorkProgress>>,
     pub messages: RwSignal<Vec<(String, ShowMessageParams)>>,
+    pub ahead: crate::ahead::AheadState,
     pub common: Rc<CommonData>,
 }
 
@@ -573,6 +574,7 @@ impl WindowTabData {
             update_in_progress: cx.create_rw_signal(false),
             progresses: cx.create_rw_signal(IndexMap::new()),
             messages: cx.create_rw_signal(Vec::new()),
+            ahead: crate::ahead::AheadState::new(),
             common,
         };
 

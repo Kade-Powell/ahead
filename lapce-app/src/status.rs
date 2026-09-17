@@ -40,6 +40,7 @@ pub fn status(
     let editor = window_tab_data.main_split.active_editor;
     let panel = window_tab_data.panel.clone();
     let palette = window_tab_data.palette.clone();
+    let ahead_state = window_tab_data.ahead;
     let diagnostic_count = create_memo(move |_| {
         let mut errors = 0;
         let mut warnings = 0;
@@ -124,6 +125,7 @@ pub fn status(
                     .align_items(Some(AlignItems::Center))
                     .selectable(false)
             }),
+            crate::ahead::ahead_status_item(ahead_state, config),
             stack((
                 svg(move || config.get().ui_svg(LapceIcons::SCM)).style(move |s| {
                     let config = config.get();

@@ -10,6 +10,7 @@ rust-version = { workspace = true }
 alacritty_terminal = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
+chrono             = { workspace = true }
 crossbeam-channel  = { workspace = true }
 directories        = { workspace = true }
 flate2             = { workspace = true }
@@ -45,6 +46,9 @@ walkdir      = "2.4.0"
 jsonrpc-lite = "0.6.0"
 polling      = "3.5.0"
 libc         = "0.2"
+rusqlite     = { version = "0.31", features = ["bundled"] }
+uuid         = { version = "1.5", features = ["v4", "serde"] }
+sha2         = "0.10"
 
 # deleting files
 trash = "3.0.6"

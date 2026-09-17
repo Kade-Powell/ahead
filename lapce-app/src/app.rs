@@ -3330,6 +3330,8 @@ fn window_tab(window_tab_data: Rc<WindowTabData>) -> impl View {
         palette(window_tab_data.clone()),
         about::about_popup(window_tab_data.clone()),
         alert::alert_box(window_tab_data.alert_data.clone()),
+        crate::ahead::start_work_modal(window_tab_data.ahead, config),
+        crate::ahead::presentation_cue_card(window_tab_data.ahead, config),
     ))
     .on_cleanup(move || {
         window_tab_scope.dispose();
