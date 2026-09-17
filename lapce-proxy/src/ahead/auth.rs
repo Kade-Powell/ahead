@@ -40,9 +40,6 @@ impl GitHubAuthManager {
             access_token: None,
         };
         let _ = mgr.load_saved_auth();
-        if !mgr.is_authenticated() {
-            let _ = mgr.detect_github_cli();
-        }
         mgr
     }
 

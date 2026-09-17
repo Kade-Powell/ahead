@@ -4,10 +4,8 @@
 
 use floem::reactive::{create_rw_signal, RwSignal, SignalGet, SignalUpdate};
 use lapce_rpc::ahead::{
-    AssistanceMode, ChangeProposal, DisplayPosition, PresentationCue,
-    SessionLifecycle, SessionParticipantRecord, SessionPolicySnapshot,
-    SessionRole, SessionView, VoiceTranscriptUpdate, WorkKind, WorkSession,
-    WorkflowPhase, WorkflowState,
+    ChangeProposal, PresentationCue, SessionParticipantRecord, SessionRole,
+    SessionView, VoiceTranscriptUpdate,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,8 +28,15 @@ pub struct TrackerOutboxEntry {
 #[derive(Clone, Copy, Debug)]
 pub struct AheadState {
     pub active_session: RwSignal<Option<SessionView>>,
+    pub saved_sessions: RwSignal<Vec<SessionView>>,
+    pub session_error: RwSignal<Option<String>>,
+    pub session_busy: RwSignal<bool>,
     pub presentation_cue: RwSignal<Option<PresentationCue>>,
     pub show_start_work_modal: RwSignal<bool>,
+    pub wizard_step: RwSignal<u8>,
+    pub wizard_title: RwSignal<String>,
+    pub wizard_starting_point: RwSignal<String>,
+    pub wizard_private: RwSignal<bool>,
     pub voice_active: RwSignal<bool>,
     pub voice_listening: RwSignal<bool>,
     pub voice_speaking: RwSignal<bool>,
@@ -45,8 +50,11 @@ pub struct AheadState {
     pub tracker_outbox: RwSignal<Vec<TrackerOutboxEntry>>,
     pub authenticated_user: RwSignal<Option<lapce_rpc::ahead::GitHubUser>>,
     pub show_auth_modal: RwSignal<bool>,
+    pub auth_error: RwSignal<Option<String>>,
+    pub auth_busy: RwSignal<bool>,
     pub pending_device_code: RwSignal<Option<lapce_rpc::ahead::GitHubDeviceCodeResponse>>,
     pub show_collab_modal: RwSignal<bool>,
+    pub collab_error: RwSignal<Option<String>>,
     pub workspace_participants: RwSignal<Vec<SessionParticipantRecord>>,
     pub new_collaborator_input: RwSignal<String>,
     pub new_collaborator_role: RwSignal<SessionRole>,
@@ -56,108 +64,35 @@ pub struct AheadState {
 
 impl AheadState {
     pub fn new() -> Self {
-        let initial_session = WorkSession {
-            id: "session-ahead-mvp".to_string(),
-            project_id: "ahead-core".to_string(),
-            worktree_id: "local-worktree".to_string(),
-            work_kind: WorkKind::ProductChange,
-            mode: AssistanceMode::Learn,
-            title: "AHEAD Development & Pairing Loop".to_string(),
-            owner_id: "ahead-engineer".to_string(),
-            lifecycle: SessionLifecycle::Active,
-            policy: SessionPolicySnapshot::default(),
-            revision: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        let initial_workflow = WorkflowState {
-            revision: 1,
-            definition_version: "2026-09-17-v1".to_string(),
-            phase: WorkflowPhase {
-                id: "plan".to_string(),
-                title: "Planning".to_string(),
-                visit: 1,
-            },
-            primary_work_item: None,
-            current_artifact_ids: Vec::new(),
-            approvals: Vec::new(),
-        };
-
-        let default_view = SessionView {
-            session: initial_session,
-            workflow: initial_workflow,
-            participants: Vec::new(),
-        };
-
-        let sample_messages = vec![
-            AgentChatMessage {
-                id: "msg-1".to_string(),
-                sender: "AHEAD Agent".to_string(),
-                text: "⚡ Welcome to AHEAD! I am your paired engineering agent. Let's work through the planning phase together.".to_string(),
-                timestamp: "Just now".to_string(),
-                is_challenge: false,
-            },
-            AgentChatMessage {
-                id: "msg-2".to_string(),
-                sender: "Socratic Guide".to_string(),
-                text: "💡 Socratic Question: What are the core state invariants that must be verified before moving to implementation?".to_string(),
-                timestamp: "Just now".to_string(),
-                is_challenge: true,
-            },
-        ];
-
-        let sample_proposals = vec![
-            ChangeProposal {
-                id: "prop-1".to_string(),
-                session_id: "session-ahead-mvp".to_string(),
-                path: "lapce-app/src/panel/view.rs".to_string(),
-                original_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-                patch: "+ // Registered AheadAgent in sidecar panel\n+ ahead_agent_panel(window_tab_data, position)".to_string(),
-                is_mechanical: true,
-                description: "Wire AHEAD AI Agent panel and Voice Chat into the right panel dock".to_string(),
-                recommended_cursor: Some(DisplayPosition { line: 472, col: 16 }),
-            },
-        ];
-
-        let sample_outbox = vec![
-            TrackerOutboxEntry {
-                id: "outbox-1".to_string(),
-                target: "GitHub Issue #10".to_string(),
-                description: "Update task checklist: AI Panel, Voice Chat & Hot Recompiling Dev loop".to_string(),
-                status: "Pending Human Authorization".to_string(),
-            },
-        ];
-
-        let sample_transcripts = vec![
-            VoiceTranscriptUpdate {
-                voice_session_id: "voice-1".to_string(),
-                epoch: 1,
-                generation: 1,
-                text: "Voice runtime initialized. Ready for hands-free pairing.".to_string(),
-                is_final: true,
-                speaker_id: "agent".to_string(),
-            },
-        ];
-
         Self {
-            active_session: create_rw_signal(Some(default_view)),
+            active_session: create_rw_signal(None),
+            saved_sessions: create_rw_signal(Vec::new()),
+            session_error: create_rw_signal(None),
+            session_busy: create_rw_signal(false),
             presentation_cue: create_rw_signal(None),
             show_start_work_modal: create_rw_signal(false),
+            wizard_step: create_rw_signal(0),
+            wizard_title: create_rw_signal(String::new()),
+            wizard_starting_point: create_rw_signal(String::new()),
+            wizard_private: create_rw_signal(true),
             voice_active: create_rw_signal(false),
             voice_listening: create_rw_signal(false),
             voice_speaking: create_rw_signal(false),
             voice_mic_muted: create_rw_signal(false),
             voice_generation: create_rw_signal(1),
-            voice_waveform_level: create_rw_signal(0.4),
-            voice_transcripts: create_rw_signal(sample_transcripts),
-            chat_messages: create_rw_signal(sample_messages),
+            voice_waveform_level: create_rw_signal(0.0),
+            voice_transcripts: create_rw_signal(Vec::new()),
+            chat_messages: create_rw_signal(Vec::new()),
             chat_input: create_rw_signal(String::new()),
-            pending_proposals: create_rw_signal(sample_proposals),
-            tracker_outbox: create_rw_signal(sample_outbox),
+            pending_proposals: create_rw_signal(Vec::new()),
+            tracker_outbox: create_rw_signal(Vec::new()),
             authenticated_user: create_rw_signal(None),
             show_auth_modal: create_rw_signal(false),
+            auth_error: create_rw_signal(None),
+            auth_busy: create_rw_signal(false),
             pending_device_code: create_rw_signal(None),
             show_collab_modal: create_rw_signal(false),
+            collab_error: create_rw_signal(None),
             workspace_participants: create_rw_signal(Vec::new()),
             new_collaborator_input: create_rw_signal(String::new()),
             new_collaborator_role: create_rw_signal(SessionRole::Editor),
@@ -166,182 +101,65 @@ impl AheadState {
         }
     }
 
-    /// Initializes a work session from the modal
-    pub fn start_local_session(
-        &self,
-        work_kind: WorkKind,
-        mode: AssistanceMode,
-        title: String,
-    ) {
-        let session = WorkSession {
-            id: "session-local".to_string(),
-            project_id: "project-local".to_string(),
-            worktree_id: "worktree-local".to_string(),
-            work_kind,
-            mode,
-            title,
-            owner_id: "user-local".to_string(),
-            lifecycle: SessionLifecycle::Active,
-            policy: SessionPolicySnapshot::default(),
-            revision: 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        let initial_phase = match work_kind {
-            WorkKind::ProductChange => WorkflowPhase {
-                id: "plan".to_string(),
-                title: "Planning".to_string(),
-                visit: 1,
-            },
-            WorkKind::CorrectiveDebugging => WorkflowPhase {
-                id: "hypothesize".to_string(),
-                title: "Hypothesis".to_string(),
-                visit: 1,
-            },
-            WorkKind::InternalImprovement => WorkflowPhase {
-                id: "invariants".to_string(),
-                title: "Invariants".to_string(),
-                visit: 1,
-            },
-            WorkKind::Investigation => WorkflowPhase {
-                id: "scrutinize".to_string(),
-                title: "Investigation".to_string(),
-                visit: 1,
-            },
-            WorkKind::Decision => WorkflowPhase {
-                id: "framing".to_string(),
-                title: "Framing".to_string(),
-                visit: 1,
-            },
-            WorkKind::OperationalStabilization => WorkflowPhase {
-                id: "stabilize".to_string(),
-                title: "Stabilization".to_string(),
-                visit: 1,
-            },
-        };
-
-        let workflow = WorkflowState {
-            revision: 1,
-            definition_version: "2026-09-17-v1".to_string(),
-            phase: initial_phase,
-            primary_work_item: None,
-            current_artifact_ids: Vec::new(),
-            approvals: Vec::new(),
-        };
-
-        self.active_session.set(Some(SessionView {
-            session,
-            workflow,
-            participants: Vec::new(),
-        }));
+    /// Adopts a durable session returned by the session host.
+    /// Clears per-session conversation scaffolds so a reopened session
+    /// never shows another session's chat, proposals, or transcripts.
+    pub fn adopt_durable_session(&self, view: SessionView) {
+        self.active_session.set(Some(view));
+        self.chat_messages.set(Vec::new());
+        self.pending_proposals.set(Vec::new());
+        self.tracker_outbox.set(Vec::new());
+        self.voice_transcripts.set(Vec::new());
+        self.voice_active.set(false);
+        self.voice_listening.set(false);
+        self.voice_speaking.set(false);
+        self.presentation_cue.set(None);
+        self.session_error.set(None);
+        self.session_busy.set(false);
         self.show_start_work_modal.set(false);
     }
 
-    /// Toggles between Learn (Socratic) and Assist (Scaffolding) mode
-    pub fn toggle_mode(&self) {
-        self.active_session.update(|opt| {
-            if let Some(view) = opt {
-                view.session.mode = match view.session.mode {
-                    AssistanceMode::Learn => AssistanceMode::Assist,
-                    AssistanceMode::Assist => AssistanceMode::Learn,
-                };
-                view.session.revision += 1;
-            }
-        });
+    /// Requests a host-backed mode change. Local state only updates when the
+    /// session host acknowledges, so the chip never diverges from durable state.
+    pub fn apply_remote_mode(&self, view: SessionView) {
+        self.active_session.set(Some(view));
+        self.session_error.set(None);
+        self.session_busy.set(false);
     }
 
-    /// Advances the active session to the next workflow phase
-    pub fn advance_phase(&self) {
-        self.active_session.update(|opt| {
-            if let Some(view) = opt {
-                let current = &view.workflow.phase.id;
-                let (next_id, next_title) = match current.as_str() {
-                    "plan" | "hypothesize" => ("invariants", "Invariants"),
-                    "invariants" => ("implement", "Implementation"),
-                    "implement" => ("verify", "Verification"),
-                    "verify" => ("review", "Review & Signoff"),
-                    "review" => ("complete", "Completed"),
-                    _ => ("plan", "Planning"),
-                };
-                view.workflow.phase = WorkflowPhase {
-                    id: next_id.to_string(),
-                    title: next_title.to_string(),
-                    visit: view.workflow.phase.visit + 1,
-                };
-                view.session.revision += 1;
-            }
-        });
-
-        // Add progress notification to agent chat
-        let phase_title = self
-            .active_session
-            .get()
-            .map(|v| v.workflow.phase.title)
-            .unwrap_or_else(|| "Next Phase".to_string());
-        self.chat_messages.update(|msgs| {
-            msgs.push(AgentChatMessage {
-                id: format!("msg-{}", msgs.len() + 1),
-                sender: "AHEAD Agent".to_string(),
-                text: format!("✅ Advanced to {}. Invariants check active.", phase_title),
-                timestamp: "Just now".to_string(),
-                is_challenge: false,
-            });
-        });
+    /// Applies a workflow state acknowledged by the host after AdvancePhase.
+    pub fn apply_remote_workflow(&self, session_id: &str, workflow: SessionView) {
+        debug_assert_eq!(workflow.session.id, session_id);
+        self.active_session.set(Some(workflow));
+        self.session_error.set(None);
+        self.session_busy.set(false);
     }
 
-    /// Toggles voice chat session (Microphone capture & audio stream)
+    /// Local mic toggle. Tracks intent only; no audio capture exists yet, so
+    /// this MUST NOT append fabricated transcripts.
     pub fn toggle_voice(&self) {
-        let current = self.voice_active.get();
-        let next = !current;
+        let next = !self.voice_active.get();
         self.voice_active.set(next);
         self.voice_listening.set(next);
-        if next {
-            self.voice_transcripts.update(|t| {
-                t.push(VoiceTranscriptUpdate {
-                    voice_session_id: "voice-live".to_string(),
-                    epoch: 1,
-                    generation: self.voice_generation.get(),
-                    text: "🎙️ Microphone connected. Full-duplex voice stream active.".to_string(),
-                    is_final: true,
-                    speaker_id: "system".to_string(),
-                });
-            });
+        if !next {
+            self.voice_speaking.set(false);
         }
     }
 
-    /// Full-duplex barge-in: preempts and interrupts playing audio within <50ms
+    /// Full-duplex barge-in: preempts playing audio within <50ms by bumping
+    /// the output generation. Input capture and coding tasks continue.
     pub fn interrupt_voice_playback(&self) {
         let next_gen = self.voice_generation.get() + 1;
         self.voice_generation.set(next_gen);
         self.voice_speaking.set(false);
-        self.voice_transcripts.update(|t| {
-            t.push(VoiceTranscriptUpdate {
-                voice_session_id: "voice-live".to_string(),
-                epoch: 1,
-                generation: next_gen,
-                text: "⏹️ Barge-in triggered: audio playback preempted.".to_string(),
-                is_final: true,
-                speaker_id: "system".to_string(),
-            });
-        });
     }
 
-    /// Sends a chat message to the paired agent
+    /// Records a human-authored chat message locally. Agent replies arrive
+    /// only via session-host notifications, never synthesized here.
     pub fn send_chat(&self, text: String) {
         if text.trim().is_empty() {
             return;
         }
-        let mode = self
-            .active_session
-            .get()
-            .map(|s| s.session.mode)
-            .unwrap_or(AssistanceMode::Learn);
-        let phase = self
-            .active_session
-            .get()
-            .map(|s| s.workflow.phase.title)
-            .unwrap_or_else(|| "Planning".to_string());
-
         self.chat_messages.update(|msgs| {
             msgs.push(AgentChatMessage {
                 id: format!("msg-{}", msgs.len() + 1),
@@ -350,78 +168,53 @@ impl AheadState {
                 timestamp: "Just now".to_string(),
                 is_challenge: false,
             });
-
-            match mode {
-                AssistanceMode::Learn => {
-                    msgs.push(AgentChatMessage {
-                        id: format!("msg-{}", msgs.len() + 1),
-                        sender: "Socratic Guide".to_string(),
-                        text: format!(
-                            "During {}, consider: How do our system invariants guarantee fault-tolerance for '{}'?",
-                            phase, text
-                        ),
-                        timestamp: "Just now".to_string(),
-                        is_challenge: true,
-                    });
-                }
-                AssistanceMode::Assist => {
-                    msgs.push(AgentChatMessage {
-                        id: format!("msg-{}", msgs.len() + 1),
-                        sender: "AHEAD Agent".to_string(),
-                        text: format!(
-                            "Drafted mechanical scaffolding proposal for '{}'. Review diff below before authorizing.",
-                            text
-                        ),
-                        timestamp: "Just now".to_string(),
-                        is_challenge: false,
-                    });
-                }
-            }
         });
         self.chat_input.set(String::new());
     }
 
-    /// Authorizes and applies a proposed change
-    pub fn authorize_proposal(&self, id: &str) {
+    /// Drops a proposal from the pending list (local filter; host
+    /// acceptance flows through AcceptProposal RPC in the panel view).
+    pub fn drop_proposal(&self, id: &str) {
         self.pending_proposals.update(|props| {
             props.retain(|p| p.id != id);
         });
+    }
+
+    /// Appends an agent/system message to the pairing feed.
+    pub fn push_message(&self, sender: &str, text: String, is_challenge: bool) {
         self.chat_messages.update(|msgs| {
             msgs.push(AgentChatMessage {
                 id: format!("msg-{}", msgs.len() + 1),
-                sender: "AHEAD Agent".to_string(),
-                text: format!("✅ Proposal {} authorized and applied by human engineer.", id),
+                sender: sender.to_string(),
+                text,
                 timestamp: "Just now".to_string(),
-                is_challenge: false,
+                is_challenge,
             });
         });
     }
 
-    /// Rejects a proposed change
-    pub fn reject_proposal(&self, id: &str) {
-        self.pending_proposals.update(|props| {
-            props.retain(|p| p.id != id);
-        });
-        self.chat_messages.update(|msgs| {
-            msgs.push(AgentChatMessage {
-                id: format!("msg-{}", msgs.len() + 1),
-                sender: "AHEAD Agent".to_string(),
-                text: format!("❌ Proposal {} rejected.", id),
-                timestamp: "Just now".to_string(),
-                is_challenge: false,
-            });
-        });
-    }
-
-    /// Dispatches a tracker outbox update
+    /// Marks a tracker outbox entry dispatched. Local-only until the
+    /// GitHub publish flow lands; status text says so explicitly.
     pub fn dispatch_tracker_item(&self, id: &str) {
         self.tracker_outbox.update(|items| {
             for item in items.iter_mut() {
                 if item.id == id {
-                    item.status = "Dispatched to GitHub Issue Tracker".to_string();
+                    item.status = "Queued locally (GitHub publish not wired yet)".to_string();
                 }
             }
         });
+    }
+
+    /// Next workflow phase for the given current phase id.
+    pub fn next_phase(current: &str) -> (&'static str, &'static str) {
+        match current {
+            "plan" | "hypothesize" => ("invariants", "Invariants"),
+            "invariants" => ("implement", "Implementation"),
+            "implement" => ("verify", "Verification"),
+            "verify" => ("review", "Review & Signoff"),
+            "review" => ("complete", "Completed"),
+            _ => ("plan", "Planning"),
+        }
     }
 }
 

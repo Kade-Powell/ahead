@@ -143,6 +143,24 @@ impl SessionStore {
         }).context("Failed to initialize AHEAD Turso/libsql schema")?;
         Ok(())
     }
+    pub fn list_sessions(&self) -> Result<Vec<SessionView>> {
+        let ids: Vec<String> = self.rt.block_on(async {
+            let mut rows = self.conn.query("SELECT id FROM sessions ORDER BY created_at DESC", ()).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let id: String = row.get(0)?;
+                out.push(id);
+            }
+            Ok::<Vec<String>, anyhow::Error>(out)
+        })?;
+        let mut views = Vec::new();
+        for id in ids {
+            if let Some(view) = self.get_session(&id)? {
+                views.push(view);
+            }
+        }
+        Ok(views)
+    }
 
     pub fn insert_session(&mut self, view: &SessionView) -> Result<()> {
         let session = &view.session;
