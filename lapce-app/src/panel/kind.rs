@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 
 use super::{data::PanelOrder, position::PanelPosition};
-use crate::config::icon::LapceIcons;
+use crate::config::icon::AheadIcons;
 
 #[derive(
     Clone, Copy, PartialEq, Serialize, Deserialize, Hash, Eq, Debug, EnumIter,
@@ -25,18 +25,18 @@ pub enum PanelKind {
 impl PanelKind {
     pub fn svg_name(&self) -> &'static str {
         match &self {
-            PanelKind::Terminal => LapceIcons::TERMINAL,
-            PanelKind::FileExplorer => LapceIcons::FILE_EXPLORER,
-            PanelKind::SourceControl => LapceIcons::SCM,
-            PanelKind::Plugin => LapceIcons::EXTENSIONS,
-            PanelKind::Search => LapceIcons::SEARCH,
-            PanelKind::Problem => LapceIcons::PROBLEM,
-            PanelKind::Debug => LapceIcons::DEBUG,
-            PanelKind::CallHierarchy => LapceIcons::TYPE_HIERARCHY,
-            PanelKind::DocumentSymbol => LapceIcons::DOCUMENT_SYMBOL,
-            PanelKind::References => LapceIcons::REFERENCES,
-            PanelKind::Implementation => LapceIcons::IMPLEMENTATION,
-            PanelKind::AheadAgent => LapceIcons::LIGHTBULB,
+            PanelKind::Terminal => AheadIcons::TERMINAL,
+            PanelKind::FileExplorer => AheadIcons::FILE_EXPLORER,
+            PanelKind::SourceControl => AheadIcons::SCM,
+            PanelKind::Plugin => AheadIcons::EXTENSIONS,
+            PanelKind::Search => AheadIcons::SEARCH,
+            PanelKind::Problem => AheadIcons::PROBLEM,
+            PanelKind::Debug => AheadIcons::DEBUG,
+            PanelKind::CallHierarchy => AheadIcons::TYPE_HIERARCHY,
+            PanelKind::DocumentSymbol => AheadIcons::DOCUMENT_SYMBOL,
+            PanelKind::References => AheadIcons::REFERENCES,
+            PanelKind::Implementation => AheadIcons::IMPLEMENTATION,
+            PanelKind::AheadAgent => AheadIcons::LIGHTBULB,
         }
     }
 

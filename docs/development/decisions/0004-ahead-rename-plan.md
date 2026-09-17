@@ -24,21 +24,32 @@
 
 ## Execution order (with the port, file-by-file)
 
-1. Crates and bins first: rename dirs + `[package] name`, `[[bin]]`
-   entries, bin source paths, workspace members. Keep `lapce` bins as
-   deprecated aliases for one release if packaging needs it.
-2. Symbols via `lsp rename` (never text find-replace): config, workspace,
-   commands, theme/color/icons, language, db, breakpoints — one symbol
-   family per commit so review stays mechanical.
-3. Strings/docs: user-visible "Lapce" → "Ahead", plugin registry URLs,
-   settings keys, schema titles, README/docs. Keep upstream attribution
-   ("forked from Lapce", license/NOTICE) — rename is identity, not
-   erasure.
-4. Paths that must NOT change without migration: `~/.ahead` data dir
-   (already Ahead), `.ahead/session.db` schema, volt/plugin install dirs
-   (rename only with a migration shim), `LapceProxy` wire protocol names
-   if external clients exist (version-gate instead).
+Measured cross-crate surface (2026-09-17): 91 files reference
+`lapce_*` crates in `use` paths; heaviest are `ahead/view.rs` (40),
+`ahead/state.rs` (29), `editor.rs` (24), `window_tab.rs` (23). A crate
+rename rewrites every one of those lines, so crates move LAST, symbols
+first. Revised order:
 
+1. Symbols via `lsp rename`, one family per commit (mechanical review):
+   `LapceColor` → `AheadColor`, `LapceIcons` → `AheadIcons`,
+   `LapceLanguage` → `AheadLanguage`, `LapceConfig` → `AheadConfig`,
+   `LapceWorkspace(+Type)` → `AheadWorkspace(+Type)`,
+   `LapceWorkbenchCommand` → `AheadWorkbenchCommand`, `LapceCommand` →
+   `AheadCommand`, `LapceDb` → `AheadDb`, `LapceBreakpoint` →
+   `AheadBreakpoint`. Gate: workspace check + suites green per family.
+2. Bins: add `ahead`/`ahead-proxy` alongside `lapce`/`lapce-proxy`,
+   verify walkthrough on new names, then remove old names + walkthrough
+   again.
+3. Crates + dirs (`lapce-app` → `ahead-app`, etc.) with `lsp rename_file`
+   so the 91 `use` paths rewrite together. Gate: workspace check +
+   suites green, walkthrough on renamed tree.
+4. Strings/docs: user-visible "Lapce" → "Ahead", settings keys, schema
+  titles, README/docs. Keep upstream attribution ("forked from Lapce",
+  license/NOTICE) — rename is identity, not erasure.
+5. Paths that must NOT change without migration: `~/.ahead` data dir
+   (already Ahead), `.ahead/session.db` schema, volt/plugin install dirs
+   (rename only with a migration shim), wire protocol names if external
+   clients exist (version-gate instead).
 ## Gates
 
 - `cargo check --workspace` + full test suite green after every step.

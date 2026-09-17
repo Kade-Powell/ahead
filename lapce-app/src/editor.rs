@@ -64,10 +64,10 @@ use self::{
     location::{EditorLocation, EditorPosition},
 };
 use crate::{
-    command::{CommandKind, InternalCommand, LapceCommand, LapceWorkbenchCommand},
+    command::{CommandKind, InternalCommand, AheadCommand, AheadWorkbenchCommand},
     completion::CompletionStatus,
-    config::LapceConfig,
-    db::LapceDb,
+    config::AheadConfig,
+    db::AheadDb,
     doc::{Doc, DocContent},
     editor_tab::EditorTabChild,
     id::{DiffEditorId, EditorTabId},
@@ -2157,7 +2157,7 @@ impl EditorData {
         } else if let Some(edits) = edits.as_ref() {
             self.do_text_edit(edits);
         } else {
-            let db: Arc<LapceDb> = use_context().unwrap();
+            let db: Arc<AheadDb> = use_context().unwrap();
             if let Ok(info) = db.get_doc_info(&self.common.workspace, &location.path)
             {
                 self.go_to_position(
@@ -2507,7 +2507,7 @@ impl EditorData {
         let cursor_offset = self.cursor().with_untracked(|c| c.offset());
         let scroll_offset = self.viewport().with_untracked(|v| v.origin().to_vec2());
 
-        let db: Arc<LapceDb> = use_context().unwrap();
+        let db: Arc<AheadDb> = use_context().unwrap();
         db.save_doc_position(
             &self.common.workspace,
             path,
@@ -2712,7 +2712,7 @@ impl EditorData {
                     match rs {
                         FindHintRs::NoMatchBreak
                         | FindHintRs::NoMatchContinue { .. } => {
-                            self.common.lapce_command.send(LapceCommand {
+                            self.common.lapce_command.send(AheadCommand {
                                 kind: CommandKind::Focus(
                                     FocusCommand::GotoDefinition,
                                 ),
@@ -2907,24 +2907,24 @@ impl EditorData {
             {
                 vec![
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::RevealInPanel,
+                        AheadWorkbenchCommand::RevealInPanel,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::RevealInFileExplorer,
+                        AheadWorkbenchCommand::RevealInFileExplorer,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
+                        AheadWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
                     )),
                     None,
                     Some(CommandKind::Edit(EditCommand::ClipboardCut)),
                     Some(CommandKind::Edit(EditCommand::ClipboardCopy)),
                     Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::AddRunDebugConfig,
+                        AheadWorkbenchCommand::AddRunDebugConfig,
                     )),
                     None,
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::PaletteCommand,
+                        AheadWorkbenchCommand::PaletteCommand,
                     )),
                 ]
             } else {
@@ -2932,27 +2932,27 @@ impl EditorData {
                     Some(CommandKind::Focus(FocusCommand::GotoDefinition)),
                     Some(CommandKind::Focus(FocusCommand::GotoTypeDefinition)),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::ShowCallHierarchy,
+                        AheadWorkbenchCommand::ShowCallHierarchy,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::FindReferences,
+                        AheadWorkbenchCommand::FindReferences,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::GoToImplementation,
+                        AheadWorkbenchCommand::GoToImplementation,
                     )),
                     Some(CommandKind::Focus(FocusCommand::Rename)),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::RunInTerminal,
+                        AheadWorkbenchCommand::RunInTerminal,
                     )),
                     None,
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::RevealInPanel,
+                        AheadWorkbenchCommand::RevealInPanel,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::RevealInFileExplorer,
+                        AheadWorkbenchCommand::RevealInFileExplorer,
                     )),
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
+                        AheadWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
                     )),
                     None,
                     Some(CommandKind::Edit(EditCommand::ClipboardCut)),
@@ -2960,7 +2960,7 @@ impl EditorData {
                     Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
                     None,
                     Some(CommandKind::Workbench(
-                        LapceWorkbenchCommand::PaletteCommand,
+                        AheadWorkbenchCommand::PaletteCommand,
                     )),
                 ]
             }
@@ -2971,13 +2971,13 @@ impl EditorData {
                 Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
                 None,
                 Some(CommandKind::Workbench(
-                    LapceWorkbenchCommand::PaletteCommand,
+                    AheadWorkbenchCommand::PaletteCommand,
                 )),
             ]
         };
         if self.diff_editor_id.get_untracked().is_some() && is_file {
             cmds.push(Some(CommandKind::Workbench(
-                LapceWorkbenchCommand::GoToLocation,
+                AheadWorkbenchCommand::GoToLocation,
             )));
         }
         let lapce_command = self.common.lapce_command;
@@ -2986,7 +2986,7 @@ impl EditorData {
                 menu = menu.entry(
                     MenuItem::new(cmd.desc().unwrap_or_else(|| cmd.str())).action(
                         move || {
-                            lapce_command.send(LapceCommand {
+                            lapce_command.send(AheadCommand {
                                 kind: cmd.clone(),
                                 data: None,
                             })
@@ -3288,7 +3288,7 @@ impl KeyPressFocus for EditorData {
     #[instrument]
     fn run_command(
         &self,
-        command: &crate::command::LapceCommand,
+        command: &crate::command::AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted {
@@ -3519,7 +3519,7 @@ fn show_inline_completion(cmd: &EditCommand) -> bool {
 
 // TODO(minor): Should we just put this on view, since it only requires those values?
 pub(crate) fn compute_screen_lines(
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
     base: RwSignal<ScreenLinesBase>,
     view_kind: ReadSignal<EditorViewKind>,
     doc: &Doc,
@@ -3849,7 +3849,7 @@ pub(crate) fn compute_screen_lines(
 
 fn parse_hover_resp(
     hover: lsp_types::Hover,
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) -> Vec<MarkdownContent> {
     match hover.contents {
         HoverContents::Scalar(text) => match text {

@@ -22,7 +22,7 @@ use crate::editor::location::{EditorLocation, EditorPosition};
 
 use crate::{
     ahead::state::AheadState,
-    config::{color::LapceColor, LapceConfig},
+    config::{color::AheadColor, AheadConfig},
     panel::{kind::PanelKind, position::PanelPosition},
     window_tab::WindowTabData,
 };
@@ -33,7 +33,7 @@ use crate::{
 /// Learn/Assist switching is an explicit host-backed control in the agent panel.
 pub fn ahead_status_item(
     ahead_state: AheadState,
-    _config: ReadSignal<Arc<LapceConfig>>,
+    _config: ReadSignal<Arc<AheadConfig>>,
     window_tab_data: Rc<WindowTabData>,
 ) -> impl View {
     let window_tab_data_ai = window_tab_data.clone();
@@ -183,7 +183,7 @@ pub fn ahead_status_item(
 /// 5) begin a durable session via StartWork RPC.
 pub fn start_work_modal(
     window_tab_data: Rc<WindowTabData>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let ahead_state = window_tab_data.ahead;
     let scope = window_tab_data.scope;
@@ -201,7 +201,7 @@ pub fn start_work_modal(
                     s.font_size(18.0)
                         .font_bold()
                         .margin_bottom(4.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 label(move || {
                     format!(
@@ -212,13 +212,13 @@ pub fn start_work_modal(
                 .style(move |s| {
                     s.font_size(12.0)
                         .margin_bottom(12.0)
-                        .color(config.get().color(LapceColor::EDITOR_DIM))
+                        .color(config.get().color(AheadColor::EDITOR_DIM))
                 }),
                 // Step 1: Choose work (resume or new)
                 label(|| "1. Choose work: resume saved or start new".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 dyn_stack(
                     move || ahead_state.saved_sessions.get(),
@@ -252,7 +252,7 @@ pub fn start_work_modal(
                     .style(move |s| {
                         s.font_size(11.0)
                             .margin_bottom(12.0)
-                            .color(config.get().color(LapceColor::EDITOR_DIM))
+                            .color(config.get().color(AheadColor::EDITOR_DIM))
                     }),
             ))
             .style(|s| s.flex_col()),
@@ -261,7 +261,7 @@ pub fn start_work_modal(
                 label(|| "2. Name the outcome (work kind + title)".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 stack((
                     work_kind_btn(selected_kind, WorkKind::ProductChange, "Product Change"),
@@ -282,8 +282,8 @@ pub fn start_work_modal(
                             .border_color(Color::from_rgb8(120, 120, 120))
                             .border_radius(4.0)
                             .margin_bottom(16.0)
-                            .background(config.get().color(LapceColor::EDITOR_BACKGROUND))
-                            .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                            .background(config.get().color(AheadColor::EDITOR_BACKGROUND))
+                            .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                     }),
             ))
             .style(|s| s.flex_col()),
@@ -292,7 +292,7 @@ pub fn start_work_modal(
                 label(|| "3. Give your starting point (typed; voice transcript lands here)".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 text_input(ahead_state.wizard_starting_point)
                     .keyboard_navigable()
@@ -304,14 +304,14 @@ pub fn start_work_modal(
                             .border_color(Color::from_rgb8(120, 120, 120))
                             .border_radius(4.0)
                             .margin_bottom(16.0)
-                            .background(config.get().color(LapceColor::EDITOR_BACKGROUND))
-                            .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                            .background(config.get().color(AheadColor::EDITOR_BACKGROUND))
+                            .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                     }),
                 // Step 4: Collaboration (mode + privacy)
                 label(|| "4. Set the collaboration (mode + sharing)".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 stack((
                     mode_btn(selected_mode, AssistanceMode::Assist, "Assist (Guided / Mechanical)"),
@@ -328,7 +328,7 @@ pub fn start_work_modal(
                 .style(move |s| {
                     s.font_size(11.0)
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_DIM))
+                        .color(config.get().color(AheadColor::EDITOR_DIM))
                 }),
                 label(move || {
                     if ahead_state.wizard_private.get() { "🔒 Private (switch to Shared)".to_string() } else { "👥 Shared (switch to Private)".to_string() }
@@ -362,7 +362,7 @@ pub fn start_work_modal(
                 label(|| "5. Begin: opens the session workspace in the right panel".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 stack((
                     label(move || {
@@ -400,7 +400,7 @@ pub fn start_work_modal(
         .style(move |s| {
             s.flex_col()
                 .padding(24.0)
-                .background(config.get().color(LapceColor::PANEL_BACKGROUND))
+                .background(config.get().color(AheadColor::PANEL_BACKGROUND))
                 .border(1.0)
                 .border_color(Color::from_rgb8(80, 80, 80))
                 .border_radius(8.0)
@@ -546,7 +546,7 @@ fn mode_btn(
 /// card re-enables them so Dismiss / Show in editor stay clickable.
 pub fn presentation_cue_card(
     window_tab_data: Rc<WindowTabData>,
-    _config: ReadSignal<Arc<LapceConfig>>,
+    _config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let ahead_state = window_tab_data.ahead;
     let has_cue = move || ahead_state.presentation_cue.get().is_some();
@@ -640,7 +640,7 @@ pub fn presentation_cue_card(
 /// (cleared after submit), and explains the token stays in ~/.ahead/auth.json.
 pub fn github_auth_modal(
     window_tab_data: Rc<WindowTabData>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let ahead_state = window_tab_data.ahead;
     let scope = window_tab_data.scope;
@@ -653,7 +653,7 @@ pub fn github_auth_modal(
                     s.font_size(18.0)
                         .font_bold()
                         .margin_bottom(12.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 // User status info (never exposes raw email bulk; login + status only)
                 label(move || {
@@ -677,13 +677,13 @@ pub fn github_auth_modal(
                 .style(move |s| {
                     s.font_size(13.0)
                         .margin_bottom(8.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 label(|| "Tokens never leave this machine except to api.github.com for verification.".to_string())
                     .style(move |s| {
                         s.font_size(11.0)
                             .margin_bottom(16.0)
-                            .color(config.get().color(LapceColor::EDITOR_DIM))
+                            .color(config.get().color(AheadColor::EDITOR_DIM))
                     }),
                 label(move || ahead_state.auth_error.get().unwrap_or_default())
                     .style(move |s| {
@@ -705,8 +705,8 @@ pub fn github_auth_modal(
                                 .border_color(Color::from_rgb8(120, 120, 120))
                                 .border_radius(4.0)
                                 .margin_bottom(10.0)
-                                .background(config.get().color(LapceColor::EDITOR_BACKGROUND))
-                                .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                                .background(config.get().color(AheadColor::EDITOR_BACKGROUND))
+                                .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                                 .display(if is_visible { Display::Flex } else { Display::None })
                         }),
                 )),
@@ -874,7 +874,7 @@ pub fn github_auth_modal(
         .style(move |s| {
             s.flex_col()
                 .padding(24.0)
-                .background(config.get().color(LapceColor::PANEL_BACKGROUND))
+                .background(config.get().color(AheadColor::PANEL_BACKGROUND))
                 .border(1.0)
                 .border_color(Color::from_rgb8(80, 80, 80))
                 .border_radius(8.0)
@@ -900,7 +900,7 @@ pub fn github_auth_modal(
 /// errors inline instead of failing silently.
 pub fn workspace_collab_modal(
     window_tab_data: Rc<WindowTabData>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let ahead_state = window_tab_data.ahead;
     let scope = window_tab_data.scope;
@@ -914,19 +914,19 @@ pub fn workspace_collab_modal(
                     s.font_size(18.0)
                         .font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 label(|| "Workspace membership grants file + session access. Session-only sharing is not supported yet — use Private in Start Work to keep work local.".to_string())
                     .style(move |s| {
                         s.font_size(12.0)
                             .margin_bottom(16.0)
-                            .color(config.get().color(LapceColor::EDITOR_DIM))
+                            .color(config.get().color(AheadColor::EDITOR_DIM))
                     }),
                 // Section 1: Current Members
                 label(|| "Current Workspace Members".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(8.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 dyn_stack(
                     move || ahead_state.workspace_participants.get(),
@@ -952,7 +952,7 @@ pub fn workspace_collab_modal(
                             stack((
                                 label(move || format!("👤 @{} ({})", p.participant.id(), p.participant.display_name()))
                                     .style(move |s| {
-                                        s.color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                                        s.color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                                             .margin_right(12.0)
                                             .flex_grow(1.0)
                                     }),
@@ -1018,7 +1018,7 @@ pub fn workspace_collab_modal(
                 label(|| "Add Person to Workspace".to_string()).style(move |s| {
                     s.font_bold()
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 text_input(ahead_state.new_collaborator_input)
                     .placeholder("GitHub username only (e.g. octocat)")
@@ -1029,13 +1029,13 @@ pub fn workspace_collab_modal(
                             .border_color(Color::from_rgb8(120, 120, 120))
                             .border_radius(4.0)
                             .margin_bottom(10.0)
-                            .background(config.get().color(LapceColor::EDITOR_BACKGROUND))
-                            .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                            .background(config.get().color(AheadColor::EDITOR_BACKGROUND))
+                            .color(config.get().color(AheadColor::EDITOR_FOREGROUND))
                     }),
                 label(|| "Permissions Role:".to_string()).style(move |s| {
                     s.font_size(12.0)
                         .margin_bottom(6.0)
-                        .color(config.get().color(LapceColor::EDITOR_DIM))
+                        .color(config.get().color(AheadColor::EDITOR_DIM))
                 }),
                 stack((
                     role_picker_pill(ahead_state, SessionRole::Editor, "Editor"),
@@ -1115,7 +1115,7 @@ pub fn workspace_collab_modal(
         .style(move |s| {
             s.flex_col()
                 .padding(24.0)
-                .background(config.get().color(LapceColor::PANEL_BACKGROUND))
+                .background(config.get().color(AheadColor::PANEL_BACKGROUND))
                 .border(1.0)
                 .border_color(Color::from_rgb8(80, 80, 80))
                 .border_radius(8.0)
@@ -2125,7 +2125,7 @@ pub fn ahead_agent_panel(
     )
     .style(move |s| {
         s.size_pct(100.0, 100.0)
-            .background(config.get().color(LapceColor::PANEL_BACKGROUND))
+            .background(config.get().color(AheadColor::PANEL_BACKGROUND))
     })
 }
 

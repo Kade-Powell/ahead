@@ -17,7 +17,7 @@ use lsp_types::{Location, SymbolKind, request::GotoImplementationResponse};
 use super::position::PanelPosition;
 use crate::{
     command::InternalCommand,
-    config::{color::LapceColor, icon::LapceIcons},
+    config::{color::AheadColor, icon::AheadIcons},
     editor::location::EditorLocation,
     window_tab::WindowTabData,
 };
@@ -49,8 +49,8 @@ pub fn common_reference_panel(
                             svg(move || {
                                 let config = config.get();
                                 let svg_str = match open.get() {
-                                    true => LapceIcons::ITEM_OPENED,
-                                    false => LapceIcons::ITEM_CLOSED,
+                                    true => AheadIcons::ITEM_OPENED,
+                                    false => AheadIcons::ITEM_CLOSED,
                                 };
                                 config.ui_svg(svg_str)
                             })
@@ -58,7 +58,7 @@ pub fn common_reference_panel(
                                 let config = config.get();
                                 let size = config.ui.icon_size() as f32;
                                 s.size(size, size).color(
-                                    config.color(LapceColor::LAPCE_ICON_ACTIVE),
+                                    config.color(AheadColor::LAPCE_ICON_ACTIVE),
                                 )
                             }),
                         )
@@ -74,7 +74,7 @@ pub fn common_reference_panel(
                             let config = config.get();
                             config
                                 .symbol_svg(&SymbolKind::FILE)
-                                .unwrap_or_else(|| config.ui_svg(LapceIcons::FILE))
+                                .unwrap_or_else(|| config.ui_svg(AheadIcons::FILE))
                         })
                         .style(move |s| {
                             let config = config.get();
@@ -87,14 +87,14 @@ pub fn common_reference_panel(
                                         .symbol_color(&SymbolKind::FILE)
                                         .unwrap_or_else(|| {
                                             config
-                                                .color(LapceColor::LAPCE_ICON_ACTIVE)
+                                                .color(AheadColor::LAPCE_ICON_ACTIVE)
                                         }),
                                 )
                         }),
                         label(move || format!("{:?}", path))
                             .style(move |s| {
                                 s.margin_left(6.0).color(
-                                    config.get().color(LapceColor::EDITOR_DIM),
+                                    config.get().color(AheadColor::EDITOR_DIM),
                                 )
                             })
                             .into_any(),
@@ -108,7 +108,7 @@ pub fn common_reference_panel(
                                 s.background(
                                     config
                                         .get()
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                        .color(AheadColor::PANEL_HOVERED_BACKGROUND),
                                 )
                                 .cursor(CursorStyle::Pointer)
                             })
@@ -117,7 +117,7 @@ pub fn common_reference_panel(
                         label(move || format!("{} {}", file_line.position.line + 1, file_line.content))
                             .style(move |s| {
                                 s.margin_left(6.0).color(
-                                    config.get().color(LapceColor::EDITOR_DIM),
+                                    config.get().color(AheadColor::EDITOR_DIM),
                                 )
                             })
                             .into_any(),
@@ -131,7 +131,7 @@ pub fn common_reference_panel(
                                 s.background(
                                     config
                                         .get()
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                        .color(AheadColor::PANEL_HOVERED_BACKGROUND),
                                 )
                                 .cursor(CursorStyle::Pointer)
                             })
@@ -167,7 +167,7 @@ pub fn common_reference_panel(
                             s.background(
                                 config
                                     .get()
-                                    .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                    .color(AheadColor::PANEL_HOVERED_BACKGROUND),
                             )
                             .cursor(CursorStyle::Pointer)
                         })

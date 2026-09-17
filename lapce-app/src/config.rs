@@ -18,17 +18,17 @@ use strum::VariantNames;
 use tracing::error;
 
 use self::{
-    color::LapceColor,
+    color::AheadColor,
     color_theme::{ColorThemeConfig, ThemeColor, ThemeColorPreference},
     core::CoreConfig,
     editor::{EditorConfig, SCALE_OR_SIZE_LIMIT, WrapStyle},
-    icon::LapceIcons,
+    icon::AheadIcons,
     icon_theme::IconThemeConfig,
     svg::SvgStore,
     terminal::TerminalConfig,
     ui::UIConfig,
 };
-use crate::workspace::{LapceWorkspace, LapceWorkspaceType};
+use crate::workspace::{AheadWorkspace, AheadWorkspaceType};
 
 pub mod color;
 pub mod color_theme;
@@ -47,9 +47,9 @@ const DEFAULT_LIGHT_THEME: &str = include_str!("../../defaults/light-theme.toml"
 const DEFAULT_DARK_THEME: &str = include_str!("../../defaults/dark-theme.toml");
 const DEFAULT_ICON_THEME: &str = include_str!("../../defaults/icon-theme.toml");
 
-static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(LapceConfig::default_config);
-static DEFAULT_LAPCE_CONFIG: Lazy<LapceConfig> =
-    Lazy::new(LapceConfig::default_lapce_config);
+static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(AheadConfig::default_config);
+static DEFAULT_LAPCE_CONFIG: Lazy<AheadConfig> =
+    Lazy::new(AheadConfig::default_lapce_config);
 
 static DEFAULT_DARK_THEME_CONFIG: Lazy<config::Config> = Lazy::new(|| {
     config::Config::builder()
@@ -64,7 +64,7 @@ static DEFAULT_DARK_THEME_CONFIG: Lazy<config::Config> = Lazy::new(|| {
 /// The default theme is the dark theme.
 static DEFAULT_DARK_THEME_COLOR_CONFIG: Lazy<ColorThemeConfig> = Lazy::new(|| {
     let (_, theme) =
-        LapceConfig::load_color_theme_from_str(DEFAULT_DARK_THEME).unwrap();
+        AheadConfig::load_color_theme_from_str(DEFAULT_DARK_THEME).unwrap();
     theme.get::<ColorThemeConfig>("color-theme")
     .expect("Failed to load default dark theme. This is likely due to a missing or misnamed field in dark-theme.toml")
 });
@@ -93,7 +93,7 @@ pub struct DropdownInfo {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct LapceConfig {
+pub struct AheadConfig {
     #[serde(skip)]
     pub id: u64,
     pub core: CoreConfig,
@@ -128,14 +128,14 @@ pub struct LapceConfig {
     wrap_style_list: im::Vector<String>,
 }
 
-impl LapceConfig {
+impl AheadConfig {
     pub fn load(
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
         disabled_volts: &[VoltID],
         extra_plugin_paths: &[PathBuf],
     ) -> Self {
         let config = Self::merge_config(workspace, None, None);
-        let mut lapce_config: LapceConfig = match config.try_deserialize() {
+        let mut lapce_config: AheadConfig = match config.try_deserialize() {
             Ok(config) => config,
             Err(error) => {
                 error!("Failed to deserialize configuration file: {error}");
@@ -178,7 +178,7 @@ impl LapceConfig {
     }
 
     fn merge_config(
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
         color_theme_config: Option<config::Config>,
         icon_theme_config: Option<config::Config>,
     ) -> config::Config {
@@ -212,7 +212,7 @@ impl LapceConfig {
         }
 
         match workspace.kind {
-            LapceWorkspaceType::Local => {
+            AheadWorkspaceType::Local => {
                 if let Some(path) = workspace.path.as_ref() {
                     let path = path.join("./.lapce/settings.toml");
                     config = config::Config::builder()
@@ -224,9 +224,9 @@ impl LapceConfig {
                         .unwrap_or_else(|_| config.clone());
                 }
             }
-            LapceWorkspaceType::RemoteSSH(_) => {}
+            AheadWorkspaceType::RemoteSSH(_) => {}
             #[cfg(windows)]
-            LapceWorkspaceType::RemoteWSL(_) => {}
+            AheadWorkspaceType::RemoteWSL(_) => {}
         }
 
         config
@@ -249,8 +249,8 @@ impl LapceConfig {
             .unwrap()
     }
 
-    fn default_lapce_config() -> LapceConfig {
-        let mut default_lapce_config: LapceConfig =
+    fn default_lapce_config() -> AheadConfig {
+        let mut default_lapce_config: AheadConfig =
             DEFAULT_CONFIG.clone().try_deserialize().expect("Failed to deserialize default config, this likely indicates a missing or misnamed field in settings.toml");
         default_lapce_config.color_theme = DEFAULT_DARK_THEME_COLOR_CONFIG.clone();
         default_lapce_config.icon_theme = DEFAULT_ICON_THEME_ICON_CONFIG.clone();
@@ -258,7 +258,7 @@ impl LapceConfig {
         default_lapce_config
     }
 
-    fn resolve_theme(&mut self, workspace: &LapceWorkspace) {
+    fn resolve_theme(&mut self, workspace: &AheadWorkspace) {
         let default_lapce_config = DEFAULT_LAPCE_CONFIG.clone();
 
         let color_theme_config = self
@@ -283,7 +283,7 @@ impl LapceConfig {
             Some(color_theme_config.clone()),
             Some(icon_theme_config.clone()),
         )
-        .try_deserialize::<LapceConfig>()
+        .try_deserialize::<AheadConfig>()
         {
             self.core = new.core;
             self.ui = new.ui;
@@ -332,19 +332,19 @@ impl LapceConfig {
 
     /// Set the active color theme.
     /// Note that this does not save the config.
-    pub fn set_color_theme(&mut self, workspace: &LapceWorkspace, theme: &str) {
+    pub fn set_color_theme(&mut self, workspace: &AheadWorkspace, theme: &str) {
         self.core.color_theme = theme.to_string();
         self.resolve_theme(workspace);
     }
 
     /// Set the active icon theme.  
     /// Note that this does not save the config.
-    pub fn set_icon_theme(&mut self, workspace: &LapceWorkspace, theme: &str) {
+    pub fn set_icon_theme(&mut self, workspace: &AheadWorkspace, theme: &str) {
         self.core.icon_theme = theme.to_string();
         self.resolve_theme(workspace);
     }
 
-    pub fn set_modal(&mut self, _workspace: &LapceWorkspace, modal: bool) {
+    pub fn set_modal(&mut self, _workspace: &AheadWorkspace, modal: bool) {
         self.core.modal = modal;
     }
 
@@ -394,7 +394,7 @@ impl LapceConfig {
         self.style_color(theme_str)
     }
 
-    fn resolve_colors(&mut self, default_config: Option<&LapceConfig>) {
+    fn resolve_colors(&mut self, default_config: Option<&AheadConfig>) {
         self.color.base = self
             .color_theme
             .base
@@ -407,8 +407,8 @@ impl LapceConfig {
             default_config.map(|c| &c.color.syntax),
         );
 
-        let fg = self.color(LapceColor::EDITOR_FOREGROUND).to_rgba8();
-        let bg = self.color(LapceColor::EDITOR_BACKGROUND).to_rgba8();
+        let fg = self.color(AheadColor::EDITOR_FOREGROUND).to_rgba8();
+        let bg = self.color(AheadColor::EDITOR_BACKGROUND).to_rgba8();
         let is_light = fg.r as u32 + fg.g as u32 + fg.b as u32
             > bg.r as u32 + bg.g as u32 + bg.b as u32;
         let high_contrast = self.color_theme.high_contrast.unwrap_or(false);
@@ -616,15 +616,15 @@ impl LapceConfig {
 
         if let Some(svg) = svg {
             let color = if self.icon_theme.use_editor_color.unwrap_or(false) {
-                Some(self.color(LapceColor::LAPCE_ICON_ACTIVE))
+                Some(self.color(AheadColor::LAPCE_ICON_ACTIVE))
             } else {
                 None
             };
             (svg, color)
         } else {
             (
-                self.ui_svg(LapceIcons::FILE),
-                Some(self.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                self.ui_svg(AheadIcons::FILE),
+                Some(self.color(AheadColor::LAPCE_ICON_ACTIVE)),
             )
         }
     }
@@ -635,28 +635,28 @@ impl LapceConfig {
 
     pub fn symbol_svg(&self, kind: &SymbolKind) -> Option<String> {
         let kind_str = match *kind {
-            SymbolKind::ARRAY => LapceIcons::SYMBOL_KIND_ARRAY,
-            SymbolKind::BOOLEAN => LapceIcons::SYMBOL_KIND_BOOLEAN,
-            SymbolKind::CLASS => LapceIcons::SYMBOL_KIND_CLASS,
-            SymbolKind::CONSTANT => LapceIcons::SYMBOL_KIND_CONSTANT,
-            SymbolKind::ENUM_MEMBER => LapceIcons::SYMBOL_KIND_ENUM_MEMBER,
-            SymbolKind::ENUM => LapceIcons::SYMBOL_KIND_ENUM,
-            SymbolKind::EVENT => LapceIcons::SYMBOL_KIND_EVENT,
-            SymbolKind::FIELD => LapceIcons::SYMBOL_KIND_FIELD,
-            SymbolKind::FILE => LapceIcons::SYMBOL_KIND_FILE,
-            SymbolKind::INTERFACE => LapceIcons::SYMBOL_KIND_INTERFACE,
-            SymbolKind::KEY => LapceIcons::SYMBOL_KIND_KEY,
-            SymbolKind::FUNCTION => LapceIcons::SYMBOL_KIND_FUNCTION,
-            SymbolKind::METHOD => LapceIcons::SYMBOL_KIND_METHOD,
-            SymbolKind::OBJECT => LapceIcons::SYMBOL_KIND_OBJECT,
-            SymbolKind::NAMESPACE => LapceIcons::SYMBOL_KIND_NAMESPACE,
-            SymbolKind::NUMBER => LapceIcons::SYMBOL_KIND_NUMBER,
-            SymbolKind::OPERATOR => LapceIcons::SYMBOL_KIND_OPERATOR,
-            SymbolKind::TYPE_PARAMETER => LapceIcons::SYMBOL_KIND_TYPE_PARAMETER,
-            SymbolKind::PROPERTY => LapceIcons::SYMBOL_KIND_PROPERTY,
-            SymbolKind::STRING => LapceIcons::SYMBOL_KIND_STRING,
-            SymbolKind::STRUCT => LapceIcons::SYMBOL_KIND_STRUCT,
-            SymbolKind::VARIABLE => LapceIcons::SYMBOL_KIND_VARIABLE,
+            SymbolKind::ARRAY => AheadIcons::SYMBOL_KIND_ARRAY,
+            SymbolKind::BOOLEAN => AheadIcons::SYMBOL_KIND_BOOLEAN,
+            SymbolKind::CLASS => AheadIcons::SYMBOL_KIND_CLASS,
+            SymbolKind::CONSTANT => AheadIcons::SYMBOL_KIND_CONSTANT,
+            SymbolKind::ENUM_MEMBER => AheadIcons::SYMBOL_KIND_ENUM_MEMBER,
+            SymbolKind::ENUM => AheadIcons::SYMBOL_KIND_ENUM,
+            SymbolKind::EVENT => AheadIcons::SYMBOL_KIND_EVENT,
+            SymbolKind::FIELD => AheadIcons::SYMBOL_KIND_FIELD,
+            SymbolKind::FILE => AheadIcons::SYMBOL_KIND_FILE,
+            SymbolKind::INTERFACE => AheadIcons::SYMBOL_KIND_INTERFACE,
+            SymbolKind::KEY => AheadIcons::SYMBOL_KIND_KEY,
+            SymbolKind::FUNCTION => AheadIcons::SYMBOL_KIND_FUNCTION,
+            SymbolKind::METHOD => AheadIcons::SYMBOL_KIND_METHOD,
+            SymbolKind::OBJECT => AheadIcons::SYMBOL_KIND_OBJECT,
+            SymbolKind::NAMESPACE => AheadIcons::SYMBOL_KIND_NAMESPACE,
+            SymbolKind::NUMBER => AheadIcons::SYMBOL_KIND_NUMBER,
+            SymbolKind::OPERATOR => AheadIcons::SYMBOL_KIND_OPERATOR,
+            SymbolKind::TYPE_PARAMETER => AheadIcons::SYMBOL_KIND_TYPE_PARAMETER,
+            SymbolKind::PROPERTY => AheadIcons::SYMBOL_KIND_PROPERTY,
+            SymbolKind::STRING => AheadIcons::SYMBOL_KIND_STRING,
+            SymbolKind::STRUCT => AheadIcons::SYMBOL_KIND_STRUCT,
+            SymbolKind::VARIABLE => AheadIcons::SYMBOL_KIND_VARIABLE,
             _ => return None,
         };
 
@@ -789,91 +789,91 @@ impl LapceConfig {
     ) -> Color {
         let (color, alpha) = match color {
             alacritty_terminal::vte::ansi::NamedColor::Cursor => {
-                (LapceColor::TERMINAL_CURSOR, 1.0)
+                (AheadColor::TERMINAL_CURSOR, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Foreground => {
-                (LapceColor::TERMINAL_FOREGROUND, 1.0)
+                (AheadColor::TERMINAL_FOREGROUND, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Background => {
-                (LapceColor::TERMINAL_BACKGROUND, 1.0)
+                (AheadColor::TERMINAL_BACKGROUND, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Blue => {
-                (LapceColor::TERMINAL_BLUE, 1.0)
+                (AheadColor::TERMINAL_BLUE, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Green => {
-                (LapceColor::TERMINAL_GREEN, 1.0)
+                (AheadColor::TERMINAL_GREEN, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Yellow => {
-                (LapceColor::TERMINAL_YELLOW, 1.0)
+                (AheadColor::TERMINAL_YELLOW, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Red => {
-                (LapceColor::TERMINAL_RED, 1.0)
+                (AheadColor::TERMINAL_RED, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::White => {
-                (LapceColor::TERMINAL_WHITE, 1.0)
+                (AheadColor::TERMINAL_WHITE, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Black => {
-                (LapceColor::TERMINAL_BLACK, 1.0)
+                (AheadColor::TERMINAL_BLACK, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Cyan => {
-                (LapceColor::TERMINAL_CYAN, 1.0)
+                (AheadColor::TERMINAL_CYAN, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::Magenta => {
-                (LapceColor::TERMINAL_MAGENTA, 1.0)
+                (AheadColor::TERMINAL_MAGENTA, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightBlue => {
-                (LapceColor::TERMINAL_BRIGHT_BLUE, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_BLUE, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightGreen => {
-                (LapceColor::TERMINAL_BRIGHT_GREEN, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_GREEN, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightYellow => {
-                (LapceColor::TERMINAL_BRIGHT_YELLOW, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_YELLOW, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightRed => {
-                (LapceColor::TERMINAL_BRIGHT_RED, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_RED, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightWhite => {
-                (LapceColor::TERMINAL_BRIGHT_WHITE, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_WHITE, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightBlack => {
-                (LapceColor::TERMINAL_BRIGHT_BLACK, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_BLACK, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightCyan => {
-                (LapceColor::TERMINAL_BRIGHT_CYAN, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_CYAN, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightMagenta => {
-                (LapceColor::TERMINAL_BRIGHT_MAGENTA, 1.0)
+                (AheadColor::TERMINAL_BRIGHT_MAGENTA, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::BrightForeground => {
-                (LapceColor::TERMINAL_FOREGROUND, 1.0)
+                (AheadColor::TERMINAL_FOREGROUND, 1.0)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimBlack => {
-                (LapceColor::TERMINAL_BLACK, 0.66)
+                (AheadColor::TERMINAL_BLACK, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimRed => {
-                (LapceColor::TERMINAL_RED, 0.66)
+                (AheadColor::TERMINAL_RED, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimGreen => {
-                (LapceColor::TERMINAL_GREEN, 0.66)
+                (AheadColor::TERMINAL_GREEN, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimYellow => {
-                (LapceColor::TERMINAL_YELLOW, 0.66)
+                (AheadColor::TERMINAL_YELLOW, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimBlue => {
-                (LapceColor::TERMINAL_BLUE, 0.66)
+                (AheadColor::TERMINAL_BLUE, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimMagenta => {
-                (LapceColor::TERMINAL_MAGENTA, 0.66)
+                (AheadColor::TERMINAL_MAGENTA, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimCyan => {
-                (LapceColor::TERMINAL_CYAN, 0.66)
+                (AheadColor::TERMINAL_CYAN, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimWhite => {
-                (LapceColor::TERMINAL_WHITE, 0.66)
+                (AheadColor::TERMINAL_WHITE, 0.66)
             }
             alacritty_terminal::vte::ansi::NamedColor::DimForeground => {
-                (LapceColor::TERMINAL_FOREGROUND, 0.66)
+                (AheadColor::TERMINAL_FOREGROUND, 0.66)
             }
         };
         self.color(color).multiply_alpha(alpha)

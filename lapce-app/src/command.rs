@@ -29,18 +29,18 @@ use crate::{
     editor_tab::EditorTabChild,
     id::EditorTabId,
     main_split::{SplitDirection, SplitMoveDirection, TabCloseKind},
-    workspace::LapceWorkspace,
+    workspace::AheadWorkspace,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LapceCommand {
+pub struct AheadCommand {
     pub kind: CommandKind,
     pub data: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandKind {
-    Workbench(LapceWorkbenchCommand),
+    Workbench(AheadWorkbenchCommand),
     Edit(EditCommand),
     Move(MoveCommand),
     Scroll(ScrollCommand),
@@ -89,11 +89,11 @@ impl From<Command> for CommandKind {
     }
 }
 
-pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
+pub fn lapce_internal_commands() -> IndexMap<String, AheadCommand> {
     let mut commands = IndexMap::new();
 
-    for c in LapceWorkbenchCommand::iter() {
-        let command = LapceCommand {
+    for c in AheadWorkbenchCommand::iter() {
+        let command = AheadCommand {
             kind: CommandKind::Workbench(c.clone()),
             data: None,
         };
@@ -101,7 +101,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in EditCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::Edit(c.clone()),
             data: None,
         };
@@ -109,7 +109,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in MoveCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::Move(c.clone()),
             data: None,
         };
@@ -117,7 +117,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in ScrollCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::Scroll(c.clone()),
             data: None,
         };
@@ -125,7 +125,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in FocusCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::Focus(c.clone()),
             data: None,
         };
@@ -133,7 +133,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in MotionModeCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::MotionMode(c.clone()),
             data: None,
         };
@@ -141,7 +141,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     }
 
     for c in MultiSelectionCommand::iter() {
-        let command = LapceCommand {
+        let command = AheadCommand {
             kind: CommandKind::MultiSelection(c.clone()),
             data: None,
         };
@@ -162,7 +162,7 @@ pub fn lapce_internal_commands() -> IndexMap<String, LapceCommand> {
     EnumMessage,
     IntoStaticStr,
 )]
-pub enum LapceWorkbenchCommand {
+pub enum AheadWorkbenchCommand {
     #[strum(serialize = "enable_modal_editing")]
     #[strum(message = "Enable Modal Editing")]
     EnableModal,
@@ -752,12 +752,12 @@ pub enum InternalCommand {
         s: String,
     },
     FindEditorCommand {
-        command: LapceCommand,
+        command: AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     },
     ReplaceEditorCommand {
-        command: LapceCommand,
+        command: AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     },
@@ -834,13 +834,13 @@ pub enum InternalCommand {
 #[derive(Clone)]
 pub enum WindowCommand {
     SetWorkspace {
-        workspace: LapceWorkspace,
+        workspace: AheadWorkspace,
     },
     CloseWorkspaceTab {
         index: Option<usize>,
     },
     NewWorkspaceTab {
-        workspace: LapceWorkspace,
+        workspace: AheadWorkspace,
         end: bool,
     },
     NextWorkspaceTab,

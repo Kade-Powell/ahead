@@ -23,8 +23,8 @@ use super::{
     view::foldable_panel_section,
 };
 use crate::{
-    command::{CommandKind, InternalCommand, LapceCommand, LapceWorkbenchCommand},
-    config::{color::LapceColor, icon::LapceIcons},
+    command::{CommandKind, InternalCommand, AheadCommand, AheadWorkbenchCommand},
+    config::{color::AheadColor, icon::AheadIcons},
     editor::view::editor_view,
     settings::checkbox,
     source_control::SourceControlData,
@@ -73,7 +73,7 @@ pub fn source_control_panel(
                             s.absolute()
                                 .items_center()
                                 .height(config.editor.line_height() as f32)
-                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .color(config.color(AheadColor::EDITOR_DIM))
                                 .apply_if(!is_empty.get(), |s| s.hide())
                                 .selectable(false)
                         }),
@@ -146,8 +146,8 @@ pub fn source_control_panel(
                     .border(1.0)
                     .padding(-1.0)
                     .border_radius(6.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
-                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                    .border_color(config.color(AheadColor::LAPCE_BORDER))
+                    .background(config.color(AheadColor::EDITOR_BACKGROUND))
             }),
             {
                 let source_control = source_control.clone();
@@ -163,16 +163,16 @@ pub fn source_control_panel(
                             .justify_center()
                             .border(1.0)
                             .border_radius(6.0)
-                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .border_color(config.color(AheadColor::LAPCE_BORDER))
                             .hover(|s| {
                                 s.cursor(CursorStyle::Pointer).background(
                                     config
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                        .color(AheadColor::PANEL_HOVERED_BACKGROUND),
                                 )
                             })
                             .active(|s| {
                                 s.background(config.color(
-                                    LapceColor::PANEL_HOVERED_ACTIVE_BACKGROUND,
+                                    AheadColor::PANEL_HOVERED_ACTIVE_BACKGROUND,
                                 ))
                             })
                             .selectable(false)
@@ -268,17 +268,17 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
                 s.text_ellipsis()
                     .flex_grow(1.0)
                     .flex_basis(0.0)
-                    .color(config.get().color(LapceColor::EDITOR_DIM))
+                    .color(config.get().color(AheadColor::EDITOR_DIM))
                     .min_width(0.0)
                     .selectable(false)
             }),
             container({
                 svg(move || {
                     let svg = match &diff {
-                        FileDiff::Modified(_) => LapceIcons::SCM_DIFF_MODIFIED,
-                        FileDiff::Added(_) => LapceIcons::SCM_DIFF_ADDED,
-                        FileDiff::Deleted(_) => LapceIcons::SCM_DIFF_REMOVED,
-                        FileDiff::Renamed(_, _) => LapceIcons::SCM_DIFF_RENAMED,
+                        FileDiff::Modified(_) => AheadIcons::SCM_DIFF_MODIFIED,
+                        FileDiff::Added(_) => AheadIcons::SCM_DIFF_ADDED,
+                        FileDiff::Deleted(_) => AheadIcons::SCM_DIFF_REMOVED,
+                        FileDiff::Renamed(_, _) => AheadIcons::SCM_DIFF_RENAMED,
                     };
                     config.get().ui_svg(svg)
                 })
@@ -286,11 +286,11 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
                     let config = config.get();
                     let size = config.ui.icon_size() as f32;
                     let color = match &diff_for_style {
-                        FileDiff::Modified(_) => LapceColor::SOURCE_CONTROL_MODIFIED,
-                        FileDiff::Added(_) => LapceColor::SOURCE_CONTROL_ADDED,
-                        FileDiff::Deleted(_) => LapceColor::SOURCE_CONTROL_REMOVED,
+                        FileDiff::Modified(_) => AheadColor::SOURCE_CONTROL_MODIFIED,
+                        FileDiff::Added(_) => AheadColor::SOURCE_CONTROL_ADDED,
+                        FileDiff::Deleted(_) => AheadColor::SOURCE_CONTROL_REMOVED,
                         FileDiff::Renamed(_, _) => {
-                            LapceColor::SOURCE_CONTROL_MODIFIED
+                            AheadColor::SOURCE_CONTROL_MODIFIED
                         }
                     };
                     let color = config.color(color);
@@ -314,9 +314,9 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
             let diff_for_menu = diff_for_menu.clone();
 
             let discard = move || {
-                lapce_command.send(LapceCommand {
+                lapce_command.send(AheadCommand {
                     kind: CommandKind::Workbench(
-                        LapceWorkbenchCommand::SourceControlDiscardTargetFileChanges,
+                        AheadWorkbenchCommand::SourceControlDiscardTargetFileChanges,
                     ),
                     data: Some(serde_json::json!(diff_for_menu.clone())),
                 });
@@ -339,7 +339,7 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
                 .items_center()
                 .cursor(CursorStyle::Pointer)
                 .hover(|s| {
-                    s.background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+                    s.background(config.color(AheadColor::PANEL_HOVERED_BACKGROUND))
                 })
         })
     };

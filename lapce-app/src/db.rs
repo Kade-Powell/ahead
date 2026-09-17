@@ -17,7 +17,7 @@ use crate::{
     panel::{data::PanelOrder, kind::PanelKind},
     window::{WindowData, WindowInfo},
     window_tab::WindowTabData,
-    workspace::{LapceWorkspace, WorkspaceInfo},
+    workspace::{AheadWorkspace, WorkspaceInfo},
 };
 
 const APP: &str = "app";
@@ -30,22 +30,22 @@ const RECENT_WORKSPACES: &str = "recent_workspaces";
 
 pub enum SaveEvent {
     App(AppInfo),
-    Workspace(LapceWorkspace, WorkspaceInfo),
-    RecentWorkspace(LapceWorkspace),
+    Workspace(AheadWorkspace, WorkspaceInfo),
+    RecentWorkspace(AheadWorkspace),
     Doc(DocInfo),
     DisabledVolts(Vec<VoltID>),
-    WorkspaceDisabledVolts(Arc<LapceWorkspace>, Vec<VoltID>),
+    WorkspaceDisabledVolts(Arc<AheadWorkspace>, Vec<VoltID>),
     PanelOrder(PanelOrder),
 }
 
 #[derive(Clone)]
-pub struct LapceDb {
+pub struct AheadDb {
     folder: PathBuf,
     workspace_folder: PathBuf,
     save_tx: Sender<SaveEvent>,
 }
 
-impl LapceDb {
+impl AheadDb {
     pub fn new() -> Result<Self> {
         let folder = Directory::config_directory()
             .ok_or_else(|| anyhow!("can't get config directory"))?
@@ -131,7 +131,7 @@ impl LapceDb {
 
     pub fn save_workspace_disabled_volts(
         &self,
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         volts: Vec<VoltID>,
     ) {
         if let Err(err) = self
@@ -150,7 +150,7 @@ impl LapceDb {
 
     pub fn insert_workspace_disabled_volts(
         &self,
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         volts: Vec<VoltID>,
     ) -> Result<()> {
         let folder = self
@@ -167,7 +167,7 @@ impl LapceDb {
 
     pub fn get_workspace_disabled_volts(
         &self,
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
     ) -> Result<Vec<VoltID>> {
         let folder = self.workspace_folder.join(workspace_folder_name(workspace));
         let volts = std::fs::read_to_string(folder.join(DISABLED_VOLTS))?;
@@ -175,14 +175,14 @@ impl LapceDb {
         Ok(volts)
     }
 
-    pub fn recent_workspaces(&self) -> Result<Vec<LapceWorkspace>> {
+    pub fn recent_workspaces(&self) -> Result<Vec<AheadWorkspace>> {
         let workspaces =
             std::fs::read_to_string(self.folder.join(RECENT_WORKSPACES))?;
-        let workspaces: Vec<LapceWorkspace> = serde_json::from_str(&workspaces)?;
+        let workspaces: Vec<AheadWorkspace> = serde_json::from_str(&workspaces)?;
         Ok(workspaces)
     }
 
-    pub fn update_recent_workspace(&self, workspace: &LapceWorkspace) -> Result<()> {
+    pub fn update_recent_workspace(&self, workspace: &AheadWorkspace) -> Result<()> {
         if workspace.path.is_none() {
             return Ok(());
         }
@@ -191,7 +191,7 @@ impl LapceDb {
         Ok(())
     }
 
-    fn insert_recent_workspace(&self, workspace: LapceWorkspace) -> Result<()> {
+    fn insert_recent_workspace(&self, workspace: AheadWorkspace) -> Result<()> {
         let mut workspaces = self.recent_workspaces().unwrap_or_default();
 
         let mut exits = false;
@@ -233,7 +233,7 @@ impl LapceDb {
 
     pub fn get_workspace_info(
         &self,
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
     ) -> Result<WorkspaceInfo> {
         let info = std::fs::read_to_string(
             self.workspace_folder
@@ -246,7 +246,7 @@ impl LapceDb {
 
     fn insert_workspace(
         &self,
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
         info: &WorkspaceInfo,
     ) -> Result<()> {
         let folder = self.workspace_folder.join(workspace_folder_name(workspace));
@@ -395,7 +395,7 @@ impl LapceDb {
 
     pub fn save_doc_position(
         &self,
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
         path: PathBuf,
         cursor_offset: usize,
         scroll_offset: Vec2,
@@ -426,7 +426,7 @@ impl LapceDb {
 
     pub fn get_doc_info(
         &self,
-        workspace: &LapceWorkspace,
+        workspace: &AheadWorkspace,
         path: &Path,
     ) -> Result<DocInfo> {
         let folder = self
@@ -439,7 +439,7 @@ impl LapceDb {
     }
 }
 
-fn workspace_folder_name(workspace: &LapceWorkspace) -> String {
+fn workspace_folder_name(workspace: &AheadWorkspace) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .append_key_only(&workspace.to_string())
         .finish()

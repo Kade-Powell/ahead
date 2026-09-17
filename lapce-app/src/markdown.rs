@@ -1,13 +1,13 @@
 use floem::text::{
     Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
 };
-use lapce_core::{language::LapceLanguage, syntax::Syntax};
+use lapce_core::{language::AheadLanguage, syntax::Syntax};
 use lapce_xi_rope::Rope;
 use lsp_types::MarkedString;
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag};
 use smallvec::SmallVec;
 
-use crate::config::{LapceConfig, color::LapceColor};
+use crate::config::{AheadConfig, color::AheadColor};
 
 #[derive(Clone)]
 pub enum MarkdownContent {
@@ -19,7 +19,7 @@ pub enum MarkdownContent {
 pub fn parse_markdown(
     text: &str,
     line_height: f64,
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) -> Vec<MarkdownContent> {
     let mut res = Vec::new();
 
@@ -28,7 +28,7 @@ pub fn parse_markdown(
         FamilyOwned::parse_list(&config.editor.font_family).collect();
 
     let default_attrs = Attrs::new()
-        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+        .color(config.color(AheadColor::EDITOR_FOREGROUND))
         .font_size(config.ui.font_size() as f32)
         .line_height(LineHeightValue::Normal(line_height as f32));
     let mut attr_list = AttrsList::new(default_attrs.clone());
@@ -165,7 +165,7 @@ pub fn parse_markdown(
                     default_attrs
                         .clone()
                         .family(&code_font_family)
-                        .color(config.color(LapceColor::MARKDOWN_BLOCKQUOTE)),
+                        .color(config.color(AheadColor::MARKDOWN_BLOCKQUOTE)),
                 );
                 current_text.push_str(&text);
                 pos += text.len();
@@ -203,7 +203,7 @@ fn attribute_for_tag<'a>(
     default_attrs: Attrs<'a>,
     tag: &Tag,
     code_font_family: &'a [FamilyOwned],
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) -> Option<Attrs<'a>> {
     use pulldown_cmark::HeadingLevel;
     match tag {
@@ -233,7 +233,7 @@ fn attribute_for_tag<'a>(
         Tag::BlockQuote(_block_quote) => Some(
             default_attrs
                 .style(Style::Italic)
-                .color(config.color(LapceColor::MARKDOWN_BLOCKQUOTE)),
+                .color(config.color(AheadColor::MARKDOWN_BLOCKQUOTE)),
         ),
         Tag::CodeBlock(_) => Some(default_attrs.family(code_font_family)),
         Tag::Emphasis => Some(default_attrs.style(Style::Italic)),
@@ -246,7 +246,7 @@ fn attribute_for_tag<'a>(
             id: _,
         } => {
             // TODO: Link support
-            Some(default_attrs.color(config.color(LapceColor::EDITOR_LINK)))
+            Some(default_attrs.color(config.color(AheadColor::EDITOR_LINK)))
         }
         // All other tags are currently ignored
         _ => None,
@@ -267,19 +267,19 @@ fn should_skip_text_in_tag(tag: &Tag) -> bool {
     matches!(tag, Tag::Image { .. })
 }
 
-fn md_language_to_lapce_language(lang: &str) -> Option<LapceLanguage> {
+fn md_language_to_lapce_language(lang: &str) -> Option<AheadLanguage> {
     // TODO: There are many other names commonly used that should be supported
-    LapceLanguage::from_name(lang)
+    AheadLanguage::from_name(lang)
 }
 
 /// Highlight the text in a richtext builder like it was a markdown codeblock
 pub fn highlight_as_code(
     attr_list: &mut AttrsList,
     default_attrs: Attrs,
-    language: Option<LapceLanguage>,
+    language: Option<AheadLanguage>,
     text: &str,
     start_offset: usize,
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) {
     let syntax = language.map(Syntax::from_language);
 
@@ -308,7 +308,7 @@ pub fn highlight_as_code(
 
 pub fn from_marked_string(
     text: MarkedString,
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) -> Vec<MarkdownContent> {
     match text {
         MarkedString::String(text) => parse_markdown(&text, 1.8, config),
@@ -328,7 +328,7 @@ pub fn from_marked_string(
 pub fn from_plaintext(
     text: &str,
     line_height: f64,
-    config: &LapceConfig,
+    config: &AheadConfig,
 ) -> Vec<MarkdownContent> {
     let mut text_layout = TextLayout::new();
     text_layout.set_text(

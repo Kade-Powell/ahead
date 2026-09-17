@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Display, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{debug::LapceBreakpoint, main_split::SplitInfo, panel::data::PanelInfo};
+use crate::{debug::AheadBreakpoint, main_split::SplitInfo, panel::data::PanelInfo};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct SshHost {
@@ -63,20 +63,20 @@ impl Display for WslHost {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LapceWorkspaceType {
+pub enum AheadWorkspaceType {
     Local,
     RemoteSSH(SshHost),
     #[cfg(windows)]
     RemoteWSL(WslHost),
 }
 
-impl LapceWorkspaceType {
+impl AheadWorkspaceType {
     pub fn is_local(&self) -> bool {
-        matches!(self, LapceWorkspaceType::Local)
+        matches!(self, AheadWorkspaceType::Local)
     }
 
     pub fn is_remote(&self) -> bool {
-        use LapceWorkspaceType::*;
+        use AheadWorkspaceType::*;
 
         #[cfg(not(windows))]
         return matches!(self, RemoteSSH(_));
@@ -86,15 +86,15 @@ impl LapceWorkspaceType {
     }
 }
 
-impl std::fmt::Display for LapceWorkspaceType {
+impl std::fmt::Display for AheadWorkspaceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LapceWorkspaceType::Local => f.write_str("Local"),
-            LapceWorkspaceType::RemoteSSH(remote) => {
+            AheadWorkspaceType::Local => f.write_str("Local"),
+            AheadWorkspaceType::RemoteSSH(remote) => {
                 write!(f, "ssh://{remote}")
             }
             #[cfg(windows)]
-            LapceWorkspaceType::RemoteWSL(remote) => {
+            AheadWorkspaceType::RemoteWSL(remote) => {
                 write!(f, "{remote} (WSL)")
             }
         }
@@ -102,13 +102,13 @@ impl std::fmt::Display for LapceWorkspaceType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LapceWorkspace {
-    pub kind: LapceWorkspaceType,
+pub struct AheadWorkspace {
+    pub kind: AheadWorkspaceType,
     pub path: Option<PathBuf>,
     pub last_open: u64,
 }
 
-impl LapceWorkspace {
+impl AheadWorkspace {
     pub fn display(&self) -> Option<String> {
         let path = self.path.as_ref()?;
         let path = path
@@ -117,12 +117,12 @@ impl LapceWorkspace {
             .to_string_lossy()
             .to_string();
         let remote = match &self.kind {
-            LapceWorkspaceType::Local => String::new(),
-            LapceWorkspaceType::RemoteSSH(remote) => {
+            AheadWorkspaceType::Local => String::new(),
+            AheadWorkspaceType::RemoteSSH(remote) => {
                 format!(" [SSH: {}]", remote.host)
             }
             #[cfg(windows)]
-            LapceWorkspaceType::RemoteWSL(remote) => {
+            AheadWorkspaceType::RemoteWSL(remote) => {
                 format!(" [WSL: {}]", remote.host)
             }
         };
@@ -130,17 +130,17 @@ impl LapceWorkspace {
     }
 }
 
-impl Default for LapceWorkspace {
+impl Default for AheadWorkspace {
     fn default() -> Self {
         Self {
-            kind: LapceWorkspaceType::Local,
+            kind: AheadWorkspaceType::Local,
             path: None,
             last_open: 0,
         }
     }
 }
 
-impl std::fmt::Display for LapceWorkspace {
+impl std::fmt::Display for AheadWorkspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -155,5 +155,5 @@ impl std::fmt::Display for LapceWorkspace {
 pub struct WorkspaceInfo {
     pub split: SplitInfo,
     pub panel: PanelInfo,
-    pub breakpoints: HashMap<PathBuf, Vec<LapceBreakpoint>>,
+    pub breakpoints: HashMap<PathBuf, Vec<AheadBreakpoint>>,
 }

@@ -26,10 +26,10 @@ use tree_sitter::{
 };
 
 use super::{PARSER, util::RopeProvider};
-use crate::{language::LapceLanguage, style::SCOPES};
+use crate::{language::AheadLanguage, style::SCOPES};
 
 thread_local! {
-    static HIGHLIGHT_CONFIGS: RefCell<HashMap<LapceLanguage, Result<Arc<HighlightConfiguration>, HighlightIssue>>> = Default::default();
+    static HIGHLIGHT_CONFIGS: RefCell<HashMap<AheadLanguage, Result<Arc<HighlightConfiguration>, HighlightIssue>>> = Default::default();
 }
 
 pub fn reset_highlight_configs() {
@@ -39,7 +39,7 @@ pub fn reset_highlight_configs() {
 }
 
 pub(crate) fn get_highlight_config(
-    lang: LapceLanguage,
+    lang: AheadLanguage,
 ) -> Result<Arc<HighlightConfiguration>, HighlightIssue> {
     HIGHLIGHT_CONFIGS.with(|configs| {
         let mut configs = configs.borrow_mut();

@@ -185,15 +185,15 @@ mod tests {
     use config::Config;
     use floem::{peniko::Color, prelude::palette::css};
 
-    use crate::{config::LapceConfig, workspace::LapceWorkspace};
+    use crate::{config::AheadConfig, workspace::AheadWorkspace};
 
     #[test]
     fn test_resolve() {
         // Mimicking load
-        let workspace = LapceWorkspace::default();
+        let workspace = AheadWorkspace::default();
 
-        let config = LapceConfig::merge_config(&workspace, None, None);
-        let mut lapce_config: LapceConfig = config.try_deserialize().unwrap();
+        let config = AheadConfig::merge_config(&workspace, None, None);
+        let mut lapce_config: AheadConfig = config.try_deserialize().unwrap();
 
         let test_theme_str = r##"
 [color-theme]

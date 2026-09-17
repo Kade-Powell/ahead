@@ -23,8 +23,8 @@ use self::{
     loader::KeyMapLoader,
 };
 use crate::{
-    command::{CommandExecuted, CommandKind, LapceCommand, lapce_internal_commands},
-    config::LapceConfig,
+    command::{CommandExecuted, CommandKind, AheadCommand, lapce_internal_commands},
+    config::AheadConfig,
     keypress::{
         condition::{CheckCondition, Condition},
         keymap::KeymapMatch,
@@ -46,7 +46,7 @@ pub trait KeyPressFocus: std::fmt::Debug {
 
     fn run_command(
         &self,
-        command: &LapceCommand,
+        command: &AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted;
@@ -72,7 +72,7 @@ impl KeyPressFocus for () {
 
     fn run_command(
         &self,
-        _command: &LapceCommand,
+        _command: &AheadCommand,
         _count: Option<usize>,
         _mods: Modifiers,
     ) -> CommandExecuted {
@@ -100,7 +100,7 @@ impl KeyPressFocus for Box<dyn KeyPressFocus> {
 
     fn run_command(
         &self,
-        command: &LapceCommand,
+        command: &AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted {
@@ -148,15 +148,15 @@ pub struct KeyPressHandle {
 pub struct KeyPressData {
     count: RwSignal<Option<usize>>,
     pending_keypress: RwSignal<(Vec<KeyPress>, Option<SystemTime>)>,
-    pub commands: Rc<IndexMap<String, LapceCommand>>,
+    pub commands: Rc<IndexMap<String, AheadCommand>>,
     pub keymaps: Rc<IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>>,
     pub command_keymaps: Rc<IndexMap<String, Vec<KeyMap>>>,
     pub commands_with_keymap: Rc<Vec<KeyMap>>,
-    pub commands_without_keymap: Rc<Vec<LapceCommand>>,
+    pub commands_without_keymap: Rc<Vec<AheadCommand>>,
 }
 
 impl KeyPressData {
-    pub fn new(cx: Scope, config: &LapceConfig) -> Self {
+    pub fn new(cx: Scope, config: &AheadConfig) -> Self {
         let (keymaps, command_keymaps) =
             Self::get_keymaps(config).unwrap_or((IndexMap::new(), IndexMap::new()));
         let mut keypress = Self {
@@ -172,7 +172,7 @@ impl KeyPressData {
         keypress
     }
 
-    pub fn update_keymaps(&mut self, config: &LapceConfig) {
+    pub fn update_keymaps(&mut self, config: &AheadConfig) {
         if let Ok((new_keymaps, new_command_keymaps)) = Self::get_keymaps(config) {
             self.keymaps = Rc::new(new_keymaps);
             self.command_keymaps = Rc::new(new_command_keymaps);
@@ -564,7 +564,7 @@ impl KeyPressData {
 
     #[allow(clippy::type_complexity)]
     fn get_keymaps(
-        config: &LapceConfig,
+        config: &AheadConfig,
     ) -> Result<(
         IndexMap<Vec<KeyMapPress>, Vec<KeyMap>>,
         IndexMap<String, Vec<KeyMap>>,
@@ -599,7 +599,7 @@ impl KeyPressData {
     }
 
     pub fn file() -> Option<PathBuf> {
-        LapceConfig::keymaps_file()
+        AheadConfig::keymaps_file()
     }
 
     fn get_file_array() -> Option<toml_edit::ArrayOfTables> {

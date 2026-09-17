@@ -1,6 +1,6 @@
-pub struct LapceIcons {}
+pub struct AheadIcons {}
 
-impl LapceIcons {
+impl AheadIcons {
     pub const WINDOW_CLOSE: &'static str = "window.close";
     pub const WINDOW_RESTORE: &'static str = "window.restore";
     pub const WINDOW_MAXIMIZE: &'static str = "window.maximize";

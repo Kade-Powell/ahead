@@ -5,10 +5,10 @@ use lapce_rpc::dap_types::RunDebugConfig;
 use lsp_types::{Range, SymbolKind};
 
 use crate::{
-    command::{LapceCommand, LapceWorkbenchCommand},
+    command::{AheadCommand, AheadWorkbenchCommand},
     debug::RunDebugMode,
     editor::location::EditorLocation,
-    workspace::{LapceWorkspace, SshHost},
+    workspace::{AheadWorkspace, SshHost},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,7 +22,7 @@ pub struct PaletteItem {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteItemContent {
     PaletteHelp {
-        cmd: LapceWorkbenchCommand,
+        cmd: AheadWorkbenchCommand,
     },
     File {
         path: PathBuf,
@@ -33,10 +33,10 @@ pub enum PaletteItemContent {
         content: String,
     },
     Command {
-        cmd: LapceCommand,
+        cmd: AheadCommand,
     },
     Workspace {
-        workspace: LapceWorkspace,
+        workspace: AheadWorkspace,
     },
     Reference {
         path: PathBuf,

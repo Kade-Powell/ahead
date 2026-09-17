@@ -57,7 +57,7 @@ impl KeyPressFocus for GlobalSearchData {
 
     fn run_command(
         &self,
-        command: &crate::command::LapceCommand,
+        command: &crate::command::AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted {

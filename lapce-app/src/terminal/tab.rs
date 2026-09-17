@@ -6,7 +6,7 @@ use lapce_rpc::terminal::TerminalProfile;
 use super::data::TerminalData;
 use crate::{
     debug::RunDebugProcess, id::TerminalTabId, window_tab::CommonData,
-    workspace::LapceWorkspace,
+    workspace::AheadWorkspace,
 };
 
 #[derive(Clone)]
@@ -19,7 +19,7 @@ pub struct TerminalTabData {
 
 impl TerminalTabData {
     pub fn new(
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,
     ) -> Self {
@@ -28,7 +28,7 @@ impl TerminalTabData {
 
     /// Create the information for a terminal tab, which can contain multiple terminals.  
     pub fn new_run_debug(
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         run_debug: Option<RunDebugProcess>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,

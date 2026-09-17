@@ -12,7 +12,7 @@ use lapce_xi_rope::Rope;
 use lsp_types::Position;
 
 use crate::{
-    command::{CommandExecuted, CommandKind, InternalCommand, LapceCommand},
+    command::{CommandExecuted, CommandKind, InternalCommand, AheadCommand},
     editor::EditorData,
     keypress::{KeyPressFocus, condition::Condition},
     main_split::Editors,
@@ -41,7 +41,7 @@ impl KeyPressFocus for RenameData {
 
     fn run_command(
         &self,
-        command: &LapceCommand,
+        command: &AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted {

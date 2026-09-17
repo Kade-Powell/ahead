@@ -18,7 +18,7 @@ use tracing::error;
 use self::{remote::start_remote, ssh::SshRemote};
 use crate::{
     terminal::event::TermEvent,
-    workspace::{LapceWorkspace, LapceWorkspaceType},
+    workspace::{AheadWorkspace, AheadWorkspaceType},
 };
 
 mod remote;
@@ -46,7 +46,7 @@ impl ProxyData {
 }
 
 pub fn new_proxy(
-    workspace: Arc<LapceWorkspace>,
+    workspace: Arc<AheadWorkspace>,
     disabled_volts: Vec<VoltID>,
     extra_plugin_paths: Vec<PathBuf>,
     plugin_configurations: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -74,14 +74,14 @@ pub fn new_proxy(
                 );
 
                 match &workspace.kind {
-                    LapceWorkspaceType::Local => {
+                    AheadWorkspaceType::Local => {
                         let core_rpc = core_rpc.clone();
                         let proxy_rpc = proxy_rpc.clone();
                         let mut dispatcher = Dispatcher::new(core_rpc, proxy_rpc);
                         let proxy_rpc = dispatcher.proxy_rpc.clone();
                         proxy_rpc.mainloop(&mut dispatcher);
                     }
-                    LapceWorkspaceType::RemoteSSH(remote) => {
+                    AheadWorkspaceType::RemoteSSH(remote) => {
                         if let Err(e) = start_remote(
                             SshRemote {
                                 ssh: remote.clone(),
@@ -93,7 +93,7 @@ pub fn new_proxy(
                         }
                     }
                     #[cfg(windows)]
-                    LapceWorkspaceType::RemoteWSL(remote) => {
+                    AheadWorkspaceType::RemoteWSL(remote) => {
                         if let Err(e) = start_remote(
                             wsl::WslRemote {
                                 wsl: remote.clone(),

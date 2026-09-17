@@ -23,7 +23,7 @@ use floem::{
 use im::Vector;
 use itertools::Itertools;
 use lapce_core::{
-    buffer::rope_text::RopeText, command::FocusCommand, language::LapceLanguage,
+    buffer::rope_text::RopeText, command::FocusCommand, language::AheadLanguage,
     line_ending::LineEnding, mode::Mode, movement::Movement, selection::Selection,
     syntax::Syntax,
 };
@@ -40,9 +40,9 @@ use self::{
 };
 use crate::{
     command::{
-        CommandExecuted, CommandKind, InternalCommand, LapceCommand, WindowCommand,
+        CommandExecuted, CommandKind, InternalCommand, AheadCommand, WindowCommand,
     },
-    db::LapceDb,
+    db::AheadDb,
     debug::{RunDebugConfigs, RunDebugMode},
     editor::{
         EditorData,
@@ -53,7 +53,7 @@ use crate::{
     main_split::MainSplitData,
     source_control::SourceControlData,
     window_tab::{CommonData, Focus},
-    workspace::{LapceWorkspace, LapceWorkspaceType, SshHost},
+    workspace::{AheadWorkspace, AheadWorkspaceType, SshHost},
 };
 
 pub mod item;
@@ -86,7 +86,7 @@ impl PaletteInput {
 pub struct PaletteData {
     run_id_counter: Arc<AtomicU64>,
     pub run_id: RwSignal<u64>,
-    pub workspace: Arc<LapceWorkspace>,
+    pub workspace: Arc<AheadWorkspace>,
     pub status: RwSignal<PaletteStatus>,
     pub index: RwSignal<usize>,
     pub preselect_index: RwSignal<Option<usize>>,
@@ -118,7 +118,7 @@ impl std::fmt::Debug for PaletteData {
 impl PaletteData {
     pub fn new(
         cx: Scope,
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         main_split: MainSplitData,
         keypress: ReadSignal<KeyPressData>,
         source_control: SourceControlData,
@@ -600,7 +600,7 @@ impl PaletteData {
 
     /// Initialize the palette with all the available workspaces, local and remote.
     fn get_workspaces(&self) {
-        let db: Arc<LapceDb> = use_context().unwrap();
+        let db: Arc<AheadDb> = use_context().unwrap();
         let workspaces = db.recent_workspaces().unwrap_or_default();
 
         let items = workspaces
@@ -608,12 +608,12 @@ impl PaletteData {
             .filter_map(|w| {
                 let text = w.path.as_ref()?.to_str()?.to_string();
                 let filter_text = match &w.kind {
-                    LapceWorkspaceType::Local => text,
-                    LapceWorkspaceType::RemoteSSH(remote) => {
+                    AheadWorkspaceType::Local => text,
+                    AheadWorkspaceType::RemoteSSH(remote) => {
                         format!("[{remote}] {text}")
                     }
                     #[cfg(windows)]
-                    LapceWorkspaceType::RemoteWSL(remote) => {
+                    AheadWorkspaceType::RemoteWSL(remote) => {
                         format!("[{remote}] {text}")
                     }
                 };
@@ -799,11 +799,11 @@ impl PaletteData {
     }
 
     fn get_ssh_hosts(&self) {
-        let db: Arc<LapceDb> = use_context().unwrap();
+        let db: Arc<AheadDb> = use_context().unwrap();
         let workspaces = db.recent_workspaces().unwrap_or_default();
         let mut hosts = HashSet::new();
         for workspace in workspaces.iter() {
-            if let LapceWorkspaceType::RemoteSSH(host) = &workspace.kind {
+            if let AheadWorkspaceType::RemoteSSH(host) = &workspace.kind {
                 hosts.insert(host.clone());
             }
         }
@@ -852,7 +852,7 @@ impl PaletteData {
             vec![]
         };
 
-        let db: Arc<LapceDb> = use_context().unwrap();
+        let db: Arc<AheadDb> = use_context().unwrap();
         let workspaces = db.recent_workspaces().unwrap_or_default();
         let mut hosts = HashSet::new();
         for distro in distros {
@@ -860,7 +860,7 @@ impl PaletteData {
         }
 
         for workspace in workspaces.iter() {
-            if let LapceWorkspaceType::RemoteWSL(host) = &workspace.kind {
+            if let AheadWorkspaceType::RemoteWSL(host) = &workspace.kind {
                 hosts.insert(host.host.clone());
             }
         }
@@ -1008,7 +1008,7 @@ impl PaletteData {
     }
 
     fn get_languages(&self) {
-        let langs = LapceLanguage::languages();
+        let langs = AheadLanguage::languages();
         let items = langs
             .iter()
             .map(|lang| PaletteItem {
@@ -1128,7 +1128,7 @@ impl PaletteData {
         if let Some(item) = items.get(index) {
             match &item.content {
                 PaletteItemContent::PaletteHelp { cmd } => {
-                    let cmd = LapceCommand {
+                    let cmd = AheadCommand {
                         kind: CommandKind::Workbench(cmd.clone()),
                         data: None,
                     };
@@ -1205,8 +1205,8 @@ impl PaletteData {
                 PaletteItemContent::SshHost { host } => {
                     self.common.window_common.window_command.send(
                         WindowCommand::SetWorkspace {
-                            workspace: LapceWorkspace {
-                                kind: LapceWorkspaceType::RemoteSSH(host.clone()),
+                            workspace: AheadWorkspace {
+                                kind: AheadWorkspaceType::RemoteSSH(host.clone()),
                                 path: None,
                                 last_open: 0,
                             },
@@ -1217,8 +1217,8 @@ impl PaletteData {
                 PaletteItemContent::WslHost { host } => {
                     self.common.window_common.window_command.send(
                         WindowCommand::SetWorkspace {
-                            workspace: LapceWorkspace {
-                                kind: LapceWorkspaceType::RemoteWSL(host.clone()),
+                            workspace: AheadWorkspace {
+                                kind: AheadWorkspaceType::RemoteWSL(host.clone()),
                                 path: None,
                                 last_open: 0,
                             },
@@ -1294,7 +1294,7 @@ impl PaletteData {
                     if name.is_empty() || name.to_lowercase().eq("plain text") {
                         doc.set_syntax(Syntax::plaintext())
                     } else {
-                        let lang = match LapceLanguage::from_name(name) {
+                        let lang = match AheadLanguage::from_name(name) {
                             Some(v) => v,
                             None => return,
                         };
@@ -1316,9 +1316,9 @@ impl PaletteData {
                 PaletteItemContent::SCMReference { name } => {
                     self.common
                         .lapce_command
-                        .send(crate::command::LapceCommand {
+                        .send(crate::command::AheadCommand {
                         kind: CommandKind::Workbench(
-                            crate::command::LapceWorkbenchCommand::CheckoutReference,
+                            crate::command::AheadWorkbenchCommand::CheckoutReference,
                         ),
                         data: Some(serde_json::json!(name.to_owned())),
                     });
@@ -1335,8 +1335,8 @@ impl PaletteData {
             let ssh = SshHost::from_string(&input);
             self.common.window_common.window_command.send(
                 WindowCommand::SetWorkspace {
-                    workspace: LapceWorkspace {
-                        kind: LapceWorkspaceType::RemoteSSH(ssh),
+                    workspace: AheadWorkspace {
+                        kind: AheadWorkspaceType::RemoteSSH(ssh),
                         path: None,
                         last_open: 0,
                     },
@@ -1674,7 +1674,7 @@ impl KeyPressFocus for PaletteData {
 
     fn run_command(
         &self,
-        command: &crate::command::LapceCommand,
+        command: &crate::command::AheadCommand,
         count: Option<usize>,
         mods: Modifiers,
     ) -> CommandExecuted {

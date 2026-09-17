@@ -19,8 +19,8 @@ use lapce_rpc::terminal::TermId;
 use super::kind::PanelKind;
 use crate::{
     app::clickable_icon,
-    command::{InternalCommand, LapceWorkbenchCommand},
-    config::{color::LapceColor, icon::LapceIcons},
+    command::{InternalCommand, AheadWorkbenchCommand},
+    config::{color::AheadColor, icon::AheadIcons},
     debug::RunDebugMode,
     listener::Listener,
     terminal::{
@@ -100,17 +100,17 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                             run_debug.as_ref().map(|r| (r.mode, r.stopped))
                         }) {
                             let svg = match (mode, stopped) {
-                                (RunDebugMode::Run, false) => LapceIcons::START,
-                                (RunDebugMode::Run, true) => LapceIcons::RUN_ERRORS,
-                                (RunDebugMode::Debug, false) => LapceIcons::DEBUG,
+                                (RunDebugMode::Run, false) => AheadIcons::START,
+                                (RunDebugMode::Run, true) => AheadIcons::RUN_ERRORS,
+                                (RunDebugMode::Debug, false) => AheadIcons::DEBUG,
                                 (RunDebugMode::Debug, true) => {
-                                    LapceIcons::DEBUG_DISCONNECT
+                                    AheadIcons::DEBUG_DISCONNECT
                                 }
                             };
                             return svg;
                         }
                     }
-                    LapceIcons::TERMINAL
+                    AheadIcons::TERMINAL
                 };
                 stack((
                     container({
@@ -122,7 +122,7 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                                         let size = config.ui.icon_size() as f32;
                                         s.size(size, size).color(
                                             config.color(
-                                                LapceColor::LAPCE_ICON_ACTIVE,
+                                                AheadColor::LAPCE_ICON_ACTIVE,
                                             ),
                                         )
                                     }),
@@ -136,7 +136,7 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                                     .selectable(false)
                             }),
                             clickable_icon(
-                                || LapceIcons::CLOSE,
+                                || AheadIcons::CLOSE,
                                 move || {
                                     terminal.close_tab(Some(terminal_tab_id));
                                 },
@@ -152,14 +152,14 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                                     .height(header_height.get() - 15.0)
                                     .border_right(1.0)
                                     .border_color(
-                                        config.get().color(LapceColor::LAPCE_BORDER),
+                                        config.get().color(AheadColor::LAPCE_BORDER),
                                     )
                                     .pointer_events_none()
                             }),
                         ))
                         .style(move |s| {
                             s.items_center().width(200.0).border_color(
-                                config.get().color(LapceColor::LAPCE_BORDER),
+                                config.get().color(AheadColor::LAPCE_BORDER),
                             )
                         })
                     })
@@ -176,9 +176,9 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
                                     if focus.get()
                                         == Focus::Panel(PanelKind::Terminal)
                                     {
-                                        LapceColor::LAPCE_TAB_ACTIVE_UNDERLINE
+                                        AheadColor::LAPCE_TAB_ACTIVE_UNDERLINE
                                     } else {
-                                        LapceColor::LAPCE_TAB_INACTIVE_UNDERLINE
+                                        AheadColor::LAPCE_TAB_INACTIVE_UNDERLINE
                                     },
                                 ))
                         })
@@ -224,9 +224,9 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
             s.size(size.width, size.height).pointer_events_none()
         }),
         container(clickable_icon(
-            || LapceIcons::ADD,
+            || AheadIcons::ADD,
             move || {
-                workbench_command.send(LapceWorkbenchCommand::NewTerminalTab);
+                workbench_command.send(AheadWorkbenchCommand::NewTerminalTab);
             },
             || false,
             || false,
@@ -261,7 +261,7 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
         s.width_pct(100.0)
             .items_center()
             .border_bottom(1.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .border_color(config.color(AheadColor::LAPCE_BORDER))
     })
 }
 
@@ -335,7 +335,7 @@ fn terminal_tab_split(
                     index.get() > 0,
                     |s| {
                         s.border_left(1.0).border_color(
-                            config.get().color(LapceColor::LAPCE_BORDER),
+                            config.get().color(AheadColor::LAPCE_BORDER),
                         )
                     },
                 )

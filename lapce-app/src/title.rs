@@ -16,20 +16,20 @@ use lapce_rpc::proxy::ProxyStatus;
 
 use crate::{
     app::{clickable_icon, not_clickable_icon, tooltip_label, window_menu},
-    command::{LapceCommand, LapceWorkbenchCommand, WindowCommand},
-    config::{LapceConfig, color::LapceColor, icon::LapceIcons},
+    command::{AheadCommand, AheadWorkbenchCommand, WindowCommand},
+    config::{AheadConfig, color::AheadColor, icon::AheadIcons},
     listener::Listener,
     main_split::MainSplitData,
     update::ReleaseInfo,
     window_tab::WindowTabData,
-    workspace::LapceWorkspace,
+    workspace::AheadWorkspace,
 };
 
 fn left(
-    workspace: Arc<LapceWorkspace>,
-    lapce_command: Listener<LapceCommand>,
-    workbench_command: Listener<LapceWorkbenchCommand>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    workspace: Arc<AheadWorkspace>,
+    lapce_command: Listener<AheadCommand>,
+    workbench_command: Listener<AheadWorkbenchCommand>,
+    config: ReadSignal<Arc<AheadConfig>>,
     proxy_status: RwSignal<Option<ProxyStatus>>,
     num_window_tabs: Memo<usize>,
 ) -> impl View {
@@ -44,16 +44,16 @@ fn left(
             };
             s.width(75.0).apply_if(should_hide, |s| s.hide())
         }),
-        container(svg(move || config.get().ui_svg(LapceIcons::LOGO)).style(
+        container(svg(move || config.get().ui_svg(AheadIcons::LOGO)).style(
             move |s| {
                 let config = config.get();
                 s.size(16.0, 16.0)
-                    .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                    .color(config.color(AheadColor::LAPCE_ICON_ACTIVE))
             },
         ))
         .style(move |s| s.margin_horiz(10.0).apply_if(is_macos, |s| s.hide())),
         not_clickable_icon(
-            || LapceIcons::MENU,
+            || AheadIcons::MENU,
             || false,
             || false,
             || "Menu",
@@ -67,16 +67,16 @@ fn left(
         }),
         tooltip_label(
             config,
-            container(svg(move || config.get().ui_svg(LapceIcons::REMOTE)).style(
+            container(svg(move || config.get().ui_svg(AheadIcons::REMOTE)).style(
                 move |s| {
                     let config = config.get();
                     let size = (config.ui.icon_size() as f32 + 2.0).min(30.0);
                     s.size(size, size).color(if is_local {
-                        config.color(LapceColor::LAPCE_ICON_ACTIVE)
+                        config.color(AheadColor::LAPCE_ICON_ACTIVE)
                     } else {
                         match proxy_status.get() {
                             Some(_) => Color::WHITE,
-                            None => config.color(LapceColor::LAPCE_ICON_ACTIVE),
+                            None => config.color(AheadColor::LAPCE_ICON_ACTIVE),
                         }
                     })
                 },
@@ -87,7 +87,7 @@ fn left(
             #[allow(unused_mut)]
             let mut menu = Menu::new("").entry(
                 MenuItem::new("Connect to SSH Host").action(move || {
-                    workbench_command.send(LapceWorkbenchCommand::ConnectSshHost);
+                    workbench_command.send(AheadWorkbenchCommand::ConnectSshHost);
                 }),
             );
             if !is_local
@@ -98,7 +98,7 @@ fn left(
                 menu = menu.entry(MenuItem::new("Disconnect remote").action(
                     move || {
                         workbench_command
-                            .send(LapceWorkbenchCommand::DisconnectRemote);
+                            .send(AheadWorkbenchCommand::DisconnectRemote);
                     },
                 ));
             }
@@ -107,7 +107,7 @@ fn left(
                 menu = menu.entry(MenuItem::new("Connect to WSL Host").action(
                     move || {
                         workbench_command
-                            .send(LapceWorkbenchCommand::ConnectWslHost);
+                            .send(AheadWorkbenchCommand::ConnectWslHost);
                     },
                 ));
             }
@@ -120,13 +120,13 @@ fn left(
             } else {
                 match proxy_status.get() {
                     Some(ProxyStatus::Connected) => {
-                        config.color(LapceColor::LAPCE_REMOTE_CONNECTED)
+                        config.color(AheadColor::LAPCE_REMOTE_CONNECTED)
                     }
                     Some(ProxyStatus::Connecting) => {
-                        config.color(LapceColor::LAPCE_REMOTE_CONNECTING)
+                        config.color(AheadColor::LAPCE_REMOTE_CONNECTING)
                     }
                     Some(ProxyStatus::Disconnected) => {
-                        config.color(LapceColor::LAPCE_REMOTE_DISCONNECTED)
+                        config.color(AheadColor::LAPCE_REMOTE_DISCONNECTED)
                     }
                     None => Color::TRANSPARENT,
                 }
@@ -137,12 +137,12 @@ fn left(
                 .background(color)
                 .hover(|s| {
                     s.cursor(CursorStyle::Pointer).background(
-                        config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                        config.color(AheadColor::PANEL_HOVERED_BACKGROUND),
                     )
                 })
                 .active(|s| {
                     s.cursor(CursorStyle::Pointer).background(
-                        config.color(LapceColor::PANEL_HOVERED_ACTIVE_BACKGROUND),
+                        config.color(AheadColor::PANEL_HOVERED_ACTIVE_BACKGROUND),
                     )
                 })
         }),
@@ -159,10 +159,10 @@ fn left(
 }
 
 fn middle(
-    workspace: Arc<LapceWorkspace>,
+    workspace: Arc<AheadWorkspace>,
     main_split: MainSplitData,
-    workbench_command: Listener<LapceWorkbenchCommand>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    workbench_command: Listener<AheadWorkbenchCommand>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let local_workspace = workspace.clone();
     let can_jump_backward = {
@@ -174,9 +174,9 @@ fn middle(
 
     let jump_backward = move || {
         clickable_icon(
-            || LapceIcons::LOCATION_BACKWARD,
+            || AheadIcons::LOCATION_BACKWARD,
             move || {
-                workbench_command.send(LapceWorkbenchCommand::JumpLocationBackward);
+                workbench_command.send(AheadWorkbenchCommand::JumpLocationBackward);
             },
             || false,
             move || !can_jump_backward.get(),
@@ -187,9 +187,9 @@ fn middle(
     };
     let jump_forward = move || {
         clickable_icon(
-            || LapceIcons::LOCATION_FORWARD,
+            || AheadIcons::LOCATION_FORWARD,
             move || {
-                workbench_command.send(LapceWorkbenchCommand::JumpLocationForward);
+                workbench_command.send(AheadWorkbenchCommand::JumpLocationForward);
             },
             || false,
             move || !can_jump_forward.get(),
@@ -201,7 +201,7 @@ fn middle(
 
     let open_folder = move || {
         not_clickable_icon(
-            || LapceIcons::PALETTE_MENU,
+            || AheadIcons::PALETTE_MENU,
             || false,
             || false,
             || "Open Folder / Recent Workspace",
@@ -210,10 +210,10 @@ fn middle(
         .popout_menu(move || {
             Menu::new("")
                 .entry(MenuItem::new("Open Folder").action(move || {
-                    workbench_command.send(LapceWorkbenchCommand::OpenFolder);
+                    workbench_command.send(AheadWorkbenchCommand::OpenFolder);
                 }))
                 .entry(MenuItem::new("Open Recent Workspace").action(move || {
-                    workbench_command.send(LapceWorkbenchCommand::PaletteWorkspace);
+                    workbench_command.send(AheadWorkbenchCommand::PaletteWorkspace);
                 }))
         })
     };
@@ -232,12 +232,12 @@ fn middle(
         }),
         container(
             stack((
-                svg(move || config.get().ui_svg(LapceIcons::SEARCH)).style(
+                svg(move || config.get().ui_svg(AheadIcons::SEARCH)).style(
                     move |s| {
                         let config = config.get();
                         let icon_size = config.ui.icon_size() as f32;
                         s.size(icon_size, icon_size)
-                            .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                            .color(config.color(AheadColor::LAPCE_ICON_ACTIVE))
                     },
                 ),
                 label(move || {
@@ -255,9 +255,9 @@ fn middle(
         .on_event_stop(EventListener::PointerDown, |_| {})
         .on_click_stop(move |_| {
             if workspace.clone().path.is_some() {
-                workbench_command.send(LapceWorkbenchCommand::PaletteHelpAndFile);
+                workbench_command.send(AheadWorkbenchCommand::PaletteHelpAndFile);
             } else {
-                workbench_command.send(LapceWorkbenchCommand::PaletteWorkspace);
+                workbench_command.send(AheadWorkbenchCommand::PaletteWorkspace);
             }
         })
         .style(move |s| {
@@ -270,15 +270,15 @@ fn middle(
                 .justify_content(Some(JustifyContent::Center))
                 .align_items(Some(AlignItems::Center))
                 .border(1.0)
-                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .border_color(config.color(AheadColor::LAPCE_BORDER))
                 .border_radius(6.0)
-                .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                .background(config.color(AheadColor::EDITOR_BACKGROUND))
         }),
         stack((
             clickable_icon(
-                || LapceIcons::START,
+                || AheadIcons::START,
                 move || {
-                    workbench_command.send(LapceWorkbenchCommand::PaletteRunAndDebug)
+                    workbench_command.send(AheadWorkbenchCommand::PaletteRunAndDebug)
                 },
                 || false,
                 || false,
@@ -306,12 +306,12 @@ fn middle(
 
 fn right(
     window_command: Listener<WindowCommand>,
-    workbench_command: Listener<LapceWorkbenchCommand>,
+    workbench_command: Listener<AheadWorkbenchCommand>,
     latest_release: ReadSignal<Arc<Option<ReleaseInfo>>>,
     update_in_progress: RwSignal<bool>,
     num_window_tabs: Memo<usize>,
     window_maximized: RwSignal<bool>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let latest_version = create_memo(move |_| {
         let latest_release = latest_release.get();
@@ -333,7 +333,7 @@ fn right(
             .style(|s| s.height_pct(100.0).flex_basis(0.0).flex_grow(1.0)),
         stack((
             not_clickable_icon(
-                || LapceIcons::SETTINGS,
+                || AheadIcons::SETTINGS,
                 || false,
                 || false,
                 || "Settings",
@@ -342,22 +342,22 @@ fn right(
             .popout_menu(move || {
                 Menu::new("")
                     .entry(MenuItem::new("Command Palette").action(move || {
-                        workbench_command.send(LapceWorkbenchCommand::PaletteCommand)
+                        workbench_command.send(AheadWorkbenchCommand::PaletteCommand)
                     }))
                     .separator()
                     .entry(MenuItem::new("Open Settings").action(move || {
-                        workbench_command.send(LapceWorkbenchCommand::OpenSettings)
+                        workbench_command.send(AheadWorkbenchCommand::OpenSettings)
                     }))
                     .entry(MenuItem::new("Open Keyboard Shortcuts").action(
                         move || {
                             workbench_command
-                                .send(LapceWorkbenchCommand::OpenKeyboardShortcuts)
+                                .send(AheadWorkbenchCommand::OpenKeyboardShortcuts)
                         },
                     ))
                     .entry(MenuItem::new("Open Theme Color Settings").action(
                         move || {
                             workbench_command
-                                .send(LapceWorkbenchCommand::OpenThemeColorSettings)
+                                .send(AheadWorkbenchCommand::OpenThemeColorSettings)
                         },
                     ))
                     .separator()
@@ -369,7 +369,7 @@ fn right(
                             MenuItem::new(format!("Restart to update ({v})")).action(
                                 move || {
                                     workbench_command
-                                        .send(LapceWorkbenchCommand::RestartToUpdate)
+                                        .send(AheadWorkbenchCommand::RestartToUpdate)
                                 },
                             )
                         }
@@ -378,17 +378,17 @@ fn right(
                     })
                     .separator()
                     .entry(MenuItem::new("About AHEAD").action(move || {
-                        workbench_command.send(LapceWorkbenchCommand::ShowAbout)
+                        workbench_command.send(AheadWorkbenchCommand::ShowAbout)
                     }))
             }),
             container(label(|| "1".to_string()).style(move |s| {
                 let config = config.get();
                 s.font_size(10.0)
-                    .color(config.color(LapceColor::EDITOR_BACKGROUND))
+                    .color(config.color(AheadColor::EDITOR_BACKGROUND))
                     .border_radius(100.0)
                     .margin_left(5.0)
                     .margin_top(10.0)
-                    .background(config.color(LapceColor::EDITOR_CARET))
+                    .background(config.color(AheadColor::EDITOR_CARET))
             }))
             .style(move |s| {
                 let has_update = has_update();
@@ -465,9 +465,9 @@ pub fn title(window_tab_data: Rc<WindowTabData>) -> impl View {
         s.width_pct(100.0)
             .height(37.0)
             .items_center()
-            .background(config.color(LapceColor::PANEL_BACKGROUND))
+            .background(config.color(AheadColor::PANEL_BACKGROUND))
             .border_bottom(1.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .border_color(config.color(AheadColor::LAPCE_BORDER))
     })
     .debug_name("Title / Top Bar")
 }
@@ -477,11 +477,11 @@ pub fn window_controls_view(
     is_title: bool,
     num_window_tabs: Memo<usize>,
     window_maximized: RwSignal<bool>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     stack((
         clickable_icon(
-            || LapceIcons::WINDOW_MINIMIZE,
+            || AheadIcons::WINDOW_MINIMIZE,
             || {
                 floem::action::minimize_window();
             },
@@ -494,9 +494,9 @@ pub fn window_controls_view(
         clickable_icon(
             move || {
                 if window_maximized.get() {
-                    LapceIcons::WINDOW_RESTORE
+                    AheadIcons::WINDOW_RESTORE
                 } else {
-                    LapceIcons::WINDOW_MAXIMIZE
+                    AheadIcons::WINDOW_MAXIMIZE
                 }
             },
             move || {
@@ -511,7 +511,7 @@ pub fn window_controls_view(
         )
         .style(|s| s.margin_right(16.0)),
         clickable_icon(
-            || LapceIcons::WINDOW_CLOSE,
+            || AheadIcons::WINDOW_CLOSE,
             move || {
                 window_command.send(WindowCommand::CloseWindow);
             },

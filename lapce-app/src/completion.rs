@@ -15,7 +15,7 @@ use lsp_types::{
 };
 use nucleo::Utf32Str;
 
-use crate::{config::LapceConfig, editor::EditorData, snippet::Snippet};
+use crate::{config::AheadConfig, editor::EditorData, snippet::Snippet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CompletionStatus {
@@ -63,11 +63,11 @@ pub struct CompletionData {
     pub latest_editor_id: Option<EditorId>,
     /// Matcher for filtering the completion items
     matcher: RwSignal<nucleo::Matcher>,
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
 }
 
 impl CompletionData {
-    pub fn new(cx: Scope, config: ReadSignal<Arc<LapceConfig>>) -> Self {
+    pub fn new(cx: Scope, config: ReadSignal<Arc<AheadConfig>>) -> Self {
         let active = cx.create_rw_signal(0);
         Self {
             status: CompletionStatus::Inactive,

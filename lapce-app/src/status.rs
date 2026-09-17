@@ -18,8 +18,8 @@ use lsp_types::{DiagnosticSeverity, ProgressToken};
 
 use crate::{
     app::clickable_icon,
-    command::LapceWorkbenchCommand,
-    config::{LapceConfig, color::LapceColor, icon::LapceIcons},
+    command::AheadWorkbenchCommand,
+    config::{AheadConfig, color::AheadColor, icon::AheadIcons},
     editor::EditorData,
     listener::Listener,
     palette::kind::PaletteKind,
@@ -31,9 +31,9 @@ use crate::{
 pub fn status(
     window_tab_data: Rc<WindowTabData>,
     source_control: SourceControlData,
-    workbench_command: Listener<LapceWorkbenchCommand>,
+    workbench_command: Listener<AheadWorkbenchCommand>,
     status_height: RwSignal<f64>,
-    _config: ReadSignal<Arc<LapceConfig>>,
+    _config: ReadSignal<Arc<AheadConfig>>,
 ) -> impl View {
     let config = window_tab_data.common.config;
     let diagnostics = window_tab_data.main_split.diagnostics;
@@ -98,20 +98,20 @@ pub fn status(
 
                 let (bg, fg) = match mode.get() {
                     Mode::Normal => (
-                        LapceColor::STATUS_MODAL_NORMAL_BACKGROUND,
-                        LapceColor::STATUS_MODAL_NORMAL_FOREGROUND,
+                        AheadColor::STATUS_MODAL_NORMAL_BACKGROUND,
+                        AheadColor::STATUS_MODAL_NORMAL_FOREGROUND,
                     ),
                     Mode::Insert => (
-                        LapceColor::STATUS_MODAL_INSERT_BACKGROUND,
-                        LapceColor::STATUS_MODAL_INSERT_FOREGROUND,
+                        AheadColor::STATUS_MODAL_INSERT_BACKGROUND,
+                        AheadColor::STATUS_MODAL_INSERT_FOREGROUND,
                     ),
                     Mode::Visual(_) => (
-                        LapceColor::STATUS_MODAL_VISUAL_BACKGROUND,
-                        LapceColor::STATUS_MODAL_VISUAL_FOREGROUND,
+                        AheadColor::STATUS_MODAL_VISUAL_BACKGROUND,
+                        AheadColor::STATUS_MODAL_VISUAL_FOREGROUND,
                     ),
                     Mode::Terminal => (
-                        LapceColor::STATUS_MODAL_TERMINAL_BACKGROUND,
-                        LapceColor::STATUS_MODAL_TERMINAL_FOREGROUND,
+                        AheadColor::STATUS_MODAL_TERMINAL_BACKGROUND,
+                        AheadColor::STATUS_MODAL_TERMINAL_FOREGROUND,
                     ),
                 };
 
@@ -128,15 +128,15 @@ pub fn status(
             }),
             crate::ahead::ahead_status_item(ahead_state, config, window_tab_data.clone()),
             stack((
-                svg(move || config.get().ui_svg(LapceIcons::SCM)).style(move |s| {
+                svg(move || config.get().ui_svg(AheadIcons::SCM)).style(move |s| {
                     let config = config.get();
                     let icon_size = config.ui.icon_size() as f32;
                     s.size(icon_size, icon_size)
-                        .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                        .color(config.color(AheadColor::LAPCE_ICON_ACTIVE))
                 }),
                 label(branch).style(move |s| {
                     s.margin_left(10.0)
-                        .color(config.get().color(LapceColor::STATUS_FOREGROUND))
+                        .color(config.get().color(AheadColor::STATUS_FOREGROUND))
                         .selectable(false)
                 }),
             ))
@@ -151,7 +151,7 @@ pub fn status(
                 .align_items(Some(AlignItems::Center))
                 .hover(|s| {
                     s.cursor(CursorStyle::Pointer).background(
-                        config.get().color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                        config.get().color(AheadColor::PANEL_HOVERED_BACKGROUND),
                     )
                 })
             })
@@ -163,7 +163,7 @@ pub fn status(
                 move |_| {
                     if pointer_down.get() {
                         workbench_command
-                            .send(LapceWorkbenchCommand::PaletteSCMReferences);
+                            .send(AheadWorkbenchCommand::PaletteSCMReferences);
                     }
                     pointer_down.set(false);
                     EventPropagation::Continue
@@ -172,12 +172,12 @@ pub fn status(
             {
                 let panel = panel.clone();
                 stack((
-                    svg(move || config.get().ui_svg(LapceIcons::ERROR)).style(
+                    svg(move || config.get().ui_svg(AheadIcons::ERROR)).style(
                         move |s| {
                             let config = config.get();
                             let size = config.ui.icon_size() as f32;
                             s.size(size, size)
-                                .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                                .color(config.color(AheadColor::LAPCE_ICON_ACTIVE))
                         },
                     ),
                     label(move || diagnostic_count.get().0.to_string()).style(
@@ -186,18 +186,18 @@ pub fn status(
                                 .color(
                                     config
                                         .get()
-                                        .color(LapceColor::STATUS_FOREGROUND),
+                                        .color(AheadColor::STATUS_FOREGROUND),
                                 )
                                 .selectable(false)
                         },
                     ),
-                    svg(move || config.get().ui_svg(LapceIcons::WARNING)).style(
+                    svg(move || config.get().ui_svg(AheadIcons::WARNING)).style(
                         move |s| {
                             let config = config.get();
                             let size = config.ui.icon_size() as f32;
                             s.size(size, size)
                                 .margin_left(5.0)
-                                .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                                .color(config.color(AheadColor::LAPCE_ICON_ACTIVE))
                         },
                     ),
                     label(move || diagnostic_count.get().1.to_string()).style(
@@ -206,7 +206,7 @@ pub fn status(
                                 .color(
                                     config
                                         .get()
-                                        .color(LapceColor::STATUS_FOREGROUND),
+                                        .color(AheadColor::STATUS_FOREGROUND),
                                 )
                                 .selectable(false)
                         },
@@ -223,7 +223,7 @@ pub fn status(
                             s.cursor(CursorStyle::Pointer).background(
                                 config
                                     .get()
-                                    .color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                                    .color(AheadColor::PANEL_HOVERED_BACKGROUND),
                             )
                         })
                 })
@@ -246,9 +246,9 @@ pub fn status(
                         if panel
                             .is_container_shown(&PanelContainerPosition::Left, true)
                         {
-                            LapceIcons::SIDEBAR_LEFT
+                            AheadIcons::SIDEBAR_LEFT
                         } else {
-                            LapceIcons::SIDEBAR_LEFT_OFF
+                            AheadIcons::SIDEBAR_LEFT_OFF
                         }
                     }
                 };
@@ -272,9 +272,9 @@ pub fn status(
                             &PanelContainerPosition::Bottom,
                             true,
                         ) {
-                            LapceIcons::LAYOUT_PANEL
+                            AheadIcons::LAYOUT_PANEL
                         } else {
-                            LapceIcons::LAYOUT_PANEL_OFF
+                            AheadIcons::LAYOUT_PANEL_OFF
                         }
                     }
                 };
@@ -298,9 +298,9 @@ pub fn status(
                         if panel
                             .is_container_shown(&PanelContainerPosition::Right, true)
                         {
-                            LapceIcons::SIDEBAR_RIGHT
+                            AheadIcons::SIDEBAR_RIGHT
                         } else {
-                            LapceIcons::SIDEBAR_RIGHT_OFF
+                            AheadIcons::SIDEBAR_RIGHT_OFF
                         }
                     }
                 };
@@ -319,7 +319,7 @@ pub fn status(
         .style(move |s| {
             s.height_pct(100.0)
                 .items_center()
-                .color(config.get().color(LapceColor::STATUS_FOREGROUND))
+                .color(config.get().color(AheadColor::STATUS_FOREGROUND))
         }),
         stack({
             let palette_clone = palette.clone();
@@ -401,8 +401,8 @@ pub fn status(
     .style(move |s| {
         let config = config.get();
         s.border_top(1.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
-            .background(config.color(LapceColor::STATUS_BACKGROUND))
+            .border_color(config.color(AheadColor::LAPCE_BORDER))
+            .background(config.color(AheadColor::STATUS_BACKGROUND))
             .flex_basis(config.ui.status_height() as f32)
             .flex_grow(0.0)
             .flex_shrink(0.0)
@@ -412,7 +412,7 @@ pub fn status(
 }
 
 fn progress_view(
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
     progresses: RwSignal<IndexMap<ProgressToken, WorkProgress>>,
 ) -> impl View {
     let id = AtomicU64::new(0);
@@ -433,7 +433,7 @@ fn progress_view(
                     .text_ellipsis()
                     .selectable(false)
                     .items_center()
-                    .color(config.get().color(LapceColor::STATUS_FOREGROUND))
+                    .color(config.get().color(AheadColor::STATUS_FOREGROUND))
             })
         },
     )
@@ -441,7 +441,7 @@ fn progress_view(
 }
 
 fn status_text<S: std::fmt::Display + 'static>(
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
     editor: Memo<Option<EditorData>>,
     text: impl Fn() -> S + 'static,
 ) -> impl View {
@@ -466,10 +466,10 @@ fn status_text<S: std::fmt::Display + 'static>(
             .height_full()
             .padding_horiz(10.0)
             .items_center()
-            .color(config.color(LapceColor::STATUS_FOREGROUND))
+            .color(config.color(AheadColor::STATUS_FOREGROUND))
             .hover(|s| {
                 s.cursor(CursorStyle::Pointer)
-                    .background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+                    .background(config.color(AheadColor::PANEL_HOVERED_BACKGROUND))
             })
             .selectable(false)
     })

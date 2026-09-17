@@ -39,7 +39,7 @@ use self::{
 };
 use crate::{
     buffer::{Buffer, rope_text::RopeText},
-    language::{self, LapceLanguage},
+    language::{self, AheadLanguage},
     lens::{Lens, LensBuilder},
     style::SCOPES,
     syntax::highlight::InjectionLanguageMarker,
@@ -513,12 +513,12 @@ impl SyntaxLayers {
         let injection_callback = |language: &InjectionLanguageMarker| {
             let language = match language {
                 InjectionLanguageMarker::Name(name) => {
-                    LapceLanguage::from_name(name)
+                    AheadLanguage::from_name(name)
                 }
                 InjectionLanguageMarker::Filename(path) => {
-                    LapceLanguage::from_path_raw(path)
+                    AheadLanguage::from_path_raw(path)
                 }
-                InjectionLanguageMarker::Shebang(id) => LapceLanguage::from_name(id),
+                InjectionLanguageMarker::Shebang(id) => AheadLanguage::from_name(id),
             };
             language
                 .map(get_highlight_config)
@@ -898,7 +898,7 @@ impl SyntaxLayers {
 #[derive(Clone)]
 pub struct Syntax {
     pub rev: u64,
-    pub language: LapceLanguage,
+    pub language: AheadLanguage,
     pub text: Rope,
     pub layers: Option<SyntaxLayers>,
     pub lens: Lens,
@@ -925,15 +925,15 @@ impl std::fmt::Debug for Syntax {
 
 impl Syntax {
     pub fn init(path: &Path) -> Syntax {
-        let language = LapceLanguage::from_path(path);
+        let language = AheadLanguage::from_path(path);
         Syntax::from_language(language)
     }
 
     pub fn plaintext() -> Syntax {
-        Self::from_language(LapceLanguage::PlainText)
+        Self::from_language(AheadLanguage::PlainText)
     }
 
-    pub fn from_language(language: LapceLanguage) -> Syntax {
+    pub fn from_language(language: AheadLanguage) -> Syntax {
         let highlight = get_highlight_config(language).ok();
         Syntax {
             rev: 0,
@@ -1204,7 +1204,7 @@ impl Syntax {
     }
 
     pub fn find_enclosing_pair(&self, offset: usize) -> Option<(usize, usize)> {
-        if self.language == LapceLanguage::Markdown {
+        if self.language == AheadLanguage::Markdown {
             // TODO: fix the issue that sometimes node.prev_sibling can stuck for markdown
             return None;
         }

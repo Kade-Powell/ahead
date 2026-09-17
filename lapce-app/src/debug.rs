@@ -61,13 +61,13 @@ pub struct RunDebugConfigs {
 pub struct RunDebugData {
     pub active_term: RwSignal<Option<TermId>>,
     pub daps: RwSignal<im::HashMap<DapId, DapData>>,
-    pub breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, LapceBreakpoint>>>,
+    pub breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, AheadBreakpoint>>>,
 }
 
 impl RunDebugData {
     pub fn new(
         cx: Scope,
-        breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, LapceBreakpoint>>>,
+        breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, AheadBreakpoint>>>,
     ) -> Self {
         let active_term: RwSignal<Option<TermId>> = cx.create_rw_signal(None);
         let daps: RwSignal<im::HashMap<DapId, DapData>> =
@@ -117,7 +117,7 @@ pub struct StackTraceData {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct LapceBreakpoint {
+pub struct AheadBreakpoint {
     pub id: Option<usize>,
     pub verified: bool,
     pub message: Option<String>,

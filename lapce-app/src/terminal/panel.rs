@@ -24,7 +24,7 @@ use crate::{
     main_split::MainSplitData,
     panel::kind::PanelKind,
     window_tab::{CommonData, Focus},
-    workspace::LapceWorkspace,
+    workspace::AheadWorkspace,
 };
 
 pub struct TerminalTabInfo {
@@ -35,7 +35,7 @@ pub struct TerminalTabInfo {
 #[derive(Clone)]
 pub struct TerminalPanelData {
     pub cx: Scope,
-    pub workspace: Arc<LapceWorkspace>,
+    pub workspace: Arc<AheadWorkspace>,
     pub tab_info: RwSignal<TerminalTabInfo>,
     pub debug: RunDebugData,
     pub breakline: Memo<Option<(usize, PathBuf)>>,
@@ -45,7 +45,7 @@ pub struct TerminalPanelData {
 
 impl TerminalPanelData {
     pub fn new(
-        workspace: Arc<LapceWorkspace>,
+        workspace: Arc<AheadWorkspace>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,
         main_split: MainSplitData,

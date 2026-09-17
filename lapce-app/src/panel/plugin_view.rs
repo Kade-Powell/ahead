@@ -25,7 +25,7 @@ use super::{
 use crate::{
     app::not_clickable_icon,
     command::InternalCommand,
-    config::{color::LapceColor, icon::LapceIcons},
+    config::{color::AheadColor, icon::AheadIcons},
     plugin::{AvailableVoltData, InstalledVoltData, PluginData, VoltIcon},
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
@@ -159,7 +159,7 @@ fn installed_view(plugin: PluginData) -> impl View {
                             .min_width(0.0)
                     }),
                     not_clickable_icon(
-                        || LapceIcons::SETTINGS,
+                        || AheadIcons::SETTINGS,
                         || false,
                         || false,
                         || "Options",
@@ -186,7 +186,7 @@ fn installed_view(plugin: PluginData) -> impl View {
                 .cursor(CursorStyle::Pointer)
                 .hover(|s| {
                     s.background(
-                        config.get().color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                        config.get().color(AheadColor::PANEL_HOVERED_BACKGROUND),
                     )
                 })
         })
@@ -241,9 +241,9 @@ fn available_view(plugin: PluginData, core_rpc: CoreRpcHandler) -> impl View {
             })
             .style(move |s| {
                 let config = config.get();
-                s.color(config.color(LapceColor::LAPCE_BUTTON_PRIMARY_FOREGROUND))
+                s.color(config.color(AheadColor::LAPCE_BUTTON_PRIMARY_FOREGROUND))
                     .background(
-                        config.color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND),
+                        config.color(AheadColor::LAPCE_BUTTON_PRIMARY_BACKGROUND),
                     )
                     .margin_left(6.0)
                     .padding_horiz(6.0)
@@ -251,18 +251,18 @@ fn available_view(plugin: PluginData, core_rpc: CoreRpcHandler) -> impl View {
                     .hover(|s| {
                         s.cursor(CursorStyle::Pointer).background(
                             config
-                                .color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND)
+                                .color(AheadColor::LAPCE_BUTTON_PRIMARY_BACKGROUND)
                                 .multiply_alpha(0.8),
                         )
                     })
                     .active(|s| {
                         s.background(
                             config
-                                .color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND)
+                                .color(AheadColor::LAPCE_BUTTON_PRIMARY_BACKGROUND)
                                 .multiply_alpha(0.6),
                         )
                     })
-                    .disabled(|s| s.background(config.color(LapceColor::EDITOR_DIM)))
+                    .disabled(|s| s.background(config.color(AheadColor::EDITOR_DIM)))
             })
         };
 
@@ -327,7 +327,7 @@ fn available_view(plugin: PluginData, core_rpc: CoreRpcHandler) -> impl View {
                 .cursor(CursorStyle::Pointer)
                 .hover(|s| {
                     s.background(
-                        config.get().color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                        config.get().color(AheadColor::PANEL_HOVERED_BACKGROUND),
                     )
                 })
         })
@@ -368,10 +368,10 @@ fn available_view(plugin: PluginData, core_rpc: CoreRpcHandler) -> impl View {
                 s.width_pct(100.0)
                     .cursor(CursorStyle::Text)
                     .items_center()
-                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                    .background(config.color(AheadColor::EDITOR_BACKGROUND))
                     .border(1.0)
                     .border_radius(6.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .border_color(config.color(AheadColor::LAPCE_BORDER))
             })
         })
         .style(|s| s.padding(10.0).width_pct(100.0)),

@@ -19,7 +19,7 @@ use lapce_rpc::plugin::VoltID;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{LapceConfig, color::LapceColor, icon::LapceIcons},
+    config::{AheadConfig, color::AheadColor, icon::AheadIcons},
     doc::{Doc, DocContent},
     editor::{
         EditorData, EditorInfo,
@@ -203,7 +203,7 @@ impl EditorTabChild {
         editors: Editors,
         diff_editors: RwSignal<im::HashMap<DiffEditorId, DiffEditorData>>,
         plugin: PluginData,
-        config: ReadSignal<Arc<LapceConfig>>,
+        config: ReadSignal<Arc<AheadConfig>>,
     ) -> Memo<EditorTabChildViewInfo> {
         match self.clone() {
             EditorTabChild::Editor(editor_id) => create_memo(move |_| {
@@ -244,8 +244,8 @@ impl EditorTabChild {
                         )
                     }
                     None => (
-                        config.ui_svg(LapceIcons::FILE),
-                        Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                        config.ui_svg(AheadIcons::FILE),
+                        Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                         "local".to_string(),
                         create_rw_signal(true),
                         true,
@@ -326,8 +326,8 @@ impl EditorTabChild {
                         )
                     }
                     [None, None] => (
-                        config.ui_svg(LapceIcons::FILE),
-                        Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                        config.ui_svg(AheadIcons::FILE),
+                        Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                         "local".to_string(),
                         true,
                     ),
@@ -344,8 +344,8 @@ impl EditorTabChild {
             EditorTabChild::Settings(_) => create_memo(move |_| {
                 let config = config.get();
                 EditorTabChildViewInfo {
-                    icon: config.ui_svg(LapceIcons::SETTINGS),
-                    color: Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                    icon: config.ui_svg(AheadIcons::SETTINGS),
+                    color: Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                     name: "Settings".to_string(),
                     path: None,
                     confirmed: None,
@@ -355,8 +355,8 @@ impl EditorTabChild {
             EditorTabChild::ThemeColorSettings(_) => create_memo(move |_| {
                 let config = config.get();
                 EditorTabChildViewInfo {
-                    icon: config.ui_svg(LapceIcons::SYMBOL_COLOR),
-                    color: Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                    icon: config.ui_svg(AheadIcons::SYMBOL_COLOR),
+                    color: Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                     name: "Theme Colors".to_string(),
                     path: None,
                     confirmed: None,
@@ -366,8 +366,8 @@ impl EditorTabChild {
             EditorTabChild::Keymap(_) => create_memo(move |_| {
                 let config = config.get();
                 EditorTabChildViewInfo {
-                    icon: config.ui_svg(LapceIcons::KEYBOARD),
-                    color: Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                    icon: config.ui_svg(AheadIcons::KEYBOARD),
+                    color: Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                     name: "Keyboard Shortcuts".to_string(),
                     path: None,
                     confirmed: None,
@@ -390,8 +390,8 @@ impl EditorTabChild {
                     })
                     .unwrap_or_else(|| id.name.clone());
                 EditorTabChildViewInfo {
-                    icon: config.ui_svg(LapceIcons::EXTENSIONS),
-                    color: Some(config.color(LapceColor::LAPCE_ICON_ACTIVE)),
+                    icon: config.ui_svg(AheadIcons::EXTENSIONS),
+                    color: Some(config.color(AheadColor::LAPCE_ICON_ACTIVE)),
                     name: display_name,
                     path: None,
                     confirmed: None,

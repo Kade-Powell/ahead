@@ -45,7 +45,7 @@ use lapce_core::{
     cursor::{Cursor, CursorAffinity},
     editor::{Action, EditConf, EditType},
     indent::IndentStyle,
-    language::LapceLanguage,
+    language::AheadLanguage,
     line_ending::LineEnding,
     mode::MotionMode,
     register::Register,
@@ -73,8 +73,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::{
-    command::{CommandKind, LapceCommand},
-    config::{LapceConfig, color::LapceColor},
+    command::{CommandKind, AheadCommand},
+    config::{AheadConfig, color::AheadColor},
     editor::{EditorData, compute_screen_lines, gutter::FoldingRanges},
     find::{Find, FindProgress, FindResult},
     history::DocumentHistory,
@@ -85,7 +85,7 @@ use crate::{
         kind::PanelKind,
     },
     window_tab::{CommonData, Focus},
-    workspace::LapceWorkspace,
+    workspace::AheadWorkspace,
 };
 
 #[derive(Clone, Debug)]
@@ -149,7 +149,7 @@ impl DocContent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocInfo {
-    pub workspace: LapceWorkspace,
+    pub workspace: AheadWorkspace,
     pub path: PathBuf,
     pub scroll_offset: (f64, f64),
     pub cursor_offset: usize,
@@ -425,7 +425,7 @@ impl Doc {
     }
 
     /// Set the syntax highlighting this document should use.
-    pub fn set_language(&self, language: LapceLanguage) {
+    pub fn set_language(&self, language: AheadLanguage) {
         self.syntax.set(Syntax::from_language(language));
     }
 
@@ -498,7 +498,7 @@ impl Doc {
         &self,
         cursor: &mut Cursor,
         s: &str,
-        config: &LapceConfig,
+        config: &AheadConfig,
     ) -> Vec<(Rope, RopeDelta, InvalLines)> {
         if self.content.with_untracked(|c| c.read_only()) {
             return Vec::new();
@@ -1590,7 +1590,7 @@ impl Document for Doc {
         };
 
         let cmd = CommandKind::from(cmd.clone());
-        let cmd = LapceCommand {
+        let cmd = AheadCommand {
             kind: cmd,
             data: None,
         };
@@ -1697,10 +1697,10 @@ impl DocumentPhantom for Doc {
                     col,
                     text,
                     affinity,
-                    fg: Some(config.color(LapceColor::INLAY_HINT_FOREGROUND)),
+                    fg: Some(config.color(AheadColor::INLAY_HINT_FOREGROUND)),
                     // font_family: Some(config.editor.inlay_hint_font_family()),
                     font_size: Some(config.editor.inlay_hint_font_size()),
-                    bg: Some(config.color(LapceColor::INLAY_HINT_BACKGROUND)),
+                    bg: Some(config.color(AheadColor::INLAY_HINT_BACKGROUND)),
                     under_line: None,
                 }
             });
@@ -1736,14 +1736,14 @@ impl DocumentPhantom for Doc {
                                         let theme_prop = if severity
                                             == DiagnosticSeverity::ERROR
                                         {
-                                            LapceColor::ERROR_LENS_ERROR_FOREGROUND
+                                            AheadColor::ERROR_LENS_ERROR_FOREGROUND
                                         } else if severity
                                             == DiagnosticSeverity::WARNING
                                         {
-                                            LapceColor::ERROR_LENS_WARNING_FOREGROUND
+                                            AheadColor::ERROR_LENS_WARNING_FOREGROUND
                                         } else {
                                             // information + hint (if we keep that) + things without a severity
-                                            LapceColor::ERROR_LENS_OTHER_FOREGROUND
+                                            AheadColor::ERROR_LENS_OTHER_FOREGROUND
                                         };
 
                                         config.color(theme_prop)
@@ -1796,7 +1796,7 @@ impl DocumentPhantom for Doc {
                 kind: PhantomTextKind::Completion,
                 col: completion_col,
                 text: completion.clone(),
-                fg: Some(config.color(LapceColor::COMPLETION_LENS_FOREGROUND)),
+                fg: Some(config.color(AheadColor::COMPLETION_LENS_FOREGROUND)),
                 font_size: Some(config.editor.completion_lens_font_size()),
                 affinity: Some(CursorAffinity::Backward),
                 // font_family: Some(config.editor.completion_lens_font_family()),
@@ -1824,7 +1824,7 @@ impl DocumentPhantom for Doc {
                 col: inline_completion_col,
                 text: completion.clone(),
                 affinity: Some(CursorAffinity::Backward),
-                fg: Some(config.color(LapceColor::COMPLETION_LENS_FOREGROUND)),
+                fg: Some(config.color(AheadColor::COMPLETION_LENS_FOREGROUND)),
                 font_size: Some(config.editor.completion_lens_font_size()),
                 // font_family: Some(config.editor.completion_lens_font_family()),
                 bg: None,
@@ -1836,7 +1836,7 @@ impl DocumentPhantom for Doc {
         }
 
         if let Some(preedit) = self
-            .preedit_phantom(Some(config.color(LapceColor::EDITOR_FOREGROUND)), line)
+            .preedit_phantom(Some(config.color(AheadColor::EDITOR_FOREGROUND)), line)
         {
             text.push(preedit)
         }
@@ -1899,7 +1899,7 @@ impl CommonAction for Doc {
 
 #[derive(Clone)]
 pub struct DocStyling {
-    config: ReadSignal<Arc<LapceConfig>>,
+    config: ReadSignal<Arc<AheadConfig>>,
     doc: Rc<Doc>,
 }
 impl DocStyling {
@@ -2081,9 +2081,9 @@ impl Styling for DocStyling {
 
                         let color_name = match diag.severity {
                             Some(DiagnosticSeverity::ERROR) => {
-                                LapceColor::LAPCE_ERROR
+                                AheadColor::LAPCE_ERROR
                             }
-                            _ => LapceColor::LAPCE_WARN,
+                            _ => AheadColor::LAPCE_WARN,
                         };
                         let color = config.color(color_name);
                         let styles = extra_styles_for_range(
@@ -2102,11 +2102,11 @@ impl Styling for DocStyling {
         // Add the styling for the diagnostic severity, if applicable
         if let Some(max_severity) = max_severity {
             let theme_prop = if max_severity == DiagnosticSeverity::ERROR {
-                LapceColor::ERROR_LENS_ERROR_BACKGROUND
+                AheadColor::ERROR_LENS_ERROR_BACKGROUND
             } else if max_severity == DiagnosticSeverity::WARNING {
-                LapceColor::ERROR_LENS_WARNING_BACKGROUND
+                AheadColor::ERROR_LENS_WARNING_BACKGROUND
             } else {
-                LapceColor::ERROR_LENS_OTHER_BACKGROUND
+                AheadColor::ERROR_LENS_OTHER_BACKGROUND
             };
 
             let size = layout.size();

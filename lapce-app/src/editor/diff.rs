@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{EditorData, EditorViewKind};
 use crate::{
-    config::{color::LapceColor, icon::LapceIcons},
+    config::{color::AheadColor, icon::AheadIcons},
     doc::{Doc, DocContent},
     id::{DiffEditorId, EditorTabId},
     main_split::{Editors, MainSplitData},
@@ -363,16 +363,16 @@ pub fn diff_show_more_section_view(
             wave_box().style(move |s| {
                 s.absolute()
                     .size_pct(100.0, 100.0)
-                    .color(config.get().color(LapceColor::PANEL_BACKGROUND))
+                    .color(config.get().color(AheadColor::PANEL_BACKGROUND))
             }),
             label(move || format!("{} Hidden Lines", section.lines)),
             label(|| "|".to_string()).style(|s| s.margin_left(10.0)),
             stack((
-                svg(move || config.get().ui_svg(LapceIcons::FOLD)).style(move |s| {
+                svg(move || config.get().ui_svg(AheadIcons::FOLD)).style(move |s| {
                     let config = config.get();
                     let size = config.ui.icon_size() as f32;
                     s.size(size, size)
-                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                        .color(config.color(AheadColor::EDITOR_FOREGROUND))
                 }),
                 label(|| "Expand All".to_string()).style(|s| s.margin_left(6.0)),
             ))
@@ -407,12 +407,12 @@ pub fn diff_show_more_section_view(
             }),
             label(|| "|".to_string()).style(|s| s.margin_left(10.0)),
             stack((
-                svg(move || config.get().ui_svg(LapceIcons::FOLD_UP)).style(
+                svg(move || config.get().ui_svg(AheadIcons::FOLD_UP)).style(
                     move |s| {
                         let config = config.get();
                         let size = config.ui.icon_size() as f32;
                         s.size(size, size)
-                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                            .color(config.color(AheadColor::EDITOR_FOREGROUND))
                     },
                 ),
                 label(|| "Expand Up".to_string()).style(|s| s.margin_left(6.0)),
@@ -448,12 +448,12 @@ pub fn diff_show_more_section_view(
             }),
             label(|| "|".to_string()).style(|s| s.margin_left(10.0)),
             stack((
-                svg(move || config.get().ui_svg(LapceIcons::FOLD_DOWN)).style(
+                svg(move || config.get().ui_svg(AheadIcons::FOLD_DOWN)).style(
                     move |s| {
                         let config = config.get();
                         let size = config.ui.icon_size() as f32;
                         s.size(size, size)
-                            .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                            .color(config.color(AheadColor::EDITOR_FOREGROUND))
                     },
                 ),
                 label(|| "Expand Down".to_string()).style(|s| s.margin_left(6.0)),
