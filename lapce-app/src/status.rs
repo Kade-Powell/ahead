@@ -72,7 +72,8 @@ pub fn status(
     };
 
     let progresses = window_tab_data.progresses;
-    let mode = create_memo(move |_| window_tab_data.mode());
+    let window_tab_data_for_mode = window_tab_data.clone();
+    let mode = create_memo(move |_| window_tab_data_for_mode.mode());
     let pointer_down = floem::reactive::create_rw_signal(false);
 
     stack((
@@ -125,7 +126,7 @@ pub fn status(
                     .align_items(Some(AlignItems::Center))
                     .selectable(false)
             }),
-            crate::ahead::ahead_status_item(ahead_state, config),
+            crate::ahead::ahead_status_item(ahead_state, config, window_tab_data.clone()),
             stack((
                 svg(move || config.get().ui_svg(LapceIcons::SCM)).style(move |s| {
                     let config = config.get();

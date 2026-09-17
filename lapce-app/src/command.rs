@@ -488,6 +488,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "toggle_search_visual")]
     ToggleSearchVisual,
 
+    #[strum(message = "Toggle AHEAD Agent Visual")]
+    #[strum(serialize = "toggle_ahead_agent_visual")]
+    ToggleAheadAgentVisual,
+
     #[strum(serialize = "focus_editor")]
     FocusEditor,
 

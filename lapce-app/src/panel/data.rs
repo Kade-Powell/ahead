@@ -44,7 +44,7 @@ pub fn default_panel_order() -> PanelOrder {
     );
     order.insert(
         PanelPosition::RightTop,
-        im::vector![PanelKind::DocumentSymbol,],
+        im::vector![PanelKind::AheadAgent, PanelKind::DocumentSymbol,],
     );
 
     order
@@ -140,7 +140,7 @@ impl PanelData {
             PanelPosition::RightTop,
             PanelStyle {
                 active: 0,
-                shown: false,
+                shown: true,
                 maximized: false,
             },
         );

@@ -81,7 +81,7 @@ use crate::{
         call_hierarchy_view::{CallHierarchyData, CallHierarchyItemData},
         data::{PanelData, PanelSection, default_panel_order},
         kind::PanelKind,
-        position::PanelContainerPosition,
+        position::{PanelContainerPosition, PanelPosition},
     },
     plugin::PluginData,
     proxy::{ProxyData, new_proxy},
@@ -454,12 +454,29 @@ impl WindowTabData {
         let panel = workspace_info
             .as_ref()
             .map(|i| {
-                let panel_order = db
+                let mut panel_order = db
                     .get_panel_orders()
                     .unwrap_or_else(|_| default_panel_order());
+                let mut has_ahead = false;
+                for panels in panel_order.values() {
+                    if panels.contains(&PanelKind::AheadAgent) {
+                        has_ahead = true;
+                        break;
+                    }
+                }
+                if !has_ahead {
+                    panel_order
+                        .entry(PanelPosition::RightTop)
+                        .or_default()
+                        .push_front(PanelKind::AheadAgent);
+                }
+                let mut styles = i.panel.styles.clone();
+                if let Some(s) = styles.get_mut(&PanelPosition::RightTop) {
+                    s.shown = true;
+                }
                 PanelData {
                     panels: cx.create_rw_signal(panel_order),
-                    styles: cx.create_rw_signal(i.panel.styles.clone()),
+                    styles: cx.create_rw_signal(styles),
                     size: cx.create_rw_signal(i.panel.size.clone()),
                     available_size: panel_available_size,
                     sections: cx.create_rw_signal(
@@ -473,9 +490,22 @@ impl WindowTabData {
                 }
             })
             .unwrap_or_else(|| {
-                let panel_order = db
+                let mut panel_order = db
                     .get_panel_orders()
                     .unwrap_or_else(|_| default_panel_order());
+                let mut has_ahead = false;
+                for panels in panel_order.values() {
+                    if panels.contains(&PanelKind::AheadAgent) {
+                        has_ahead = true;
+                        break;
+                    }
+                }
+                if !has_ahead {
+                    panel_order
+                        .entry(PanelPosition::RightTop)
+                        .or_default()
+                        .push_front(PanelKind::AheadAgent);
+                }
                 PanelData::new(
                     cx,
                     panel_order,
@@ -1316,6 +1346,9 @@ impl WindowTabData {
             }
             ToggleSearchVisual => {
                 self.toggle_panel_visual(PanelKind::Search);
+            }
+            ToggleAheadAgentVisual => {
+                self.toggle_panel_visual(PanelKind::AheadAgent);
             }
             FocusEditor => {
                 self.common.focus.set(Focus::Workbench);
@@ -2412,6 +2445,12 @@ impl WindowTabData {
                     PresentationCueDismissed { .. } => {
                         self.ahead.presentation_cue.set(None);
                     }
+                    VoiceTranscript { update } => {
+                        self.ahead.voice_transcripts.update(|t| t.push(update.clone()));
+                    }
+                    VoiceAudio { .. } => {
+                        self.ahead.voice_speaking.set(true);
+                    }
                     _ => {}
                 }
             }
@@ -2727,7 +2766,8 @@ impl WindowTabData {
             | PanelKind::CallHierarchy
             | PanelKind::DocumentSymbol
             | PanelKind::References
-            | PanelKind::Implementation => {
+            | PanelKind::Implementation
+            | PanelKind::AheadAgent => {
                 // Some panels don't accept focus (yet). Fall back to visibility check
                 // in those cases.
                 self.panel.is_panel_visible(&kind)
