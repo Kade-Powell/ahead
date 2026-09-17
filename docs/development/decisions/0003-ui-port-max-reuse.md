@@ -117,20 +117,29 @@ ecosystem.
 ## Hard acceptance gates
 
 The port does not become the default shell until all of these work in the
-same pinned dependency set:
+same pinned dependency set. Status as of 2026-09-17 (evidence-linked):
 
 1. Open, edit, undo, IME-compose, and save a real file through the existing
-   proxy/document path without losing unsaved changes.
+   proxy/document path without losing unsaved changes. Status: PARTIAL —
+   spike opens/edits/saves a real file with dirty tracking
+   (`../ahead-spike-gpui/spike`, `CodePanel`), but through direct `fs`
+   writes, NOT the proxy/document path; undo and IME untested.
 2. Complete one LSP request and render diagnostics, inline completion, and a
-   non-caret-stealing AHEAD pointer/range overlay.
+   non-caret-stealing AHEAD pointer/range overlay. Status: NOT STARTED —
+   no LSP round-trip, no diagnostics/completion, no overlay in the spike.
 3. Run the Start Work, agent panel, voice state, collaboration, and review
-   flows through `ahead-viewmodel` and the existing session host.
+   flows through `ahead-viewmodel` and the existing session host. Status:
+   PARTIAL — chat/mode/phase/voice run through the viewmodel in
+   `SessionPanel`; Start Work RPC, collaboration, review, and session-host
+   wiring are Floem-only so far.
 4. Pass keyboard-only traversal and screen-reader narration on macOS for the
-   MVP shell. Windows and Linux accessibility checks are release gates for
-   those platforms.
+   MVP shell. Status: NOT STARTED — no traversal audit, no narration check.
 5. Demonstrate stable frame/input behavior with a large file and a streamed
-   voice/agent update occurring while editing.
+   voice/agent update occurring while editing. Status: NOT STARTED.
 
+Verdict: gates NOT passed. Floem stays the default shell; the spike is
+evidence for the strangler direction, not a passing port. Tauri + Vue
+contingency stands by.
 If any gate fails, stop the GPUI migration and build the contingency shell as
 Tauri + Vue 3 + TypeScript. Do not carry both production shells indefinitely;
 Floem is the temporary safety shell, not a third long-term product.
