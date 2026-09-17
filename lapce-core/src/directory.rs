@@ -13,7 +13,7 @@ impl Directory {
 
     #[cfg(not(feature = "portable"))]
     fn project_dirs() -> Option<ProjectDirs> {
-        ProjectDirs::from("dev", "lapce", NAME)
+        ProjectDirs::from("io", "ahead", NAME)
     }
 
     /// Return path adjacent to lapce executable when built as portable
@@ -21,7 +21,7 @@ impl Directory {
     fn project_dirs() -> Option<ProjectDirs> {
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
-                return ProjectDirs::from_path(parent.join("lapce-data"));
+                return ProjectDirs::from_path(parent.join("ahead-data"));
             }
             unreachable!("Couldn't obtain current process parent path");
         }

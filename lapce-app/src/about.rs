@@ -21,10 +21,8 @@ use crate::{
 struct AboutUri {}
 
 impl AboutUri {
-    const LAPCE: &'static str = "https://lapce.dev";
-    const GITHUB: &'static str = "https://github.com/lapce/lapce";
-    const MATRIX: &'static str = "https://matrix.to/#/#lapce-editor:matrix.org";
-    const DISCORD: &'static str = "https://discord.gg/n8tGJ6Rn6D";
+    const AHEAD: &'static str = "https://github.com/Kade-Powell/ahead";
+    const GITHUB: &'static str = "https://github.com/Kade-Powell/ahead";
     const CODICONS: &'static str = "https://github.com/microsoft/vscode-codicons";
 }
 
@@ -105,7 +103,7 @@ pub fn about_popup(window_tab_data: Rc<WindowTabData>) -> impl View {
                 s.size(logo_size, logo_size)
                     .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
             }),
-            label(|| "Lapce".to_string()).style(move |s| {
+            label(|| "AHEAD".to_string()).style(move |s| {
                 s.font_bold()
                     .margin_top(10.0)
                     .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
@@ -115,8 +113,8 @@ pub fn about_popup(window_tab_data: Rc<WindowTabData>) -> impl View {
                     .color(config.get().color(LapceColor::EDITOR_DIM))
             }),
             web_link(
-                || "Website".to_string(),
-                || AboutUri::LAPCE.to_string(),
+                || "Repository".to_string(),
+                || AboutUri::AHEAD.to_string(),
                 move || config.get().color(LapceColor::EDITOR_LINK),
                 internal_command,
             )
@@ -124,20 +122,6 @@ pub fn about_popup(window_tab_data: Rc<WindowTabData>) -> impl View {
             web_link(
                 || "GitHub".to_string(),
                 || AboutUri::GITHUB.to_string(),
-                move || config.get().color(LapceColor::EDITOR_LINK),
-                internal_command,
-            )
-            .style(|s| s.margin_top(10.0)),
-            web_link(
-                || "Discord".to_string(),
-                || AboutUri::DISCORD.to_string(),
-                move || config.get().color(LapceColor::EDITOR_LINK),
-                internal_command,
-            )
-            .style(|s| s.margin_top(10.0)),
-            web_link(
-                || "Matrix".to_string(),
-                || AboutUri::MATRIX.to_string(),
                 move || config.get().color(LapceColor::EDITOR_LINK),
                 internal_command,
             )

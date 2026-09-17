@@ -115,11 +115,11 @@ mod grammars;
 mod logging;
 
 #[derive(Parser)]
-#[clap(name = "Lapce")]
+#[clap(name = "AHEAD")]
 #[clap(version=meta::VERSION)]
 #[derive(Debug)]
 struct Cli {
-    /// Launch new window even if Lapce is already running
+    /// Launch new window even if AHEAD is already running
     #[clap(short, long, action)]
     new: bool,
     /// Don't return instantly when opened in a terminal
@@ -205,7 +205,7 @@ impl AppData {
     fn default_window_config(&self) -> WindowConfig {
         WindowConfig::default()
             .apply_default_theme(false)
-            .title("Lapce")
+            .title("AHEAD")
     }
 
     pub fn new_window(&self, folder: Option<PathBuf>) {
@@ -3677,8 +3677,8 @@ fn window(window_data: WindowData) -> impl View {
             .or_else(|| window_tabs.last())
             .and_then(|(_, window_tab)| window_tab.workspace.display());
         match workspace {
-            Some(workspace) => format!("{workspace} - Lapce"),
-            None => "Lapce".to_string(),
+            Some(workspace) => format!("{workspace} - AHEAD"),
+            None => "AHEAD".to_string(),
         }
     })
     .on_event_stop(EventListener::ImeEnabled, move |_| {
@@ -3706,7 +3706,7 @@ fn window(window_data: WindowData) -> impl View {
             let lapce_command = window_tab.common.lapce_command;
             window_menu(lapce_command, workbench_command)
         } else {
-            Menu::new("Lapce")
+            Menu::new("AHEAD")
         }
     })
     .style(|s| s.size_full())
@@ -3721,7 +3721,7 @@ pub fn launch() {
     }
 
     let (reload_handle, _guard) = logging::logging();
-    trace!(TraceLevel::INFO, "Starting up Lapce..");
+    trace!(TraceLevel::INFO, "Starting up AHEAD..");
 
     #[cfg(feature = "vendored-fonts")]
     {
@@ -3968,7 +3968,7 @@ pub fn launch() {
             }
         });
         std::thread::Builder::new()
-            .name("LapceUpdater".to_owned())
+            .name("AheadUpdater".to_owned())
             .spawn(move || {
                 loop {
                     if let Ok(release) = crate::update::get_latest_release() {
@@ -4169,10 +4169,10 @@ pub fn window_menu(
     lapce_command: Listener<LapceCommand>,
     workbench_command: Listener<LapceWorkbenchCommand>,
 ) -> Menu {
-    Menu::new("Lapce")
+    Menu::new("AHEAD")
         .entry({
-            let mut menu = Menu::new("Lapce")
-                .entry(MenuItem::new("About Lapce").action(move || {
+            let mut menu = Menu::new("AHEAD")
+                .entry(MenuItem::new("About AHEAD").action(move || {
                     workbench_command.send(LapceWorkbenchCommand::ShowAbout)
                 }))
                 .separator()
@@ -4191,13 +4191,13 @@ pub fn window_menu(
                         )),
                 )
                 .separator()
-                .entry(MenuItem::new("Quit Lapce").action(move || {
+                .entry(MenuItem::new("Quit AHEAD").action(move || {
                     workbench_command.send(LapceWorkbenchCommand::Quit);
                 }));
             if cfg!(target_os = "macos") {
                 menu = menu
                     .separator()
-                    .entry(MenuItem::new("Hide Lapce"))
+                    .entry(MenuItem::new("Hide AHEAD"))
                     .entry(MenuItem::new("Hide Others"))
                     .entry(MenuItem::new("Show All"))
             }

@@ -548,7 +548,7 @@ pub enum LapceWorkbenchCommand {
     RestartToUpdate,
 
     #[strum(serialize = "show_about")]
-    #[strum(message = "About Lapce")]
+    #[strum(message = "About AHEAD")]
     ShowAbout,
 
     #[strum(message = "Save All Files")]
@@ -556,12 +556,12 @@ pub enum LapceWorkbenchCommand {
     SaveAll,
 
     #[cfg(target_os = "macos")]
-    #[strum(message = "Install Lapce to PATH")]
+    #[strum(message = "Install AHEAD to PATH")]
     #[strum(serialize = "install_to_path")]
     InstallToPATH,
 
     #[cfg(target_os = "macos")]
-    #[strum(message = "Uninstall Lapce from PATH")]
+    #[strum(message = "Uninstall AHEAD from PATH")]
     #[strum(serialize = "uninstall_from_path")]
     UninstallFromPATH,
 

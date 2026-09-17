@@ -30,7 +30,7 @@ pub fn get_latest_release() -> Result<ReleaseInfo> {
         _ => "https://api.github.com/repos/lapce/lapce/releases/latest",
     };
 
-    let resp = lapce_proxy::get_url(url, Some("Lapce"))?;
+    let resp = lapce_proxy::get_url(url, Some("AHEAD"))?;
     if !resp.status().is_success() {
         return Err(anyhow!("get release info failed {}", resp.text()?));
     }
@@ -56,16 +56,16 @@ pub fn download_release(release: &ReleaseInfo) -> Result<PathBuf> {
     let dir =
         Directory::updates_directory().ok_or_else(|| anyhow!("no directory"))?;
     let name = match std::env::consts::OS {
-        "macos" => "Lapce-macos.dmg",
+        "macos" => "Ahead-macos.dmg",
         "linux" => match std::env::consts::ARCH {
-            "aarch64" => "lapce-linux-arm64.tar.gz",
-            "x86_64" => "lapce-linux-amd64.tar.gz",
+            "aarch64" => "ahead-linux-arm64.tar.gz",
+            "x86_64" => "ahead-linux-amd64.tar.gz",
             _ => return Err(anyhow!("arch not supported")),
         },
         #[cfg(feature = "portable")]
-        "windows" => "Lapce-windows-portable.zip",
+        "windows" => "Ahead-windows-portable.zip",
         #[cfg(not(feature = "portable"))]
-        "windows" => "Lapce-windows.msi",
+        "windows" => "Ahead-windows.msi",
         _ => return Err(anyhow!("os not supported")),
     };
     let file_path = dir.join(name);
@@ -94,9 +94,15 @@ pub fn extract(src: &Path, process_path: &Path) -> Result<PathBuf> {
     } else {
         dest
     };
-    std::fs::remove_dir_all(dest.join("Lapce.app"))?;
+    let _ = std::fs::remove_dir_all(dest.join("Ahead.app"));
+    let _ = std::fs::remove_dir_all(dest.join("Lapce.app"));
+    let app_name = if info.mount_point.join("Ahead.app").exists() {
+        "Ahead.app"
+    } else {
+        "Lapce.app"
+    };
     fs_extra::copy_items(
-        &[info.mount_point.join("Lapce.app")],
+        &[info.mount_point.join(app_name)],
         dest,
         &fs_extra::dir::CopyOptions {
             overwrite: true,
@@ -107,7 +113,7 @@ pub fn extract(src: &Path, process_path: &Path) -> Result<PathBuf> {
             depth: 0,
         },
     )?;
-    Ok(dest.join("Lapce.app"))
+    Ok(dest.join(app_name))
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]

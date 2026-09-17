@@ -1,5 +1,6 @@
 .vscode
 .lapce
+.ahead
 .idea
 .fleet
 shell.nix
