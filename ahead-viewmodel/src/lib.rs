@@ -11,10 +11,12 @@
 //! generation, Codex turn-shape assembly, approval/sandbox mapping.
 //! See `docs/development/decisions/0003-ui-port-max-reuse.md`.
 
+pub mod editor_context;
 pub mod session;
 pub mod turn;
 pub mod voice;
 
+pub use editor_context::{caret_to_display, offset_to_display, relative_path, selection_range, EditorCursor};
 pub use session::{
     adopt_session, apply_mode, apply_workflow, begin_validation_error,
     drop_proposal, next_phase, push_agent_message, push_human_message,

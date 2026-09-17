@@ -173,10 +173,10 @@ impl AheadState {
         window_tab: &std::rc::Rc<crate::window_tab::WindowTabData>,
     ) -> (String, lapce_rpc::ahead::DisplayPosition, Option<lapce_rpc::ahead::DisplayRange>, String) {
         use floem::reactive::{SignalGet, SignalWith};
-        use lapce_core::buffer::rope_text::RopeText;
+        use lapce_core::{buffer::rope_text::RopeText, encoding::offset_utf8_to_utf16};
         let fallback = (
             String::new(),
-            lapce_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+            ahead_viewmodel::caret_to_display(0, 0),
             None,
             String::new(),
         );
@@ -184,23 +184,27 @@ impl AheadState {
             return fallback;
         };
         let doc = editor.doc();
-        let path = match doc.content.get_untracked() {
-            crate::doc::DocContent::File { path, .. } => {
-                // Workspace-relative when possible; else lossy absolute.
-                let ws_root = window_tab.workspace.path.clone().unwrap_or_default();
-                path.strip_prefix(&ws_root)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string())
-            }
+        let abs_path = match doc.content.get_untracked() {
+            crate::doc::DocContent::File { path, .. } => path.to_string_lossy().to_string(),
             _ => return fallback,
         };
+        let ws_root = window_tab.workspace.path.clone().unwrap_or_default()
+            .to_string_lossy().to_string();
+        let path = ahead_viewmodel::relative_path(&ws_root, &abs_path);
         let offset = editor.cursor().get_untracked().offset();
         let (caret, content) = doc.buffer.with_untracked(|b| {
-            let (line, col) = b.offset_to_line_col(offset);
-            let caret = lapce_rpc::ahead::DisplayPosition {
-                line: line as u32,
-                col: col as u32,
-            };
+            let caret = ahead_viewmodel::offset_to_display(
+                offset,
+                |off| b.offset_to_line_col(off),
+                |off| {
+                    let (line, _col) = b.offset_to_line_col(off);
+                    let line_offset = b.offset_of_line(line);
+                    offset_utf8_to_utf16(
+                        b.char_indices_iter(line_offset..),
+                        off - line_offset,
+                    )
+                },
+            );
             (caret, b.text().to_string())
         });
         (path, caret, None, content)
