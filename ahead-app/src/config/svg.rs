@@ -10,7 +10,7 @@ use crate::config::LOGO;
 
 const CODICONS_ICONS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/../icons/codicons");
-const LAPCE_ICONS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../icons/lapce");
+const AHEAD_ICONS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../icons/ahead");
 
 #[derive(Debug, Clone)]
 pub struct SvgStore {
@@ -41,8 +41,8 @@ impl SvgStore {
 
     pub fn get_default_svg(&mut self, name: &str) -> String {
         if !self.svgs.contains_key(name) {
-            let file = if name == "lapce_remote.svg" || name == "ahead_logo.svg" {
-                LAPCE_ICONS_DIR.get_file(name).unwrap()
+            let file = if name == "ahead_remote.svg" || name == "ahead_logo.svg" {
+                AHEAD_ICONS_DIR.get_file(name).unwrap()
             } else {
                 CODICONS_ICONS_DIR
                     .get_file(name)

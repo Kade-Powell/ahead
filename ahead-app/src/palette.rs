@@ -883,7 +883,7 @@ impl PaletteData {
         let configs: Option<RunDebugConfigs> = toml::from_str(&content).ok();
         if configs.is_none() {
             if let Some(path) = self.workspace.path.as_ref() {
-                let path = path.join(".lapce").join("run.toml");
+                let path = path.join(".ahead").join("run.toml");
                 self.common
                     .internal_command
                     .send(InternalCommand::OpenFile { path });
@@ -942,7 +942,7 @@ impl PaletteData {
 
     fn get_run_configs(&self) {
         if let Some(workspace) = self.common.workspace.path.as_deref() {
-            let run_toml = workspace.join(".lapce").join("run.toml");
+            let run_toml = workspace.join(".ahead").join("run.toml");
             let (doc, new_doc) = self.main_split.get_doc(run_toml.clone(), None);
             if !new_doc {
                 let content = doc.buffer.with_untracked(|b| b.to_string());

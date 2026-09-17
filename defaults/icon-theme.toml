@@ -1,7 +1,7 @@
 #:schema ../extra/schemas/icon-theme.json
 
 [icon-theme]
-name = "Lapce Codicons"
+name = "Ahead Codicons"
 
 [icon-theme.ui]
 "logo" = "ahead_logo.svg"

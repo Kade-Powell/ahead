@@ -214,7 +214,7 @@ impl AheadConfig {
         match workspace.kind {
             AheadWorkspaceType::Local => {
                 if let Some(path) = workspace.path.as_ref() {
-                    let path = path.join("./.lapce/settings.toml");
+                    let path = path.join("./.ahead/settings.toml");
                     config = config::Config::builder()
                         .add_source(config.clone())
                         .add_source(
