@@ -50,6 +50,7 @@ libsql       = { version = "0.6.0", default-features = false, features = ["core"
 tokio        = { version = "1.38", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 uuid         = { version = "1.5", features = ["v4", "serde"] }
 sha2         = "0.10"
+agent-client-protocol = { version = "2.1.0" }
 
 # deleting files
 trash = "3.0.6"

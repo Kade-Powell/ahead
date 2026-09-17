@@ -611,3 +611,50 @@ Use focused tests at these trust/concurrency boundaries plus rendered end-to-end
 5. **Pilot users:** choose two languages, one reference OS, one GitHub project and a small team. Record their must-have editor extensions/features before locking the base.
 
 The repository replacement and Lapce foundation are settled direction. These remaining questions determine feature scope; the milestones turn the design into observable engineering evidence.
+
+## 16. Built-in agent loop + ACP side tasks (2026-09-17)
+
+Decision (user-confirmed): the primary coding agent is built directly
+into the session host. No ACP round-trip for the primary loop. ACP is
+used only for side tasks to external agents.
+
+### What the fork gives us (pinned: `third-party/codex`, tag `rust-v0.152.0`)
+
+- Wire framing: no `jsonrpc` header; `{id, method, params?, trace?}` /
+  `{id, result}` / `{id, error}`. Snapshot in `ahead-agent/schemas/`.
+- Lifecycle: `initialize` → `initialized` → `thread/start|resume|fork` →
+  `turn/start|steer|interrupt`, streamed `item/*` updates.
+- Approval seam: server-initiated `requestApproval` (command execution,
+  file change, permissions) answered accept/decline by the host.
+- Policy vocabulary: `AskForApproval` (`untrusted`/`never`), `SandboxMode`
+  (`read-only`/`workspace-write`; `danger-full-access` never emitted),
+  `execpolicy` prefix-rule engine, approve/decline decision kinds.
+- Explicitly NOT reused: ratatui/crossterm TUI, autonomous instructions,
+  direct shell/process/fs-write tools, hooks/plugins/MCP mutations,
+  cloud/remote control, rollout logs as session authority.
+
+### Built-in loop (`lapce-proxy/src/ahead/agent.rs`)
+
+- `AgentTurnRequest`: `thread_id`, `cwd`, approval/sandbox overrides
+  (Codex-compatible subset) plus `expected_policy_sha256`, scope, editor
+  context. Stale policy fails closed.
+- `TurnApprovalPolicy::for_mode` / `TurnSandbox::for_mode`: Learn →
+  never/read-only; Assist → on-request/workspace-write.
+- `decide_approval`: Learn always declines; Assist accepts only
+  mechanical + in-approved-scope + file/command kinds.
+- `to_codex_turn_params`: serializes a turn in fork `turn/start` shape
+  for logging and a future managed runtime; approvals still resolve
+  in the host.
+- 50 proxy tests pass, including stale-policy rejection, Codex
+  vocabulary mapping, and closed approval decisions.
+
+### ACP side tasks only (`AcpDelegator`, `agent-client-protocol` 2.1.0)
+
+- Spawns the external agent binary over stdio (`initialize` → `session/new`
+  → `session/prompt`); declines ALL permission requests (read-only);
+  returns findings as attributed review text, never edits.
+- Request shape carries `task_id`, prompt, read-only file refs, tool
+  allowlist — no shell string, no write grant, no session credentials.
+- Canonical Rust DTOs added to `lapce-rpc/src/ahead.rs`
+  (`TurnEditorContext`, `TurnMechanicalScope`, `AgentTurnRequestDto`)
+  mirroring `ahead-editor-contracts.ts`.

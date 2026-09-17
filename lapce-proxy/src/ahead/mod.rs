@@ -18,7 +18,7 @@ pub mod tracker;
 pub mod voice;
 pub mod scenarios;
 
-pub use agent::{AheadAgentLoop, AgentTurnInput, AgentTurnOutput, AcpDelegator, AcpDelegatedTask};
+pub use agent::{AheadAgentLoop, AgentTurnInput, AgentTurnOutput, AgentTurnRequest, TurnApprovalPolicy, TurnSandbox, AcpDelegator, AcpDelegatedTask, AcpTaskResult};
 pub use auth::{GitHubAuthManager, AuthRecord, PollTokenResult};
 pub use collab::{CollabSession, CollabParticipant, ParticipantStatus, StickyAnchorIndex, ReviewSnapshot};
 pub use host::AheadSessionHost;

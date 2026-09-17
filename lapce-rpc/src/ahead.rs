@@ -296,6 +296,45 @@ pub struct PredictionResult {
     pub cursor_offset: usize,
 }
 
+/// Editor context attached to a governed turn: active document version,
+/// visible range, selection, and explicit attachments. Mirrors
+/// `EditorContext` in `ahead-editor-contracts.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEditorContext {
+    pub active_path: RepoPath,
+    pub caret: DisplayPosition,
+    pub selection: Option<DisplayRange>,
+    pub file_content: String,
+    pub visible_end: Option<DisplayPosition>,
+    pub attached_anchor_ids: Vec<Id>,
+}
+
+/// Explicit mechanical scope: paths plus the human contract artifact the
+/// turn may work under. Mirrors `MechanicalScope` in contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnMechanicalScope {
+    pub scope_id: Id,
+    pub instruction: String,
+    pub human_contract_artifact_id: Id,
+    pub allowed_paths: Vec<RepoPath>,
+    pub approved_by: Id,
+}
+
+/// Governed turn request for the built-in loop. `turn/start`-compatible
+/// subset (`thread_id`, `cwd`, approval/sandbox overrides) plus AHEAD
+/// gates (`expected_policy_sha256`, scope, editor context).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTurnRequestDto {
+    pub session_id: Id,
+    pub thread_id: Id,
+    pub user_message: String,
+    pub context: TurnEditorContext,
+    pub invariants: Vec<String>,
+    pub cwd: Option<String>,
+    pub expected_policy_sha256: String,
+    pub scope: Option<TurnMechanicalScope>,
+}
+
 /// Change proposal requiring explicit human approval
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeProposal {
