@@ -624,6 +624,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "ahead_sign_out_github")]
     #[strum(message = "AHEAD: Sign Out of GitHub")]
     AheadSignOutGitHub,
+
+    #[strum(serialize = "ahead_manage_collab")]
+    #[strum(message = "AHEAD: Workspace Collaboration & Team (Add People)")]
+    AheadManageCollab,
 }
 
 #[derive(Clone, Debug)]

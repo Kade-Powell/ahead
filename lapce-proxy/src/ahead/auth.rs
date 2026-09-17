@@ -40,6 +40,9 @@ impl GitHubAuthManager {
             access_token: None,
         };
         let _ = mgr.load_saved_auth();
+        if !mgr.is_authenticated() {
+            let _ = mgr.detect_github_cli();
+        }
         mgr
     }
 
@@ -51,6 +54,55 @@ impl GitHubAuthManager {
         };
         let _ = mgr.load_saved_auth();
         mgr
+    }
+
+    /// Automatically detects and imports active GitHub CLI (gh) session if available
+    pub fn detect_github_cli(&mut self) -> Result<GitHubUser> {
+        let mut token_cmd = std::process::Command::new("gh");
+        token_cmd.args(["auth", "token"]);
+        let token_output = token_cmd.output()?;
+        if !token_output.status.success() {
+            bail!("GitHub CLI not logged in");
+        }
+        let token = String::from_utf8_lossy(&token_output.stdout).trim().to_string();
+        if token.is_empty() {
+            bail!("Empty token from gh CLI");
+        }
+
+        let mut api_cmd = std::process::Command::new("gh");
+        api_cmd.args(["api", "user"]);
+        let api_output = api_cmd.output()?;
+        if !api_output.status.success() {
+            bail!("gh api user failed");
+        }
+        let user_json = String::from_utf8_lossy(&api_output.stdout);
+        let user = Self::parse_user_profile(&user_json)?;
+        let _ = self.save_auth(token, user.clone());
+        Ok(user)
+    }
+
+    /// Sign in directly using a personal access token (PAT)
+    pub fn sign_in_with_token(&mut self, token: String) -> Result<GitHubUser> {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            bail!("Token cannot be empty");
+        }
+        let output = std::process::Command::new("curl")
+            .args([
+                "-sSL",
+                "-H", "User-Agent: AHEAD",
+                "-H", &format!("Authorization: Bearer {}", token),
+                "-H", "Accept: application/vnd.github+json",
+                "https://api.github.com/user",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!("Failed to connect to GitHub API with token");
+        }
+        let json = String::from_utf8_lossy(&output.stdout);
+        let user = Self::parse_user_profile(&json)?;
+        self.save_auth(token, user.clone())?;
+        Ok(user)
     }
 
     /// Returns the currently active developer identity: authenticated GitHub user, or local Git config fallback

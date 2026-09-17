@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
 use lapce_rpc::ahead::{
     CodeAnchor, DisplayPosition, DisplayRange, Id, Sha256, Timestamp,
 };

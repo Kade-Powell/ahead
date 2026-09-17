@@ -32,15 +32,27 @@ pub struct AheadSessionHost {
     auth: Arc<RwLock<GitHubAuthManager>>,
     active_sessions: Arc<RwLock<HashMap<Id, SessionView>>>,
     active_voice_sessions: Arc<RwLock<HashMap<Id, Arc<VoiceSession>>>>,
+    workspace_participants: Arc<RwLock<Vec<SessionParticipantRecord>>>,
 }
 
 impl AheadSessionHost {
     pub fn new(store: SessionStore) -> Self {
+        let auth_mgr = GitHubAuthManager::new();
+        let user = auth_mgr.get_active_user(None);
+        let host_record = SessionParticipantRecord {
+            participant: Participant::Human {
+                id: user.login.clone(),
+                subject: user.email.clone().unwrap_or_default(),
+                display_name: user.name.clone().unwrap_or_else(|| user.login.clone()),
+            },
+            role: SessionRole::Owner,
+        };
         Self {
             store: Arc::new(RwLock::new(store)),
-            auth: Arc::new(RwLock::new(GitHubAuthManager::new())),
+            auth: Arc::new(RwLock::new(auth_mgr)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             active_voice_sessions: Arc::new(RwLock::new(HashMap::new())),
+            workspace_participants: Arc::new(RwLock::new(vec![host_record])),
         }
     }
 
@@ -59,24 +71,34 @@ impl AheadSessionHost {
                 starting_point,
                 work_item,
             } => {
-                let view = self.start_work(work_kind, mode, title, starting_point, work_item)?;
+                let view = self.start_work(
+                    work_kind,
+                    mode,
+                    title,
+                    starting_point,
+                    work_item,
+                )?;
                 Ok(serde_json::to_value(view)?)
             }
             AheadRequest::GetSession { session_id } => {
-                let view = self.get_session(&session_id)?;
-                Ok(serde_json::to_value(view)?)
+                let session = self.get_session(&session_id)?;
+                Ok(serde_json::to_value(session)?)
             }
             AheadRequest::SetMode { session_id, mode } => {
-                self.set_mode(&session_id, mode)?;
-                Ok(serde_json::json!({ "status": "ok" }))
+                let session = self.set_mode(&session_id, mode)?;
+                Ok(serde_json::to_value(session)?)
             }
             AheadRequest::AdvancePhase {
                 session_id,
                 expected_revision,
                 target_phase_id,
             } => {
-                let wf = self.advance_phase(&session_id, expected_revision, target_phase_id)?;
-                Ok(serde_json::to_value(wf)?)
+                let session = self.advance_phase(
+                    &session_id,
+                    expected_revision,
+                    target_phase_id,
+                )?;
+                Ok(serde_json::to_value(session)?)
             }
             AheadRequest::CreateAnchor {
                 session_id,
@@ -87,13 +109,19 @@ impl AheadSessionHost {
                 let anchor = self.create_anchor(&session_id, path, range, quote)?;
                 Ok(serde_json::to_value(anchor)?)
             }
-            AheadRequest::ProposeEdit { session_id, proposal } => {
-                self.propose_edit(&session_id, proposal)?;
-                Ok(serde_json::json!({ "status": "proposed" }))
+            AheadRequest::ProposeEdit {
+                session_id,
+                proposal,
+            } => {
+                let res = self.propose_edit(&session_id, proposal)?;
+                Ok(serde_json::to_value(res)?)
             }
-            AheadRequest::AcceptProposal { session_id, proposal_id } => {
-                self.accept_proposal(&session_id, &proposal_id)?;
-                Ok(serde_json::json!({ "status": "accepted" }))
+            AheadRequest::AcceptProposal {
+                session_id,
+                proposal_id,
+            } => {
+                let res = self.accept_proposal(&session_id, &proposal_id)?;
+                Ok(serde_json::to_value(res)?)
             }
             AheadRequest::RequestPrediction { request } => {
                 let res = self.request_prediction(request, &[])?;
@@ -119,11 +147,74 @@ impl AheadSessionHost {
                 let user = self.auth.read().get_active_user(None);
                 Ok(serde_json::to_value(user)?)
             }
+            AheadRequest::GitHubAuthSignInWithToken { token } => {
+                let user = self.auth.write().sign_in_with_token(token)?;
+                Ok(serde_json::to_value(user)?)
+            }
+            AheadRequest::GitHubAuthDetectCli => {
+                let user = self.auth.write().detect_github_cli()?;
+                Ok(serde_json::to_value(user)?)
+            }
+            AheadRequest::GitHubAuthSignOut => {
+                self.auth.write().sign_out()?;
+                let user = self.auth.read().get_active_user(None);
+                Ok(serde_json::to_value(user)?)
+            }
             AheadRequest::GetAuthenticatedUser => {
                 let user = self.auth.read().get_active_user(None);
                 Ok(serde_json::to_value(user)?)
             }
+            AheadRequest::GetWorkspaceParticipants => {
+                let parts = self.get_workspace_participants();
+                Ok(serde_json::to_value(parts)?)
+            }
+            AheadRequest::AddWorkspaceParticipant { user_handle, role } => {
+                let parts = self.add_workspace_participant(user_handle, role);
+                Ok(serde_json::to_value(parts)?)
+            }
+            AheadRequest::RevokeWorkspaceParticipant { user_handle } => {
+                let parts = self.revoke_workspace_participant(&user_handle)?;
+                Ok(serde_json::to_value(parts)?)
+            }
         }
+    }
+
+    pub fn get_workspace_participants(&self) -> Vec<SessionParticipantRecord> {
+        let mut parts = self.workspace_participants.read().clone();
+        let user = self.auth.read().get_active_user(None);
+        if let Some(owner) = parts.iter_mut().find(|p| p.role == SessionRole::Owner) {
+            owner.participant = Participant::Human {
+                id: user.login.clone(),
+                subject: user.email.clone().unwrap_or_default(),
+                display_name: user.name.clone().unwrap_or_else(|| user.login.clone()),
+            };
+        }
+        parts
+    }
+
+    pub fn add_workspace_participant(&self, user_handle: String, role: SessionRole) -> Vec<SessionParticipantRecord> {
+        let mut parts = self.workspace_participants.write();
+        let handle = user_handle.trim().trim_start_matches('@').to_string();
+        if let Some(existing) = parts.iter_mut().find(|p| p.participant.id() == handle) {
+            existing.role = role;
+        } else {
+            parts.push(SessionParticipantRecord {
+                participant: Participant::Human {
+                    id: handle.clone(),
+                    subject: format!("{}@github.com", handle),
+                    display_name: handle,
+                },
+                role,
+            });
+        }
+        parts.clone()
+    }
+
+    pub fn revoke_workspace_participant(&self, user_handle: &str) -> Result<Vec<SessionParticipantRecord>> {
+        let mut parts = self.workspace_participants.write();
+        let handle = user_handle.trim().trim_start_matches('@');
+        parts.retain(|p| p.participant.id() != handle || p.role == SessionRole::Owner);
+        Ok(parts.clone())
     }
 
     pub fn start_work(
@@ -170,6 +261,7 @@ impl AheadSessionHost {
             },
         };
 
+        let user = self.auth.read().get_active_user(None);
         let session = WorkSession {
             id: session_id.clone(),
             project_id: "project-local".to_string(),
@@ -177,7 +269,7 @@ impl AheadSessionHost {
             work_kind,
             mode,
             title,
-            owner_id: "user-local".to_string(),
+            owner_id: user.login.clone(),
             lifecycle: SessionLifecycle::Active,
             policy: SessionPolicySnapshot::default(),
             revision: 1,
@@ -193,25 +285,16 @@ impl AheadSessionHost {
             approvals: Vec::new(),
         };
 
-        let participants = vec![
-            SessionParticipantRecord {
-                participant: Participant::Human {
-                    id: "user-local".to_string(),
-                    subject: "developer".to_string(),
-                    display_name: "Engineer".to_string(),
-                },
-                role: SessionRole::Owner,
+        let mut participants = self.get_workspace_participants();
+        participants.push(SessionParticipantRecord {
+            participant: Participant::Ai {
+                id: "ai-assistant".to_string(),
+                backend_id: "codex-loop".to_string(),
+                on_behalf_of: user.login.clone(),
+                display_name: "AHEAD Pair".to_string(),
             },
-            SessionParticipantRecord {
-                participant: Participant::Ai {
-                    id: "ai-assistant".to_string(),
-                    backend_id: "codex-loop".to_string(),
-                    on_behalf_of: "user-local".to_string(),
-                    display_name: "AHEAD Pair".to_string(),
-                },
-                role: SessionRole::Editor,
-            },
-        ];
+            role: SessionRole::Editor,
+        });
 
         let view = SessionView {
             session,

@@ -628,6 +628,33 @@ impl WindowTabData {
             });
         }
 
+        {
+            let ahead_state = window_tab_data.ahead;
+            let send_user = create_ext_action(cx, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                if let Ok(val) = res {
+                    if let Ok(user) = serde_json::from_value::<lapce_rpc::ahead::GitHubUser>(val) {
+                        ahead_state.authenticated_user.set(Some(user));
+                    }
+                }
+            });
+            window_tab_data.common.proxy.ahead_request(
+                lapce_rpc::ahead::AheadRequest::GetAuthenticatedUser,
+                move |res| send_user(res),
+            );
+
+            let send_parts = create_ext_action(cx, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                if let Ok(val) = res {
+                    if let Ok(parts) = serde_json::from_value::<Vec<lapce_rpc::ahead::SessionParticipantRecord>>(val) {
+                        ahead_state.workspace_participants.set(parts);
+                    }
+                }
+            });
+            window_tab_data.common.proxy.ahead_request(
+                lapce_rpc::ahead::AheadRequest::GetWorkspaceParticipants,
+                move |res| send_parts(res),
+            );
+        }
+
         window_tab_data
     }
 
@@ -1611,9 +1638,23 @@ impl WindowTabData {
                 );
             }
             AheadSignOutGitHub => {
-                self.ahead.authenticated_user.set(None);
+                let ahead_state = self.ahead;
+                let send = create_ext_action(self.scope, move |res: Result<serde_json::Value, lapce_rpc::RpcError>| {
+                    if let Ok(val) = res {
+                        if let Ok(user) = serde_json::from_value::<lapce_rpc::ahead::GitHubUser>(val) {
+                            ahead_state.authenticated_user.set(Some(user));
+                        }
+                    }
+                });
+                self.common.proxy.ahead_request(
+                    lapce_rpc::ahead::AheadRequest::GitHubAuthSignOut,
+                    move |res| send(res),
+                );
                 self.ahead.pending_device_code.set(None);
                 self.ahead.show_auth_modal.set(false);
+            }
+            AheadManageCollab => {
+                self.ahead.show_collab_modal.update(|v| *v = !*v);
             }
         }
     }

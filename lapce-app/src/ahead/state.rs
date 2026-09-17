@@ -17,6 +17,12 @@ pub struct AheadState {
     pub authenticated_user: RwSignal<Option<lapce_rpc::ahead::GitHubUser>>,
     pub show_auth_modal: RwSignal<bool>,
     pub pending_device_code: RwSignal<Option<lapce_rpc::ahead::GitHubDeviceCodeResponse>>,
+    pub show_collab_modal: RwSignal<bool>,
+    pub workspace_participants: RwSignal<Vec<lapce_rpc::ahead::SessionParticipantRecord>>,
+    pub new_collaborator_input: RwSignal<String>,
+    pub new_collaborator_role: RwSignal<lapce_rpc::ahead::SessionRole>,
+    pub token_input: RwSignal<String>,
+    pub show_token_input: RwSignal<bool>,
 }
 
 impl AheadState {
@@ -29,6 +35,12 @@ impl AheadState {
             authenticated_user: create_rw_signal(None),
             show_auth_modal: create_rw_signal(false),
             pending_device_code: create_rw_signal(None),
+            show_collab_modal: create_rw_signal(false),
+            workspace_participants: create_rw_signal(Vec::new()),
+            new_collaborator_input: create_rw_signal(String::new()),
+            new_collaborator_role: create_rw_signal(lapce_rpc::ahead::SessionRole::Editor),
+            token_input: create_rw_signal(String::new()),
+            show_token_input: create_rw_signal(false),
         }
     }
 

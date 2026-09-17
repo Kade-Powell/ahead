@@ -356,7 +356,20 @@ pub enum AheadRequest {
     GitHubAuthPoll {
         device_code: String,
     },
+    GitHubAuthSignInWithToken {
+        token: String,
+    },
+    GitHubAuthDetectCli,
+    GitHubAuthSignOut,
     GetAuthenticatedUser,
+    GetWorkspaceParticipants,
+    AddWorkspaceParticipant {
+        user_handle: String,
+        role: SessionRole,
+    },
+    RevokeWorkspaceParticipant {
+        user_handle: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
