@@ -273,6 +273,7 @@ pub fn start_work_modal(
                 ))
                 .style(|s| s.margin_bottom(12.0)),
                 text_input(ahead_state.wizard_title)
+                    .keyboard_navigable()
                     .placeholder("Work title, e.g. Implement retry backoff")
                     .style(move |s| {
                         s.width(400.0)
@@ -294,6 +295,7 @@ pub fn start_work_modal(
                         .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
                 }),
                 text_input(ahead_state.wizard_starting_point)
+                    .keyboard_navigable()
                     .placeholder("Observed vs expected, invariant, hypothesis, or open question")
                     .style(move |s| {
                         s.width(400.0)
@@ -1265,24 +1267,26 @@ pub fn ahead_agent_panel(
                         .border_color(Color::from_rgb8(30, 41, 59))
                 }),
 
-                // 2. Full-Duplex Voice Chat Hub & Barge-In Preemption
+                // 2. Voice: state/queue probe only — no mic, STT/TTS, or streaming yet.
                 container(
                     stack((
                         stack((
-                            label(|| "🎙️ REAL-TIME VOICE CHAT".to_string()).style(|s| {
+                            label(|| "🎙️ VOICE (PROBE — NOT WIRED)".to_string()).style(|s| {
                                 s.font_bold()
                                     .font_size(11.0)
                                     .color(Color::from_rgb8(148, 163, 184))
                             }),
+                            label(|| "Mic/STT/TTS not implemented. Toggle tracks intent; barge-in bumps the output generation only.".to_string())
+                                .style(|s| {
+                                    s.font_size(10.0)
+                                        .color(Color::from_rgb8(100, 116, 139))
+                                        .margin_top(2.0)
+                                }),
                             label(move || {
                                 if ahead_state.voice_active.get() {
-                                    if ahead_state.voice_speaking.get() {
-                                        "🔊 Voice: Agent Speaking".to_string()
-                                    } else {
-                                        "🎙️ Voice: Live (Listening...)".to_string()
-                                    }
+                                    "Probe: intent ON (no audio flows)".to_string()
                                 } else {
-                                    "🎙️ Connect Voice (Hands-Free)".to_string()
+                                    "Probe: intent OFF".to_string()
                                 }
                             })
                             .on_click_stop({
@@ -1293,13 +1297,8 @@ pub fn ahead_agent_panel(
                             })
                             .style(move |s| {
                                 let is_active = ahead_state.voice_active.get();
-                                let is_speaking = ahead_state.voice_speaking.get();
                                 let bg = if is_active {
-                                    if is_speaking {
-                                        Color::from_rgb8(2, 132, 199)
-                                    } else {
-                                        Color::from_rgb8(16, 185, 129)
-                                    }
+                                    Color::from_rgb8(16, 185, 129)
                                 } else {
                                     Color::from_rgb8(51, 65, 85)
                                 };
@@ -1316,9 +1315,9 @@ pub fn ahead_agent_panel(
                         ))
                         .style(|s| s.flex_col()),
 
-                        // Voice Controls: Barge-In Interrupt (<50ms) and Mic Mute
+                        // Voice Controls: probe generation bump + mic intent
                         stack((
-                            label(|| "⏹️ Barge In (Interrupt Audio)".to_string())
+                            label(|| "⏹️ Barge In (probe: bump generation)".to_string())
                                 .on_click_stop({
                                     let ahead_state = ahead_state;
                                     let proxy = proxy.clone();
@@ -1384,7 +1383,7 @@ pub fn ahead_agent_panel(
                         // Live Voice Transcript box
                         container(
                             stack((
-                                label(|| "💬 Live Speech Feed:".to_string()).style(|s| {
+                                label(|| "💬 Speech Feed (probe — host events only, no live mic):".to_string()).style(|s| {
                                     s.font_size(10.0)
                                         .font_bold()
                                         .color(Color::from_rgb8(100, 116, 139))
@@ -1783,9 +1782,14 @@ pub fn ahead_agent_panel(
                         ))
                         .style(|s| s.margin_top(8.0)),
 
-                        // User Chat Input Box
+                        // User Chat Input Box (keyboard navigable; Enter sends)
                         stack((
                             text_input(ahead_state.chat_input)
+                                .keyboard_navigable()
+                                .on_enter(move || {
+                                    let text = ahead_state.chat_input.get_untracked();
+                                    ahead_state.send_chat(text);
+                                })
                                 .style(move |s| {
                                     s.flex_grow(1.0)
                                         .padding_horiz(8.0)
