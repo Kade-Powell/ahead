@@ -8,15 +8,20 @@
 //! - `host`: Session host lifecycle and RPC dispatch
 
 pub mod agent;
+pub mod collab;
 pub mod host;
 pub mod policy;
 pub mod prediction;
 pub mod store;
+pub mod tracker;
 pub mod voice;
+pub mod scenarios;
 
 pub use agent::{AheadAgentLoop, AgentTurnInput, AgentTurnOutput, AcpDelegator, AcpDelegatedTask};
+pub use collab::{CollabSession, CollabParticipant, ParticipantStatus, StickyAnchorIndex, ReviewSnapshot};
 pub use host::AheadSessionHost;
 pub use policy::PolicyEvaluator;
 pub use prediction::PredictionEngine;
 pub use store::SessionStore;
+pub use tracker::{TrackerAdapter, TrackerOutboxItem, TrackerUpdatePayload, OutboxStatus};
 pub use voice::VoiceSession;
