@@ -1,11 +1,11 @@
 //! Session/chat/proposal/tracker pure transitions.
 //!
-//! Ported 1:1 from the logic inside `lapce-app/src/ahead/state.rs`
+//! Ported 1:1 from the logic inside `ahead-app/src/ahead/state.rs`
 //! (`AheadState` methods), minus the Floem signals. The Floem shell keeps
 //! working by delegating to these functions; the GPUI shell will call the
 //! same functions from entities.
 
-use lapce_rpc::ahead::{ChangeProposal, SessionView, VoiceTranscriptUpdate};
+use ahead_rpc::ahead::{ChangeProposal, SessionView, VoiceTranscriptUpdate};
 
 /// Minimal chat message (mirrors `AgentChatMessage` without timestamps-as-logic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,23 +181,23 @@ mod tests {
             recommended_cursor: None,
         });
         let view = SessionView {
-            session: lapce_rpc::ahead::WorkSession {
+            session: ahead_rpc::ahead::WorkSession {
                 id: "sess".into(),
                 project_id: "p".into(),
                 worktree_id: "w".into(),
-                work_kind: lapce_rpc::ahead::WorkKind::ProductChange,
-                mode: lapce_rpc::ahead::AssistanceMode::Assist,
+                work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
+                mode: ahead_rpc::ahead::AssistanceMode::Assist,
                 title: "t".into(),
                 owner_id: "o".into(),
-                lifecycle: lapce_rpc::ahead::SessionLifecycle::Active,
-                policy: lapce_rpc::ahead::SessionPolicySnapshot::default(),
+                lifecycle: ahead_rpc::ahead::SessionLifecycle::Active,
+                policy: ahead_rpc::ahead::SessionPolicySnapshot::default(),
                 revision: 1,
                 created_at: "now".into(),
             },
-            workflow: lapce_rpc::ahead::WorkflowState {
+            workflow: ahead_rpc::ahead::WorkflowState {
                 revision: 1,
                 definition_version: "v".into(),
-                phase: lapce_rpc::ahead::WorkflowPhase { id: "plan".into(), title: "Planning".into(), visit: 1 },
+                phase: ahead_rpc::ahead::WorkflowPhase { id: "plan".into(), title: "Planning".into(), visit: 1 },
                 primary_work_item: None,
                 current_artifact_ids: Vec::new(),
                 approvals: Vec::new(),

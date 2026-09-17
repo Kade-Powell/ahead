@@ -6,20 +6,20 @@ default_job = "check"
 [jobs.check]
 command = ["cargo", "check", "--bin", "ahead", "--tests"]
 need_stdout = false
-watch = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core", "ahead-viewmodel"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
 
 [jobs.check-all]
 command = ["cargo", "check", "--workspace", "--all-targets"]
 need_stdout = false
-watch = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core", "ahead-viewmodel"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
 
 [jobs.test]
-command = ["cargo", "test", "-p", "lapce-proxy", "--lib", "-p", "ahead-viewmodel"]
+command = ["cargo", "test", "-p", "ahead-proxy", "--lib", "-p", "ahead-viewmodel"]
 need_stdout = true
-watch = ["lapce-proxy", "lapce-rpc", "ahead-viewmodel"]
+watch = ["ahead-proxy", "ahead-rpc", "ahead-viewmodel"]
 
 [jobs.run]
 command = ["cargo", "run", "--bin", "ahead"]
 need_stdout = false
-watch = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core", "ahead-viewmodel"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
 kill = ["cargo", "run", "--bin", "ahead"]

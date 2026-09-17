@@ -9,19 +9,19 @@ test_cmd() {
 }
 
 # proxy version
-lapce_new_ver="${1}"
+ahead_new_ver="${1}"
 # proxy directory
 # eval to resolve '~' into proper user dir
-eval lapce_dir="'${2}'"
+eval ahead_dir="'${2}'"
 
-case "${lapce_new_ver}" in
+case "${ahead_new_ver}" in
   v*)
-    lapce_new_version=$(echo "${lapce_new_ver}" | cut -d'v' -f2)
-    lapce_new_ver_tag="${lapce_new_ver}"
+    ahead_new_version=$(echo "${ahead_new_ver}" | cut -d'v' -f2)
+    ahead_new_ver_tag="${ahead_new_ver}"
   ;;
   nightly*)
-    lapce_new_version="${lapce_new_ver}"
-    lapce_new_ver_tag=$(echo ${lapce_new_ver} | cut -d '-' -f1)
+    ahead_new_version="${ahead_new_ver}"
+    ahead_new_ver_tag=$(echo ${ahead_new_ver} | cut -d '-' -f1)
   ;;
   *)
     printf 'Unknown version\n'
@@ -29,17 +29,17 @@ case "${lapce_new_ver}" in
   ;;
 esac
 
-if [ -e "${lapce_dir}/lapce" ]; then
-  lapce_installed_ver=$("${lapce_dir}/lapce" --version | cut -d' ' -f2)
+if [ -e "${ahead_dir}/ahead" ]; then
+  ahead_installed_ver=$("${ahead_dir}/ahead" --version | cut -d' ' -f2)
 
-  printf '[DEBUG]: Current proxy version: %s\n' "${lapce_installed_ver}"
-  printf '[DEBUG]: New proxy version: %s\n' "${lapce_new_version}"
-  if [ "${lapce_installed_ver}" = "${lapce_new_version}" ]; then
+  printf '[DEBUG]: Current proxy version: %s\n' "${ahead_installed_ver}"
+  printf '[DEBUG]: New proxy version: %s\n' "${ahead_new_version}"
+  if [ "${ahead_installed_ver}" = "${ahead_new_version}" ]; then
     printf 'Proxy already exists\n'
     exit 0
   else
     printf 'Proxy outdated. Replacing proxy\n'
-    rm "${lapce_dir}/lapce"
+    rm "${ahead_dir}/ahead"
   fi
 fi
 
@@ -71,34 +71,34 @@ case $(uname -m) in
   ;;
 esac
 
-lapce_download_url="https://github.com/lapce/lapce/releases/download/${lapce_new_ver_tag}/lapce-proxy-${os_name}-${arch_name}.gz"
+ahead_download_url="https://github.com/Kade-Powell/ahead/releases/download/${ahead_new_ver_tag}/ahead-proxy-${os_name}-${arch_name}.gz"
 
-printf 'Creating "%s"\n' "${lapce_dir}"
-mkdir -p "${lapce_dir}"
-cd "${lapce_dir}"
+printf 'Creating "%s"\n' "${ahead_dir}"
+mkdir -p "${ahead_dir}"
+cd "${ahead_dir}"
 
 if test_cmd 'curl'; then
   # How old curl has these options? we'll find out
   printf 'Downloading using curl\n'
-  curl --proto '=https' --tlsv1.2 -LfS -O "${lapce_download_url}"
-  # curl --proto '=https' --tlsv1.2 -LZfS -o "${tmp_dir}/lapce-proxy-${os_name}-${arch_name}.gz" "${lapce_download_url}"
+  curl --proto '=https' --tlsv1.2 -LfS -O "${ahead_download_url}"
+  # curl --proto '=https' --tlsv1.2 -LZfS -o "${tmp_dir}/ahead-proxy-${os_name}-${arch_name}.gz" "${ahead_download_url}"
 elif test_cmd 'wget'; then
   printf 'Downloading using wget\n'
-  wget "${lapce_download_url}"
+  wget "${ahead_download_url}"
 else
   printf 'curl/wget not found, failed to download proxy\n'
   exit 1
 fi
 
 printf 'Decompressing gzip\n'
-gzip -df "${lapce_dir}/lapce-proxy-${os_name}-${arch_name}.gz"
+gzip -df "${ahead_dir}/ahead-proxy-${os_name}-${arch_name}.gz"
 
 printf 'Renaming proxy \n'
-mv -v "${lapce_dir}/lapce-proxy-${os_name}-${arch_name}" "${lapce_dir}/lapce"
+mv -v "${ahead_dir}/ahead-proxy-${os_name}-${arch_name}" "${ahead_dir}/ahead"
 
 printf 'Making it executable\n'
-chmod +x "${lapce_dir}/lapce"
+chmod +x "${ahead_dir}/ahead"
 
-printf 'lapce-proxy installed\n'
+printf 'ahead-proxy installed\n'
 
 exit 0

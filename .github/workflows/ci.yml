@@ -53,7 +53,7 @@ jobs:
 
       - name: Build as portable
         if: startsWith(matrix.os, 'windows')
-        run: cargo build --frozen --features lapce-app/portable
+        run: cargo build --frozen --features ahead-app/portable
 
       - name: Free space on Windows
         if: startsWith(matrix.os, 'windows')

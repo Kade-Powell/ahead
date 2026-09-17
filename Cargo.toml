@@ -1,5 +1,5 @@
 [package]
-name         = "lapce"
+name         = "ahead"
 version      = { workspace = true }
 authors      = { workspace = true }
 edition      = { workspace = true }
@@ -8,27 +8,20 @@ rust-version = { workspace = true }
 default-run  = "ahead"
 
 [dependencies]
-lapce-app   = { path = "./lapce-app" }
-lapce-proxy = { path = "./lapce-proxy" }
+ahead-app   = { path = "./ahead-app" }
+ahead-proxy = { path = "./ahead-proxy" }
 
 [[bin]]
 name = "ahead"
-path = "lapce-app/src/bin/lapce.rs"
-
-[[bin]]
-name = "lapce"
-path = "lapce-app/src/bin/lapce.rs"
+path = "ahead-app/src/bin/ahead.rs"
 
 [[bin]]
 name = "ahead-proxy"
-path = "lapce-proxy/src/bin/lapce-proxy.rs"
+path = "ahead-proxy/src/bin/ahead-proxy.rs"
 
-[[bin]]
-name = "lapce-proxy"
-path = "lapce-proxy/src/bin/lapce-proxy.rs"
 
 [workspace]
-members = ["lapce-app", "lapce-proxy", "lapce-rpc", "lapce-core", "ahead-viewmodel"]
+members = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -164,9 +157,9 @@ psp-types = { git = "https://github.com/lapce/psp-types", rev = "f7fea28f59e7b2d
 
 lapce-xi-rope = { version = "0.3.2", features = ["serde"] }
 
-lapce-core  = { path = "./lapce-core" }
-lapce-rpc   = { path = "./lapce-rpc" }
-lapce-proxy = { path = "./lapce-proxy" }
+ahead-core  = { path = "./ahead-core" }
+ahead-rpc   = { path = "./ahead-rpc" }
+ahead-proxy = { path = "./ahead-proxy" }
 
 floem = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56", features = ["editor", "serde", "default-image-formats", "rfd-async-std"] }
 # floem = { path = "../floem", features = ["editor", "serde", "default-image-formats", "rfd-async-std"] }

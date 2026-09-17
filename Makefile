@@ -1,4 +1,4 @@
-# This Makefile is intended *only* for building macOS binaries of Lapce.
+# This Makefile is intended *only* for building macOS binaries of Ahead.
 # It uses macOS-specific tools like `lipo`, `codesign`, and `hdiutil`,
 # and requires that a valid Apple Developer signing identity is installed
 # and available in the system Keychain under the fingerprint set in 
@@ -33,7 +33,7 @@ help: ## Print this help message
 	@grep -E '^[a-zA-Z._-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 dev: ## Run hot-recompiling dev loop with watchexec
-	watchexec -e rs,toml -w lapce-app -w lapce-proxy -w lapce-core -w lapce-rpc -w ahead-viewmodel -r -- cargo run --bin ahead
+	watchexec -e rs,toml -w ahead-app -w ahead-proxy -w ahead-core -w ahead-rpc -w ahead-viewmodel -r -- cargo run --bin ahead
 
 bacon: ## Fast check loop (bacon default job)
 	bacon
@@ -59,8 +59,8 @@ $(TARGET)-universal:
 	@lipo target/{x86_64,aarch64}-apple-darwin/release-lto/$(TARGET) -create -output $(APP_BINARY)
 	/usr/bin/codesign -vvv --deep --entitlements $(ASSETS_DIR)/entitlements.plist --strict --options=runtime --force -s $(CODESIGN_IDENTITY) $(APP_BINARY)
 
-app: $(APP_NAME)-native ## Create a Lapce.app
-app-universal: $(APP_NAME)-universal ## Create a universal Lapce.app
+app: $(APP_NAME)-native ## Create an Ahead.app
+app-universal: $(APP_NAME)-universal ## Create a universal Ahead.app
 $(APP_NAME)-%: $(TARGET)-%
 	@mkdir -p $(APP_BINARY_DIR)
 	@mkdir -p $(APP_EXTRAS_DIR)
@@ -69,11 +69,11 @@ $(APP_NAME)-%: $(TARGET)-%
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 	xattr -c $(APP_DIR)/$(APP_NAME)/Contents/Info.plist
-	xattr -c $(APP_DIR)/$(APP_NAME)/Contents/Resources/lapce.icns
+	xattr -c $(APP_DIR)/$(APP_NAME)/Contents/Resources/ahead.icns
 	/usr/bin/codesign -vvv --deep  --entitlements $(ASSETS_DIR)/entitlements.plist --strict --options=runtime --force -s $(CODESIGN_IDENTITY) $(APP_DIR)/$(APP_NAME)
 
-dmg: $(DMG_NAME)-native ## Create a Lapce.dmg
-dmg-universal: $(DMG_NAME)-universal ## Create a universal Lapce.dmg
+dmg: $(DMG_NAME)-native ## Create an Ahead.dmg
+dmg-universal: $(DMG_NAME)-universal ## Create a universal Ahead.dmg
 $(DMG_NAME)-%: $(APP_NAME)-%
 	@echo "Packing disk image..."
 	@ln -sf /Applications $(DMG_DIR)/Applications

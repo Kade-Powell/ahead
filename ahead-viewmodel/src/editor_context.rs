@@ -4,15 +4,15 @@
 //! (workspace-relative path, UTF-16 caret line/col, selection, content)
 //! from different buffer primitives. This module owns the conversions:
 //! - Floem shell path: UTF-8 byte offset → UTF-16 line/col via
-//!   `lapce_core::rope_text_pos::RopeTextPosition` (implemented in
-//!   `lapce-app`, which owns the Floem dependency).
+//!   `ahead_core::rope_text_pos::RopeTextPosition` (implemented in
+//!   `ahead-app`, which owns the Floem dependency).
 //! - GPUI path: ropey byte offset → `Point{row,column}` via
 //!   `offset_to_point`, then column mapped the same UTF-16 way the host
 //!   already uses for display positions.
 //! - Shared: line/col pair → `DisplayPosition`, selection range assembly,
 //!   workspace-relative path reduction, empty-context fallback.
 
-use lapce_rpc::ahead::{DisplayPosition, DisplayRange};
+use ahead_rpc::ahead::{DisplayPosition, DisplayRange};
 
 /// Caret/selection in shell-neutral line/col (UTF-16 col, matching the
 /// host's display-position contract).

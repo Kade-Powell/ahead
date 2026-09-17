@@ -1,11 +1,11 @@
 //! Governed-turn assembly shared by shells and the proxy loop.
 //!
-//! Mirrors the vocabulary in `lapce-proxy/src/ahead/agent.rs`
+//! Mirrors the vocabulary in `ahead-proxy/src/ahead/agent.rs`
 //! (`TurnApprovalPolicy`, `TurnSandbox`, Codex `turn/start` params,
 //! approval decisions) without depending on the proxy crate, so both UI
 //! shells and future runtimes assemble identical turns.
 
-use lapce_rpc::ahead::AssistanceMode;
+use ahead_rpc::ahead::AssistanceMode;
 
 /// What the built-in loop may do on a turn. Mirrors the fork's
 /// `AskForApproval` vocabulary; the host answers every approval from

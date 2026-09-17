@@ -73,23 +73,23 @@ jobs:
       - name: Crate msi installer
         run: |
           candle.exe -arch "x64" -ext WixUIExtension -ext WixUtilExtension \
-            -out "./lapce.wixobj" "extra/windows/wix/lapce.wxs"
+            -out "./ahead.wixobj" "extra/windows/wix/ahead.wxs"
 
           light.exe -ext WixUIExtension -ext WixUtilExtension \
-            -out "./Lapce-windows.msi" -sice:ICE61 -sice:ICE91 \
-            "./lapce.wixobj"
+            -out "./Ahead-windows.msi" -sice:ICE61 -sice:ICE91 \
+            "./ahead.wixobj"
 
       - name: Create portable
         shell: pwsh
         run: |
-          cargo build --profile release-lto --features lapce-app/portable
-          Compress-Archive ./target/release-lto/lapce.exe ./Lapce-windows-portable.zip
+          cargo build --profile release-lto --features ahead-app/portable
+          Compress-Archive ./target/release-lto/ahead.exe ./Ahead-windows-portable.zip
 
-      - name: Create lapce-proxy archive
+      - name: Create ahead-proxy archive
         shell: pwsh
         run: |
-          $file = [System.IO.File]::Open((Join-Path $PWD '.\target\release-lto\lapce-proxy.exe'), [System.IO.FileMode]::Open)
-          $archive = [System.IO.File]::Create((Join-Path $PWD '.\lapce-proxy-windows-x86_64.gz'))
+          $file = [System.IO.File]::Open((Join-Path $PWD '.\target\release-lto\ahead-proxy.exe'), [System.IO.FileMode]::Open)
+          $archive = [System.IO.File]::Create((Join-Path $PWD '.\ahead-proxy-windows-x86_64.gz'))
           $compressor = [System.IO.Compression.GZipStream]::new($archive, [System.IO.Compression.CompressionMode]::Compress)
           $file.CopyTo($compressor)
           Start-Sleep -Seconds 10
@@ -97,11 +97,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-windows
+          name: ahead-windows
           path: |
-            ./lapce-proxy-windows-*.gz
-            ./Lapce-windows-portable.zip
-            ./Lapce-windows.msi
+            ./ahead-proxy-windows-*.gz
+            ./Ahead-windows-portable.zip
+            ./Ahead-windows.msi
           retention-days: 1
 
   linux:
@@ -118,15 +118,15 @@ jobs:
 
       - name: Gzip
         run: |
-          mkdir Lapce
-          cp ./target/linux_amd64/lapce Lapce/
-          tar -zcvf ./lapce-linux-amd64.tar.gz Lapce
+          mkdir Ahead
+          cp ./target/linux_amd64/ahead Ahead/
+          tar -zcvf ./ahead-linux-amd64.tar.gz Ahead
 
-          rm -rf Lapce
+          rm -rf Ahead
 
-          mkdir Lapce
-          cp ./target/linux_arm64/lapce Lapce/
-          tar -zcvf ./lapce-linux-arm64.tar.gz Lapce
+          mkdir Ahead
+          cp ./target/linux_arm64/ahead Ahead/
+          tar -zcvf ./ahead-linux-arm64.tar.gz Ahead
 
       - name: Fetch dependencies
         run: cargo fetch --locked
@@ -139,9 +139,9 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-linux
+          name: ahead-linux
           path: |
-            ./lapce-linux-*.tar.gz
+            ./ahead-linux-*.tar.gz
             ./vendor.tar.gz
           retention-days: 1
 
@@ -174,7 +174,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-${{ matrix.os-name }}-${{ matrix.os-version }}
+          name: ahead-${{ matrix.os-name }}-${{ matrix.os-version }}
           path: |
             ./target/linux_*/*
           retention-days: 1
@@ -204,12 +204,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-${{ matrix.os-name }}-${{ matrix.os-version }}
+          name: ahead-${{ matrix.os-name }}-${{ matrix.os-version }}
           path: |
             ./target/*
           retention-days: 1
 
-  lapce-proxy:
+  ahead-proxy:
     runs-on: ubuntu-latest
     needs: tagname
     env:
@@ -226,21 +226,21 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Build lapce-proxy binary
+      - name: Build ahead-proxy binary
         run: |
           docker buildx create --driver=docker-container --use
           docker buildx bake --pull ${{ matrix.os-name }}-${{ matrix.os-version }}
 
       - name: Gzip
         run: |
-          gzip -c ./target/linux_amd64/lapce-proxy > ./lapce-proxy-linux-x86_64.gz
-          gzip -c ./target/linux_arm64/lapce-proxy > ./lapce-proxy-linux-aarch64.gz
+          gzip -c ./target/linux_amd64/ahead-proxy > ./ahead-proxy-linux-x86_64.gz
+          gzip -c ./target/linux_arm64/ahead-proxy > ./ahead-proxy-linux-aarch64.gz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-proxy-linux
+          name: ahead-proxy-linux
           path: |
-            ./lapce-proxy-linux-*.gz
+            ./ahead-proxy-linux-*.gz
           retention-days: 1
 
   macos:
@@ -276,40 +276,40 @@ jobs:
 
       - name: Rename
         run: |
-          cp ./target/release-lto/macos/Lapce.dmg ./target/release-lto/macos/Lapce-macos.dmg
+          cp ./target/release-lto/macos/Ahead.dmg ./target/release-lto/macos/Ahead-macos.dmg
 
-      - name: Gzip lapce-proxy
+      - name: Gzip ahead-proxy
         run: |
-          gzip -c ./target/x86_64-apple-darwin/release-lto/lapce-proxy > ./target/release-lto/macos/lapce-proxy-darwin-x86_64.gz
-          gzip -c ./target/aarch64-apple-darwin/release-lto/lapce-proxy > ./target/release-lto/macos/lapce-proxy-darwin-aarch64.gz
+          gzip -c ./target/x86_64-apple-darwin/release-lto/ahead-proxy > ./target/release-lto/macos/ahead-proxy-darwin-x86_64.gz
+          gzip -c ./target/aarch64-apple-darwin/release-lto/ahead-proxy > ./target/release-lto/macos/ahead-proxy-darwin-aarch64.gz
 
       - name: Notarize Release Build
         uses: lando/notarize-action@v2
         with:
-          product-path: "./target/release-lto/macos/Lapce-macos.dmg"
+          product-path: "./target/release-lto/macos/Ahead-macos.dmg"
           appstore-connect-username: ${{ secrets.NOTARIZE_USERNAME }}
           appstore-connect-password: ${{ secrets.NOTARIZE_PASSWORD }}
           appstore-connect-team-id: CYSGAZFR8D
-          primary-bundle-id: "io.lapce"
+          primary-bundle-id: "io.ahead"
           verbose: true
 
       - name: "Staple Release Build"
         uses: lapce/xcode-staple@062485d6eeafe841c18a412f012e80f49e23c517
         with:
-          product-path: "./target/release-lto/macos/Lapce-macos.dmg"
+          product-path: "./target/release-lto/macos/Ahead-macos.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lapce-macos
+          name: ahead-macos
           path: |
-            ./target/release-lto/macos/lapce-proxy-darwin-*.gz
-            ./target/release-lto/macos/Lapce-macos.dmg
+            ./target/release-lto/macos/ahead-proxy-darwin-*.gz
+            ./target/release-lto/macos/Ahead-macos.dmg
           retention-days: 3
 
   publish:
     needs:
       - linux
-      - lapce-proxy
+      - ahead-proxy
       - deb
       - rpm
       - windows
@@ -341,7 +341,7 @@ jobs:
       - if: env.TAG_NAME == 'nightly'
         run: |
           {
-            echo 'SUBJECT=Lapce development build'
+            echo 'SUBJECT=Ahead development build'
             echo 'PRERELEASE=--prerelease'
           } | tee -a $GITHUB_ENV
 
@@ -354,7 +354,7 @@ jobs:
       - if: env.TAG_NAME != 'nightly'
         run: |
           {
-            echo 'SUBJECT=Lapce release build'
+            echo 'SUBJECT=Ahead release build'
             echo 'PRERELEASE='
           } | tee -a $GITHUB_ENV
 
@@ -364,10 +364,10 @@ jobs:
           DEBUG: api
         run: |
           gh release create $TAG_NAME $PRERELEASE --title "$TAG_NAME" --target $GITHUB_SHA \
-            lapce-macos/* \
-            lapce-linux/* \
-            lapce-debian*/*/* \
-            lapce-ubuntu*/*/* \
-            lapce-fedora*/* \
-            lapce-proxy-linux/* \
-            lapce-windows/*
+            ahead-macos/* \
+            ahead-linux/* \
+            ahead-debian*/*/* \
+            ahead-ubuntu*/*/* \
+            ahead-fedora*/* \
+            ahead-proxy-linux/* \
+            ahead-windows/*
