@@ -1,6 +1,6 @@
-# Decision 0002: Port UI from Floem to GPUI + gpui-kit
+# Decision 0002: UI framework comparison (superseded by Decision 0003)
 
-- Status: Accepted (spike-gated; Floem tree kept intact until spike passes)
+- Status: Superseded by [Decision 0003](0003-ui-port-max-reuse.md)
 - Date: 2026-09-17
 - Deciders: AHEAD maintainers
 - Context: Lapce-fork UI is built on Floem (pinned git rev `e0dd862`); AHEAD must own its UI future. Related: [0001](0001-deltadb-collaboration-fallback.md) (Yrs + SQLite fallback), spec §3.2/§15 (extension scope), §14 (a11y).
@@ -76,7 +76,7 @@ for **full GPUI port**, against Tauri + Leptos/Dioxus/Vue:
   keyboard-only traversal + screen-reader narration, one `gpui-shell` JS
   panel under a test capability grant.
 
-## Amendment 2026-09-17 (superseding): port REJECTED on reuse grounds
+## Amendment 2026-09-17 (superseded)
 
 The user reframed the objective: port to whatever reuses the MOST existing
 fork code. Measured in this repo that day:
@@ -92,9 +92,7 @@ fork code. Measured in this repo that day:
   entity/context) shares nothing with `floem::views::editor`. Reuse there
   is concepts, not code.
 
-Verdict: **stay on Floem**, pinned at `e0dd862`. The vertical-slice work
-(merged to main) lands directly with no translation layer. Extension
-answer stays: native volts + standalone LSP now, Zed-style declarative
-layer as first extensibility epic, no VSIX host. Spike branch
-`spike/gpui-kit` + `../ahead-spike-gpui` kept as evidence (window opened,
-file loaded/highlighted, save wired, screenshot-verified).
+This interim verdict was based on maximizing immediate code reuse and is
+superseded by Decision 0003, which adds the required framework-neutral
+viewmodel seam and selects GPUI as the long-term shell. Floem remains the
+working shell until the GPUI acceptance gates pass.

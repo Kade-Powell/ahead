@@ -209,7 +209,7 @@ This is a substantial editor project. A solo proof of concept is an early milest
 
 ```mermaid
 flowchart TD
-    UI["AHEAD editor: Lapce / Floem"] --> Host["AHEAD session host: workflow / policy"]
+    UI["AHEAD editor: GPUI + gpui-kit (Floem during migration)"] --> Host["AHEAD session host: workflow / policy"]
     UI --> Proxy["Lapce proxy: files / LSP / terminal / Git"]
     Host --> Runtime["Managed Codex-derived runtime or certified ACP process"]
     Runtime --> Models["Configured reasoning provider"]
