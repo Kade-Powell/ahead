@@ -3,9 +3,9 @@
 //! 4-column Zed-style layout:
 //! - Left dock: File explorer (toggleable via bottom icon row)
 //! - Center: Code editor on top, interactive PTY terminal on bottom (toggleable via bottom icon row)
-//! - Right dock: AHEAD Agent chat & Work Items checklist tabs, Threads sidebar on far-right (toggleable via bottom icon row)
+//! - Right dock: AHEAD Agent conversation on left, Threads sidebar on right (toggleable via bottom icon row)
 //! - Top: TitleBar chrome with brand and native traffic lights
-//! - Bottom: Rich StatusBar with dock toggles and panel switchers
+//! - Bottom: StatusBar with branch, proxy connection, dock toggles, and metadata
 
 use gpui_kit::*;
 use gpui_kit::component::button::Button;
@@ -150,21 +150,6 @@ impl Render for Shell {
                                     }))
                             )
                             .child(
-                                Button::new("work_items_btn")
-                                    .icon(IconName::ListTodo)
-                                    .label("Work Items")
-                                    .on_click(cx.listener({
-                                        let area = self.area.clone();
-                                        move |_, _, window, cx| {
-                                            area.update(cx, |area, cx| {
-                                                if !area.is_dock_open(DockPlacement::Right) {
-                                                    area.toggle_dock(DockPlacement::Right, window, cx);
-                                                }
-                                            });
-                                        }
-                                    }))
-                            )
-                            .child(
                                 Button::new("threads_btn")
                                     .icon(IconName::Layers)
                                     .label("Threads")
@@ -251,7 +236,6 @@ pub fn launch() {
 
                         let code = cx.new(|cx| crate::code_panel::CodePanel::new(&path, window, cx));
                         let session = cx.new(|cx| crate::session_panel::SessionPanel::new(window, cx));
-                        let work_items = cx.new(|cx| crate::work_items_panel::WorkItemsPanel::new(window, cx));
                         let threads = cx.new(|cx| crate::threads_panel::ThreadsPanel::new(window, cx));
                         let explorer = cx.new(|cx| crate::explorer_panel::ExplorerPanel::new(&explorer_root, window, cx));
                         let terminal = cx.new(|cx| crate::terminal_panel::TerminalPanel::new(window, cx));
@@ -259,20 +243,12 @@ pub fn launch() {
                         // Center: Code on top, Terminal on bottom (vertical split)
                         let center = DockLayout::v_split()
                             .child(DockLayout::tabs().panel_view(panel_handle(code), cx), None)
-                            .child(DockLayout::tabs().panel_view(panel_handle(terminal), cx), Some(px(220.)));
+                            .child(DockLayout::tabs().panel_view(panel_handle(terminal), cx), Some(px(240.)));
 
-                        // Right dock: Agent chat and Work Items checklist as tabs, Threads sidebar on far right
+                        // Right dock: Agent conversation on left, Threads sidebar on right (horizontal split)
                         let right = DockLayout::h_split()
-                            .child(
-                                DockLayout::tabs()
-                                    .panel_view(panel_handle(session), cx)
-                                    .panel_view(panel_handle(work_items), cx),
-                                None,
-                            )
-                            .child(
-                                DockLayout::tabs().panel_view(panel_handle(threads), cx),
-                                Some(px(240.)),
-                            );
+                            .child(DockLayout::tabs().panel_view(panel_handle(session), cx), None)
+                            .child(DockLayout::tabs().panel_view(panel_handle(threads), cx), Some(px(220.)));
 
                         // Left dock: File Explorer
                         let left = DockLayout::tabs().panel_view(panel_handle(explorer), cx);

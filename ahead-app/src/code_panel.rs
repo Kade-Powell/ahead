@@ -1,11 +1,14 @@
 //! AHEAD Code Editor Panel - GPUI Implementation
 //!
-//! Uses gpui-kit components, Lucide icons, and dynamic Dark/Light theming.
-//! Grounded in Sections 3.1, 4.4, and 4.5 of `ahead-editor-mvp.md`.
+//! Modern editor matching Zed and VS Code:
+//! - NO save button: Cmd+S / Ctrl+S saves directly.
+//! - NO intrusive alert banners: agent points directly with clean status.
+//! - File tab bar with icon, dirty indicator (`•`), and close button.
+//! - Path breadcrumb navigation.
+//! - Real Tree-sitter highlighted code editor with line numbers and folding.
 
 use gpui_kit::*;
 use gpui_kit::prelude::*;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent,
 };
@@ -20,7 +23,7 @@ pub struct CodePanel {
     pub saved_rev: usize,
     pub dirty_rev: usize,
     pub status: SharedString,
-    pub cue_info: Option<(String, u32)>,
+    pub active_line: u32,
 }
 
 impl CodePanel {
@@ -52,8 +55,8 @@ impl CodePanel {
             file_path: path.to_string(),
             saved_rev: 0,
             dirty_rev: 0,
-            status: "File loaded into editor".into(),
-            cue_info: Some(("Focus on retry invariants".to_string(), 3)),
+            status: "Ready".into(),
+            active_line: 1,
         }
     }
 
@@ -62,7 +65,7 @@ impl CodePanel {
         match std::fs::write(&self.file_path, text) {
             Ok(()) => {
                 self.saved_rev = self.dirty_rev;
-                self.status = format!("Saved to {}", self.file_path).into();
+                self.status = format!("Saved {}", self.file_path).into();
             }
             Err(e) => {
                 self.status = format!("Save failed: {e}").into();
@@ -71,15 +74,13 @@ impl CodePanel {
         cx.notify();
     }
 
-    pub fn set_presentation_cue(&mut self, label: String, line: u32, cx: &mut Context<Self>) {
-        self.cue_info = Some((label, line));
-        self.status = format!("Agent cue target set at line {line}").into();
-        cx.notify();
-    }
+    pub fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let cmd = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
 
-    pub fn dismiss_cue(&mut self, cx: &mut Context<Self>) {
-        self.cue_info = None;
-        cx.notify();
+        if cmd && key == "s" {
+            self.save(cx);
+        }
     }
 }
 
@@ -91,11 +92,13 @@ impl BasePanel for CodePanel {
 
 impl Panel for CodePanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let name = std::path::Path::new(&self.file_path)
+        let file_name = std::path::Path::new(&self.file_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("Code");
-        SharedString::from(name.to_string())
+            .unwrap_or("untitled");
+        let dirty = self.dirty_rev != self.saved_rev;
+        let suffix = if dirty { " •" } else { "" };
+        SharedString::from(format!("{}{}", file_name, suffix))
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -114,108 +117,79 @@ impl Focusable for CodePanel {
 impl Render for CodePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dirty = self.dirty_rev != self.saved_rev;
-        let cue_info = self.cue_info.clone();
-        let bar_bg = cx.theme().sidebar;
         let border_color = cx.theme().border;
         let text_color = cx.theme().sidebar_foreground;
         let is_dark = cx.theme().mode.is_dark();
+        let bar_bg = if is_dark { gpui_kit::rgb(0x121214) } else { gpui_kit::rgb(0xF8FAFC) };
+        let editor_bg = if is_dark { gpui_kit::rgb(0x18181B) } else { gpui_kit::rgb(0xFFFFFF) };
+
+        let file_name = std::path::Path::new(&self.file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled");
 
         v_flex()
             .size_full()
+            .bg(editor_bg)
             .track_focus(&self.focus)
-            // Top Toolbar: Path, Clean/Dirty Status, Save Button
+            .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, _, cx| {
+                this.handle_key(event, cx);
+            }))
+            // Breadcrumb path navigation bar (clean, matching Zed / VS Code)
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .h(px(28.))
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .gap_2()
                     .bg(bar_bg)
                     .border_b_1()
                     .border_color(border_color)
                     .child(
                         h_flex()
-                            .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(12.))
-                                    .text_color(text_color)
-                                    .child(self.file_path.clone())
-                            )
+                            .items_center()
+                            .child(IconName::FileCode)
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(if dirty {
-                                        if is_dark { gpui_kit::rgb(0xF59E0B) } else { gpui_kit::rgb(0xD97706) }
-                                    } else {
-                                        if is_dark { gpui_kit::rgb(0x10B981) } else { gpui_kit::rgb(0x059669) }
-                                    })
-                                    .child(if dirty { "[modified • unsaved]" } else { "[clean]" })
+                                    .text_color(text_color)
+                                    .child(self.file_path.clone())
                             )
-                    )
-                    .child(
-                        Button::new("save_btn")
-                            .primary()
-                            .icon(IconName::Save)
-                            .label("Save")
-                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.save(cx)))
+                            .when(dirty, |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(gpui_kit::rgb(0xF59E0B))
+                                        .child("• modified (Cmd+S to save)")
+                                )
+                            })
                     )
             )
-            // Presentation Cue Banner (if active)
-            .when_some(cue_info, |this, (label, line)| {
-                this.child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .px_3()
-                        .py_2()
-                        .bg(if is_dark { gpui_kit::rgb(0x133E2F) } else { gpui_kit::rgb(0xECFDF5) })
-                        .border_b_1()
-                        .border_color(if is_dark { gpui_kit::rgb(0x059669) } else { gpui_kit::rgb(0xA7F3D0) })
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(IconName::Target)
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(if is_dark { gpui_kit::rgb(0x34D399) } else { gpui_kit::rgb(0x065F46) })
-                                        .child(format!("Agent Pointer: {label} (pointing to line {line})"))
-                                )
-                        )
-                        .child(
-                            Button::new("dismiss_cue_btn")
-                                .icon(IconName::X)
-                                .label("Dismiss")
-                                .on_click(cx.listener(|this: &mut Self, _, _, cx| this.dismiss_cue(cx)))
-                        )
-                )
-            })
             // Real GPUI Code Editor
             .child(
                 div()
                     .flex_1()
+                    .bg(editor_bg)
                     .child(
                         Editor::new(&self.editor)
                             .aria_label("AHEAD Code Editor")
                             .h_full()
                     )
             )
-            // Footer status
+            // Footer status strip
             .child(
                 h_flex()
-                    .h(px(24.))
+                    .h(px(22.))
                     .items_center()
+                    .justify_between()
                     .px_3()
                     .bg(bar_bg)
                     .border_t_1()
                     .border_color(border_color)
                     .text_size(px(11.))
                     .text_color(text_color)
+                    .child(format!("{} · Ln {}, Col 1", file_name, self.active_line))
                     .child(self.status.clone())
             )
     }

@@ -1,7 +1,10 @@
-//! AHEAD AI Pairing Agent Panel - GPUI Implementation
+//! AHEAD AI Agent Conversation Panel - GPUI Implementation
 //!
-//! Fully scrollable agent panel matching the Zed AI Agent aesthetic.
-//! Uses gpui-kit components, Lucide icons, and dynamic theming.
+//! True conversational AI interface matching Zed and modern assistant panels:
+//! - Thread header with title (`helo`), model badge, and action buttons.
+//! - Chat stream with user message bubbles, agent responses, and inline plan cards.
+//! - Inline code proposals gate within the conversation flow.
+//! - Modern bottom composer: "Message the AHEAD Agent, @ to include context, / for commands".
 
 use gpui_kit::*;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -16,7 +19,6 @@ use gpui_kit_assets::IconName;
 pub struct SessionPanel {
     pub focus: FocusHandle,
     pub chat_input: Entity<InputState>,
-    pub work_item_input: Entity<InputState>,
     pub session: ahead_viewmodel::SessionSnapshot,
     pub voice: ahead_viewmodel::VoiceIntent,
     pub mode_assist: bool,
@@ -31,7 +33,6 @@ pub struct SessionPanel {
 impl SessionPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let chat_input = cx.new(|cx| InputState::new(window, cx));
-        let work_item_input = cx.new(|cx| InputState::new(window, cx));
         let mut session = ahead_viewmodel::SessionSnapshot::default();
 
         ahead_viewmodel::push_human_message(&mut session, "helo");
@@ -39,7 +40,7 @@ impl SessionPanel {
             &mut session,
             ahead_viewmodel::AgentMessage {
                 sender: "AHEAD Agent".into(),
-                text: "Session started. Current phase: Plan. State your next reasoning step or ask for an edge-case challenge.".into(),
+                text: "I've analyzed the problem. Let's work through the implementation together. State your next step or ask for an edge-case challenge.".into(),
                 is_challenge: false,
             },
         );
@@ -83,14 +84,13 @@ impl SessionPanel {
         Self {
             focus: cx.focus_handle(),
             chat_input,
-            work_item_input,
             session,
             voice: ahead_viewmodel::VoiceIntent::new(),
             mode_assist: true,
             phase_id: "plan",
             active_work_title: "Implement resilient retry logic".to_string(),
             active_work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
-            status: "AHEAD Agent ready".into(),
+            status: "Connected".into(),
             work_items: initial_items,
             pending_proposals: initial_proposals,
         }
@@ -150,36 +150,19 @@ impl SessionPanel {
                     &mut self.session,
                     ahead_viewmodel::AgentMessage {
                         sender: "AHEAD Agent".into(),
-                        text: format!("Analyzed reasoning: '{}'. Consider state invariants before proceeding to code edits.", text),
+                        text: format!("Analyzed: '{}'. Verify state preconditions before proceeding.", text),
                         is_challenge: false,
                     },
                 );
             }
 
-            self.status = format!("Chat updated ({} messages)", self.session.chat.len()).into();
+            self.status = format!("{} messages", self.session.chat.len()).into();
         }
         cx.notify();
     }
 
-    pub fn send_prompt(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_input.update(cx, |input, cx| input.set_value(prompt, window, cx));
-        self.send_chat(window, cx);
-    }
-
     pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         self.mode_assist = !self.mode_assist;
-        let mode = if self.mode_assist {
-            ahead_rpc::ahead::AssistanceMode::Assist
-        } else {
-            ahead_rpc::ahead::AssistanceMode::Learn
-        };
-        let policy = ahead_viewmodel::approval_policy_for_mode(mode);
-        self.status = format!(
-            "Mode switched to {} (Policy: {})",
-            if self.mode_assist { "Assist" } else { "Learn" },
-            policy.codex_wire_value()
-        )
-        .into();
         cx.notify();
     }
 
@@ -190,74 +173,10 @@ impl SessionPanel {
             &mut self.session,
             ahead_viewmodel::AgentMessage {
                 sender: "AHEAD Agent".into(),
-                text: format!("Advanced to phase: {next_title}. Invariants check active."),
+                text: format!("Phase advanced: {next_title}."),
                 is_challenge: false,
             },
         );
-        self.status = format!("Phase advanced to {next_title}").into();
-        cx.notify();
-    }
-
-    pub fn toggle_voice(&mut self, cx: &mut Context<Self>) {
-        ahead_viewmodel::voice::toggle(&mut self.voice);
-        self.status = format!(
-            "Voice: {} (generation {})",
-            if self.voice.active { "LIVE (listening)" } else { "OFF" },
-            self.voice.generation
-        )
-        .into();
-        cx.notify();
-    }
-
-    pub fn barge_in(&mut self, cx: &mut Context<Self>) {
-        ahead_viewmodel::voice::barge_in(&mut self.voice);
-        self.status = format!("Barge-in triggered (gen {})", self.voice.generation).into();
-        cx.notify();
-    }
-
-    pub fn toggle_mic_mute(&mut self, cx: &mut Context<Self>) {
-        self.voice.mic_muted = !self.voice.mic_muted;
-        self.status = format!(
-            "Microphone {}",
-            if self.voice.mic_muted { "MUTED" } else { "ACTIVE" }
-        )
-        .into();
-        cx.notify();
-    }
-
-    pub fn add_work_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.work_item_input.read(cx).value().to_string();
-        if title.trim().is_empty() {
-            return;
-        }
-
-        let new_item = ahead_rpc::ahead::WorkItem {
-            id: format!("wi-{}", self.work_items.len() + 1),
-            session_id: "sess-current".to_string(),
-            title: title.clone(),
-            status: ahead_rpc::ahead::WorkItemStatus::Open,
-            position: self.work_items.len() as i64,
-            created_by: "human".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            closed_at: None,
-        };
-
-        self.work_items.push(new_item);
-        self.work_item_input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.status = format!("Added work item: {title}").into();
-        cx.notify();
-    }
-
-    pub fn cycle_work_item_status(&mut self, item_id: &str, cx: &mut Context<Self>) {
-        if let Some(item) = self.work_items.iter_mut().find(|i| i.id == item_id) {
-            item.status = match item.status {
-                ahead_rpc::ahead::WorkItemStatus::Open => ahead_rpc::ahead::WorkItemStatus::InProgress,
-                ahead_rpc::ahead::WorkItemStatus::InProgress => ahead_rpc::ahead::WorkItemStatus::Done,
-                ahead_rpc::ahead::WorkItemStatus::Done => ahead_rpc::ahead::WorkItemStatus::Dropped,
-                ahead_rpc::ahead::WorkItemStatus::Dropped => ahead_rpc::ahead::WorkItemStatus::Open,
-            };
-            self.status = format!("Work item status: {:?}", item.status).into();
-        }
         cx.notify();
     }
 
@@ -268,11 +187,10 @@ impl SessionPanel {
                 &mut self.session,
                 ahead_viewmodel::AgentMessage {
                     sender: "AHEAD Agent".into(),
-                    text: format!("Proposal {} authorized and applied by human engineer.", prop.id),
+                    text: format!("Proposal {} authorized and applied.", prop.id),
                     is_challenge: false,
                 },
             );
-            self.status = format!("Authorized proposal {}", prop.id).into();
         }
         cx.notify();
     }
@@ -288,7 +206,6 @@ impl SessionPanel {
                     is_challenge: false,
                 },
             );
-            self.status = format!("Rejected proposal {}", prop.id).into();
         }
         cx.notify();
     }
@@ -302,7 +219,7 @@ impl BasePanel for SessionPanel {
 
 impl Panel for SessionPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "AHEAD AI Agent"
+        "helo"
     }
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
         Some(PanelControl::Toolbar)
@@ -319,249 +236,230 @@ impl Focusable for SessionPanel {
 
 impl Render for SessionPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let chat_count = self.session.chat.len();
-        let phase_name = match self.phase_id {
-            "plan" => "Plan",
-            "invariants" => "Invariants",
-            "implement" => "Implement",
-            "verify" => "Verify",
-            "review" => "Review",
-            "complete" => "Completed",
-            _ => "Plan",
-        };
-
-        let phase_goal = match self.phase_id {
-            "plan" => "Define scope, map affected crates, author problem framing.",
-            "invariants" => "Document state preconditions, postconditions, and idempotency.",
-            "implement" => "Author minimal, strictly-bounded code changes adhering to invariants.",
-            "verify" => "Run cargo test --workspace, inspect edge cases, zero regressions.",
-            "review" => "Peer inspection, human verification signoff, and tracker sync.",
-            _ => "Milestone complete.",
-        };
-
-        let panel_bg = cx.theme().sidebar;
         let border_color = cx.theme().border;
         let text_color = cx.theme().sidebar_foreground;
-        let group_box = cx.theme().group_box;
         let is_dark = cx.theme().mode.is_dark();
+        let bg_color = if is_dark { gpui_kit::rgb(0x18181B) } else { gpui_kit::rgb(0xFFFFFF) };
+        let bubble_user_bg = if is_dark { gpui_kit::rgb(0x27272A) } else { gpui_kit::rgb(0xF1F5F9) };
+        let card_bg = if is_dark { gpui_kit::rgb(0x202023) } else { gpui_kit::rgb(0xF8FAFC) };
 
         v_flex()
             .size_full()
-            .min_h_0()
-            .overflow_y_scrollbar()
-            .gap_2()
-            .p_3()
+            .bg(bg_color)
             .track_focus(&self.focus)
-            // Header Section: active work kind and mode badge
+            // Top Thread Title Header
             .child(
-                v_flex()
-                    .p_3()
-                    .gap_1()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
+                h_flex()
+                    .h(px(38.))
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .border_b_1()
                     .border_color(border_color)
                     .child(
                         h_flex()
+                            .gap_2()
                             .items_center()
-                            .justify_between()
                             .child(
-                                v_flex()
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .items_center()
-                                            .child(IconName::Zap)
-                                            .child(
-                                                div()
-                                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                                    .text_color(if is_dark { gpui_kit::rgb(0xF59E0B) } else { gpui_kit::rgb(0xD97706) })
-                                                    .child("AHEAD AI AGENT")
-                                            )
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(text_color)
-                                            .child(format!("{} · {}", self.active_work_kind.display_name(), self.active_work_title))
-                                    )
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_size(px(13.))
+                                    .text_color(text_color)
+                                    .child("helo")
                             )
                             .child(
-                                Button::new("mode_toggle")
-                                    .primary()
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(gpui_kit::rgb(0x71717A))
+                                    .child("· Claude 3.5 Sonnet")
+                            )
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("mode_pill")
                                     .icon(if self.mode_assist { IconName::Code } else { IconName::Shield })
                                     .label(if self.mode_assist { "Assist" } else { "Learn" })
                                     .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_mode(cx)))
                             )
                     )
             )
-            // Workflow Pipeline Section
+            // Scrollable Conversation Message Stream
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_h_0()
                     .p_3()
-                    .gap_1()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(IconName::Workflow)
-                                    .child(
-                                        div()
-                                            .font_weight(gpui_kit::FontWeight::BOLD)
-                                            .text_size(px(11.))
-                                            .text_color(text_color)
-                                            .child(format!("Workflow: {phase_name}"))
-                                    )
-                            )
-                            .child(
-                                Button::new("advance_btn")
-                                    .icon(IconName::ArrowRight)
-                                    .label("Advance")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.advance_phase(cx)))
-                            )
-                    )
-                    .child(
-                        div()
-                            .p_1()
-                            .text_size(px(11.))
-                            .text_color(text_color)
-                            .child(phase_goal)
-                    )
-            )
-            // Voice Controls
-            .child(
-                h_flex()
-                    .p_2()
-                    .gap_2()
-                    .items_center()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        Button::new("voice_toggle")
-                            .icon(if self.voice.active { IconName::Mic } else { IconName::MicOff })
-                            .label(if self.voice.active { "Voice: Live" } else { "Voice: Off" })
-                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_voice(cx)))
-                    )
-                    .child(
-                        Button::new("barge_in")
-                            .icon(IconName::Square)
-                            .label("Barge In")
-                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.barge_in(cx)))
-                    )
-                    .child(
-                        Button::new("mute_mic")
-                            .icon(if self.voice.mic_muted { IconName::MicOff } else { IconName::Mic })
-                            .label(if self.voice.mic_muted { "Unmute" } else { "Mute" })
-                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_mic_mute(cx)))
-                    )
-            )
-            // Agent Pairing Feed Section (chat stream)
-            .child(
-                v_flex()
-                    .gap_2()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(IconName::MessageSquare)
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(text_color)
-                                    .child(format!("Conversation ({chat_count} messages)"))
-                            )
-                    )
+                    .gap_3()
+                    .overflow_y_scrollbar()
+                    // Conversation messages
                     .children(
                         self.session.chat.iter().map(|msg| {
                             let is_human = msg.sender == "Human";
                             let is_challenge = msg.is_challenge;
-                            let sender_color = if is_human {
-                                gpui_kit::rgb(0x60A5FA)
-                            } else if is_challenge {
-                                gpui_kit::rgb(0xFBBF24)
-                            } else {
-                                gpui_kit::rgb(0x34D399)
-                            };
 
-                            v_flex()
-                                .p_2()
-                                .gap_1()
-                                .rounded_md()
-                                .bg(if is_human {
-                                    group_box
-                                } else {
-                                    panel_bg
+                            if is_human {
+                                // User prompt bubble: clean, right-aligned, matching Zed
+                                h_flex()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .max_w(px(400.))
+                                            .p_2()
+                                            .rounded_lg()
+                                            .bg(bubble_user_bg)
+                                            .text_size(px(13.))
+                                            .text_color(text_color)
+                                            .child(msg.text.clone())
+                                    )
+                            } else {
+                                // Agent reply block: clean typography, avatar
+                                v_flex()
+                                    .gap_1()
+                                    .p_1()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                if is_challenge { IconName::ShieldAlert } else { IconName::Bot }
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                                    .text_size(px(12.))
+                                                    .text_color(if is_challenge { gpui_kit::rgb(0xFBBF24) } else { gpui_kit::rgb(0x34D399) })
+                                                    .child(msg.sender.clone())
+                                            )
+                                    )
+                                    .child(
+                                        div()
+                                            .pl_5()
+                                            .text_size(px(13.))
+                                            .line_height(px(20.))
+                                            .text_color(text_color)
+                                            .child(msg.text.clone())
+                                    )
+                            }
+                        })
+                    )
+                    // Inline Plan / Work Items card inside the conversation
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .rounded_lg()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border_color)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(IconName::ListTodo)
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                                    .text_size(px(12.))
+                                                    .text_color(text_color)
+                                                    .child(format!("Plan: {} · Phase {}", self.active_work_title, self.phase_id))
+                                            )
+                                    )
+                                    .child(
+                                        Button::new("advance_btn")
+                                            .icon(IconName::ArrowRight)
+                                            .label("Advance")
+                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.advance_phase(cx)))
+                                    )
+                            )
+                            .children(
+                                self.work_items.iter().map(|item| {
+                                    let is_done = matches!(item.status, ahead_rpc::ahead::WorkItemStatus::Done);
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(if is_done { IconName::CircleCheck } else { IconName::Circle })
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(if is_done { gpui_kit::rgb(0x71717A).into() } else { text_color })
+                                                .child(item.title.clone())
+                                        )
                                 })
+                            )
+                    )
+                    // Inline Code Proposal cards inside the conversation
+                    .children(
+                        self.pending_proposals.iter().map(|prop| {
+                            let pid = prop.id.clone();
+                            let pid_rej = prop.id.clone();
+                            v_flex()
+                                .p_3()
+                                .gap_2()
+                                .rounded_lg()
+                                .bg(card_bg)
                                 .border_1()
                                 .border_color(border_color)
                                 .child(
-                                    div()
-                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                        .text_size(px(11.))
-                                        .text_color(sender_color)
-                                        .child(msg.sender.clone())
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(IconName::FileCode)
+                                        .child(
+                                            div()
+                                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                                .text_size(px(12.))
+                                                .text_color(text_color)
+                                                .child(format!("Proposal: {}", prop.path))
+                                        )
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .text_color(text_color)
-                                        .child(msg.text.clone())
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(if is_dark { gpui_kit::rgb(0x0C0E14) } else { gpui_kit::rgb(0xF1F5F9) })
+                                        .text_size(px(11.))
+                                        .font_family("Menlo")
+                                        .text_color(gpui_kit::rgb(0x86EFAC))
+                                        .child(prop.patch.clone())
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(SharedString::from(format!("auth_{}", pid)))
+                                                .primary()
+                                                .icon(IconName::Check)
+                                                .label("Authorize & Apply")
+                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                    this.authorize_proposal(&pid, cx);
+                                                }))
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("rej_{}", pid_rej)))
+                                                .icon(IconName::X)
+                                                .label("Reject")
+                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                    this.reject_proposal(&pid_rej, cx);
+                                                }))
+                                        )
                                 )
                         })
-                    )
-            )
-            // Quick Action Prompt Chips
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("prompt_edge")
-                            .icon(IconName::ShieldAlert)
-                            .label("Edge Cases")
-                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                this.send_prompt("Challenge my edge cases for this phase", window, cx);
-                            }))
-                    )
-                    .child(
-                        Button::new("prompt_inv")
-                            .icon(IconName::ShieldCheck)
-                            .label("Invariants")
-                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                this.send_prompt("What invariants must hold here?", window, cx);
-                            }))
-                    )
-                    .child(
-                        Button::new("prompt_scaffold")
-                            .icon(IconName::Code)
-                            .label("Scaffold")
-                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                this.send_prompt("Scaffold boilerplate for the active task", window, cx);
-                            }))
                     )
             )
             // Zed-Style Bottom Chat Composer
             .child(
                 v_flex()
+                    .m_3()
                     .p_2()
                     .gap_2()
-                    .rounded_lg()
-                    .bg(group_box)
+                    .rounded_xl()
+                    .bg(card_bg)
                     .border_1()
                     .border_color(border_color)
                     .child(
@@ -574,178 +472,26 @@ impl Render for SessionPanel {
                             .justify_between()
                             .child(
                                 h_flex()
-                                    .gap_1()
+                                    .gap_2()
                                     .items_center()
                                     .child(
+                                        Button::new("add_context_btn")
+                                            .icon(IconName::Plus)
+                                    )
+                                    .child(
                                         div()
-                                            .text_size(px(10.))
-                                            .text_color(text_color)
-                                            .child("AHEAD Model")
+                                            .text_size(px(11.))
+                                            .text_color(gpui_kit::rgb(0x71717A))
+                                            .child("Claude 3.5 Sonnet")
                                     )
                             )
                             .child(
                                 Button::new("send_btn")
                                     .primary()
                                     .icon(IconName::Send)
-                                    .label("Send")
                                     .on_click(cx.listener(|this: &mut Self, _, window, cx| this.send_chat(window, cx)))
                             )
                     )
-            )
-            // Work Items Checklist Section
-            .child(
-                v_flex()
-                    .gap_1()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(IconName::ListTodo)
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(text_color)
-                                    .child(format!("Work Items ({} items)", self.work_items.len()))
-                            )
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Input::new(&self.work_item_input).aria_label("Work item title").flex_1())
-                            .child(
-                                Button::new("add_wi_btn")
-                                    .icon(IconName::Plus)
-                                    .label("Add")
-                                    .on_click(cx.listener(|this: &mut Self, _, window, cx| this.add_work_item(window, cx)))
-                            )
-                    )
-                    .children(
-                        self.work_items.iter().map(|item| {
-                            let item_id = item.id.clone();
-                            let (status_icon, status_label) = match item.status {
-                                ahead_rpc::ahead::WorkItemStatus::Open => (IconName::Circle, "Open"),
-                                ahead_rpc::ahead::WorkItemStatus::InProgress => (IconName::CircleDashed, "Doing"),
-                                ahead_rpc::ahead::WorkItemStatus::Done => (IconName::CircleCheck, "Done"),
-                                ahead_rpc::ahead::WorkItemStatus::Dropped => (IconName::CircleX, "Dropped"),
-                            };
-
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .p_2()
-                                .rounded_md()
-                                .bg(group_box)
-                                .border_1()
-                                .border_color(border_color)
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(text_color)
-                                        .child(item.title.clone())
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("wi_status_{}", item_id)))
-                                        .icon(status_icon)
-                                        .label(status_label)
-                                        .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                            this.cycle_work_item_status(&item_id, cx);
-                                        }))
-                                )
-                        })
-                    )
-            )
-            // Mechanical Proposals Gate Section
-            .child(
-                v_flex()
-                    .gap_1()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(IconName::FileCode)
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(if is_dark { gpui_kit::rgb(0x60A5FA) } else { gpui_kit::rgb(0x2563EB) })
-                                    .child(format!("Code Proposals ({} pending)", self.pending_proposals.len()))
-                            )
-                    )
-                    .children(
-                        self.pending_proposals.iter().map(|prop| {
-                            let prop_id = prop.id.clone();
-                            let prop_id_reject = prop.id.clone();
-                            v_flex()
-                                .p_2()
-                                .gap_1()
-                                .rounded_md()
-                                .bg(group_box)
-                                .border_1()
-                                .border_color(border_color)
-                                .child(
-                                    div()
-                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                        .text_size(px(11.))
-                                        .text_color(text_color)
-                                        .child(format!("File: {}", prop.path))
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(text_color)
-                                        .child(prop.description.clone())
-                                )
-                                .child(
-                                    div()
-                                        .p_2()
-                                        .rounded_md()
-                                        .bg(if is_dark { gpui_kit::rgb(0x020617) } else { gpui_kit::rgb(0x0F172A) })
-                                        .text_size(px(11.))
-                                        .text_color(gpui_kit::rgb(0x86EFAC))
-                                        .child(prop.patch.clone())
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new(SharedString::from(format!("auth_{}", prop_id)))
-                                                .primary()
-                                                .icon(IconName::Check)
-                                                .label("Authorize & Apply")
-                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                                    this.authorize_proposal(&prop_id, cx);
-                                                }))
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!("rej_{}", prop_id_reject)))
-                                                .icon(IconName::X)
-                                                .label("Reject")
-                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                                    this.reject_proposal(&prop_id_reject, cx);
-                                                }))
-                                        )
-                                )
-                        })
-                    )
-            )
-            // Footer status
-            .child(
-                div()
-                    .pt_1()
-                    .text_size(px(10.))
-                    .text_color(text_color)
-                    .child(self.status.clone())
             )
     }
 }
