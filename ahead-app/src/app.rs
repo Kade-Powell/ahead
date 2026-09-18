@@ -1,13 +1,14 @@
 //! AHEAD Application Shell - GPUI Application Lifecycle
 //!
 //! 4-column Zed-style layout:
-//! - Left dock: File explorer
-//! - Center: Code editor on top, interactive terminal on bottom
-//! - Right dock: AHEAD Agent conversation on left, Threads sidebar on right
-//! - Top: TitleBar chrome with brand and traffic lights
-//! - Bottom: StatusBar with branch and proxy connection state
+//! - Left dock: File explorer (toggleable via bottom icon row)
+//! - Center: Code editor on top, interactive PTY terminal on bottom (toggleable via bottom icon row)
+//! - Right dock: AHEAD Agent chat & Work Items checklist tabs, Threads sidebar on far-right (toggleable via bottom icon row)
+//! - Top: TitleBar chrome with brand and native traffic lights
+//! - Bottom: Rich StatusBar with dock toggles and panel switchers
 
 use gpui_kit::*;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::dock::{
     DockArea, DockLayout, DockPlacement, DockSkin, PanelStyle, panel_handle,
 };
@@ -24,6 +25,10 @@ impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let text = cx.theme().sidebar_foreground;
+        let area_left = self.area.clone();
+        let area_bottom = self.area.clone();
+        let area_right = self.area.clone();
+
         v_flex()
             .size_full()
             .child(
@@ -44,29 +49,143 @@ impl Render for Shell {
             .child(div().flex_1().child(self.area.clone()))
             .child(
                 StatusBar::new()
+                    // Left Region: Dock toggles and panel quick-switchers
                     .left(
                         h_flex()
-                            .gap_2()
+                            .gap_1()
                             .items_center()
-                            .child(IconName::GitBranch)
                             .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(text)
-                                    .child("main · AHEAD session active"),
-                            ),
+                                Button::new("toggle_left_dock")
+                                    .icon(IconName::PanelLeft)
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        area_left.update(cx, |area, cx| area.toggle_dock(DockPlacement::Left, window, cx));
+                                    }))
+                            )
+                            .child(
+                                Button::new("files_btn")
+                                    .icon(IconName::Folder)
+                                    .label("Files")
+                                    .on_click(cx.listener({
+                                        let area = self.area.clone();
+                                        move |_, _, window, cx| {
+                                            area.update(cx, |area, cx| {
+                                                if !area.is_dock_open(DockPlacement::Left) {
+                                                    area.toggle_dock(DockPlacement::Left, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }))
+                            )
+                            .child(
+                                Button::new("git_btn")
+                                    .icon(IconName::GitBranch)
+                                    .label("main")
+                            )
+                            .child(
+                                Button::new("toggle_bottom_dock")
+                                    .icon(IconName::PanelBottom)
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        area_bottom.update(cx, |area, cx| area.toggle_dock(DockPlacement::Bottom, window, cx));
+                                    }))
+                            )
+                            .child(
+                                Button::new("terminal_btn")
+                                    .icon(IconName::Terminal)
+                                    .label("Terminal")
+                                    .on_click(cx.listener({
+                                        let area = self.area.clone();
+                                        move |_, _, window, cx| {
+                                            area.update(cx, |area, cx| {
+                                                if !area.is_dock_open(DockPlacement::Bottom) {
+                                                    area.toggle_dock(DockPlacement::Bottom, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }))
+                            )
+                            .child(
+                                Button::new("problems_btn")
+                                    .icon(IconName::ShieldCheck)
+                                    .label("0 Problems")
+                            )
                     )
-                    .right(
+                    // Center Region: Active work session chip
+                    .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(IconName::CircleCheck)
+                            .child(IconName::Zap)
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_size(px(11.))
+                                    .text_color(text)
+                                    .child("AHEAD: Implement resilient retry logic [Assist · Plan]")
+                            )
+                    )
+                    // Right Region: Editor stats and Right dock panel switchers
+                    .right(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
                             .child(
                                 div()
                                     .text_size(px(11.))
                                     .text_color(text)
-                                    .child("proxy connected · 0 problems"),
-                            ),
+                                    .child("Ln 1, Col 1 · Rust · UTF-8")
+                            )
+                            .child(
+                                Button::new("agent_btn")
+                                    .icon(IconName::MessageSquare)
+                                    .label("Agent")
+                                    .on_click(cx.listener({
+                                        let area = self.area.clone();
+                                        move |_, _, window, cx| {
+                                            area.update(cx, |area, cx| {
+                                                if !area.is_dock_open(DockPlacement::Right) {
+                                                    area.toggle_dock(DockPlacement::Right, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }))
+                            )
+                            .child(
+                                Button::new("work_items_btn")
+                                    .icon(IconName::ListTodo)
+                                    .label("Work Items")
+                                    .on_click(cx.listener({
+                                        let area = self.area.clone();
+                                        move |_, _, window, cx| {
+                                            area.update(cx, |area, cx| {
+                                                if !area.is_dock_open(DockPlacement::Right) {
+                                                    area.toggle_dock(DockPlacement::Right, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }))
+                            )
+                            .child(
+                                Button::new("threads_btn")
+                                    .icon(IconName::Layers)
+                                    .label("Threads")
+                                    .on_click(cx.listener({
+                                        let area = self.area.clone();
+                                        move |_, _, window, cx| {
+                                            area.update(cx, |area, cx| {
+                                                if !area.is_dock_open(DockPlacement::Right) {
+                                                    area.toggle_dock(DockPlacement::Right, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }))
+                            )
+                            .child(
+                                Button::new("toggle_right_dock")
+                                    .icon(IconName::PanelRight)
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        area_right.update(cx, |area, cx| area.toggle_dock(DockPlacement::Right, window, cx));
+                                    }))
+                            )
                     )
                     .border_t_1()
                     .border_color(border),
@@ -132,6 +251,7 @@ pub fn launch() {
 
                         let code = cx.new(|cx| crate::code_panel::CodePanel::new(&path, window, cx));
                         let session = cx.new(|cx| crate::session_panel::SessionPanel::new(window, cx));
+                        let work_items = cx.new(|cx| crate::work_items_panel::WorkItemsPanel::new(window, cx));
                         let threads = cx.new(|cx| crate::threads_panel::ThreadsPanel::new(window, cx));
                         let explorer = cx.new(|cx| crate::explorer_panel::ExplorerPanel::new(&explorer_root, window, cx));
                         let terminal = cx.new(|cx| crate::terminal_panel::TerminalPanel::new(window, cx));
@@ -141,10 +261,18 @@ pub fn launch() {
                             .child(DockLayout::tabs().panel_view(panel_handle(code), cx), None)
                             .child(DockLayout::tabs().panel_view(panel_handle(terminal), cx), Some(px(220.)));
 
-                        // Right dock: Agent on left, Threads sidebar on right (horizontal split)
+                        // Right dock: Agent chat and Work Items checklist as tabs, Threads sidebar on far right
                         let right = DockLayout::h_split()
-                            .child(DockLayout::tabs().panel_view(panel_handle(session), cx), None)
-                            .child(DockLayout::tabs().panel_view(panel_handle(threads), cx), Some(px(240.)));
+                            .child(
+                                DockLayout::tabs()
+                                    .panel_view(panel_handle(session), cx)
+                                    .panel_view(panel_handle(work_items), cx),
+                                None,
+                            )
+                            .child(
+                                DockLayout::tabs().panel_view(panel_handle(threads), cx),
+                                Some(px(240.)),
+                            );
 
                         // Left dock: File Explorer
                         let left = DockLayout::tabs().panel_view(panel_handle(explorer), cx);
@@ -153,7 +281,7 @@ pub fn launch() {
                             area.set_center(center, window, cx);
                             area.set_dock(DockPlacement::Left, left, window, cx);
                             area.set_dock(DockPlacement::Right, right, window, cx);
-                            area.set_dock_size(DockPlacement::Right, px(680.), window, cx);
+                            area.set_dock_size(DockPlacement::Right, px(720.), window, cx);
                             area.set_dock_size(DockPlacement::Left, px(240.), window, cx);
                         });
                         let shell = cx.new(|_| Shell { area });
