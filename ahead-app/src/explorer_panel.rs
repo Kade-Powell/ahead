@@ -49,6 +49,7 @@ impl ExplorerPanel {
         cx.notify();
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn collect(dir: &std::path::Path, root: &str, depth: usize, query: &str, out: &mut Vec<ExplorerEntry>) {
         let Ok(read) = std::fs::read_dir(dir) else { return };
         let mut names: Vec<std::path::PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();

@@ -1,23 +1,25 @@
 //! AHEAD Agent Threads Sidebar - GPUI Implementation
 //!
-//! Mirrors the multi-thread sidebar layout from modern AI-native editors (Zed/AHEAD),
-//! supporting both collaborative AHEAD work-item threads and delegated harness tasks.
-//! Uses gpui-kit components, Lucide icons, and dynamic Dark/Light theming.
+//! Mirrors the multi-thread sidebar layout from Zed/AHEAD:
+//! - Search threads input at top
+//! - Unified thread list under the workspace root (`ahead`)
+//! - Threads can be AHEAD collaborative threads or external agent threads
+//! - Each thread shows title, relative time, close button, and active state
 
 use gpui_kit::*;
-use gpui_kit::prelude::*;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent,
 };
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{v_flex, h_flex, ActiveTheme};
 use gpui_kit_assets::IconName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadKind {
-    AheadWorkItem { item_id: String, shared_collaborators: Vec<String> },
-    DelegatedTask { harness: String },
+    Ahead { item_id: String, shared: bool },
+    External { harness: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,9 +27,8 @@ pub struct AgentThread {
     pub id: String,
     pub title: String,
     pub kind: ThreadKind,
-    pub message_count: usize,
+    pub time_str: String,
     pub is_active: bool,
-    pub updated_at: String,
 }
 
 pub struct ThreadsPanel {
@@ -35,7 +36,6 @@ pub struct ThreadsPanel {
     pub search_input: Entity<InputState>,
     pub threads: Vec<AgentThread>,
     pub status: SharedString,
-    pub filter: String,
 }
 
 impl ThreadsPanel {
@@ -43,46 +43,32 @@ impl ThreadsPanel {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let threads = vec![
             AgentThread {
-                id: "thread-ahead-1".into(),
-                title: "Implement resilient retry logic".into(),
-                kind: ThreadKind::AheadWorkItem {
-                    item_id: "wi-2".into(),
-                    shared_collaborators: vec!["kpowel859".into(), "alice".into()],
-                },
-                message_count: 5,
+                id: "thread-1".into(),
+                title: "helo".into(),
+                kind: ThreadKind::Ahead { item_id: "wi-1".into(), shared: false },
+                time_str: "1m".into(),
                 is_active: true,
-                updated_at: "Just now".into(),
             },
             AgentThread {
-                id: "thread-ahead-2".into(),
-                title: "Invariants & bounds audit".into(),
-                kind: ThreadKind::AheadWorkItem {
-                    item_id: "wi-1".into(),
-                    shared_collaborators: vec!["kpowel859".into()],
-                },
-                message_count: 12,
+                id: "thread-2".into(),
+                title: "Implement resilient retry logic".into(),
+                kind: ThreadKind::Ahead { item_id: "wi-2".into(), shared: true },
+                time_str: "12m".into(),
                 is_active: false,
-                updated_at: "10m ago".into(),
             },
             AgentThread {
-                id: "thread-task-1".into(),
+                id: "thread-3".into(),
                 title: "Audit third-party/codex runtime bloat".into(),
-                kind: ThreadKind::DelegatedTask {
-                    harness: "ACP Subagent".into(),
-                },
-                message_count: 8,
+                kind: ThreadKind::External { harness: "Subagent".into() },
+                time_str: "45m".into(),
                 is_active: false,
-                updated_at: "15m ago".into(),
             },
             AgentThread {
-                id: "thread-task-2".into(),
-                title: "Sync Tree-sitter grammar queries".into(),
-                kind: ThreadKind::DelegatedTask {
-                    harness: "External ACP".into(),
-                },
-                message_count: 3,
+                id: "thread-4".into(),
+                title: "Tree-sitter queries synchronization".into(),
+                kind: ThreadKind::External { harness: "External".into() },
+                time_str: "2h".into(),
                 is_active: false,
-                updated_at: "1h ago".into(),
             },
         ];
 
@@ -90,8 +76,7 @@ impl ThreadsPanel {
             focus: cx.focus_handle(),
             search_input,
             threads,
-            status: "Threads loaded".into(),
-            filter: String::new(),
+            status: "Threads".into(),
         }
     }
 
@@ -99,52 +84,31 @@ impl ThreadsPanel {
         for thread in &mut self.threads {
             thread.is_active = thread.id == thread_id;
         }
-        self.status = format!("Active thread: {thread_id}").into();
+        self.status = format!("Thread: {thread_id}").into();
         cx.notify();
     }
 
-    pub fn new_ahead_thread(&mut self, cx: &mut Context<Self>) {
-        let count = self.threads.len() + 1;
-        let new_thread = AgentThread {
-            id: format!("thread-ahead-{count}"),
-            title: format!("New AHEAD Work Thread {count}"),
-            kind: ThreadKind::AheadWorkItem {
-                item_id: format!("wi-{count}"),
-                shared_collaborators: vec!["kpowel859".into()],
-            },
-            message_count: 0,
-            is_active: true,
-            updated_at: "Just now".into(),
-        };
-
-        for thread in &mut self.threads {
-            thread.is_active = false;
+    pub fn close_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.threads.retain(|t| t.id != thread_id);
+        if let Some(first) = self.threads.first_mut() {
+            first.is_active = true;
         }
-
-        self.threads.insert(0, new_thread);
-        self.status = "Created new collaborative AHEAD thread".into();
         cx.notify();
     }
 
-    pub fn new_delegated_task(&mut self, cx: &mut Context<Self>) {
+    pub fn new_thread(&mut self, cx: &mut Context<Self>) {
         let count = self.threads.len() + 1;
-        let new_thread = AgentThread {
-            id: format!("thread-task-{count}"),
-            title: format!("Delegated Task #{count}"),
-            kind: ThreadKind::DelegatedTask {
-                harness: "Background Subagent".into(),
-            },
-            message_count: 0,
+        let new_t = AgentThread {
+            id: format!("thread-{count}"),
+            title: format!("Thread {count}"),
+            kind: ThreadKind::Ahead { item_id: format!("wi-{count}"), shared: false },
+            time_str: "Just now".into(),
             is_active: true,
-            updated_at: "Just now".into(),
         };
-
-        for thread in &mut self.threads {
-            thread.is_active = false;
+        for t in &mut self.threads {
+            t.is_active = false;
         }
-
-        self.threads.insert(0, new_thread);
-        self.status = "Spawned new delegated task thread".into();
+        self.threads.insert(0, new_t);
         cx.notify();
     }
 }
@@ -180,85 +144,61 @@ impl Render for ThreadsPanel {
         let active_bg = cx.theme().sidebar_accent;
         let active_fg = cx.theme().sidebar_accent_foreground;
         let group_box = cx.theme().group_box;
-        let is_dark = cx.theme().mode.is_dark();
 
         v_flex()
             .size_full()
-            .p_3()
-            .gap_2()
+            .min_h_0()
+            .p_2()
+            .gap_1()
             .track_focus(&self.focus)
-            // Top Search Bar & New Thread Actions
+            // Top Search Bar & New Thread button
             .child(
-                v_flex()
-                    .gap_2()
-                    .p_2()
-                    .rounded_lg()
-                    .bg(group_box)
-                    .border_1()
-                    .border_color(border_color)
+                h_flex()
+                    .gap_1()
+                    .items_center()
                     .child(
                         Input::new(&self.search_input)
-                            .aria_label("Search threads")
+                            .aria_label("Search threads...")
                     )
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("new_ahead_thread_btn")
-                                    .primary()
-                                    .icon(IconName::MessageSquare)
-                                    .label("AHEAD Thread")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.new_ahead_thread(cx)))
-                            )
-                            .child(
-                                Button::new("new_task_thread_btn")
-                                    .icon(IconName::Bot)
-                                    .label("Task")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.new_delegated_task(cx)))
-                            )
+                        Button::new("new_thread_icon_btn")
+                            .icon(IconName::Plus)
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.new_thread(cx)))
                     )
             )
-            // Workspace Group Header
+            // Workspace Header
             .child(
                 div()
                     .px_2()
                     .pt_2()
+                    .pb_1()
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .text_size(px(11.))
                     .text_color(text_color)
                     .child("ahead")
             )
-            // Thread List Entries
+            // Unified Thread List (scrollable)
             .child(
                 v_flex()
                     .flex_1()
+                    .min_h_0()
                     .gap_1()
+                    .overflow_y_scrollbar()
                     .children(
                         self.threads.iter()
                             .filter(move |t| search_query.is_empty() || t.title.to_lowercase().contains(&search_query))
                             .map(|thread| {
                                 let thread_id = thread.id.clone();
+                                let thread_id_close = thread.id.clone();
                                 let is_active = thread.is_active;
-
-                                let (badge_text, badge_color, is_shared) = match &thread.kind {
-                                    ThreadKind::AheadWorkItem { shared_collaborators, .. } => (
-                                        "AHEAD".to_string(),
-                                        if is_dark { gpui_kit::rgb(0x10B981) } else { gpui_kit::rgb(0x059669) },
-                                        shared_collaborators.len() > 1,
-                                    ),
-                                    ThreadKind::DelegatedTask { harness } => (
-                                        harness.clone(),
-                                        if is_dark { gpui_kit::rgb(0x60A5FA) } else { gpui_kit::rgb(0x2563EB) },
-                                        false,
-                                    ),
-                                };
 
                                 h_flex()
                                     .id(ElementId::Name(thread_id.clone().into()))
                                     .items_center()
                                     .justify_between()
-                                    .p_3()
-                                    .rounded_lg()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
                                     .bg(if is_active { active_bg } else { group_box })
                                     .border_1()
                                     .border_color(if is_active { active_bg } else { border_color })
@@ -267,8 +207,9 @@ impl Render for ThreadsPanel {
                                         this.select_thread(&thread_id, cx);
                                     }))
                                     .child(
-                                        v_flex()
-                                            .gap_1()
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
                                             .child(
                                                 div()
                                                     .font_weight(if is_active { gpui_kit::FontWeight::BOLD } else { gpui_kit::FontWeight::NORMAL })
@@ -276,49 +217,27 @@ impl Render for ThreadsPanel {
                                                     .text_color(if is_active { active_fg } else { text_color })
                                                     .child(thread.title.clone())
                                             )
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
                                             .child(
-                                                h_flex()
-                                                    .gap_2()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.))
-                                                            .font_weight(gpui_kit::FontWeight::BOLD)
-                                                            .text_color(badge_color)
-                                                            .child(badge_text)
-                                                    )
-                                                    .when(is_shared, |el| {
-                                                        el.child(
-                                                            h_flex()
-                                                                .gap_1()
-                                                                .items_center()
-                                                                .child(IconName::Users)
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(10.))
-                                                                        .text_color(if is_dark { gpui_kit::rgb(0x34D399) } else { gpui_kit::rgb(0x059669) })
-                                                                        .child("Shared")
-                                                                )
-                                                        )
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.))
-                                                            .text_color(text_color)
-                                                            .child(format!("{} msgs · {}", thread.message_count, thread.updated_at))
-                                                    )
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(text_color)
+                                                    .child(thread.time_str.clone())
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("close_{}", thread_id_close)))
+                                                    .icon(IconName::X)
+                                                    .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                        this.close_thread(&thread_id_close, cx);
+                                                    }))
                                             )
                                     )
                             })
                     )
-            )
-            // Footer status
-            .child(
-                div()
-                    .pt_1()
-                    .text_size(px(10.))
-                    .text_color(text_color)
-                    .child(self.status.clone())
             )
     }
 }

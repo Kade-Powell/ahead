@@ -1,7 +1,7 @@
 //! AHEAD AI Pairing Agent Panel - GPUI Implementation
 //!
-//! Uses gpui-kit components, Lucide icons, and dynamic Dark/Light theming.
-//! Grounded in Sections 4.2, 4.4, 4.5, and 8.2 of `ahead-editor-mvp.md`.
+//! Fully scrollable agent panel matching the Zed AI Agent aesthetic.
+//! Uses gpui-kit components, Lucide icons, and dynamic theming.
 
 use gpui_kit::*;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -9,6 +9,7 @@ use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent,
 };
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{v_flex, h_flex, ActiveTheme};
 use gpui_kit_assets::IconName;
 
@@ -33,7 +34,7 @@ impl SessionPanel {
         let work_item_input = cx.new(|cx| InputState::new(window, cx));
         let mut session = ahead_viewmodel::SessionSnapshot::default();
 
-        ahead_viewmodel::push_human_message(&mut session, "Ready to begin our engineering session.");
+        ahead_viewmodel::push_human_message(&mut session, "helo");
         ahead_viewmodel::push_agent_message(
             &mut session,
             ahead_viewmodel::AgentMessage {
@@ -125,7 +126,7 @@ impl SessionPanel {
                         },
                     );
                     self.pending_proposals.push(ahead_rpc::ahead::ChangeProposal {
-                        id: format!("prop-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()),
+                        id: format!("prop-{}", &uuid::Uuid::new_v4().to_string()[..8]),
                         session_id: "sess-current".to_string(),
                         path: "src/retry.rs".to_string(),
                         original_sha256: "00000000".to_string(),
@@ -320,11 +321,11 @@ impl Render for SessionPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let chat_count = self.session.chat.len();
         let phase_name = match self.phase_id {
-            "plan" => "1. Plan",
-            "invariants" => "2. Invariants",
-            "implement" => "3. Implement",
-            "verify" => "4. Verify",
-            "review" => "5. Review",
+            "plan" => "Plan",
+            "invariants" => "Invariants",
+            "implement" => "Implement",
+            "verify" => "Verify",
+            "review" => "Review",
             "complete" => "Completed",
             _ => "Plan",
         };
@@ -346,10 +347,12 @@ impl Render for SessionPanel {
 
         v_flex()
             .size_full()
+            .min_h_0()
+            .overflow_y_scrollbar()
             .gap_2()
             .p_3()
             .track_focus(&self.focus)
-            // Header Section
+            // Header Section: active work kind and mode badge
             .child(
                 v_flex()
                     .p_3()
@@ -373,7 +376,7 @@ impl Render for SessionPanel {
                                                 div()
                                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                                     .text_color(if is_dark { gpui_kit::rgb(0xF59E0B) } else { gpui_kit::rgb(0xD97706) })
-                                                    .child("AHEAD AI PAIRING AGENT")
+                                                    .child("AHEAD AI AGENT")
                                             )
                                     )
                                     .child(
@@ -415,13 +418,13 @@ impl Render for SessionPanel {
                                             .font_weight(gpui_kit::FontWeight::BOLD)
                                             .text_size(px(11.))
                                             .text_color(text_color)
-                                            .child(format!("WORKFLOW: {phase_name}"))
+                                            .child(format!("Workflow: {phase_name}"))
                                     )
                             )
                             .child(
                                 Button::new("advance_btn")
                                     .icon(IconName::ArrowRight)
-                                    .label("Advance Phase")
+                                    .label("Advance")
                                     .on_click(cx.listener(|this: &mut Self, _, _, cx| this.advance_phase(cx)))
                             )
                     )
@@ -433,44 +436,39 @@ impl Render for SessionPanel {
                             .child(phase_goal)
                     )
             )
-            // Voice Section
+            // Voice Controls
             .child(
-                v_flex()
-                    .p_3()
-                    .gap_1()
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .items_center()
                     .rounded_lg()
                     .bg(panel_bg)
                     .border_1()
                     .border_color(border_color)
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("voice_toggle")
-                                    .icon(if self.voice.active { IconName::Mic } else { IconName::MicOff })
-                                    .label(if self.voice.active { "Voice: Live" } else { "Voice: Off" })
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_voice(cx)))
-                            )
-                            .child(
-                                Button::new("barge_in")
-                                    .icon(IconName::Square)
-                                    .label("Barge In")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.barge_in(cx)))
-                            )
-                            .child(
-                                Button::new("mute_mic")
-                                    .icon(if self.voice.mic_muted { IconName::MicOff } else { IconName::Mic })
-                                    .label(if self.voice.mic_muted { "Unmute" } else { "Mute" })
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_mic_mute(cx)))
-                            )
+                        Button::new("voice_toggle")
+                            .icon(if self.voice.active { IconName::Mic } else { IconName::MicOff })
+                            .label(if self.voice.active { "Voice: Live" } else { "Voice: Off" })
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_voice(cx)))
+                    )
+                    .child(
+                        Button::new("barge_in")
+                            .icon(IconName::Square)
+                            .label("Barge In")
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.barge_in(cx)))
+                    )
+                    .child(
+                        Button::new("mute_mic")
+                            .icon(if self.voice.mic_muted { IconName::MicOff } else { IconName::Mic })
+                            .label(if self.voice.mic_muted { "Unmute" } else { "Mute" })
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_mic_mute(cx)))
                     )
             )
-            // Agent Pairing Feed Section
+            // Agent Pairing Feed Section (chat stream)
             .child(
                 v_flex()
-                    .flex_1()
-                    .gap_1()
+                    .gap_2()
                     .p_3()
                     .rounded_lg()
                     .bg(panel_bg)
@@ -486,7 +484,7 @@ impl Render for SessionPanel {
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_size(px(11.))
                                     .text_color(text_color)
-                                    .child(format!("AGENT PAIRING FEED ({chat_count} messages)"))
+                                    .child(format!("Conversation ({chat_count} messages)"))
                             )
                     )
                     .children(
@@ -557,17 +555,41 @@ impl Render for SessionPanel {
                             }))
                     )
             )
-            // Chat Input Box
+            // Zed-Style Bottom Chat Composer
             .child(
-                h_flex()
+                v_flex()
+                    .p_2()
                     .gap_2()
-                    .child(Input::new(&self.chat_input).aria_label("Chat input").flex_1())
+                    .rounded_lg()
+                    .bg(group_box)
+                    .border_1()
+                    .border_color(border_color)
                     .child(
-                        Button::new("send_btn")
-                            .primary()
-                            .icon(IconName::Send)
-                            .label("Send")
-                            .on_click(cx.listener(|this: &mut Self, _, window, cx| this.send_chat(window, cx)))
+                        Input::new(&self.chat_input)
+                            .aria_label("Message the AHEAD Agent, @ to include context, / for commands")
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(text_color)
+                                            .child("AHEAD Model")
+                                    )
+                            )
+                            .child(
+                                Button::new("send_btn")
+                                    .primary()
+                                    .icon(IconName::Send)
+                                    .label("Send")
+                                    .on_click(cx.listener(|this: &mut Self, _, window, cx| this.send_chat(window, cx)))
+                            )
                     )
             )
             // Work Items Checklist Section
@@ -589,7 +611,7 @@ impl Render for SessionPanel {
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_size(px(11.))
                                     .text_color(text_color)
-                                    .child(format!("WORK ITEMS ({} items)", self.work_items.len()))
+                                    .child(format!("Work Items ({} items)", self.work_items.len()))
                             )
                     )
                     .child(
@@ -657,7 +679,7 @@ impl Render for SessionPanel {
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_size(px(11.))
                                     .text_color(if is_dark { gpui_kit::rgb(0x60A5FA) } else { gpui_kit::rgb(0x2563EB) })
-                                    .child(format!("CODE PROPOSALS GATE ({} pending)", self.pending_proposals.len()))
+                                    .child(format!("Code Proposals ({} pending)", self.pending_proposals.len()))
                             )
                     )
                     .children(
@@ -717,7 +739,7 @@ impl Render for SessionPanel {
                         })
                     )
             )
-            // Status bar footer
+            // Footer status
             .child(
                 div()
                     .pt_1()
