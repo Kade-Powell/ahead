@@ -7,9 +7,9 @@ assignees: ''
 
 ---
 
-## Lapce Version
+## Ahead Version
 
-The Lapce version you are using, which can be found in "About Lapce" at the top right settings icon. 
+The Ahead version you are using, which can be found in "About Ahead" at the top right settings icon. 
 
 ## System information
 

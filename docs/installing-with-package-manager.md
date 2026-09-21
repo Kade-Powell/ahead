@@ -1,20 +1,20 @@
 ## Installation With Package Manager
 
-Lapce is available in below software repositories:
+Ahead is not yet published to upstream package repositories (the existing `lapce` listings there carry Lapce, the project Ahead is forked from).
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/lapce.svg)](https://repology.org/project/lapce/versions)
+For now, install Ahead from:
 
-Lapce is also additionally available via:
-
-- [Flatpak](https://flathub.org/apps/details/dev.lapce.lapce)
-- [Scoop](https://scoop.sh/#/apps?q=lapce)
-
-
-For Fedora Linux, Lapce is (unofficially) available via dnf RPM package manager, using nightly as of 2024.01:
-
-- [copr](https://copr.fedorainfracloud.org/coprs/titaniumtown/lapce/)
-
-```bash
-sudo dnf copr enable titaniumtown/lapce 
-sudo dnf install lapce
-```
+- **GitHub releases** (https://github.com/Kade-Powell/ahead/releases):
+  - macOS: `Ahead-macos.dmg`
+  - Windows: `Ahead-windows.msi` or `Ahead-windows-portable.zip`
+  - Debian/Ubuntu: `.deb` packages built per distribution version
+  - Linux (other): `ahead-linux-*.tar.gz`
+- **Cargo**, from a checkout (see [Building from source](building-from-source.md)):
+  ```sh
+  cargo install --path . --bin ahead --profile release-lto --locked
+  ```
+- **macOS bundle**, from a checkout:
+  ```sh
+  just app
+  open target/release-lto/macos/Ahead.app
+  ```

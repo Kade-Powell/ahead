@@ -193,7 +193,7 @@ cat <<- EOL > debian/control
 	Maintainer: Jakub Panek <me+debian@panekj.dev>
 	Architecture: ${_PACKAGE_ARCHITECTURE}
 	Description: Lightning-fast and Powerful Code Editor
-	Source: https://lapce.dev
+	Source: https://github.com/Kade-Powell/ahead
 EOL
 
 depends=$(dpkg-shlibdeps -O -e usr/bin/ahead)

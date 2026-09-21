@@ -100,16 +100,16 @@ RUN \
 #!/usr/bin/env bash
 set -euxo pipefail
 
-LAPCE_VERSION=$(cargo pkgid | cut -d'#' -f2 | cut -d'@' -f2 | cut -d':' -f2)
+AHEAD_VERSION=$(cargo pkgid | cut -d'#' -f2 | cut -d'@' -f2 | cut -d':' -f2)
 
 case "${RELEASE_TAG_NAME}" in
   nightly-*)
     commit=$(echo "${RELEASE_TAG_NAME}" | cut -d'-' -f2)
-    RELEASE_TAG_NAME="${LAPCE_VERSION}+${commit}"
+    RELEASE_TAG_NAME="${AHEAD_VERSION}+${commit}"
   ;;
   debug|nightly)
     date=$(date +%Y%m%d%H%M)
-    RELEASE_TAG_NAME="${LAPCE_VERSION}+${date}"
+    RELEASE_TAG_NAME="${AHEAD_VERSION}+${date}"
   ;;
   *)
     RELEASE_TAG_NAME="${RELEASE_TAG_NAME//v/}"

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+    <Product Name="Ahead" Id="*" UpgradeCode="9c09a374-1135-4782-959f-2dec376a1dfa" Language="1033" Codepage="1252" Version="0.4.6" Manufacturer="Ahead">
+        <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
+        <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+        <Icon Id="ahead.exe" SourceFile=".\extra\windows\ahead.ico"/>
+        <WixVariable Id="WixUILicenseRtf" Value=".\extra\windows\wix\license.rtf"/>
+        <Property Id="ARPPRODUCTICON" Value="ahead.exe"/>
+        <MediaTemplate EmbedCab="yes"/>
+        <UIRef Id="WixUI_Minimal"/>
+
+        <Feature Id="ProductFeature" Title="ConsoleApp" Level="1">
+            <ComponentRef Id="AheadExe"/>
+            <ComponentRef Id="AheadShortcut"/>
+            <ComponentRef Id="ModifyPathEnv"/>
+            <ComponentRef Id="ContextMenu"/>
+        </Feature>
+
+        <!-- Create directories -->
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder">
+                <Directory Id="AheadProgramFiles" Name="Ahead"/>
+            </Directory>
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="AheadProgramMenu" Name="Ahead"/>
+            </Directory>
+        </Directory>
+
+        <!-- Application binaries -->
+        <DirectoryRef Id="AheadProgramFiles">
+            <Component Id="AheadExe" Guid="*">
+                <File Id="AheadExeFile" Source=".\target\release-lto\ahead.exe" Name="ahead.exe" KeyPath="yes"/>
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="AheadProgramMenu">
+            <!-- Application shortcut -->
+            <Component Id="AheadShortcut" Guid="7d3d3a8e-febb-4759-8eca-873676d5066a">
+                <Shortcut Id="AheadShortcutFile" Icon="ahead.exe" Name="Ahead" Description="AI-native code editor" Target="[AheadProgramFiles]ahead.exe"/>
+                <RemoveFolder Id="AheadProgramMenu" On="uninstall"/>
+                <RegistryValue Root="HKCU" Key="Software\Microsoft\Ahead" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="AheadProgramFiles">
+            <!-- Add to PATH -->
+            <Component Id="ModifyPathEnv" Guid="0581ccb0-5db8-4935-8b07-8f46bc2d7171" KeyPath="yes">
+                <Environment Id="PathEnv" Value="[AheadProgramFiles]" Name="PATH" Permanent="no" Part="first" Action="set" System="yes"/>
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="TARGETDIR">
+            <!-- Add context menu -->
+            <Component Id="ContextMenu" Guid="22ad399b-1d77-416c-ae33-57e8f8511177">
+                <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\Open Ahead here\command">
+                    <RegistryValue Type="string" Value="[AheadProgramFiles]ahead.exe &quot;%V&quot;" KeyPath="yes"/>
+                </RegistryKey>
+                <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\Open Ahead here">
+                    <RegistryValue Type="string" Name="Icon" Value="[AheadProgramFiles]ahead.exe"/>
+                </RegistryKey>
+            </Component>
+        </DirectoryRef>
+    </Product>
+</Wix>
