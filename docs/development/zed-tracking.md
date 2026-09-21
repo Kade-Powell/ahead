@@ -45,6 +45,10 @@
 ## Review log
 
 - 2026-09-17: tracking file created. No Zed checkout pinned yet.
+- 2026-09-21: pinned `418f89714891f9d8105a3e92e60b9a7a5084d232`
+  (main, 2026-09-21, "Prevent multibuffer items from switching acti...").
+  Checkout lives at `~/dev/zed` (shallow, outside this repo — do not
+  vendor it here; record imported paths per item below).
 - 2026-09-21: direct source reuse accepted for the editor, search, source
   control, terminal/task and debugger surfaces. Pin the checkout before the
   first import; preserve Apache-2.0 notices and record every imported path.
