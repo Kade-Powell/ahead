@@ -11,21 +11,21 @@ use std::{
 use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender};
 use dyn_clone::DynClone;
-use floem_editor_core::buffer::rope_text::{RopeText, RopeTextRef};
 use jsonrpc_lite::{Id, JsonRpc, Params};
-use ahead_core::{encoding::offset_utf16_to_utf8, rope_text_pos::RopeTextPosition};
+use ahead_core::encoding::{offset_utf16_to_utf8, offset_utf8_to_utf16};
 use ahead_rpc::{
     RpcError,
     core::{CoreRpcHandler, ServerStatusParams},
+    delta::AheadDelta,
     plugin::{PluginId, VoltID},
     style::{LineStyle, Style},
 };
-use lapce_xi_rope::{Rope, RopeDelta};
+use ropey::{LineType, Rope};
 use lsp_types::{
     CancelParams, CodeActionProviderCapability, DidChangeTextDocumentParams,
     DidSaveTextDocumentParams, DocumentSelector, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, InitializeResult,
-    LogMessageParams, MessageType, OneOf, ProgressParams, PublishDiagnosticsParams,
+    LogMessageParams, MessageType, OneOf, Position, ProgressParams, PublishDiagnosticsParams,
     Range, Registration, RegistrationParams, SemanticTokens, SemanticTokensLegend,
     SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier,
@@ -142,7 +142,7 @@ pub enum PluginServerRpc {
     DidChangeTextDocument {
         language_id: String,
         document: VersionedTextDocumentIdentifier,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
         change: Arc<
@@ -241,7 +241,7 @@ pub trait PluginServerHandler {
         &mut self,
         language_id: String,
         document: VersionedTextDocumentIdentifier,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
         change: Arc<
@@ -1064,7 +1064,7 @@ impl PluginHostHandler {
         &mut self,
         lanaguage_id: String,
         document: VersionedTextDocumentIdentifier,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
         change: Arc<
@@ -1150,23 +1150,40 @@ impl PluginHostHandler {
     }
 }
 
+/// Byte offset of a line start, clamped to the document.
+fn offset_of_line(text: &Rope, line: usize) -> usize {
+    let lines = text.len_lines(LineType::LF_CR);
+    text.line_to_byte_idx(line.min(lines), LineType::LF_CR)
+}
+
+/// Converts a UTF-8 byte offset to an LSP position, clamping into range.
+fn offset_to_position(text: &Rope, offset: usize) -> Position {
+    let offset = offset.min(text.len());
+    let line = text.byte_to_line_idx(offset, LineType::LF_CR);
+    let line_start = text.line_to_byte_idx(line, LineType::LF_CR);
+    let utf16_col = offset_utf8_to_utf16(
+        text.slice(line_start..).char_indices(),
+        offset - line_start,
+    );
+    Position {
+        line: line as u32,
+        character: utf16_col as u32,
+    }
+}
+
 fn get_document_content_change(
     text: &Rope,
-    delta: &RopeDelta,
+    delta: &AheadDelta,
 ) -> Option<TextDocumentContentChangeEvent> {
-    let (interval, _) = delta.summary();
-    let (start, end) = interval.start_end();
-
-    let text = RopeTextRef::new(text);
+    let (start, end) = delta.summary();
 
     // TODO: Handle more trivial cases like typing when there's a selection or transpose
     if let Some(node) = delta.as_simple_insert() {
-        let (start, end) = interval.start_end();
-        let start = text.offset_to_position(start);
+        let start = offset_to_position(text, start);
 
-        let end = text.offset_to_position(end);
+        let end = offset_to_position(text, end);
 
-        let text = String::from(node);
+        let text = node.to_string();
         let text_document_content_change_event = TextDocumentContentChangeEvent {
             range: Some(Range { start, end }),
             range_length: None,
@@ -1177,9 +1194,9 @@ fn get_document_content_change(
     }
     // Or a simple delete
     else if delta.is_simple_delete() {
-        let end_position = text.offset_to_position(end);
+        let end_position = offset_to_position(text, end);
 
-        let start = text.offset_to_position(start);
+        let start = offset_to_position(text, start);
 
         let text_document_content_change_event = TextDocumentContentChangeEvent {
             range: Some(Range {
@@ -1204,7 +1221,6 @@ fn format_semantic_styles(
     let semantic_tokens_provider = semantic_tokens_provider?;
     let semantic_legends = semantic_tokens_legend(semantic_tokens_provider);
 
-    let text = RopeTextRef::new(text);
     let mut highlights = Vec::new();
     let mut line = 0;
     let mut start = 0;
@@ -1212,13 +1228,13 @@ fn format_semantic_styles(
     for semantic_token in &tokens.data {
         if semantic_token.delta_line > 0 {
             line += semantic_token.delta_line as usize;
-            start = text.offset_of_line(line);
+            start = offset_of_line(text, line);
         }
 
-        let sub_text = text.char_indices_iter(start..);
+        let sub_text = text.slice(start..).char_indices();
         start += offset_utf16_to_utf8(sub_text, semantic_token.delta_start as usize);
 
-        let sub_text = text.char_indices_iter(start..);
+        let sub_text = text.slice(start..).char_indices();
         let end =
             start + offset_utf16_to_utf8(sub_text, semantic_token.length as usize);
 

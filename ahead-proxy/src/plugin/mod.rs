@@ -20,12 +20,13 @@ use ahead_rpc::{
     RequestId, RpcError,
     core::CoreRpcHandler,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
+    delta::AheadDelta,
     plugin::PluginId,
     proxy::ProxyRpcHandler,
     style::LineStyle,
     terminal::TermId,
 };
-use lapce_xi_rope::{Rope, RopeDelta};
+use ropey::Rope;
 use lsp_types::{
     CallHierarchyClientCapabilities, CallHierarchyIncomingCall,
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyPrepareParams,
@@ -127,7 +128,7 @@ pub enum PluginCatalogRpc {
     DidChangeTextDocument {
         language_id: String,
         document: VersionedTextDocumentIdentifier,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
     },
@@ -495,7 +496,7 @@ impl PluginCatalogRpcHandler {
         &self,
         path: &Path,
         rev: u64,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
     ) {

@@ -18,9 +18,7 @@ include_dir  = { workspace = true }
 regex        = { workspace = true }
 
 lsp-types         = { workspace = true }
-lapce-xi-rope     = { workspace = true }
 ahead-rpc         = { workspace = true }
-floem-editor-core = { workspace = true }
 
 libloading  = "0.8.1"
 slotmap     = "1.0"

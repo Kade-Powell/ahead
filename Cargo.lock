@@ -216,12 +216,10 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "directories",
- "floem-editor-core",
  "git2",
  "hashbrown 0.14.5",
  "include_dir",
  "itertools 0.12.1",
- "lapce-xi-rope",
  "libloading",
  "lsp-types 0.95.1",
  "once_cell",
@@ -266,7 +264,6 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "dyn-clone",
- "floem-editor-core",
  "git2",
  "globset",
  "grep-matcher",
@@ -276,7 +273,6 @@ dependencies = [
  "indexmap 2.14.2",
  "interprocess",
  "jsonrpc-lite",
- "lapce-xi-rope",
  "libc",
  "libsql",
  "lsp-types 0.95.1",
@@ -285,6 +281,7 @@ dependencies = [
  "polling",
  "regex",
  "reqwest",
+ "ropey",
  "serde",
  "serde_json",
  "sha2 0.10.8",
@@ -306,9 +303,9 @@ dependencies = [
  "crossbeam-channel",
  "human-sort",
  "indexmap 2.14.2",
- "lapce-xi-rope",
  "lsp-types 0.95.1",
  "parking_lot",
+ "ropey",
  "serde",
  "serde_json",
  "tracing 0.2.0",
@@ -1004,12 +1001,6 @@ name = "bumpalo"
 version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f30e7476521f6f8af1a1c4c0b8cc94f0bee37d91763d0ca2665f299b6cd8aec"
-
-[[package]]
-name = "bytecount"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c676a478f63e9fa2dd5368a42f28bba0d6c560b775f38583c8bbaa7fcd67c9c"
 
 [[package]]
 name = "bytemuck"
@@ -2163,20 +2154,6 @@ name = "float_next_after"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
-
-[[package]]
-name = "floem-editor-core"
-version = "0.2.0"
-source = "git+https://github.com/lapce/floem?rev=e0dd862564e3afbad5cba8ebe60df166a7a41e56#e0dd862564e3afbad5cba8ebe60df166a7a41e56"
-dependencies = [
- "bitflags 2.13.2",
- "itertools 0.14.0",
- "lapce-xi-rope",
- "memchr",
- "serde",
- "strum 0.27.2",
- "strum_macros 0.27.2",
-]
 
 [[package]]
 name = "fluent-uri"
@@ -4251,19 +4228,6 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
-]
-
-[[package]]
-name = "lapce-xi-rope"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6516aaa99c5059dc1a1bc02ed782d5e524699c1b4330028a6bed8259f9d9ff0a"
-dependencies = [
- "bytecount",
- "memchr",
- "regex",
- "serde",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -7460,9 +7424,6 @@ name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
 
 [[package]]
 name = "strum"

@@ -52,26 +52,12 @@ the app itself.
 
 ## Dependencies (Lapce-org removal; see decision 0006)
 
-- [ ] Volt-stack deletion DONE 2026-09-21: `wasi.rs`/`wasi/`, volt loading,
-      activation, registry/download/install, volt RPC surface and fixtures
-      are gone; `psp-types`, `wasi-experimental-http`, `wasmtime 14`,
-      `flate2`/`tar`/`walkdir`/`zstd` deps dropped; `lsp-types` fork dropped
-      for upstream registry (no `Debug` shim proved necessary). LSP/DAP host
-      core (`psp.rs`, `lsp.rs`, `dap.rs`, catalog sync fan-out) still
-      compiles with legacy server-identity fields kept as the documented
-      seam. Remaining host work moves with the Zed-model extension host:
-      dispatch direct server handle, DAP config-direct startup (no volt
-      debugger registry), `LspClient` startup path, dead-field and
-      legacy-`VoltID` cleanup.
 - [ ] Decide the extension host (Zed WIT component model on wasmtime 48 vs
       deferred). `wasmtime 14` is already out of the graph; the host decision
-      picks the new runtime (Zed uses wasmtime 48) and the guest ABI.
-- [ ] Migrate `lapce-xi-rope` (14 use sites) to `ropey 2.0.0-beta.1` with a
-      new `ahead-rope` crate owning the gap ropey lacks (delta apply/invert
-      + serde, ranges for intervals, small spans map, ropey-native text
-      helpers); remove `floem-editor-core` (7 use sites) in the same pass.
-      Full design + order in decision 0006. Contribute improvements back
-      upstream toward ropey 2.0 stable.
+      picks the new runtime (Zed uses wasmtime 48) and the guest ABI. It also
+      absorbs the remaining volt-host leftovers: dispatch direct server
+      handle, DAP config-direct startup, `LspClient` startup path, dead-field
+      and legacy-`VoltID` cleanup.
 
 ## Attribution & change tracking
 
@@ -118,6 +104,19 @@ the app itself.
 
 ## Harness integration (new 2026-09-18)
 
+- [ ] Bundle and load the AHEAD-owned skills under `ahead-harness/skills/`:
+      expose only each skill's `name`/`description` initially, load the body and
+      references on selection, pin the skill revision in task/session records,
+      and make the host—not the skill—enforce capabilities and authorization.
+      Read applicable `AGENTS.md` files from the workspace root through every
+      target directory before skill selection or task actions; record their
+      paths and hashes and surface conflicting instructions.
+      Discover workspace-local skills from `.agents/skills/`, `.agent/skills/`
+      and `.skills/` plus explicitly configured user roots; namespace their
+      provenance, reject policy conflicts, and never auto-install or execute
+      discovered scripts/network effects.
+      Activate end-of-session `ahead-code-review` against an immutable snapshot;
+      findings must remain non-mutating until a human chooses a disposition.
 - [ ] Managed Codex App Server transport now exists in
       `ahead-harness/src/managed_client.rs` and is the default tier; complete
       AHEAD-owned per-tool decision UI and verify a real multi-tool turn. The
@@ -129,13 +128,14 @@ the app itself.
       executed shell/`edit` tool calls with **zero** `session/request_permission`
       and never called client `fs/write_text_file`, even in `read-only` mode, and
       wrote the target file in every mode. Do not present external ACP agents as
-      satisfying Learn read-only, scope allowlists or edit attribution.
+      satisfying teaching-task read-only enforcement, scope allowlists or edit
+      attribution.
 - [ ] `AHEAD_ACP_COMMAND`/`AHEAD_ACP_ARGS` override exists for tests; expose
       external-agent selection in settings. The conversation header labels the
       active tier and warns that external shell/edits are not AHEAD-mediated;
       the remaining unsupported-capability list should be actionable.
 - [ ] Permission policy currently auto-selects the first `allow_*` option in
-      Assist; with the ACP tier this is presentation only. Do not claim it is an
+      assistance tasks; with the ACP tier this is presentation only. Do not claim it is an
       enforcement boundary.
 - [ ] The ACP adapter is launched via `npx -y @agentclientprotocol/codex-acp`
       (unpinned). Pin/package the adapter and record provenance; consider the ACP
@@ -199,6 +199,23 @@ the app itself.
 
 ## Guided investigation, debugger and voice
 
+- [ ] Replace the session-wide Learn/Assist switch with task-local intent:
+      create `teaching` tasks only when the human asks to learn and default all
+      other work to `assistance`; link teaching arcs to parent debugging or
+      feature tasks without changing their effect policy. Update
+      `ahead-viewmodel`, `ahead-proxy`, `ahead-app` and the generated Rust/RPC
+      contract before claiming the new workflow is live.
+- [ ] Implement durable teaching arcs for explicit teaching tasks: mission,
+      verified source references, concept state, learner responses, evidence and
+      review queue. Render one native conversation card at a time, preserve the
+      human caret, keep teaching read-only and export selected records through
+      the `.ahead` Markdown artifact convention.
+- [ ] Integrate the graduated `diagnosing-bugs` loop into investigation and
+      corrective-debugging assistance tasks: red reproduction gate, minimization,
+      ranked falsifiable hypotheses, selected experiment, regression evidence,
+      cleanup and diagnostic-evidence redaction. Stop honestly when no tight
+      loop can be built; do not let a linked teaching arc turn an untested
+      hypothesis into a fact.
 - [ ] Connect session-scoped presentation actions to real GPUI focus/pointer
       rendering through `ahead-rpc/src/ahead.rs::PresentationCue` and
       `ahead-app/src/code_panel.rs`; acknowledge actual rendering, reject stale

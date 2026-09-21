@@ -12,10 +12,11 @@ use std::{
 use ahead_rpc::{
     RpcError,
     dap_types::{self, DapId, DapServer, SetBreakpointsResponse},
+    delta::AheadDelta,
     plugin::PluginId,
     style::LineStyle,
 };
-use lapce_xi_rope::{Rope, RopeDelta};
+use ropey::Rope;
 use lsp_types::{
     DidOpenTextDocumentParams, MessageType, SemanticTokens, ShowMessageParams,
     TextDocumentIdentifier, TextDocumentItem, VersionedTextDocumentIdentifier,
@@ -202,7 +203,7 @@ impl PluginCatalog {
         &mut self,
         language_id: String,
         document: VersionedTextDocumentIdentifier,
-        delta: RopeDelta,
+        delta: AheadDelta,
         text: Rope,
         new_text: Rope,
     ) {

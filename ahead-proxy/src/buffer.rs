@@ -4,16 +4,16 @@ use std::{
     fs,
     fs::File,
     io::{Read, Write},
+    ops::RangeBounds,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
 use anyhow::{Result, anyhow};
-use floem_editor_core::buffer::rope_text::CharIndicesJoin;
 use ahead_core::encoding::offset_utf8_to_utf16;
-use ahead_rpc::buffer::BufferId;
-use lapce_xi_rope::{RopeDelta, interval::IntervalBounds, rope::Rope};
+use ahead_rpc::{buffer::BufferId, delta::AheadDelta};
 use lsp_types::*;
+use ropey::{LineType, Rope};
 
 #[derive(Clone)]
 pub struct Buffer {
@@ -48,7 +48,7 @@ impl Buffer {
             }
         };
         let rope = Rope::from(s);
-        let rev = u64::from(!rope.is_empty());
+        let rev = u64::from(rope.len() != 0);
         let language_id = language_id_from_path(&path).unwrap_or("");
         let mod_time = get_mod_time(&path);
         Buffer {
@@ -101,7 +101,7 @@ impl Buffer {
             .write(true)
             .truncate(true)
             .open(&path)?;
-        for chunk in self.rope.iter_chunks(..self.rope.len()) {
+        for chunk in self.rope.chunks() {
             f.write_all(chunk.as_bytes())?;
         }
 
@@ -115,7 +115,7 @@ impl Buffer {
 
     pub fn update(
         &mut self,
-        delta: &RopeDelta,
+        delta: &AheadDelta,
         rev: u64,
     ) -> Option<TextDocumentContentChangeEvent> {
         if self.rev + 1 != rev {
@@ -138,11 +138,11 @@ impl Buffer {
     }
 
     pub fn offset_of_line(&self, line: usize) -> usize {
-        self.rope.offset_of_line(line)
+        self.rope.line_to_byte_idx(line, LineType::LF_CR)
     }
 
     pub fn line_of_offset(&self, offset: usize) -> usize {
-        self.rope.line_of_offset(offset)
+        self.rope.byte_to_line_idx(offset, LineType::LF_CR)
     }
 
     pub fn offset_to_line_col(&self, offset: usize) -> (usize, usize) {
@@ -165,22 +165,26 @@ impl Buffer {
         }
     }
 
-    pub fn slice_to_cow<T: IntervalBounds>(&self, range: T) -> Cow<'_, str> {
-        self.rope.slice_to_cow(range)
+    pub fn slice_to_cow<R: RangeBounds<usize>>(&self, range: R) -> Cow<'_, str> {
+        Cow::from(self.rope.slice(range))
     }
 
     pub fn line_to_cow(&self, line: usize) -> Cow<'_, str> {
-        self.rope
-            .slice_to_cow(self.offset_of_line(line)..self.offset_of_line(line + 1))
+        Cow::from(
+            self.rope
+                .slice(self.offset_of_line(line)..self.offset_of_line(line + 1)),
+        )
     }
 
-    /// Iterate over (utf8_offset, char) values in the given range  
-    /// This uses `iter_chunks` and so does not allocate, compared to `slice_to_cow` which can
-    pub fn char_indices_iter<T: IntervalBounds>(
+    /// Iterate over (utf8_offset, char) values in the given range.
+    /// Offsets are relative to the start of `range`, matching the previous
+    /// chunk-joined behavior; see the `char_indices_are_slice_relative`
+    /// test that pins this.
+    pub fn char_indices_iter<R: RangeBounds<usize>>(
         &self,
-        range: T,
+        range: R,
     ) -> impl Iterator<Item = (usize, char)> + '_ {
-        CharIndicesJoin::new(self.rope.iter_chunks(range).map(str::char_indices))
+        self.rope.slice(range).char_indices()
     }
 
     pub fn len(&self) -> usize {
@@ -302,15 +306,13 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
 }
 
 fn get_document_content_changes(
-    delta: &RopeDelta,
+    delta: &AheadDelta,
     buffer: &Buffer,
 ) -> Option<TextDocumentContentChangeEvent> {
-    let (interval, _) = delta.summary();
-    let (start, end) = interval.start_end();
+    let (start, end) = delta.summary();
 
     // TODO: Handle more trivial cases like typing when there's a selection or transpose
     if let Some(node) = delta.as_simple_insert() {
-        let (start, end) = interval.start_end();
         let start = buffer.offset_to_position(start);
 
         let end = buffer.offset_to_position(end);
@@ -318,7 +320,7 @@ fn get_document_content_changes(
         Some(TextDocumentContentChangeEvent {
             range: Some(Range { start, end }),
             range_length: None,
-            text: String::from(node),
+            text: node.to_string(),
         })
     }
     // Or a simple delete
@@ -347,4 +349,72 @@ pub fn get_mod_time<P: AsRef<Path>>(path: P) -> Option<SystemTime> {
         .and_then(|f| f.metadata())
         .and_then(|meta| meta.modified())
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ahead_rpc::delta::DeltaOp;
+
+    fn buffer_with(name: &str, text: &str) -> Buffer {
+        let path = std::env::temp_dir().join(format!(
+            "ahead-buffer-test-{}-{name}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, text).unwrap();
+        Buffer::new(BufferId::next(), path)
+    }
+
+    #[test]
+    fn line_offsets_round_trip() {
+        let buffer = buffer_with("offsets", "ab\ncde\nf");
+        assert_eq!(buffer.offset_of_line(1), 3);
+        assert_eq!(buffer.line_of_offset(5), 1);
+        assert_eq!(buffer.line_to_cow(1).as_ref(), "cde\n");
+    }
+
+    #[test]
+    fn char_indices_are_slice_relative() {
+        let buffer = buffer_with("charidx", "ab\ncde\nf");
+        let collected: Vec<(usize, char)> = buffer.char_indices_iter(3..).collect();
+        assert_eq!(
+            collected,
+            vec![('c', 0), ('d', 1), ('e', 2), ('\n', 3), ('f', 4)]
+                .into_iter()
+                .map(|(ch, off)| (off, ch))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn update_applies_delta_and_bumps_rev() {
+        let mut buffer = buffer_with("update", "hello world");
+        assert_eq!(buffer.rev, 1);
+        let delta = AheadDelta::new(
+            buffer.len(),
+            vec![
+                DeltaOp::Retain(6),
+                DeltaOp::Insert("wonderful ".to_string()),
+                DeltaOp::Retain(5),
+            ],
+        );
+        let change = buffer.update(&delta, 2).unwrap();
+        assert_eq!(buffer.get_document(), "hello wonderful world");
+        assert_eq!(buffer.rev, 2);
+        let range = change.range.unwrap();
+        assert_eq!((range.start.line, range.start.character), (0, 6));
+        assert_eq!((range.end.line, range.end.character), (0, 6));
+        assert_eq!(change.text, "wonderful ");
+    }
+
+    #[test]
+    fn update_rejects_wrong_rev() {
+        let mut buffer = buffer_with("reject", "hello");
+        let delta = AheadDelta::new(
+            buffer.len(),
+            vec![DeltaOp::Insert("!".to_string())],
+        );
+        assert!(buffer.update(&delta, 99).is_none());
+        assert_eq!(buffer.get_document(), "hello");
+    }
 }

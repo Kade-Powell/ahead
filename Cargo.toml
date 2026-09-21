@@ -126,6 +126,7 @@ once_cell         = { version = "1.19" }
 parking_lot       = { version = "0.12.3" }
 regex             = { version = "1.10.5" }
 reqwest           = { version = "0.11", features = ["blocking", "json", "socks"] }
+ropey             = { version = "2.0.0-beta.1" }
 serde             = { version = "1.0" }
 serde_json        = { version = "1.0" }
 strum             = { version = "0.27.1" }
@@ -135,16 +136,11 @@ toml              = { version = "*" }
 url               = { version = "2.5.0" }
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
-psp-types = { git = "https://github.com/lapce/psp-types", rev = "f7fea28f59e7b2d6faa1034a21679ad49b3524ad" }
-
-lapce-xi-rope = { version = "0.3.2", features = ["serde"] }
 
 ahead-core = { path = "./ahead-core" }
 ahead-rpc  = { path = "./ahead-rpc" }
 
 gpui-kit = { version = "0.6", features = ["tree-sitter-rust"] }
-floem-editor-core = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56", features = ["serde"] }
-# floem-editor-core = { path = "../floem/editor-core/", features = ["serde"] }
 
 [patch.crates-io]
 regalloc2 = { rev = "5d79e12d0a93b10fc181f4da409b4671dd365228", git = "https://github.com/bytecodealliance/regalloc2" }

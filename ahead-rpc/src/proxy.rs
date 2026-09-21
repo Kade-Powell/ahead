@@ -9,7 +9,6 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
-use lapce_xi_rope::RopeDelta;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CodeAction, CodeActionResponse,
     CodeLens, CompletionItem, Diagnostic, DocumentSymbolResponse, FoldingRange,
@@ -24,6 +23,7 @@ use crate::{
     RequestId, RpcError, RpcMessage,
     buffer::BufferId,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
+    delta::AheadDelta,
     file::{FileNodeItem, PathObject},
     file_line::FileLine,
     plugin::PluginId,
@@ -254,7 +254,7 @@ pub enum ProxyNotification {
     },
     Update {
         path: PathBuf,
-        delta: RopeDelta,
+        delta: AheadDelta,
         rev: u64,
     },
     NewTerminal {
@@ -1051,7 +1051,7 @@ impl ProxyRpcHandler {
         );
     }
 
-    pub fn update(&self, path: PathBuf, delta: RopeDelta, rev: u64) {
+    pub fn update(&self, path: PathBuf, delta: AheadDelta, rev: u64) {
         self.notification(ProxyNotification::Update { path, delta, rev });
     }
 

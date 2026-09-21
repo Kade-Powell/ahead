@@ -13,10 +13,11 @@ use jsonrpc_lite::{Id, Params};
 use ahead_core::meta;
 use ahead_rpc::{
     RpcError,
+    delta::AheadDelta,
     plugin::{PluginId, VoltID},
     style::LineStyle,
 };
-use lapce_xi_rope::Rope;
+use ropey::Rope;
 use lsp_types::{
     notification::{Initialized, Notification},
     request::{Initialize, Request},
@@ -127,7 +128,7 @@ impl PluginServerHandler for LspClient {
         language_id: String,
         path: PathBuf,
         text_document: TextDocumentIdentifier,
-        text: lapce_xi_rope::Rope,
+        text: Rope,
     ) {
         self.host.handle_did_save_text_document(
             language_id,
@@ -141,9 +142,9 @@ impl PluginServerHandler for LspClient {
         &mut self,
         language_id: String,
         document: lsp_types::VersionedTextDocumentIdentifier,
-        delta: lapce_xi_rope::RopeDelta,
-        text: lapce_xi_rope::Rope,
-        new_text: lapce_xi_rope::Rope,
+        delta: AheadDelta,
+        text: Rope,
+        new_text: Rope,
         change: Arc<
             Mutex<(
                 Option<TextDocumentContentChangeEvent>,
