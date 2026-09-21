@@ -10,7 +10,7 @@ rust-version = { workspace = true }
 ahead-viewmodel = { path = "../ahead-viewmodel" }
 ahead-rpc       = { workspace = true }
 alacritty_terminal = { workspace = true }
-portable-pty = "0.8"
+crossbeam-channel = { workspace = true }
 chrono          = { workspace = true }
 gpui-kit        = { workspace = true }
 gpui-kit-assets = "0.6"
