@@ -18,7 +18,11 @@ export type Base64 = string;
 export type WorkKind =
   | "product-change" | "corrective-debugging" | "internal-improvement"
   | "investigation" | "decision" | "operational-stabilization";
-export type AssistanceMode = "learn" | "assist";
+/** Task-local intent; sessions do not carry a binary teaching/assistance mode. */
+export type TaskIntent = "teaching" | "assistance";
+export type LearningState =
+  | "introduced" | "explained" | "retrieved" | "practiced"
+  | "demonstrated" | "needs_review";
 export type Capability =
   | "read_context" | "present_code" | "record_draft"
   | "propose_edit" | "run_approved_check";
@@ -54,6 +58,7 @@ export interface LocalCheckout {
 export interface SessionPolicySnapshot {
   id: Id;
   sha256: Sha256;
+  teaching: "explicit-task";
   assistance: "maieutic-strict";
   work_item_required_before_phase: string | null;
   allowed_provider_ids: Id[];
@@ -73,7 +78,6 @@ export interface WorkSession {
   project_id: Id;
   worktree_id: Id;
   work_kind: WorkKind;
-  mode: AssistanceMode;
   title: string;
   owner_id: Id;
   lifecycle: SessionLifecycle;
@@ -82,8 +86,67 @@ export interface WorkSession {
   created_at: Timestamp;
 }
 
+export interface SessionTask {
+  id: Id;
+  session_id: Id;
+  intent: TaskIntent;
+  work_kind: WorkKind;
+  title: string;
+  parent_task_id?: Id;
+  learning_arc_id?: Id;
+  created_at: Timestamp;
+  completed_at?: Timestamp;
+}
+
+export interface LearningArc {
+  id: Id;
+  task_id: Id;
+  mission: string;
+  current_concept_id?: Id;
+  concepts: Array<{
+    id: Id;
+    title: string;
+    state: LearningState;
+    review_due_at?: Timestamp;
+  }>;
+  source_ids: Id[];
+}
+
+export interface SkillDescriptor {
+  id: string;
+  revision: string;
+  description: string;
+  supported_task_intents: TaskIntent[];
+  required_capabilities: Capability[];
+  source:
+    | { kind: "builtin"; root: "ahead-harness/skills" }
+    | {
+        kind: "workspace";
+        root: ".agents/skills" | ".agent/skills" | ".skills";
+        content_sha256: Sha256;
+      }
+    | { kind: "user"; root_id: Id; content_sha256: Sha256 };
+  trusted: boolean;
+}
+
+export type InstructionFileRef =
+  | { kind: "workspace"; path: RepoPath; content_sha256: Sha256 }
+  | { kind: "user"; root_id: Id; relative_path: string; content_sha256: Sha256 };
+
+export interface SkillSelection {
+  task_id: Id;
+  skill_id: string;
+  skill_revision: string;
+  selected_by: "human" | "agent" | "host";
+  loaded_references: string[];
+  instruction_files: InstructionFileRef[];
+  selected_at: Timestamp;
+}
+
 export interface SessionView {
   session: WorkSession;
+  tasks: SessionTask[];
+  current_task_id?: Id;
   workflow: WorkflowState;
   participants: Array<{ participant: Participant; role: SessionRole }>;
 }
@@ -123,7 +186,6 @@ export interface StartWorkInput {
   human_starting_point: string;
   work_item?: GithubIssueRef;
   urgency: "normal" | "incident";
-  mode: AssistanceMode;
 }
 
 export interface ArtifactRevision {
@@ -466,11 +528,13 @@ export interface ModelRoute {
 
 export interface AgentTurnRequest {
   session_id: Id;
+  task_id: Id;
   thread_id: Id;
   message_id: Id;
   backend_id: Id;
   model_route_id: Id;
-  mode: AssistanceMode;
+  task_intent: TaskIntent;
+  active_skill_ids: string[];
   expected_policy_sha256: Sha256;
   context: EditorContext;
 }
@@ -532,7 +596,7 @@ export interface PredictionRequest {
 }
 
 export interface PredictionWorkContext {
-  mode: AssistanceMode;
+  task_intent: TaskIntent;
   work_kind: WorkKind;
   workflow_version: string;
   workflow_revision: Revision;

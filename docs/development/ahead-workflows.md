@@ -1,0 +1,387 @@
+# AHEAD workflow atlas
+
+Status: reviewable product design, 2026-09-18. The requirements in §1 come from the design conversation; the detailed flows and storage convention are proposals until reviewed. These diagrams describe intended behavior, not working product features. Implementation gaps belong in [TODO.md](../../TODO.md).
+
+This is the entry point for reviewing workflows, human/AI responsibilities and SDLC coverage. [HumanLayer research and adaptation](ahead-humanlayer-workflows.md) contains the product comparison; [Editor MVP](ahead-editor-mvp.md) contains architecture and FIM details. Keep diagrams here rather than maintaining divergent copies in those documents.
+
+## 1. Requirements and decisions
+
+Record new agreements here as the design conversation continues. Distinguish a user requirement, an accepted design decision and a proposed default. When a choice changes, update its owning diagram and artifact convention in the same edit; do not leave a contradictory diagram as the apparent current design.
+
+| ID | Status | Requirement or proposed choice |
+|---|---|---|
+| W1 | Required | Humans own business behavior and write business logic with explicitly accepted FIM in assistance tasks. FIM receives current/open-file context plus the active work, decisions, plan and relevant attached history. Teaching tasks do not receive edit predictions. |
+| W2 | Required | Preserve the selected Codex harness's model-facing tools and loop behavior. **2026-09-18 decision:** two tiers — a managed Codex App Server runtime (AHEAD owns the effect boundary, default for explicit teaching and assistance tasks) and external ACP agents (compatibility only, no enforcement guarantees). Live probes showed the Codex ACP adapter executes shell/edit tool calls with no permission requests and does not route writes through the client, so ACP alone cannot carry teaching read-only enforcement, mechanical scope or edit attribution. See [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18). |
+| W3 | Required | Store project work/configuration under `.ahead`; let developers browse and attach shared past sessions. User credentials and personal settings remain local. |
+| W4 | Required | Support voice conversation while coding, with Maieutic-style highlighting and pointing, and teaching from actual code. |
+| W5 | Required | Diagram the flows and human/AI roles across the SDLC, including investigation and bug diagnosis. Preserve one discoverable, readable home for design artifacts. |
+| W6 | Proposed detail | Let the agent place debugger breakpoints for a human-selected experiment. Preserve human breakpoints and distinguish editor configuration from running/stepping the program. |
+| W7 | Proposed detail | Retain the current libSQL database for live runtime state; keep working research/design/plan/evidence as named Markdown artifacts, with explicit portable history export for sharing. |
+| W8 | Proposed detail | Ordinary pointing never moves the human caret. Explicit navigation or an opted-in follow mode can move the view/caret; typing suspends following. |
+| W9 | Proposed detail | Guided debugging uses user-directed execution by default. The agent may prepare a breakpoint, fixture or observation for a human-selected experiment; it does not silently step or run code. |
+| W10 | Open for review | Shared sessions default to selected checkpoints; the precise project sharing preference and transcript retention choices remain to be settled. |
+| W11 | Settled 2026-09-21 | A session is a durable container, not a binary Learn/Assist mode. Each session contains explicit tasks: `teaching` when the human asks to learn, and `assistance` for everything else. A teaching task may be linked to an assistance task without changing the parent task's effect policy. |
+| W12 | Settled 2026-09-21 | Integrate a graduated diagnosing-bugs workflow into corrective-debugging and investigation tasks: establish a red reproduction loop, minimize it, rank falsifiable hypotheses, instrument or test, fix with regression evidence, then clean up. Redact sensitive diagnostic evidence before persistence or sharing. |
+| W13 | Settled 2026-09-21 | Ship AHEAD-owned skills as built-in `SKILL.md` bundles with startup metadata and progressive body/reference loading. The agent may select relevant assistance skills, but the session host enforces task policy, capabilities and human authorization. End-of-session automated review is a standard review step; it never auto-applies findings or publishes externally. |
+| W14 | Settled 2026-09-21 | Read applicable `AGENTS.md` files from the workspace root through each target directory before selecting skills or taking actions. Discover workspace-local skills from `.agents/skills/`, `.agent/skills/` and `.skills/` plus explicitly configured user roots. These provide extra instructions only within AHEAD's rules; built-ins cannot be silently shadowed, discovered skills do not authorize effects, and scripts/network/credential/external-write behavior remains host-gated. |
+
+No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
+
+## 1.1 Task intent replaces the session mode switch
+
+A session is a durable container for work, conversation, artifacts and evidence. It
+does not have a Learn/Assist toggle. Start Work asks for the work outcome and
+starting point; the first request creates an explicit task intent:
+
+- **Teaching:** the human asks to learn a concept, code path or skill. The task
+  uses read-only context and presentation tools, records a learning arc, and
+  keeps experiments and implementation under human control.
+- **Assistance:** the default for every other request, including feature work,
+  investigation, corrective debugging, review and operational support. The
+  task receives the capabilities allowed by the current phase, policy, role and
+  explicit scope.
+
+“Teach me why this retry path behaves this way” creates a teaching task. “Debug
+this retry path” creates an assistance task. “Teach me while we debug it” creates
+an assistance task with a linked teaching arc; the debugging task remains the
+parent for execution, hypotheses and regression evidence. Switching between
+these requests does not create a new session or discard context.
+
+The distinction is task-local, not a UI chip or session-wide state. The panel
+should show the current task intent in its header and conversation cards, but
+must not offer a binary session-mode control.
+
+## 2. SDLC map and responsibility legend
+
+**H** = human engineer/team. **A** = conversational agent. **E** = editor, harness tools, debugger or checks returning actual results. **F** = FIM; it suggests at the caret and never applies on its own. Prefixes remain readable without color.
+
+The workflow is iterative. Learning, voice, documentation, security, accessibility and collaboration apply throughout; they are not phases that wait until the end.
+
+```mermaid
+flowchart TD
+  Need["H: identify outcome, symptom or question"] --> Kind{"H: choose useful starting path"}
+  Kind -->|Unknown system or cause| Investigate["H + A: investigate and gather evidence"]
+  Kind -->|Feature or product change| Design["H: choose behavior and design; A: explore options"]
+  Kind -->|Small understood change| Write["H + F: write; A: requested supporting work"]
+  Investigate -->|Understanding is the outcome| Record["H + A: record findings and limits"]
+  Investigate -->|Change justified| Design
+  Design --> Outline["H + A: outline testable slices"]
+  Outline --> Write
+  Write --> Verify["E: run checks; H + A: inspect evidence"]
+  Verify -->|Behavior fails| Investigate
+  Verify -->|Ready for judgment| Review["H: judge full change; A: analyze diff and omissions"]
+  Review -->|Revision needed| Design
+  Review -->|Ready to deliver| Release["H: authorize delivery; E: deploy and observe"]
+  Release --> Operate["H + A: assess real outcomes and operational evidence"]
+  Operate -->|Unexpected behavior| Investigate
+  Operate -->|Urgent impact| Stabilize["H: select mitigation; A: support diagnosis and checks"]
+  Stabilize --> Investigate
+  Operate -->|Replace or retire| Retire["H: decide migration or removal; E: verify completion"]
+  Retire --> Record
+  Record --> Need
+```
+
+| SDLC concern | Human responsibility | Agent/editor contribution | Reviewable evidence |
+|---|---|---|---|
+| Discovery and requirements | Define problem, users, success and constraints | Find relevant prior work; clarify uncertainty; explore options | Brief, examples and open questions |
+| Investigation and diagnosis | Build/assess the mental model; choose hypotheses and experiments | Trace code, point out counterexamples, prepare observation and summarize results | Findings, predictions, actual observations and limitations |
+| Design | Decide behavior, tradeoffs and code boundaries | Compare alternatives; show diagrams, types and call paths | Design and attributed decisions |
+| Planning | Choose slices, priorities and responsibility | Identify dependencies, files and checks | Plan with outcomes and verification |
+| Implementation | Write business logic and accept FIM deliberately | Suggest at the caret; prepare instructed supporting edits | Diff and authorship |
+| Verification | Define expected behavior; judge manual/exploratory results | Run instructed checks and expose failures | Code revision, check results and untested areas |
+| Review and security/accessibility | Assess design, risk, usability and acceptance | Trace requirements to changes; challenge assumptions | Findings, dispositions and remaining risk |
+| Release and migration | Select destination, rollout and recovery approach | Prepare/run instructed existing commands; gather outcomes | Release revision, migrations, observed behavior and rollback evidence |
+| Operations and incidents | Prioritize service recovery and choose mitigation | Correlate signals; maintain timeline and test recovery | Impact, mitigation and recovery evidence; follow-up |
+| Maintenance and retirement | Choose preserved invariants and migration/deletion criteria | Find dependents; compare behavior; verify cleanup | Invariants, migrated consumers and removal evidence |
+
+This is coverage of the engineering work, not a promise that AHEAD supplies a CI service, deployment platform, observability backend or incident-management system. Link or use the project's existing tools.
+
+## 3. Feature and product development
+
+HumanLayer's RPI and PRD-Oriented paths inform this flow. Product and technical design can be one artifact for ordinary features. A larger change can split product behavior from system/program design. Quick changes enter at the relevant slice when intent is already clear; Freeform can stop at a useful finding. [HumanLayer workflow selection](https://docs.humanlayer.com/guide/skills-workflows).
+
+```mermaid
+flowchart TD
+  H1["H: describe outcome and examples"] --> A1["A: identify unknowns and research current code"]
+  A1 --> H2["H: inspect evidence and choose behavior"]
+  H2 --> A2["A: expose tradeoffs, code shape and consequences"]
+  A2 --> D{"H: decisions sufficiently clear?"}
+  D -->|No| H2
+  D -->|Yes| P["H + A: outline one runnable slice and checks"]
+  P --> H3["H + F: write business logic with current session context"]
+  P --> A3["A: perform requested scaffolding, fixtures or wiring"]
+  H3 --> E1["E: run the selected checks on the actual revision"]
+  A3 --> E1
+  E1 --> H4{"H + A: result matches intended behavior?"}
+  H4 -->|Implementation error| H3
+  H4 -->|Design assumption changed| H2
+  H4 -->|Next slice| P
+  H4 -->|Complete| R["H + A: review full diff, evidence and handoff"]
+```
+
+The outline is the single plan card in the conversation. Parallel arrows show distinct responsibilities, not mandatory concurrent agents or permission to edit the same active buffer. Tests for chosen behavior must not become a way for the agent to invent the business specification.
+
+## 4. Investigation and bug diagnosis
+
+HumanLayer's current published catalog contains research, RPI/PRD-oriented planning, Freeform, Oneshot for clear small fixes, and implementation revision for bug reports. It does not list a dedicated hypothesis/experiment/debugger workflow. That is a bounded finding about the reviewed documentation, not proof that users cannot debug with the product. [Skill catalog](https://docs.humanlayer.com/reference/skills-workflows).
+
+**Investigation** may finish with an explanation, disproven assumption or explicit unknown. **Corrective debugging** continues to a justified fix and regression evidence. A production symptom may require operational stabilization before either; not every incident is a software defect.
+
+```mermaid
+flowchart TD
+  H1["H: expected vs observed behavior, scope and impact"] --> A1["A: trace code, tests, history and available signals"]
+  A1 --> H2["H: state current model and candidate explanations"]
+  H2 --> A2["A: challenge assumptions; propose discriminating experiments"]
+  A2 --> H3["H: select experiment and predict each possible result"]
+  H3 --> E1["A + E: prepare requested breakpoint, fixture or observation"]
+  E1 --> Run["H: run or instruct the experiment; E: capture actual results"]
+  Run --> Compare["H + A: compare observation with prediction"]
+  Compare --> C{"H: what does the evidence support?"}
+  C -->|Inconclusive or contradicted| H2
+  C -->|Need different observation| H3
+  C -->|Understanding complete; no change| Findings["H + A: record conclusion, confidence and remaining limits"]
+  C -->|Cause supports a correction| Fix["H: choose correction and regression expectation"]
+  Fix --> Code["H + F: implement; A: requested supporting work"]
+  Code --> Check["E: reproduce original failure and check correction"]
+  Check --> V{"H + A: regression and relevant checks support fix?"}
+  V -->|No| H2
+  V -->|Yes| Review["H: review; A: preserve evidence and follow-up"]
+```
+
+Record each meaningful experiment's question, hypothesis, predicted outcomes, target revision/environment, procedure, observation and resulting conclusion in `research.md`. Missing reproduction is a result to explain, not a reason to declare a fix. Avoid changing several suspected causes at once when that destroys the ability to interpret the experiment.
+
+### 4.1 Graduated hard-bug diagnosis
+
+AHEAD adopts the useful discipline from Matt Pocock's
+[`diagnosing-bugs`](https://github.com/mattpocock/skills/blob/main/docs/engineering/diagnosing-bugs.md)
+workflow for hard bugs and performance regressions. It is not required for a
+simple explanation or an already-understood fix. The assistance task graduates
+through these phases:
+
+1. **Characterize the symptom:** expected versus observed behavior, scope,
+   impact and environment.
+2. **Build a red loop:** one named test, command, fixture, request, browser
+   probe or replay that fails for the reported symptom and can later turn green.
+3. **Minimize the loop:** remove parts that are not load-bearing and increase a
+   flaky reproduction rate when necessary.
+4. **Rank hypotheses:** list three to five explanations, each with a falsifiable
+   prediction, before instrumenting or changing the suspected cause.
+5. **Run the selected experiment:** the human chooses the experiment; AHEAD may
+   prepare a breakpoint, fixture, logpoint or approved check and records the
+   actual result.
+6. **Correct and verify:** add the regression expectation, apply the bounded
+   correction, rerun the original red loop and relevant checks, then remove
+   temporary instrumentation.
+
+If AHEAD cannot create a tight red loop, it stops before forming a confident
+theory and records what is missing: environment access, a captured artifact,
+an observable seam or permission to add temporary instrumentation. A missing
+reproduction is an honest finding, not permission to guess.
+
+Diagnostic commands, logs, HAR files, traces and captures are sensitive by
+default. Keep raw evidence local where possible; redact credentials, tokens,
+cookies, personal data and unrelated payloads before putting excerpts in the
+conversation, `research.md`, a shared checkpoint or a tracker update.
+
+When the learner asks for explanation during this loop, attach a teaching arc
+to the assistance task. Use the same verified code ranges and experiment
+evidence, but do not let the teaching arc claim that a hypothesis is true until
+the selected experiment supports it.
+
+Example: intermittent duplicate requests. The engineer predicts that a particular retry branch executes twice; the agent locates the branch and places a requested breakpoint/logpoint. The observed call stack may instead reveal two callers. That finding updates the model before either participant starts changing the retry rule.
+
+## 5. Guided debugger interaction
+
+The agent can help set up observation without taking over the engineer's reasoning. Reuse the existing DAP route; do not add a second debugger protocol. DAP provides capability negotiation, breakpoint responses and paused-state inspection. [DAP overview](https://microsoft.github.io/debug-adapter-protocol/overview).
+
+```mermaid
+sequenceDiagram
+  participant H as Human
+  participant A as Agent
+  participant E as AHEAD editor
+  participant D as Debug adapter
+  H->>A: Test this hypothesis and stop before the retry branch
+  A->>E: Reveal verified source and request breakpoint placement
+  E->>D: Send the complete breakpoint set for that source
+  D-->>E: Actual locations and verified or pending status
+  E-->>A: Report what was actually configured
+  A-->>H: Explain expected observation at the visible location
+  H->>E: Run or step the selected debug target
+  D-->>E: Stopped event, thread and current stack
+  E->>D: Request selected frame scopes and variables
+  D-->>E: Values for this paused state
+  E-->>A: Relevant evidence with current stop identity
+  A-->>H: Compare observed values with the prediction
+  H->>A: Refine the hypothesis or choose the next step
+```
+
+Proposed interaction rules:
+
+- Place/remove an agent-owned breakpoint when instructed, including through voice. A selected guided experiment can cover several necessary placements; no per-breakpoint approval dialog is needed. Do not delete or overwrite the human's breakpoints.
+- The editor owns the combined breakpoint set. DAP `setBreakpoints` replaces the set for one source; reconcile all owners before sending it. Show verified, pending, relocated and failed bindings honestly. Conditions, hit counts and logpoints depend on adapter support.
+- Breakpoint setup does not authorize launch, attach, resume or arbitrary evaluation. In a teaching task the human controls execution; in an assistance task explicit run/step instructions can use the existing execution path. Explain expressions without invoking functions or changing variables merely to obtain a nicer explanation.
+- Bind observations to the target, thread, frame, paused state and source revision. DAP variable references expire on resume; stale observations may be retained as historical evidence but not presented as current values.
+- Dirty editor text may differ from the running binary/source map. Show that mismatch and use the actual mapped breakpoint; never pretend an unsaved line was executed. If a needed adapter/capability is absent, retain the investigation and offer an ordinary test/logging path.
+- At the end of an experiment, remove only temporary agent-owned breakpoints unless the user keeps them. Preserve human changes made during the experiment.
+
+These are proposed debugger defaults. They extend the presentation experience; they are not evidence that agent-directed debugging works today.
+
+## 6. Teaching and talking while working
+
+The local [Maieutic README](../../../vscode-maieutic/README.md) and [focus controller](../../../vscode-maieutic/src/focus-controller.ts) establish the reference behavior: `focusContent`, `pointAtContent`, and `clearFocusContent` use a separate decoration and preserve the user's selection/caret. AHEAD's `PresentationCue` already describes that separation. Reuse the behavior through native GPUI views; do not copy the old host dependency or its approval-card assumptions.
+
+```mermaid
+sequenceDiagram
+  participant H as Human speaking or typing
+  participant E as AHEAD editor and voice
+  participant A as Selected agent harness
+  H->>E: Explain this branch / here is what I think
+  E->>A: Same work, selected code, transcript and current decisions
+  A->>E: Request one verified focus or pointer change
+  E-->>A: Render acknowledged or target unavailable
+  A-->>E: Explain the visible concept and identify it in text
+  E-->>H: Show transcript and speak while keeping the cue stable
+  H->>E: Interrupt, ask a question, or keep coding
+  E->>E: Stop obsolete speech and keep typing responsive
+  E->>A: Corrected intent and updated code context
+  A-->>H: Adapt the explanation or propose the next observation
+```
+
+Teaching tasks can use a small loop: **human prediction/explanation → verified visible example → agent hint or challenge → human experiment/explanation → evidence and next concept**. Ask a useful question when it develops understanding; answer straightforward factual questions directly. The former extension's exact word limits and mandatory quiz cadence are not automatically AHEAD requirements.
+
+Voice is an input/output channel for the same work, not a competing engineering authority. The speech frontend must not invent code observations or decisions while a different coding harness works. Keep visible, correctable transcripts; speak from verified context and acknowledge a visual change before claiming it is on screen. Preserve microphone input during speech and editing. Barge-in stops obsolete speech; it does not silently cancel a test or resume a paused program. “Stop talking,” “cancel that task” and “pause the program” are distinct intents; clarify an ambiguous “stop” when the target matters.
+
+Use a separate range highlight, agent pointer and debugger execution marker. Explicit “take me there” or opted-in follow mode can navigate; ordinary pointing never steals the insertion caret. Pause following when the user types and offer return to the previous location. Explain the same location in text for keyboard/screen-reader users. Do not use intrusive file banners.
+
+In assistance tasks, the human continues typing with session-aware FIM during conversation. In teaching tasks, retain the no-generated-implementation/FIM-off default; the learner types and controls tests/debug execution. Breakpoint configuration in a teaching task is a presentation aid, not a relaxation of its execution boundary.
+
+## 7. Maintenance and refactoring
+
+```mermaid
+flowchart TD
+  H1["H: name improvement and behavior that must remain"] --> A1["A: map dependents and establish current evidence"]
+  A1 --> H2["H: choose a small structural change"]
+  H2 --> Code["H + F: write; A: requested behavior-preserving edits"]
+  Code --> E1["E: compare before and after checks or measurements"]
+  E1 --> D{"H: invariants preserved and objective achieved?"}
+  D -->|No| H2
+  D -->|Next bounded change| Code
+  D -->|Yes| R["H + A: review compatibility, removal and documentation"]
+```
+
+If work discovers a required behavior change, return to design and make it explicit. Performance work records the measurement conditions; cleanup does not count as an improvement merely because the diff is smaller.
+
+## 8. Review, delivery and operation
+
+```mermaid
+flowchart TD
+  Diff["A + E: assemble full diff, decisions and check results"] --> Review["H: assess behavior, design and risk"]
+  Review --> Verdict{"H: ready for delivery?"}
+  Verdict -->|No| Revise["H + A: revise owning decision or implementation"]
+  Revise --> Diff
+  Verdict -->|Yes| Plan["H: choose rollout, migration and recovery criteria"]
+  Plan --> Execute["E: execute instructed existing release process"]
+  Execute --> Observe["H + A: inspect deployed behavior and operational signals"]
+  Observe --> Result{"H: outcome meets criteria?"}
+  Result -->|Yes| Close["H + A: record outcome, handoff and remaining work"]
+  Result -->|No or uncertain| Recover["H: select rollback, mitigation or further observation"]
+  Recover --> Evidence["A + E: gather actual recovery evidence"]
+  Evidence --> Observe
+  Evidence --> Diagnose["H + A: linked investigation after or alongside recovery"]
+```
+
+For an incident, service recovery can precede a known root cause. Keep recovery evidence and the later causal investigation distinguishable. A build, a passed test or a deploy command exiting successfully is not proof of observed production behavior. For retirement, use the same review/delivery loop with consumer migration, data retention and removal criteria instead of a feature rollout.
+
+## 9. Storage and artifact convention
+
+The current store already uses Turso's `libsql` and opens `.ahead/session.db`. Retain that installed database path and library unless a measured need requires changing them. This refers to the existing SQLite-compatible libSQL implementation; it does not select a migration to Turso's separate rewritten database engine or require Turso Cloud. [libSQL distinction](https://docs.turso.tech/libsql).
+
+SQLite is a binary, page-based database, not a plain-text document format. It gives us transactional/queryable storage; it does not guarantee fewer bytes than Markdown/JSON. Pages, indexes and journals also occupy space. Measure real histories before claiming a size benefit. [SQLite format](https://www.sqlite.org/fileformat.html).
+
+**Proposed split:** database for frequent runtime state; ordinary Markdown for intentional engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. It may cache document content by revision/hash, but that cache is not a second independently editable design document.
+
+```mermaid
+flowchart LR
+  Conversation["Human + agent conversation and execution"] --> DB["Local libSQL session.db: runtime authority"]
+  Documents["Human + agent artifact edits"] --> MD["Named Markdown: document authority"]
+  MD --> Index["Rebuildable local index with content hashes"]
+  DB --> Context["Versioned current-work context"]
+  Index --> Context
+  Context --> Agent["Selected harness"]
+  Context --> FIM["FIM plus live editor buffers"]
+  DB --> Export["Explicit share checkpoint"]
+  MD --> Export
+  Export --> Shared["Portable .ahead/sessions record"]
+  Shared --> Git["Ordinary Git commit and pull"]
+  Git --> History["Teammate opens history and attaches a revision"]
+  History --> Context
+```
+
+Standard paths proposed for implementation:
+
+```text
+.ahead/
+  config.toml                       shared project/editor/workflow defaults
+  config.local.toml                 ignored checkout-specific overrides
+  session.db                       ignored live database, plus its sidecars
+  local/sessions/<id>/              ignored private working documents
+    session.md                     entry point, outcome, status, links, next action
+    research.md                    questions, findings, hypotheses and experiments
+    design.md                      chosen behavior, rationale, invariants, open choices
+    plan.md                        current slices, responsibility and checks
+    verification.md                observed results, revisions and unresolved checks
+  sessions/<id>/                   shareable checkpoint using the same document names
+    session.json                   format, identity, authors, revision and file manifest
+    session.md                     entry point into the shared work
+    research.md / design.md / plan.md / verification.md   only when present
+    conversation.jsonl             selected readable message history when shared
+    artifacts/                     larger diagrams, images or supporting evidence
+```
+
+Only `session.md` is the initial entry point; create the other documents when they contain useful work. Small tasks can keep sections in `session.md`; its links and `session.json` artifact roles identify the canonical location when split. Product-oriented work may add `requirements.md`. Use a consistent `Decisions` section in `design.md` (or the unsplit session document), with status and authorship. Keep diagram source in Markdown/Mermaid; generate rendered outputs only when useful. The current MVP export materializes `session.json`, `session.md` and `conversation.jsonl` under `.ahead/sessions/<session-id>/`; artifact files and revision-pinned attachments remain follow-up work.
+
+For a working session, each artifact has one active file path: private or explicitly shared. Publishing creates a checkpoint, not a second live editable copy of private work. Explicitly continuing shared work creates a linked working session. If a file is edited externally, index the new revision and surface conflicts with unsaved editor content; never overwrite it from a stale database cache. Persist artifact writes atomically, then reconcile the database hash/index so a crash or external edit cannot leave two apparent authoritative versions.
+
+Human and agent UI links should open the same canonical artifact. Session context names the artifact root and current roles/paths; agents do not guess the newest filename or read arbitrary SQLite internals. FIM reads the compact versioned context assembled from these documents and the session. Save chosen decisions before a harness reset. Pin attached past-session evidence to its source revision; importing it must not revive old grants or execute old commands.
+
+Shared snapshots are plain-text readable without AHEAD. A database export/backup can remain an optional complete local archive; do not use a live SQLite file as the default Git interchange format. Large logs/audio are not duplicated on every turn or embedded in every checkpoint: preserve selected evidence and its provenance, use explicit retention/export for larger material, and do not claim history is complete after pruning it. No whole-repository compression system or new storage engine is needed for this design.
+
+This refines the previous export-only artifact proposal: working design artifacts become ordinary files too, while the runtime remains database-backed. The `.ahead` ignore migration must keep private roots, database sidecars and credentials excluded. No existing private contents or ignore rules were changed while writing this design.
+
+## 10. Implementation status and review scenarios
+
+Source inspection on 2026-09-18, not live end-to-end validation:
+
+- **Harness (updated 2026-09-18, after live validation):** AHEAD now speaks ACP
+  v1 over stdio to the maintained `@agentclientprotocol/codex-acp` adapter,
+  which launches the real Codex App Server. `ahead-harness/src/acp_client.rs`
+  performs `initialize` → `session/new|load` → `session/prompt`, streams
+  `session/update`, answers `session/request_permission` from the current task
+  intent and policy,
+  and cancels with `session/cancel`. `ahead-harness/src/session.rs` binds each durable
+  AHEAD session to a harness conversation, persists streamed messages, and
+  reopens via `session/load`. Live-verified on this machine against Codex
+  runtime `0.152.0` (adapter `1.12.0`): streamed reply, durable message rows,
+  cancellation (`stopReason: cancelled`), and reopen/continue all passed
+  (see `ahead-proxy/tests/harness_{e2e,session_e2e}.rs`). The old deterministic
+  `AheadAgentLoop` remains as a fallback/`AgentTurn` path but is no longer the
+  conversational foundation. Model/tool fidelity beyond one streamed turn
+  (multi-tool turns, compaction, unsaved-buffer reads) is still unverified.
+- `ahead-proxy/src/ahead/store.rs` and `ahead-proxy/src/dispatch.rs` already provide the local libSQL store and `.ahead/session.db` path. `dispatch.rs` now surfaces an open failure instead of silently presenting an in-memory store as durable, but full message/artifact sharing and canonical working-document synchronization remain incomplete.
+- `ahead-rpc/src/ahead.rs::PresentationCue` already separates agent highlighting from the human caret. The complete visible cue/voice interaction is not established by that DTO.
+- `ahead-proxy/src/plugin/dap.rs`, `ahead-rpc/src/dap_types.rs`, `ahead-app/src/debug_bar.rs` and `ahead-app/src/proxy_client.rs` contain DAP machinery. The current client reduces breakpoint responses to line numbers and flattens stopped frames; it does not yet establish the ownership, binding state and stop identity required above. The debug bar also initializes an illustrative active line rather than proving current-caret targeting.
+- `ahead-proxy/src/ahead/voice.rs` identifies itself as a runtime probe. Queue-generation tests are not evidence of working microphone capture, playback or synchronized teaching in the editor.
+- `ahead-app/src/session_panel.rs` is now bound to the real streamed harness conversation (proxy `AgentTurnStart`/`AgentTurnCancel`, 250 ms delta polling, durable reopen) instead of the previous keyword-mocked replies, but the rendered journey has only been compile-verified here, not driven in a running window.
+
+Review the design against these concrete journeys before implementing a generic workflow system:
+
+1. A feature starts from a human outcome, reaches one runnable slice, gets session-aware FIM and resumes with its decisions intact.
+2. An investigation disproves a suspected cause and ends without a code change; its conclusion remains useful to a teammate.
+3. A bug experiment places a breakpoint while preserving a human breakpoint in the same file, reports an unbound breakpoint honestly, observes a real stop and produces regression evidence.
+4. A learner talks over an explanation while typing; stale audio stops, their caret stays put, the current cue remains meaningful, and no debugging execution happens merely from a voice interruption.
+5. A teammate pulls shared history, opens the standard documents and attaches one decision; a later source update does not silently change that attachment.
+6. A refactor preserves its stated invariants; a design change is sent back to a human decision rather than hidden in cleanup.
+7. A passed CI run is followed by a failed rollout; the workflow records actual recovery and keeps causal follow-up open.
+8. A retirement identifies consumers and data handling, verifies migration/removal and retains the rationale for future investigation.
+
+The first deliverable remains a small usable editor journey. This atlas defines coverage and responsibilities; it does not require building every integration at once.

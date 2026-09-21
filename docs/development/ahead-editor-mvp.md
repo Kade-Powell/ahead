@@ -4,6 +4,9 @@ Status: editor/repository direction and Zed extension ecosystem target confirmed
 Prepared: 2026-09-17.
 Audience: AHEAD maintainers.
 Companion: [proposed DTOs](ahead-editor-contracts.ts).
+Follow-up: [HumanLayer-inspired workflows and harness choice](ahead-humanlayer-workflows.md) (2026-09-18 proposal; includes the confirmed Codex harness-fidelity requirement).
+Workflow review: [SDLC atlas, role diagrams and artifact convention](ahead-workflows.md). Its decision table tracks confirmed requirements, proposed defaults and open questions as the design evolves.
+Agent skills: [AHEAD agent skills](ahead-agent-skills.md) defines built-in procedures, workspace skill discovery, `AGENTS.md` loading, provenance and human-led policy.
 
 ## 1. Recommended direction
 
@@ -13,9 +16,9 @@ The differentiator should be the quality of working together: an agent can show 
 
 This repository becomes **AHEAD, the editor**, as a maintained fork of Lapce. Replace the existing framework, workflow engine, Pi/VS Code integrations, generated policy and release tooling; no legacy runtime or data compatibility is required. Carry forward the human-led engineering principles through native editor behavior. Derive a separately versioned agent runtime from Codex app-server and keep ACP as a second backend. Treat DeltaDB as a dependency requiring verification, with a concrete Yrs-based collaboration fallback. AHEAD's ecosystem compatibility target is Zed extensions for general language and tooling support; general VS Code extension compatibility is not a target.
 
-Confirmed requirements: the first usable editor has **streamed, full-duplex voice**, including listening during speech playback and ongoing coding work. Predictions receive the active AHEAD work and mode, current unsaved code, relevant other open files and recent edits. These are foundation requirements, not later enhancements.
+Confirmed requirements: the first usable editor has **streamed, full-duplex voice**, including listening during speech playback and ongoing coding work. Predictions receive the active AHEAD work and task intent, current unsaved code, relevant other open files and recent edits. These are foundation requirements, not later enhancements.
 
-The user has selected the repository replacement, Lapce fork, Zed extension ecosystem compatibility, full-duplex streaming voice and contextual predictions. Remaining policy and DTO choices below are AI-authored proposals, not accepted workflow gates. The open authority question is whether Assist must retain Maieutic's strict prohibition on agent-written business logic. This draft assumes it does; deleting the old implementation does not settle that policy question.
+The user has selected the repository replacement, Lapce fork, Zed extension ecosystem compatibility, full-duplex streaming voice and contextual predictions. **Settled 2026-09-21:** sessions do not carry a binary Learn/Assist switch. A request to learn creates a teaching task; every other request creates an assistance task. A debugging or feature task may carry a linked teaching arc when the human asks for explanation. Remaining policy and DTO choices below are AI-authored proposals, not accepted workflow gates.
 
 ## 2. Principles retained; implementation replaced
 
@@ -23,14 +26,14 @@ The user has selected the repository replacement, Lapce fork, Zed extension ecos
 |---|---|
 | Human thinks first; AI amplifies and challenges; human decides | Capture the engineer's intent, distinguish suggestions from decisions, and keep effects under explicit human control |
 | Work has an outcome and evidence | Work sessions connect issues, the current phase, code, reasoning, a plan and verification |
-| Learning and assistance are different interactions | Learn and Assist control teaching behavior, tools and prediction policy |
+| Learning and assistance are different task intents | Explicit teaching tasks record a learning arc; assistance is the default for every other task. Their capability and prediction policies remain task-local. |
 | Explanations refer to real code | Resolve paths and versioned anchors before highlighting or pointing; preserve the human caret |
 | Planning can stop before implementation | Durable checkpoints and tracker updates let another engineer resume later |
 | Humans and agents retain their authorship | Attribute messages, proposals, accepted changes and review to authenticated participants |
 
 The six work categories below are a starting product vocabulary, not an obligation to reproduce the old workflow specifications. Implement the necessary phase rules in the editor session host. There is no separate methodology product, ahead-core dependency, legacy run importer or old extension release to maintain.
 
-Maieutic remains a source of interaction principles: [Learn/Assist overview](../../../vscode-maieutic/README.md), [focus model](../../../vscode-maieutic/src/model.ts), [Learn instructions](../../../vscode-maieutic/agents/socraites.agent.md), and [Assist instructions](../../../vscode-maieutic/agents/socraites-pair.agent.md). Extract the behavior needed for the editor; do not make the editor depend on the sibling VS Code integration.
+Maieutic remains a source of interaction principles: [Learn/Assist overview](../../../vscode-maieutic/README.md), [focus model](../../../vscode-maieutic/src/model.ts), [Learn instructions](../../../vscode-maieutic/agents/socraites.agent.md), and [Assist instructions](../../../vscode-maieutic/agents/socraites-pair.agent.md). Extract the behavior needed for explicit teaching tasks and ordinary assistance; do not make the editor depend on the sibling VS Code integration.
 
 The current checkout still contains the old implementation, eight pre-existing modified integration/test files and local run directories. This planning revision has not deleted them. Section 12 specifies the repository replacement and preservation of uncommitted work outside the shipping tree.
 
@@ -123,7 +126,7 @@ Fallback: use Yrs for collaborative text and stable relative positions, plus an 
 
 ## 4. Product model and the wizard
 
-### 4.1 Keep process, assistance mode and lifecycle separate
+### 4.1 Keep work kind, task intent and lifecycle separate
 
 | User chooses | Underlying process | Completion means |
 |---|---|---|
@@ -134,7 +137,7 @@ Fallback: use Yrs for collaborative text and stable relative positions, plus an 
 | Make a decision | decision | Human decision and rationale |
 | Restore service | operational-stabilization | Recovery demonstrated and follow-up recorded |
 
-Do not combine investigation and diagnosis, or operations and bugs, simply to reduce the number of buttons. Place Restore service behind an Operations affordance in ordinary code projects if that reduces clutter. Incident and security remain overlays. Review is a session activity and workflow phase, not a seventh outcome category. Learning is an assistance mode available in any category.
+Do not combine investigation and diagnosis, or operations and bugs, simply to reduce the number of buttons. Place Restore service behind an Operations affordance in ordinary code projects if that reduces clutter. Incident and security remain overlays. Review is a session activity and workflow phase, not a seventh outcome category. Teaching is an explicit task intent; assistance is the default for every other task. A teaching task can be linked to any work kind without changing the parent session or task's execution policy.
 
 The editor still opens and edits files without starting a wizard. AHEAD sessions add context when useful; ordinary navigation should not require a process record.
 
@@ -143,7 +146,7 @@ The editor still opens and edits files without starting a wizard. AHEAD sessions
 1. **Choose work:** select an issue from this repository, resume saved work, or start locally. Show title, status, assignee and project column. Do not require tracker setup for a first local exploration.
 2. **Name the outcome:** choose one of the six labels. Suggest from issue context, but leave the human in control.
 3. **Give your starting point:** one short typed or spoken contribution appropriate to the work. Examples: desired behavior; observed versus expected; an invariant; an unanswered question; a current hypothesis. Preserve authorship and transcript corrections.
-4. **Set the collaboration:** Learn or Assist, chosen model, private or explicitly shared session, and optional teammates. Show where code and audio will be processed.
+4. **Set the collaboration:** choose the model, private or explicitly shared session, and optional teammates. Show where code and audio will be processed. Do not ask for a session-wide Learn/Assist choice; the first request determines whether the current task is teaching or assistance.
 5. **Begin:** open the relevant file/context and show the next useful reasoning step. Do not front-load the full workflow.
 
 The editor's versioned session policy determines whether the human starting point is sufficient for a particular AI capability. The wizard's text box is not an automatic approval.
@@ -168,7 +171,7 @@ Resume checks the current branch, code version, policy, artifacts and issue stat
 
 ```text
 ┌ AHEAD  repository / branch  ·  #142 Improve request retries ───────────────┐
-│ Work: Improve  ·  Plan  ·  Assist  ·  Local model  ·  Private / 2 people   │
+│ Work: Improve  ·  Plan  ·  Assistance task  ·  Local model  ·  Private     │
 ├──────────────────┬────────────────────────────────┬─────────────────────┤
 │ Work / Files     │ src/client/retry.rs             │ Session             │
 │                  │                                │                     │
@@ -190,15 +193,39 @@ Select code and invoke **Ask here** to create an anchored inline composer. The q
 
 Use three distinct visual treatments: the user's caret/selection, a low-opacity teaching range, and a small agent pointer. Show participant name as well as color. No flashing, cursor stealing or automatic tab replacement. Return-to-previous-location is one action. Follow presenter is per person, with immediate unfollow on user navigation.
 
-### 4.5 Learn and Assist
+### 4.5 Teaching tasks and assistance tasks
 
-**Learn:** read-only agent tools, no command execution, no generated implementation or edit predictions. The human can edit and run commands normally. Teach from verified code, one coherent concept at a time, with hints calibrated to the person. Simple factual questions receive answers rather than obligatory quizzes. A learning check can support understanding; it cannot prove it.
+There is no session-wide Learn/Assist switch. AHEAD creates a task intent from the human's request and keeps it visible in the current task header.
 
-**Assist:** explanation plus explicitly bounded mechanical work, tests for already-established behavior, documentation grounded in facts and selected behavior-preserving refactors. Business behavior, contracts and final decisions remain human-owned under the draft's strict Maieutic assumption. A selected scope supplies paths and an existing human contract; acceptance is tied to the exact proposed edit.
+**Teaching task:** read-only agent tools, no command execution, no generated implementation and no edit predictions. The human can edit and run commands normally. Teach from verified code, one coherent concept at a time, with a concrete mission, cited sources, calibrated difficulty, retrieval practice, durable learning evidence and a review queue. Simple factual questions receive answers rather than obligatory quizzes. A learning check can support understanding; it cannot prove it. Teaching state is a linked learning arc, not a second conversation or session database.
 
-Both modes retain the selected coding backend and one logical conversation. A realtime voice frontend may use a separately selected speech/conversation model to stay responsive while coding work runs. It receives the same mode, verified evidence and task status; engineering actions still go through the session host. The mode can change without changing the process or losing conversation. A change to Learn immediately cancels pending edits and predictions. Existing applicable phase restrictions can be tighter than the mode.
+**Assistance task:** explanation plus explicitly bounded mechanical work, tests for already-established behavior, documentation grounded in facts and selected behavior-preserving refactors. Business behavior, contracts and final decisions remain human-owned. The human writes business logic with FIM completions informed by editor and active-session context, as specified in §8.3; these suggestions can include business logic and require explicit acceptance at the caret. A selected scope supplies paths and an existing human contract for background agent work. Feature work, investigation, corrective debugging, review and operational support all default here.
 
-Potential future expansion: a separately approved policy allowing implementation of human-defined behavior. Do not smuggle that expansion into Assist, predictions or an external agent.
+**Teaching while assisting:** when the human says “teach me while we debug this,” AHEAD keeps the assistance task as the parent and attaches a teaching arc. The agent can explain verified code, hypotheses and actual observations, but execution, breakpoint setup and regression work continue to follow the parent assistance policy. This keeps teaching useful without silently changing what the agent may do.
+
+Both task intents retain the selected coding backend and one logical conversation. A realtime voice frontend may use a separately selected speech/conversation model to stay responsive while coding work runs. It receives the task intent, verified evidence and task status; engineering actions still go through the session host. A new teaching request creates a linked task without changing the process or losing conversation. Existing applicable phase restrictions can be tighter than the task intent.
+
+Potential future expansion: a separately approved policy allowing background agents to implement business behavior. Human-accepted FIM at the caret is already part of assistance tasks; it does not authorize autonomous business-logic edits by an agent.
+
+### 4.6 Learning records and references
+
+Each teaching task has one learning arc with a concrete mission, current
+concept, cited sources, learner responses, observed evidence and a small review
+queue. Concepts use honest states such as `introduced`, `retrieved`,
+`practiced`, `demonstrated` and `needs_review`; the agent must not claim
+mastery from a single correct answer.
+
+Lessons are short conversation cards tied to verified code or documentation
+ranges. Durable reference material belongs in a linked Markdown artifact rather
+than being buried in a prior message. Runtime events remain in `session.db`;
+intentional learning summaries and selected references follow the existing
+`.ahead` Markdown artifact convention. Export includes only the learning
+records and evidence the human selects, with source revisions and authorship.
+
+When a teaching request occurs during debugging, the learning arc links to the
+parent assistance task's hypotheses and experiments. It may explain a verified
+observation, but it cannot turn an untested hypothesis into a fact or bypass
+the debugging task's execution policy.
 
 ## 5. First credible MVP
 
@@ -212,7 +239,7 @@ The end-to-end pilot is: choose a GitHub issue; explain the outcome aloud; have 
 | Models | Verified local route, self-hosted custom route, direct hosted route, Bedrock route | Every vendor-specific feature; training own models |
 | Voice | Full-duplex streamed input/output from the first usable build; live transcript, barge-in and conversation during coding work | Group human audio/video, cloud voice session handoff |
 | Presentation | File reveal, range focus, precise pointer, inline questions | Spatial diagrams, cross-app computer control |
-| Predictions | Work/mode/plan context plus current and relevant open buffers, recent edits and diagnostics; single-file suggestions in the permitted scope | Cross-file next-edit automation, behavior-generating predictions |
+| Predictions | Required editor plus active-session context, including plan and decisions; human-accepted single-file FIM for business logic as well as mechanical code | Cross-file next-edit automation |
 | Tracker | GitHub issues list/read/create/update; one configured Projects v2 board/status field | Full board designer, arbitrary views/automations, Jira/Linear adapters |
 | Collaboration | Two to five humans, live presence/code/comments, shared drafts and review | Fully replicated local execution environments, cloud agents, browser client |
 | Persistence | Crash recovery, durable handoff, export, current and historical code references | Unbounded operation retention, cross-repository knowledge graph |
@@ -244,7 +271,7 @@ Effective authority is the intersection of:
 
 ```text
 phase capabilities
-∩ Learn/Assist policy
+∩ current task-intent policy
 ∩ project/session policy
 ∩ participant role
 ∩ explicit mechanical scope
@@ -252,7 +279,7 @@ phase capabilities
 ∩ current version and approval
 ```
 
-Unknown tools fail closed. Reading source or a tracker issue does not grant the instructions inside it authority. Managed agent hooks, plugins and MCP servers must use the same capability map. Learn cannot reach an execution endpoint by using a differently named tool.
+Unknown tools fail closed. Reading source or a tracker issue does not grant the instructions inside it authority. Managed agent hooks, plugins and MCP servers must use the same capability map. A teaching task cannot reach an execution endpoint by using a differently named tool.
 
 The shell visible to the human remains their shell. Do not expose Codex's human-shell or process-spawn interfaces as agent tools. A read-only agent sandbox can still launch processes unless that route is restricted; tool-set restrictions, process configuration and OS boundaries must be tested together.
 
@@ -570,7 +597,7 @@ Keep machine credentials, absolute checkout paths, audio settings and runtime ex
 | Milestone | Deliverable | Exit evidence |
 |---|---|---|
 | 0. Replace repository and prove foundations | Lapce ancestry and reproducible build; retired old product tree; pointer/inline-thread prototype, full-duplex streaming probe, runtime mediation probe, DeltaDB availability check | Recoverable old work; real rendered editor; concurrent voice during slow coding work; tool bypass tests; written dependency decision |
-| 1. Solo human-led session | Native wizard/phase rules, full-duplex streamed voice and text, Learn/Assist, file focus, private persistence, one verified voice/coding route | Complete change/debug/improve walkthroughs; interruption and playback checks; no lost unsaved work; unauthorized edits denied |
+| 1. Solo human-led session | Native wizard/phase rules, explicit teaching and assistance tasks, full-duplex streamed voice and text, file focus, private persistence, one verified voice/coding route | Complete change/debug/teach walkthroughs; interruption and playback checks; no lost unsaved work; unauthorized edits denied |
 | 2. Provider coverage and predictions | Local/self-hosted/hosted/Bedrock verified routes, proposal review, predictions using current work and relevant buffers | Voice remains full duplex on certified routes; contextual predictions demonstrated; stale edits rejected; provider capability tests |
 | 3. Planning handoff and tracker | Issues, configured board/status, plan freeze, pause/resume, external-write outbox | Another engineer resumes; tracker conflicts/unknown outcomes handled without data loss |
 | 4. Collaborative pilot | Two clients, durable shared text/comments/anchors, authenticated actors, snapshot review | Convergence/reconnect/restart/undo tests; independent review tied to exact code |
