@@ -59,6 +59,9 @@ pub enum LspRpc {
 }
 
 pub struct LspClient {
+    // Retained for the future extension host (see TODO.md); no catalog
+    // registration exists today.
+    #[allow(dead_code)]
     plugin_rpc: PluginCatalogRpcHandler,
     server_rpc: PluginServerRpcHandler,
     process: Child,
@@ -95,7 +98,6 @@ impl PluginServerHandler for LspClient {
             Shutdown => {
                 self.shutdown();
             }
-            SpawnedPluginLoaded { .. } => {}
         }
     }
 
@@ -403,14 +405,9 @@ impl LspClient {
                     None,
                     false,
                 );
-                if self
-                    .plugin_rpc
-                    .plugin_server_loaded(self.server_rpc.clone())
-                    .is_err()
-                {
-                    self.server_rpc.shutdown();
-                    self.shutdown();
-                }
+                // Volt hosting is removed, so there is no catalog to
+                // register this server with. Language servers start
+                // through the future extension host (see TODO.md).
             }
             Err(err) => {
                 tracing::error!("{:?}", err);

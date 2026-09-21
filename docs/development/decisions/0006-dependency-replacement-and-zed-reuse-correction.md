@@ -70,3 +70,12 @@ copyright notices, ship license texts, disclose source).
    pass (its `RopeText` adapters die with xi-rope).
 5. Decide the extension host (Zed WIT on wasmtime 48 vs deferred) before
    touching wasmtime versions.
+
+## Priority (confirmed 2026-09-21)
+
+Ecosystem crates first; Zed source second; bespoke AHEAD code last. When
+rearchitecture needs implementation patterns, follow Zed's source at the
+pinned checkout (`~/dev/zed`) and use its code directly where no
+ecosystem crate covers the need — adapting names and boundaries to AHEAD
+(clean-room obligation applies). Do not build bespoke what a healthy
+crate already does; do not vendor Zed where a healthy crate exists.

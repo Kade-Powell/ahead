@@ -319,7 +319,7 @@ impl DapClient {
 
     pub(crate) fn initialize(&mut self) -> Result<()> {
         let params = dap_types::InitializeParams {
-            client_id: Some("lapce".to_owned()),
+            client_id: Some("ahead".to_owned()),
             client_name: Some("Ahead".to_owned()),
             adapter_id: "".to_string(),
             locale: Some("en-us".to_owned()),

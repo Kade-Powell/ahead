@@ -20,15 +20,13 @@ use lsp_types::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-
-use super::plugin::VoltID;
 use crate::{
     RequestId, RpcError, RpcMessage,
     buffer::BufferId,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
     file::{FileNodeItem, PathObject},
     file_line::FileLine,
-    plugin::{PluginId, VoltInfo, VoltMetadata},
+    plugin::PluginId,
     source_control::FileDiff,
     style::SemanticStyles,
     terminal::{TermId, TerminalProfile},
@@ -233,10 +231,6 @@ pub enum ProxyRequest {
 pub enum ProxyNotification {
     Initialize {
         workspace: Option<PathBuf>,
-        disabled_volts: Vec<VoltID>,
-        /// Paths to extra plugins that should be loaded
-        extra_plugin_paths: Vec<PathBuf>,
-        plugin_configurations: HashMap<String, HashMap<String, serde_json::Value>>,
         window_id: usize,
         tab_id: usize,
     },
@@ -263,27 +257,9 @@ pub enum ProxyNotification {
         delta: RopeDelta,
         rev: u64,
     },
-    UpdatePluginConfigs {
-        configs: HashMap<String, HashMap<String, serde_json::Value>>,
-    },
     NewTerminal {
         term_id: TermId,
         profile: TerminalProfile,
-    },
-    InstallVolt {
-        volt: VoltInfo,
-    },
-    RemoveVolt {
-        volt: VoltMetadata,
-    },
-    ReloadVolt {
-        volt: VoltMetadata,
-    },
-    DisableVolt {
-        volt: VoltInfo,
-    },
-    EnableVolt {
-        volt: VoltInfo,
     },
     GitCommit {
         message: String,
@@ -620,26 +596,6 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::GitCheckout { reference });
     }
 
-    pub fn install_volt(&self, volt: VoltInfo) {
-        self.notification(ProxyNotification::InstallVolt { volt });
-    }
-
-    pub fn reload_volt(&self, volt: VoltMetadata) {
-        self.notification(ProxyNotification::ReloadVolt { volt });
-    }
-
-    pub fn remove_volt(&self, volt: VoltMetadata) {
-        self.notification(ProxyNotification::RemoveVolt { volt });
-    }
-
-    pub fn disable_volt(&self, volt: VoltInfo) {
-        self.notification(ProxyNotification::DisableVolt { volt });
-    }
-
-    pub fn enable_volt(&self, volt: VoltInfo) {
-        self.notification(ProxyNotification::EnableVolt { volt });
-    }
-
     pub fn shutdown(&self) {
         self.notification(ProxyNotification::Shutdown {});
         if let Err(err) = self.tx.send(ProxyRpc::Shutdown) {
@@ -650,17 +606,11 @@ impl ProxyRpcHandler {
     pub fn initialize(
         &self,
         workspace: Option<PathBuf>,
-        disabled_volts: Vec<VoltID>,
-        extra_plugin_paths: Vec<PathBuf>,
-        plugin_configurations: HashMap<String, HashMap<String, serde_json::Value>>,
         window_id: usize,
         tab_id: usize,
     ) {
         self.notification(ProxyNotification::Initialize {
             workspace,
-            disabled_volts,
-            extra_plugin_paths,
-            plugin_configurations,
             window_id,
             tab_id,
         });
@@ -1105,13 +1055,6 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::Update { path, delta, rev });
     }
 
-    pub fn update_plugin_configs(
-        &self,
-        configs: HashMap<String, HashMap<String, serde_json::Value>>,
-    ) {
-        self.notification(ProxyNotification::UpdatePluginConfigs { configs });
-    }
-
     pub fn git_discard_files_changes(&self, files: Vec<PathBuf>) {
         self.notification(ProxyNotification::GitDiscardFilesChanges { files });
     }
@@ -1236,6 +1179,21 @@ impl ProxyRpcHandler {
             })),
             Err(err) => f(Err(err)),
         });
+    }
+
+    /// Blocking variant for call sites that can afford to wait (conversation
+    /// history refresh, turn start/cancel from a background task).
+    pub fn ahead_request_blocking(
+        &self,
+        request: crate::ahead::AheadRequest,
+    ) -> Result<serde_json::Value, RpcError> {
+        match self.request(ProxyRequest::AheadRequest { request })? {
+            ProxyResponse::AheadResponse { response } => Ok(response),
+            _ => Err(RpcError {
+                code: 0,
+                message: "Unexpected response variant for AheadRequest".into(),
+            }),
+        }
     }
 
     pub fn ahead_notification(&self, notification: crate::ahead::AheadNotification) {

@@ -115,7 +115,6 @@ chrono            = { version = "0.4" }
 clap              = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive"] }
 crossbeam-channel = { version = "0.5.12" }
 directories       = { version = "4.0.1" }
-flate2            = { version = "1.0" }
 git2              = { version = "0.20.0", features = ["vendored-openssl"] }
 globset           = { version = "0.4.14" }
 include_dir       = { version = "0.7" }
@@ -131,11 +130,9 @@ serde             = { version = "1.0" }
 serde_json        = { version = "1.0" }
 strum             = { version = "0.27.1" }
 strum_macros      = { version = "0.27.1" }
-tar               = { version = "0.4" }
 thiserror         = { version = "1.0" }
 toml              = { version = "*" }
 url               = { version = "2.5.0" }
-zstd              = { version = "0.11.2" }                                                                         # follow same version wasmtime-cache in lockfile
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
 psp-types = { git = "https://github.com/lapce/psp-types", rev = "f7fea28f59e7b2d6faa1034a21679ad49b3524ad" }
@@ -150,10 +147,6 @@ floem-editor-core = { git = "https://github.com/lapce/floem", rev = "e0dd862564e
 # floem-editor-core = { path = "../floem/editor-core/", features = ["serde"] }
 
 [patch.crates-io]
-# Temporarily patch lsp-types with a version that adds message-type debug.
-# (Blocked on psp-types removal: psp-types imports lsp_types::Url, which only
-# exists in this fork. Drop this patch together with psp-types.)
-lsp-types = { git = "https://github.com/lapce/lsp-types", rev = "feaa1e2ec80975c9dadd400a238ceacf071058e6" }
 regalloc2 = { rev = "5d79e12d0a93b10fc181f4da409b4671dd365228", git = "https://github.com/bytecodealliance/regalloc2" }
 
 # cargo vendor issue: https://github.com/rust-lang/cargo/issues/10310

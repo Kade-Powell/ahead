@@ -52,33 +52,17 @@ the app itself.
 
 ## Dependencies (Lapce-org removal; see decision 0006)
 
-- [ ] Extract shared RPC plumbing from `ahead-proxy/src/plugin/psp.rs` and
-      rewire `LspClient`/`DapClient` startup to `dispatch.rs` (they currently
-      ride the volt abstraction). Then delete the volt stack (`catalog.rs`,
-      `wasi.rs`, `wasi/`, volt RPC surface, registry URL, fixtures) and drop
-      `psp-types`, `wasi-experimental-http` and unused `wasmtime 14` deps.
-      Track the Zed-model extension host as a separate item.
-      Execution plan (mapped 2026-09-21, tree green at 07e35e5):
-      LspClient::start has exactly 2 call sites, both volt StartLspServer
-      handlers in psp.rs; DapClient::start is catalog-mediated. The app UI
-      has zero volt references, so no `ahead-app` changes. Cut order:
-      (1) new `plugin/host.rs` with ResponseHandler/RpcCallback/
-      ClonableCallback/PluginServerHandler/PluginServerRpcHandler/
-      ResponseSender/handle_plugin_server_message moved verbatim from
-      psp.rs; (2) point lsp.rs/dap.rs at it, keep compiling; (3) give
-      dispatch a direct host handle and move DapClient::start +
-      did_change/test-doc sync off catalog_rpc; (4) delete catalog.rs,
-      wasi.rs, wasi/, volt fns in mod.rs/psp.rs, volt RPC in
-      ahead-rpc (InstallVolt, volt notifications, disabled_volts/
-      extra_plugin_paths/plugin_configurations), fixtures; (5) drop
-      deps, `cargo check --workspace` + `cargo test -p ahead-proxy`
-      green after every step.
-- [ ] Drop the `lsp-types` fork patch (blocked on the item above: psp-types
-      needs fork-only `Url`); adopt upstream `lsp-types 0.97.0` with a local
-      `Debug` shim where message logging needs it.
-- [ ] Migrate `lapce-xi-rope` to `ropey 2.0.0-beta.1` with an AHEAD delta
-      layer (apply/invert + serde for RPC DTOs); remove `floem-editor-core`
-      in the same pass (its `RopeText` adapters die with xi-rope).
+- [ ] Volt-stack deletion DONE 2026-09-21: `wasi.rs`/`wasi/`, volt loading,
+      activation, registry/download/install, volt RPC surface and fixtures
+      are gone; `psp-types`, `wasi-experimental-http`, `wasmtime 14`,
+      `flate2`/`tar`/`walkdir`/`zstd` deps dropped; `lsp-types` fork dropped
+      for upstream registry (no `Debug` shim proved necessary). LSP/DAP host
+      core (`psp.rs`, `lsp.rs`, `dap.rs`, catalog sync fan-out) still
+      compiles with legacy server-identity fields kept as the documented
+      seam. Remaining host work moves with the Zed-model extension host:
+      dispatch direct server handle, DAP config-direct startup (no volt
+      debugger registry), `LspClient` startup path, dead-field and
+      legacy-`VoltID` cleanup.
 - [ ] Decide the extension host (Zed WIT component model on wasmtime 48 vs
       deferred) before upgrading `wasmtime 14`, which only serves volt
       plugins today.

@@ -130,14 +130,14 @@ pub fn mainloop() {
             tracing::error!("{:?}", err);
         }
     });
-    if let Err(err) = register_lapce_path() {
+    if let Err(err) = register_ahead_path() {
         tracing::error!("{:?}", err);
     }
 
     proxy_rpc.mainloop(&mut dispatcher);
 }
 
-pub fn register_lapce_path() -> Result<()> {
+pub fn register_ahead_path() -> Result<()> {
     let exedir = std::env::current_exe()?
         .parent()
         .ok_or(anyhow!("can't get parent dir of exe"))?

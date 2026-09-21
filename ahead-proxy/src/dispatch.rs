@@ -71,9 +71,6 @@ impl ProxyHandler for Dispatcher {
         match rpc {
             Initialize {
                 workspace,
-                disabled_volts,
-                extra_plugin_paths,
-                plugin_configurations,
                 window_id,
                 tab_id,
             } => {
@@ -95,9 +92,6 @@ impl ProxyHandler for Dispatcher {
                 thread::spawn(move || {
                     let mut plugin = PluginCatalog::new(
                         workspace,
-                        disabled_volts,
-                        extra_plugin_paths,
-                        plugin_configurations,
                         plugin_rpc.clone(),
                     );
                     plugin_rpc.mainloop(&mut plugin);
@@ -107,14 +101,53 @@ impl ProxyHandler for Dispatcher {
                     let ahead_dir = ws.join(".ahead");
                     let _ = std::fs::create_dir_all(&ahead_dir);
                     let db_path = ahead_dir.join("session.db");
-                    crate::ahead::store::SessionStore::open(&db_path)
-                        .unwrap_or_else(|_| crate::ahead::store::SessionStore::in_memory().unwrap())
+                    match crate::ahead::store::SessionStore::open(&db_path) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            // Never present an in-memory fallback as durably
+                            // saved work. Surface the failure to the UI and
+                            // keep running only for this process lifetime.
+                            tracing::event!(
+                                tracing::Level::ERROR,
+                                "AHEAD session store failed to open at {}: {e}. \
+                                 Falling back to a NON-DURABLE in-memory store.",
+                                db_path.display()
+                            );
+                            self.core_rpc.show_message(
+                                "AHEAD session storage unavailable".to_string(),
+                                lsp_types::ShowMessageParams {
+                                    typ: lsp_types::MessageType::ERROR,
+                                    message: format!(
+                                        "Could not open {}. This session will NOT be saved. Cause: {e}",
+                                        db_path.display()
+                                    ),
+                                },
+                            );
+                            crate::ahead::store::SessionStore::in_memory()
+                                .unwrap_or_else(|_| unreachable!("in-memory store must open"))
+                        }
+                    }
                 } else {
-                    crate::ahead::store::SessionStore::in_memory().unwrap()
+                    crate::ahead::store::SessionStore::in_memory()
+                        .unwrap_or_else(|_| unreachable!("in-memory store must open"))
                 };
-                self.ahead_host = Some(Arc::new(parking_lot::RwLock::new(
+                let ahead_host = Arc::new(parking_lot::RwLock::new(
                     crate::ahead::host::AheadSessionHost::new(session_store),
-                )));
+                ));
+                {
+                    let host = ahead_host.read();
+                    if let Some(ws) = self.workspace.clone() {
+                        host.set_workspace(ws);
+                    }
+                    // Streamed harness output flows to the UI over the core
+                    // notification channel; the sink is installed before any
+                    // turn can start.
+                    let core_rpc = self.core_rpc.clone();
+                    host.set_notification_sink(Arc::new(move |notification| {
+                        core_rpc.ahead_notification(notification);
+                    }));
+                }
+                self.ahead_host = Some(ahead_host);
 
                 self.core_rpc.notification(CoreNotification::ProxyStatus {
                     status: ahead_rpc::proxy::ProxyStatus::Connected,
@@ -191,11 +224,6 @@ impl ProxyHandler for Dispatcher {
                     old_text,
                     buffer.rope.clone(),
                 );
-            }
-            UpdatePluginConfigs { configs } => {
-                if let Err(err) = self.catalog_rpc.update_plugin_configs(configs) {
-                    tracing::error!("{:?}", err);
-                }
             }
             NewTerminal { term_id, profile } => {
                 let mut terminal = match Terminal::new(term_id, profile, 50, 10) {
@@ -328,32 +356,64 @@ impl ProxyHandler for Dispatcher {
                     tracing::error!("{:?}", err);
                 }
             }
-            InstallVolt { volt } => {
-                let catalog_rpc = self.catalog_rpc.clone();
-                if let Err(err) = catalog_rpc.install_volt(volt) {
-                    tracing::error!("{:?}", err);
-                }
-            }
-            ReloadVolt { volt } => {
-                if let Err(err) = self.catalog_rpc.reload_volt(volt) {
-                    tracing::error!("{:?}", err);
-                }
-            }
-            RemoveVolt { volt } => {
-                self.catalog_rpc.remove_volt(volt);
-            }
-            DisableVolt { volt } => {
-                self.catalog_rpc.stop_volt(volt);
-            }
-            EnableVolt { volt } => {
-                if let Err(err) = self.catalog_rpc.enable_volt(volt) {
-                    tracing::error!("{:?}", err);
-                }
-            }
             GitCommit { message, diffs } => {
                 if let Some(workspace) = self.workspace.as_ref() {
-                    match git_commit(workspace, &message, diffs) {
-                        Ok(()) => (),
+                    // Paths in the commit, repo-relative, for attribution cleanup.
+                    let committed_paths: Vec<String> = diffs
+                        .iter()
+                        .flat_map(|d| match d {
+                            FileDiff::Renamed(old, new) => vec![old.clone(), new.clone()],
+                            other => vec![other.path().clone()],
+                        })
+                        .filter_map(|p| {
+                            p.strip_prefix(workspace)
+                                .ok()
+                                .map(|rel| rel.to_string_lossy().to_string())
+                        })
+                        .collect();
+
+                    // A commit is authored as `ahead` only when the changeset
+                    // actually includes agent-authored regions; a human-only
+                    // commit keeps the human author.
+                    let agent_session_id = self
+                        .ahead_host
+                        .as_ref()
+                        .and_then(|host| host.read().anchors_for_paths(&committed_paths).ok())
+                        .and_then(|anchors| {
+                            anchors
+                                .into_iter()
+                                .find(|a| a.actor_id == ahead_rpc::ahead::AHEAD_ACTOR_ID)
+                                .map(|anchor| anchor.session_id)
+                        });
+                    match git_commit(
+                        workspace,
+                        &message,
+                        diffs,
+                        agent_session_id.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            if let Some(host) = self.ahead_host.as_ref() {
+                                let head_contents: HashMap<String, String> = committed_paths
+                                    .iter()
+                                    .filter_map(|path| {
+                                        fs::read_to_string(workspace.join(path))
+                                            .ok()
+                                            .map(|content| (path.clone(), content))
+                                    })
+                                    .collect();
+                                match host
+                                    .read()
+                                    .clear_committed_anchors(&committed_paths, &head_contents)
+                                {
+                                    Ok(cleared) => tracing::debug!(
+                                        "cleared {cleared} committed attribution anchors"
+                                    ),
+                                    Err(e) => {
+                                        tracing::warn!("failed to clear committed anchors: {e}")
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => {
                             self.core_rpc.show_message(
                                 "Git Commit failure".to_owned(),
@@ -675,47 +735,53 @@ impl ProxyHandler for Dispatcher {
                     trigger_kind,
                     move |_, result| {
                         let mut completions_opt = result.ok();
-                        let has_items = completions_opt.as_ref().map(|c| match c {
-                            lsp_types::InlineCompletionResponse::Array(arr) => !arr.is_empty(),
-                            lsp_types::InlineCompletionResponse::List(l) => !l.items.is_empty(),
+                        let has_items = completions_opt.as_ref().map(|completions| match completions {
+                            lsp_types::InlineCompletionResponse::Array(items) => !items.is_empty(),
+                            lsp_types::InlineCompletionResponse::List(list) => !list.items.is_empty(),
                         }).unwrap_or(false);
 
                         if !has_items {
                             if let Some(host_lock) = ahead_host {
                                 let host = host_lock.read();
-                                let path_str = path_buf.to_string_lossy().to_string();
-                                let (prefix, suffix) = if let Some(ref text) = buffer_content {
+                                let (prefix, suffix) = if let Some(text) = &buffer_content {
                                     let lines: Vec<&str> = text.lines().collect();
                                     let line_idx = position.line as usize;
-                                    if line_idx < lines.len() {
-                                        let col_idx = (position.character as usize).min(lines[line_idx].len());
-                                        let (p, s) = lines[line_idx].split_at(col_idx);
-                                        (p.to_string(), s.to_string())
+                                    if let Some(line) = lines.get(line_idx) {
+                                        let col_idx = (position.character as usize).min(line.len());
+                                        let (prefix, suffix) = line.split_at(col_idx);
+                                        (prefix.to_string(), suffix.to_string())
                                     } else {
                                         (String::new(), String::new())
                                     }
                                 } else {
                                     (String::new(), String::new())
                                 };
-
-                                let req = ahead_rpc::ahead::PredictionRequest {
+                                let request = ahead_rpc::ahead::PredictionRequest {
                                     request_id: uuid::Uuid::new_v4().to_string(),
                                     session_id: "active".to_string(),
-                                    path: path_str,
-                                    cursor: ahead_rpc::ahead::DisplayPosition { line: position.line, col: position.character },
+                                    path: path_buf.to_string_lossy().to_string(),
+                                    cursor: ahead_rpc::ahead::DisplayPosition {
+                                        line: position.line,
+                                        col: position.character,
+                                    },
                                     prefix,
                                     suffix,
                                     work_context: "ahead-editor-flow".to_string(),
                                 };
-                                if let Ok(pred) = host.request_prediction(req, &[]) {
-                                    let item = lsp_types::InlineCompletionItem {
-                                        insert_text: pred.replacement,
-                                        filter_text: None,
-                                        range: None,
-                                        command: None,
-                                        insert_text_format: None,
-                                    };
-                                    completions_opt = Some(lsp_types::InlineCompletionResponse::Array(vec![item]));
+                                if let Ok(prediction) = host.request_prediction(request, &[])
+                                    && !prediction.replacement.is_empty()
+                                {
+                                    completions_opt = Some(
+                                        lsp_types::InlineCompletionResponse::Array(vec![
+                                            lsp_types::InlineCompletionItem {
+                                                insert_text: prediction.replacement,
+                                                filter_text: None,
+                                                range: None,
+                                                command: None,
+                                                insert_text_format: None,
+                                            },
+                                        ]),
+                                    );
                                 }
                             }
                         }
@@ -1478,6 +1544,7 @@ fn git_commit(
     workspace_path: &Path,
     message: &str,
     diffs: Vec<FileDiff>,
+    agent_session_id: Option<&str>,
 ) -> Result<()> {
     let repo = Repository::discover(workspace_path)?;
     let mut index = repo.index()?;
@@ -1486,9 +1553,9 @@ fn git_commit(
             FileDiff::Modified(p) | FileDiff::Added(p) => {
                 index.add_path(p.strip_prefix(workspace_path)?)?;
             }
-            FileDiff::Renamed(a, d) => {
-                index.add_path(a.strip_prefix(workspace_path)?)?;
-                index.remove_path(d.strip_prefix(workspace_path)?)?;
+            FileDiff::Renamed(old, new) => {
+                index.add_path(new.strip_prefix(workspace_path)?)?;
+                index.remove_path(old.strip_prefix(workspace_path)?)?;
             }
             FileDiff::Deleted(p) => {
                 index.remove_path(p.strip_prefix(workspace_path)?)?;
@@ -1507,11 +1574,25 @@ fn git_commit(
                 .unwrap_or(vec![]);
             let parents_refs = parents.iter().collect::<Vec<_>>();
 
+            // Committer is always the human driving the commit. Author is
+            // `ahead` when the changeset carries agent-authored regions, so
+            // attribution is visible in `git log --author=ahead` / blame.
+            let author = if agent_session_id.is_some() {
+                git2::Signature::now("ahead", "ahead@ahead.local")
+                    .unwrap_or_else(|_| signature.clone())
+            } else {
+                signature.clone()
+            };
+            let commit_message = match agent_session_id {
+                Some(session_id) => format!("{message}\n\nAhead-Session: {session_id}"),
+                None => message.to_string(),
+            };
+
             repo.commit(
                 Some("HEAD"),
+                &author,
                 &signature,
-                &signature,
-                message,
+                &commit_message,
                 &tree,
                 &parents_refs,
             )?;
@@ -1845,4 +1926,169 @@ fn search_in_path(
     }
 
     Ok(ProxyResponse::GlobalSearchResponse { matches })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dispatcher, git_commit};
+    use ahead_rpc::{
+        ahead::{AssistanceMode, DisplayPosition, DisplayRange, WorkKind},
+        core::CoreRpcHandler,
+        proxy::{ProxyHandler, ProxyNotification, ProxyRpcHandler},
+        source_control::FileDiff,
+    };
+    use git2::Repository;
+    use std::fs;
+
+    #[test]
+    fn agent_changes_use_ahead_author_and_human_committer() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-git-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        let repo = Repository::init(&workspace).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Human Developer").unwrap();
+            config.set_str("user.email", "human@example.test").unwrap();
+        }
+        let path = workspace.join("src/lib.rs");
+        fs::write(&path, "pub fn retry() {}\n").unwrap();
+
+        git_commit(
+            &workspace,
+            "Implement retry",
+            vec![FileDiff::Added(path)],
+            Some("session-1"),
+        )
+        .unwrap();
+
+        let repo = Repository::open(&workspace).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.author().name(), Some("ahead"));
+        assert_eq!(commit.author().email(), Some("ahead@ahead.local"));
+        assert_eq!(commit.committer().name(), Some("Human Developer"));
+        assert!(commit.message().unwrap().contains("Ahead-Session: session-1"));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn rename_commit_stages_destination_and_removes_source() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-git-rename-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        let repo = Repository::init(&workspace).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Human Developer").unwrap();
+            config.set_str("user.email", "human@example.test").unwrap();
+        }
+
+        let old = workspace.join("old.md");
+        let new = workspace.join("new.md");
+        fs::write(&old, "working document\n").unwrap();
+        git_commit(
+            &workspace,
+            "Add working document",
+            vec![FileDiff::Added(old.clone())],
+            None,
+        )
+        .unwrap();
+        fs::rename(&old, &new).unwrap();
+
+        git_commit(
+            &workspace,
+            "Rename working document",
+            vec![FileDiff::Renamed(old.clone(), new.clone())],
+            None,
+        )
+        .unwrap();
+
+        let repo = Repository::open(&workspace).unwrap();
+        let commit = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_path(std::path::Path::new("new.md")).is_ok());
+        assert!(tree.get_path(std::path::Path::new("old.md")).is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn dispatcher_commit_uses_anchor_attribution_and_clears_rows() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-dispatch-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        let repo = Repository::init(&workspace).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Human Developer").unwrap();
+            config.set_str("user.email", "human@example.test").unwrap();
+        }
+
+        let path = workspace.join("agent.md");
+        fs::write(&path, "AHEAD authored content\n").unwrap();
+
+        let mut dispatcher = Dispatcher::new(
+            CoreRpcHandler::new(),
+            ProxyRpcHandler::new(),
+        );
+        dispatcher.handle_notification(ProxyNotification::Initialize {
+            workspace: Some(workspace.clone()),
+            window_id: 1,
+            tab_id: 1,
+        });
+        let host = dispatcher.ahead_host.as_ref().unwrap().clone();
+        let view = host
+            .write()
+            .start_work(
+                WorkKind::ProductChange,
+                AssistanceMode::Assist,
+                "Commit route".to_string(),
+                "Test attribution".to_string(),
+                None,
+            )
+            .unwrap();
+        let session_id = view.session.id;
+        host.write()
+            .create_anchor(
+                &session_id,
+                "agent.md".to_string(),
+                DisplayRange {
+                    start: DisplayPosition { line: 0, col: 0 },
+                    end: DisplayPosition { line: 0, col: 23 },
+                },
+                "AHEAD authored content".to_string(),
+                ahead_rpc::ahead::AHEAD_ACTOR_ID,
+            )
+            .unwrap();
+
+        dispatcher.handle_notification(ProxyNotification::GitCommit {
+            message: "Commit agent work".to_string(),
+            diffs: vec![FileDiff::Added(path)],
+        });
+
+        let repo = Repository::open(&workspace).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.author().name(), Some("ahead"));
+        assert_eq!(commit.committer().name(), Some("Human Developer"));
+        assert!(commit
+            .message()
+            .unwrap()
+            .contains(&format!("Ahead-Session: {session_id}")));
+        assert!(host
+            .read()
+            .anchors_for_paths(&["agent.md".to_string()])
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(workspace).unwrap();
+    }
 }
