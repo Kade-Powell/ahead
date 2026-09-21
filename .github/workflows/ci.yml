@@ -7,8 +7,9 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
-      - lapce-**
-      - .github/wofklows/ci.yml
+      - ahead-**
+      - justfile
+      - .github/workflows/ci.yml
   workflow_dispatch:
 
 name: CI
@@ -34,9 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install just
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: extractions/setup-just@v4
+
       - name: Install dependencies on Ubuntu
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo make ubuntu-deps
+        run: sudo env PATH="$PATH" just ubuntu-deps
 
       - name: Update toolchain & add llvm-tools
         run: |
@@ -91,9 +96,13 @@ jobs:
           rustup update --no-self-update
           rustup component add clippy
 
+      - name: Install just
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: extractions/setup-just@v4
+
       - name: Install dependencies on Ubuntu
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo make ubuntu-deps
+        run: sudo env PATH="$PATH" just ubuntu-deps
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

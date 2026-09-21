@@ -271,8 +271,11 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
+      - name: Install just
+        uses: extractions/setup-just@v4
+
       - name: Make DMG
-        run: make dmg-universal
+        run: just dmg-universal
 
       - name: Rename
         run: |
