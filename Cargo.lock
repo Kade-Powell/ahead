@@ -190,13 +190,20 @@ dependencies = [
 name = "ahead-app"
 version = "0.4.6"
 dependencies = [
+ "ahead-core",
  "ahead-rpc",
  "ahead-viewmodel",
  "alacritty_terminal",
  "chrono",
+ "crossbeam-channel",
  "gpui-kit",
  "gpui-kit-assets",
+ "interprocess",
+ "lsp-types 0.95.1",
  "portable-pty",
+ "reqwest",
+ "serde_json",
+ "toml 0.5.9",
  "uuid",
 ]
 
@@ -228,11 +235,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "ahead-proxy"
+name = "ahead-harness"
 version = "0.4.6"
 dependencies = [
  "agent-client-protocol",
+ "ahead-rpc",
+ "anyhow",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "tokio",
+ "tracing 0.2.0",
+ "uuid",
+]
+
+[[package]]
+name = "ahead-proxy"
+version = "0.4.6"
+dependencies = [
  "ahead-core",
+ "ahead-harness",
  "ahead-rpc",
  "ahead-viewmodel",
  "alacritty_terminal",
@@ -256,7 +280,6 @@ dependencies = [
  "lapce-xi-rope",
  "libc",
  "libsql",
- "locale_config",
  "lsp-types 0.95.1",
  "notify 5.2.0",
  "parking_lot",
@@ -267,6 +290,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.8",
+ "sys-locale",
  "tar",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -4813,18 +4837,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ce301924b7887e9d637144fdade93f9dfff9b60981d4ac161db09720d39aa5"
 
 [[package]]
-name = "locale_config"
-version = "0.3.1-alpha.0"
-source = "git+https://github.com/lapce/locale_config.git?branch=lapce#54c9fe6a247c3618c224ec57e6c3a747bc3a96e4"
-dependencies = [
- "lazy_static",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
- "regex",
- "winapi",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6421,7 +6433,7 @@ dependencies = [
 [[package]]
 name = "psp-types"
 version = "0.1.0"
-source = "git+https://github.com/lapce/psp-types?rev=f7fea28f59e7b2d6faa1034a21679ad49b3524ad#f7fea28f59e7b2d6faa1034a21679ad49b3524ad"
+source = "git+https://github.com/lapce/psp-types?rev=f7fea28f59e7b2d6faa1034a21679ad49b3524ad#f7fea28f"
 dependencies = [
  "lsp-types 0.95.1",
  "serde",

@@ -375,8 +375,8 @@ impl State {
 
 #[cfg(target_os = "macos")]
 fn set_locale_environment() {
-    let locale = locale_config::Locale::global_default()
-        .to_string()
+    let locale = sys_locale::get_locale()
+        .unwrap_or_else(|| String::from("en-US"))
         .replace('-', "_");
     unsafe {
         std::env::set_var("LC_ALL", locale + ".UTF-8");
