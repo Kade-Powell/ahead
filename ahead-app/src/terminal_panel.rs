@@ -62,10 +62,42 @@ struct TerminalPalette {
 
 pub struct TerminalPanel {
     pub focus: FocusHandle,
+    tabs: Vec<TerminalTab>,
+    active_tab: usize,
+    next_tab_id: usize,
+}
+
+struct TerminalTab {
+    id: usize,
     terminal: Option<TerminalBackend>,
-    pub cwd: String,
-    pub shell_name: String,
-    pub status: SharedString,
+    cwd: String,
+    shell_name: String,
+    status: SharedString,
+}
+
+impl TerminalTab {
+    fn new(id: usize, cwd: String, shell: &str) -> Self {
+        let shell_name = std::path::Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+            .to_string();
+        let (terminal, status) = match TerminalBackend::new(&cwd, shell) {
+            Ok(terminal) => (Some(terminal), SharedString::from("ready")),
+            Err(error) => (None, format!("terminal error: {error}").into()),
+        };
+        Self {
+            id,
+            terminal,
+            cwd,
+            shell_name,
+            status,
+        }
+    }
+
+    fn title(&self) -> String {
+        format!("{} {}", self.shell_name, self.id)
+    }
 }
 
 impl TerminalPanel {
@@ -75,46 +107,47 @@ impl TerminalPanel {
             .unwrap_or_else(|_| "~".to_string());
         let shell =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let shell_name = std::path::Path::new(&shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("zsh")
-            .to_string();
-        let (terminal, status) = match TerminalBackend::new(&cwd, &shell) {
-            Ok(terminal) => (Some(terminal), SharedString::from("ready")),
-            Err(error) => (None, format!("terminal error: {error}").into()),
-        };
+        let tab = TerminalTab::new(1, cwd, &shell);
         let panel = Self {
             focus: cx.focus_handle(),
-            terminal,
-            cwd,
-            shell_name,
-            status,
+            tabs: vec![tab],
+            active_tab: 0,
+            next_tab_id: 2,
         };
         panel.start_output_pump(cx);
         panel
     }
 
     fn start_output_pump(&self, cx: &mut Context<Self>) {
-        let Some(events) = self.terminal.as_ref().map(TerminalBackend::events)
-        else {
-            return;
-        };
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
-                let received = events.try_iter().collect::<Vec<_>>();
-                if received.is_empty() {
-                    continue;
-                }
                 if this
                     .update(cx, |this, cx| {
-                        for event in received {
-                            this.handle_terminal_event(event);
+                        let received = this
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| {
+                                let id = tab.id;
+                                tab.terminal.as_ref().into_iter().flat_map(
+                                    move |terminal| {
+                                        terminal
+                                            .events()
+                                            .try_iter()
+                                            .map(move |event| (id, event))
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let had_events = !received.is_empty();
+                        for (tab_id, event) in received {
+                            this.handle_terminal_event(tab_id, event);
                         }
-                        cx.notify();
+                        if had_events {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -125,31 +158,50 @@ impl TerminalPanel {
         .detach();
     }
 
+    fn active_tab(&self) -> Option<&TerminalTab> {
+        self.tabs.get(self.active_tab)
+    }
+
+    fn active_terminal(&self) -> Option<&TerminalBackend> {
+        self.active_tab()?.terminal.as_ref()
+    }
+
     fn snapshot(&self) -> TerminalSnapshot {
-        self.terminal
-            .as_ref()
+        self.active_terminal()
             .map(TerminalBackend::snapshot)
             .unwrap_or_default()
     }
 
-    fn send_bytes(&mut self, bytes: Vec<u8>) {
-        if let Some(terminal) = self.terminal.as_ref()
+    fn send_bytes(&mut self, tab_id: usize, bytes: Vec<u8>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if let Some(terminal) = tab.terminal.as_ref()
             && let Err(error) = terminal.send(bytes)
         {
-            self.status = error.into();
+            tab.status = error.into();
         }
     }
 
-    fn handle_terminal_event(&mut self, event: TerminalEvent) {
+    fn handle_terminal_event(&mut self, tab_id: usize, event: TerminalEvent) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
         match event {
-            TerminalEvent::PtyWrite(text) => self.send_bytes(text.into_bytes()),
-            TerminalEvent::Title(title) => self.shell_name = title,
-            TerminalEvent::ResetTitle => self.shell_name = "shell".to_string(),
-            TerminalEvent::ChildExit(code) => {
-                self.status = format!("shell exited ({code})").into();
+            TerminalEvent::PtyWrite(text) => {
+                if let Some(terminal) = tab.terminal.as_ref()
+                    && let Err(error) = terminal.send(text.into_bytes())
+                {
+                    tab.status = error.into();
+                }
             }
-            TerminalEvent::Exit => self.status = "terminal closed".into(),
-            TerminalEvent::Bell => self.status = "bell".into(),
+            TerminalEvent::Title(title) => tab.shell_name = title,
+            TerminalEvent::ResetTitle => tab.shell_name = "shell".to_string(),
+            TerminalEvent::ChildExit(code) => {
+                tab.status = format!("shell exited ({code})").into();
+            }
+            TerminalEvent::Exit => tab.status = "terminal closed".into(),
+            TerminalEvent::Bell => tab.status = "bell".into(),
             TerminalEvent::Wakeup
             | TerminalEvent::MouseCursorDirty
             | TerminalEvent::ClipboardStore(_, _)
@@ -161,23 +213,73 @@ impl TerminalPanel {
     }
 
     pub fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if let Some(bytes) = terminal_key_bytes(event, self.terminal_mode()) {
-            self.send_bytes(bytes);
+        if let Some(bytes) = terminal_key_bytes(event, self.terminal_mode())
+            && let Some(tab_id) = self.active_tab().map(|tab| tab.id)
+        {
+            self.send_bytes(tab_id, bytes);
             cx.notify();
         }
     }
 
     fn terminal_mode(&self) -> TermMode {
-        self.terminal
-            .as_ref()
+        self.active_terminal()
             .map(TerminalBackend::mode)
             .unwrap_or_else(TermMode::empty)
     }
 
     fn scroll_display(&self, scroll: Scroll) {
-        if let Some(terminal) = self.terminal.as_ref() {
+        if let Some(terminal) = self.active_terminal() {
             terminal.scroll_display(scroll);
         }
+    }
+
+    fn activate_tab(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+            self.active_tab = index;
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "~".to_string());
+        let shell =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(TerminalTab::new(tab_id, cwd, &shell));
+        self.active_tab = self.tabs.len() - 1;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn close_tab(
+        &mut self,
+        tab_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.len() == 1 {
+            return;
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        self.tabs.remove(index);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 }
 
@@ -318,7 +420,9 @@ impl BasePanel for TerminalPanel {
 
 impl Panel for TerminalPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        format!("ahead — {}", self.shell_name)
+        self.active_tab()
+            .map(TerminalTab::title)
+            .unwrap_or_else(|| "ahead terminal".to_string())
     }
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
         Some(PanelControl::Toolbar)
@@ -376,11 +480,59 @@ impl Render for TerminalPanel {
         let snapshot = self.snapshot();
         let cursor = snapshot.cursor;
         let colors = snapshot.colors;
+        let active_tab_id = self.active_tab().map(|tab| tab.id);
+        let tab_bar = h_flex()
+            .h(px(30.))
+            .items_center()
+            .gap_1()
+            .px_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .children(self.tabs.iter().map(|tab| {
+                let tab_id = tab.id;
+                let is_active = tab_id == active_tab_id;
+                let title = tab.title();
+                let tooltip = format!("Working directory: {}", tab.cwd);
+                let button = Button::new(("terminal_tab", tab_id)).label(title);
+                let button = if is_active {
+                    button.primary()
+                } else {
+                    button.ghost()
+                };
+                h_flex()
+                    .items_center()
+                    .child(button.tooltip(tooltip).on_click(cx.listener(
+                        move |this: &mut Self, _, window, cx| {
+                            this.activate_tab(tab_id, window, cx);
+                        },
+                    )))
+                    .child(
+                        Button::new(("close_terminal_tab", tab_id))
+                            .icon(IconName::X)
+                            .ghost()
+                            .tooltip("Close terminal")
+                            .on_click(cx.listener(
+                                move |this: &mut Self, _, window, cx| {
+                                    this.close_tab(tab_id, window, cx);
+                                },
+                            )),
+                    )
+            }))
+            .child(
+                Button::new("new_terminal_tab")
+                    .icon(IconName::Plus)
+                    .ghost()
+                    .tooltip("New terminal")
+                    .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                        this.new_tab(window, cx);
+                    })),
+            );
 
         v_flex()
             .size_full()
             .bg(term_bg)
             .track_focus(&self.focus)
+            .child(tab_bar)
             // Interactive Terminal Grid: captures keystrokes directly! No input box!
             .child(
                 div()
