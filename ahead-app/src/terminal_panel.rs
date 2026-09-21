@@ -390,6 +390,12 @@ impl Render for TerminalPanel {
                     .p_3()
                     .bg(term_bg)
                     .overflow_y_scrollbar()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut Self, _, window, cx| {
+                            window.focus(&this.focus, cx);
+                        }),
+                    )
                     .on_scroll_wheel(cx.listener(
                         |this, event: &ScrollWheelEvent, _, cx| {
                             let lines = event.delta.pixel_delta(px(18.)).y / px(18.);
