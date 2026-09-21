@@ -250,6 +250,8 @@ impl ProxyClient {
                 if line.ends_with(".rs") || line.contains("target/debug") {
                     configs.push(RunDebugConfig {
                         ty: Some("lldb".into()),
+                        debug_adapter: Some(default_debug_adapter()),
+                        debug_adapter_args: None,
                         name: format!("Run {line}"),
                         program: line.to_string(),
                         args: None,
@@ -1170,6 +1172,8 @@ fn default_debug_configs() -> Vec<RunDebugConfig> {
     vec![
         RunDebugConfig {
             ty: Some("lldb".into()),
+            debug_adapter: Some(default_debug_adapter()),
+            debug_adapter_args: None,
             name: "Debug current target".into(),
             program: "target/debug/ahead".into(),
             args: None,
@@ -1183,6 +1187,8 @@ fn default_debug_configs() -> Vec<RunDebugConfig> {
         },
         RunDebugConfig {
             ty: Some("lldb".into()),
+            debug_adapter: Some(default_debug_adapter()),
+            debug_adapter_args: None,
             name: "Debug tests".into(),
             program: "cargo".into(),
             args: Some(vec!["test".into(), "-p".into(), "ahead-app".into()]),
@@ -1195,6 +1201,10 @@ fn default_debug_configs() -> Vec<RunDebugConfig> {
             config_source: Default::default(),
         },
     ]
+}
+
+fn default_debug_adapter() -> String {
+    std::env::var("AHEAD_DAP_ADAPTER").unwrap_or_else(|_| "lldb-dap".to_string())
 }
 
 #[allow(dead_code)]

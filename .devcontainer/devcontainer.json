@@ -1,5 +1,5 @@
 {
-    "image": "ghcr.io/lapce/lapdev-devcontainer-lapce",
+    "image": "mcr.microsoft.com/devcontainers/rust:1-1-bookworm",
     "forwardPorts": [6080],
     "portsAttributes": {
         "6080": {
@@ -7,4 +7,3 @@
         }
     }
 }
-

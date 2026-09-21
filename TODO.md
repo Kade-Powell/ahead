@@ -55,9 +55,8 @@ the app itself.
 - [ ] Decide the extension host (Zed WIT component model on wasmtime 48 vs
       deferred). `wasmtime 14` is already out of the graph; the host decision
       picks the new runtime (Zed uses wasmtime 48) and the guest ABI. It also
-      absorbs the remaining volt-host leftovers: dispatch direct server
-      handle, DAP config-direct startup, `LspClient` startup path, dead-field
-      and legacy-`VoltID` cleanup.
+      covers the deferred Zed extension install/update/runtime boundary. Direct
+      settings-configured LSP and DAP startup is already the MVP path.
 
 ## Attribution & change tracking
 

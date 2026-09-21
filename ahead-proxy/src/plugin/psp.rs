@@ -17,7 +17,7 @@ use ahead_rpc::{
     RpcError,
     core::{CoreRpcHandler, ServerStatusParams},
     delta::AheadDelta,
-    plugin::{PluginId, VoltID},
+    plugin::{PluginId, ServerId},
     style::{LineStyle, Style},
 };
 use ropey::{LineType, Rope};
@@ -161,9 +161,8 @@ pub enum PluginServerRpc {
 
 #[derive(Clone)]
 pub struct PluginServerRpcHandler {
-    pub spawned_by: Option<PluginId>,
     pub plugin_id: PluginId,
-    pub volt_id: VoltID,
+    pub server_id: ServerId,
     rpc_tx: Sender<PluginServerRpc>,
     rpc_rx: Receiver<PluginServerRpc>,
     io_tx: Sender<JsonRpc>,
@@ -261,16 +260,14 @@ pub trait PluginServerHandler {
 
 impl PluginServerRpcHandler {
     pub fn new(
-        volt_id: VoltID,
-        spawned_by: Option<PluginId>,
+        server_id: ServerId,
         plugin_id: Option<PluginId>,
         io_tx: Sender<JsonRpc>,
     ) -> Self {
         let (rpc_tx, rpc_rx) = crossbeam_channel::unbounded();
 
         let rpc = Self {
-            spawned_by,
-            volt_id,
+            server_id,
             plugin_id: plugin_id.unwrap_or_else(PluginId::next),
             rpc_tx,
             rpc_rx,
@@ -611,10 +608,8 @@ struct ServerRegistrations {
 }
 
 pub struct PluginHostHandler {
-    volt_id: VoltID,
-    volt_display_name: String,
-    // Retained for the future extension host (see TODO.md); no live
-    // servers exist to populate these today.
+    server_id: ServerId,
+    server_display_name: String,
     #[allow(dead_code)]
     pwd: Option<PathBuf>,
     #[allow(dead_code)]
@@ -632,8 +627,8 @@ impl PluginHostHandler {
     pub fn new(
         workspace: Option<PathBuf>,
         pwd: Option<PathBuf>,
-        volt_id: VoltID,
-        volt_display_name: String,
+        server_id: ServerId,
+        server_display_name: String,
         document_selector: DocumentSelector,
         core_rpc: CoreRpcHandler,
         server_rpc: PluginServerRpcHandler,
@@ -646,8 +641,8 @@ impl PluginHostHandler {
         Self {
             pwd,
             workspace,
-            volt_id,
-            volt_display_name,
+            server_id,
+            server_display_name,
             document_selector,
             core_rpc,
             catalog_rpc,
@@ -982,7 +977,7 @@ impl PluginHostHandler {
             ShowMessage::METHOD => {
                 let message: ShowMessageParams =
                     serde_json::from_value(serde_json::to_value(params)?)?;
-                let title = format!("Plugin: {}", self.volt_display_name);
+                let title = format!("Language server: {}", self.server_display_name);
                 self.catalog_rpc.core_rpc.show_message(title, message);
             }
             LogMessage::METHOD => {
@@ -992,7 +987,7 @@ impl PluginHostHandler {
                     message,
                     format!(
                         "ahead_proxy::plugin::psp::{}::{}::LogMessage",
-                        self.volt_id.author, self.volt_id.name
+                        self.server_id.author, self.server_id.name
                     ),
                 );
             }
@@ -1023,7 +1018,7 @@ impl PluginHostHandler {
                     format!("host notification {method} not handled"),
                     Some(format!(
                         "ahead_proxy::plugin::psp::{}::{}::{method}",
-                        self.volt_id.author, self.volt_id.name
+                        self.server_id.author, self.server_id.name
                     )),
                 );
             }

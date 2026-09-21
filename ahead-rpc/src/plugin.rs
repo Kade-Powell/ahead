@@ -1,5 +1,3 @@
-use core::fmt;
-
 use serde::{Deserialize, Serialize};
 
 use crate::counter::Counter;
@@ -14,18 +12,8 @@ impl PluginId {
     }
 }
 
-/// Legacy server identity (`author.name`) inherited from the removed volt
-/// plugin format. Still carried by the language-server host plumbing until
-/// the Zed-model extension host replaces it (see TODO.md). Do not use for
-/// anything new.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoltID {
+pub struct ServerId {
     pub author: String,
     pub name: String,
-}
-
-impl fmt::Display for VoltID {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.author, self.name)
-    }
 }

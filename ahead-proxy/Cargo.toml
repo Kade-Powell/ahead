@@ -55,7 +55,7 @@ grep-searcher = "0.1"
 grep-matcher  = "0.1"
 grep-regex    = "0.1"
 
-# wasm (volt plugin hosting removed; see TODO extension-host item)
+# WASM extension hosting is deferred; see the TODO extension-host item.
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sys-locale = "0.3"

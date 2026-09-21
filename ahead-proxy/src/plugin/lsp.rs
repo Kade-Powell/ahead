@@ -14,7 +14,7 @@ use ahead_core::meta;
 use ahead_rpc::{
     RpcError,
     delta::AheadDelta,
-    plugin::{PluginId, VoltID},
+    plugin::{PluginId, ServerId},
     style::LineStyle,
 };
 use ropey::Rope;
@@ -60,10 +60,6 @@ pub enum LspRpc {
 }
 
 pub struct LspClient {
-    // Retained for the future extension host (see TODO.md); no catalog
-    // registration exists today.
-    #[allow(dead_code)]
-    plugin_rpc: PluginCatalogRpcHandler,
     server_rpc: PluginServerRpcHandler,
     process: Child,
     workspace: Option<PathBuf>,
@@ -178,9 +174,8 @@ impl LspClient {
         plugin_rpc: PluginCatalogRpcHandler,
         document_selector: DocumentSelector,
         workspace: Option<PathBuf>,
-        volt_id: VoltID,
-        volt_display_name: String,
-        spawned_by: Option<PluginId>,
+        server_id: ServerId,
+        server_display_name: String,
         plugin_id: Option<PluginId>,
         pwd: Option<PathBuf>,
         server_uri: Url,
@@ -212,8 +207,7 @@ impl LspClient {
         let mut writer = Box::new(BufWriter::new(stdin));
         let (io_tx, io_rx) = crossbeam_channel::unbounded();
         let server_rpc = PluginServerRpcHandler::new(
-            volt_id.clone(),
-            spawned_by,
+            server_id.clone(),
             plugin_id,
             io_tx.clone(),
         );
@@ -242,8 +236,8 @@ impl LspClient {
 
         let local_server_rpc = server_rpc.clone();
         let core_rpc = plugin_rpc.core_rpc.clone();
-        let volt_id_closure = volt_id.clone();
-        let name = volt_display_name.clone();
+        let server_id_closure = server_id.clone();
+        let name = server_display_name.clone();
         thread::spawn(move || {
             let mut reader = Box::new(BufReader::new(stdout));
             loop {
@@ -268,7 +262,7 @@ impl LspClient {
                             format!("lsp server {server} stopped!"),
                             Some(format!(
                                 "ahead_proxy::plugin::lsp::{}::{}::stopped",
-                                volt_id_closure.author, volt_id_closure.name
+                                server_id_closure.author, server_id_closure.name
                             )),
                         );
                         return;
@@ -278,7 +272,7 @@ impl LspClient {
         });
 
         let core_rpc = plugin_rpc.core_rpc.clone();
-        let volt_id_closure = volt_id.clone();
+        let server_id_closure = server_id.clone();
         thread::spawn(move || {
             let mut reader = Box::new(BufReader::new(stderr));
             loop {
@@ -293,7 +287,7 @@ impl LspClient {
                             line.trim_end().to_string(),
                             Some(format!(
                                 "ahead_proxy::plugin::lsp::{}::{}::stderr",
-                                volt_id_closure.author, volt_id_closure.name
+                                server_id_closure.author, server_id_closure.name
                             )),
                         );
                     }
@@ -307,8 +301,8 @@ impl LspClient {
         let host = PluginHostHandler::new(
             workspace.clone(),
             pwd,
-            volt_id,
-            volt_display_name,
+            server_id,
+            server_display_name,
             document_selector,
             plugin_rpc.core_rpc.clone(),
             server_rpc.clone(),
@@ -316,7 +310,6 @@ impl LspClient {
         );
 
         Ok(Self {
-            plugin_rpc,
             server_rpc,
             process,
             workspace,
@@ -330,22 +323,20 @@ impl LspClient {
         plugin_rpc: PluginCatalogRpcHandler,
         document_selector: DocumentSelector,
         workspace: Option<PathBuf>,
-        volt_id: VoltID,
-        volt_display_name: String,
-        spawned_by: Option<PluginId>,
+        server_id: ServerId,
+        server_display_name: String,
         plugin_id: Option<PluginId>,
         pwd: Option<PathBuf>,
         server_uri: Url,
         args: Vec<String>,
         options: Option<Value>,
-    ) -> Result<PluginId> {
+    ) -> Result<(PluginId, PluginServerRpcHandler)> {
         let mut lsp = Self::new(
             plugin_rpc,
             document_selector,
             workspace,
-            volt_id,
-            volt_display_name,
-            spawned_by,
+            server_id,
+            server_display_name,
             plugin_id,
             pwd,
             server_uri,
@@ -355,10 +346,11 @@ impl LspClient {
         let plugin_id = lsp.server_rpc.plugin_id;
 
         let rpc = lsp.server_rpc.clone();
+        let handler = lsp.server_rpc.clone();
         thread::spawn(move || {
             rpc.mainloop(&mut lsp);
         });
-        Ok(plugin_id)
+        Ok((plugin_id, handler))
     }
 
     fn initialize(&mut self) {
@@ -406,24 +398,11 @@ impl LspClient {
                     None,
                     false,
                 );
-                // Volt hosting is removed, so there is no catalog to
-                // register this server with. Language servers start
-                // through the future extension host (see TODO.md).
             }
             Err(err) => {
                 tracing::error!("{:?}", err);
             }
         }
-        //     move |result| {
-        //         if let Ok(value) = result {
-        //             let result: InitializeResult =
-        //                 serde_json::from_value(value).unwrap();
-        //             server_rpc.handle_rpc(PluginServerRpc::Handler(
-        //                 PluginHandlerNotification::InitializeDone(result),
-        //             ));
-        //         }
-        //     },
-        // );
     }
 
     fn shutdown(&mut self) {

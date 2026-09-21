@@ -47,6 +47,10 @@ pub struct RunDebugProgram {
 pub struct RunDebugConfig {
     #[serde(rename = "type")]
     pub ty: Option<String>,
+    /// Command used to speak the Debug Adapter Protocol. When absent, the
+    /// direct-config fallback treats `program`/`args` as the adapter command.
+    pub debug_adapter: Option<String>,
+    pub debug_adapter_args: Option<Vec<String>>,
     pub name: String,
     pub program: String,
     pub args: Option<Vec<String>>,

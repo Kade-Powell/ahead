@@ -1,9 +1,9 @@
 .github
 .vscode
-.lapce
+.ahead
 docs
 extra/linux/docker
 extra/macos
 extra/windows
 target
-lapce.spec
+ahead.spec

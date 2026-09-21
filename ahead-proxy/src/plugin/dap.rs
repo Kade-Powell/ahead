@@ -424,13 +424,6 @@ pub enum DapRpc {
 }
 
 #[derive(Clone)]
-pub struct DebuggerData {
-    pub debugger_type: String,
-    pub program: String,
-    pub args: Option<Vec<String>>,
-}
-
-#[derive(Clone)]
 pub struct DapRpcHandler {
     pub dap_id: DapId,
     rpc_tx: Sender<DapRpc>,
