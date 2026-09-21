@@ -18,10 +18,12 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{
     Color as TerminalColor, CursorShape, NamedColor, Rgb,
 };
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::*;
+use gpui_kit_assets::IconName;
 
 use crate::terminal::{TerminalBackend, TerminalCell, TerminalSnapshot};
 
@@ -137,6 +139,7 @@ impl TerminalPanel {
                                             .events()
                                             .try_iter()
                                             .map(move |event| (id, event))
+                                            .collect::<Vec<_>>()
                                     },
                                 )
                             })
@@ -490,7 +493,7 @@ impl Render for TerminalPanel {
             .border_color(cx.theme().border)
             .children(self.tabs.iter().map(|tab| {
                 let tab_id = tab.id;
-                let is_active = tab_id == active_tab_id;
+                let is_active = active_tab_id == Some(tab_id);
                 let title = tab.title();
                 let tooltip = format!("Working directory: {}", tab.cwd);
                 let button = Button::new(("terminal_tab", tab_id)).label(title);
