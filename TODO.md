@@ -64,8 +64,14 @@ the app itself.
       debugger registry), `LspClient` startup path, dead-field and
       legacy-`VoltID` cleanup.
 - [ ] Decide the extension host (Zed WIT component model on wasmtime 48 vs
-      deferred) before upgrading `wasmtime 14`, which only serves volt
-      plugins today.
+      deferred). `wasmtime 14` is already out of the graph; the host decision
+      picks the new runtime (Zed uses wasmtime 48) and the guest ABI.
+- [ ] Migrate `lapce-xi-rope` (14 use sites) to `ropey 2.0.0-beta.1` with a
+      new `ahead-rope` crate owning the gap ropey lacks (delta apply/invert
+      + serde, ranges for intervals, small spans map, ropey-native text
+      helpers); remove `floem-editor-core` (7 use sites) in the same pass.
+      Full design + order in decision 0006. Contribute improvements back
+      upstream toward ropey 2.0 stable.
 
 ## Attribution & change tracking
 

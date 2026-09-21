@@ -79,3 +79,28 @@ pinned checkout (`~/dev/zed`) and use its code directly where no
 ecosystem crate covers the need — adapting names and boundaries to AHEAD
 (clean-room obligation applies). Do not build bespoke what a healthy
 crate already does; do not vendor Zed where a healthy crate exists.
+
+## Ropey 2.0 migration design (mapped 2026-09-21, post volt-cut)
+
+lapce-xi-rope has 14 use sites, floem-editor-core 7. ropey 2.0.0-beta.1
+provides `Rope`/`RopeSlice`/`RopeBuilder`/`Chunks`/`ChunkCursor` with
+**byte indices** and a `LineType` parameter — but no deltas, intervals
+or spans. New workspace crate `ahead-rope` owns exactly the gap:
+
+- `AheadDelta`: retain/insert/delete op runs over byte offsets, with
+  apply/invert and serde. Replaces `RopeDelta` in buffer sync, the
+  `Update{delta}` RPC method and syntax edits. App and proxy ship as one
+  binary pair, so no wire-version negotiation is needed.
+- Ranges replace `Interval`/`IntervalBounds` at call sites (`lens.rs`,
+  `buffer.rs` slice APIs).
+- A small spans map replaces `spans::Spans`/`LinesMetric` (`style.rs`,
+  syntax highlighting); `Chunks`/`chunk()` replace `ChunkIter`
+  (`syntax/util.rs`); ropey line APIs (+`LF_CR`) replace line metrics.
+- `RopeText`/`RopeTextRef`/`CharIndicesJoin`/bracket utils become
+  ropey-native helpers in `ahead-rope` (`rope_text_pos.rs`,
+  `syntax/edit.rs`, `syntax/mod.rs`, `buffer.rs`, `psp.rs` semantic
+  styles). `ahead-core`'s `pub use floem_editor_core::*` goes away.
+- Keep default features (SIMD on) plus `metric_chars` as needed.
+- Order: `ahead-rope` with round-trip tests first (apply/invert, serde,
+  chunk parity), then leaf-first migration, then drop both deps.
+- Contribute improvements back upstream toward ropey 2.0 stable.
