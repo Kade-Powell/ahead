@@ -62,3 +62,13 @@
   later (decision 0006). Pin + import unblocked; clean-room rewrite is a
   standing TODO obligation. Until the rewrite, preserve per-file copyright
   notices and ship license texts with distributed builds.
+- 2026-09-21: FIM behavior port (independent implementation, no verbatim
+  copy — see decision 0006 clean-room record): prompt-format inference,
+  FIM prompt tags, stop tokens, completion cleaning, cursor-excerpt
+  bounding, Ollama `/api/generate` routing, ghost interpolation on
+  typing. Sources: `crates/edit_prediction/src/{fim,ollama,
+  open_ai_compatible,cursor_excerpt}.rs` and `interpolate_edits` from
+  `crates/edit_prediction_types/.../edit_prediction_types.rs`. Tests
+  carried (adapted): format-inference family cases. AHEAD additions:
+  session comment header, unknown-model fallback path, generation-guarded
+  ghost flow with request-offset tracking.
