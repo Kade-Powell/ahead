@@ -430,13 +430,20 @@ impl Render for ExplorerPanel {
                             )
                             .on_click({
                                 let explorer = explorer.clone();
-                                move |_, window, cx| {
+                                move |event, window, cx| {
                                     if !is_dir {
                                         explorer.update(cx, |this, cx| {
-                                            crate::ross::request_open(
-                                                this.mailbox_id,
-                                                &path_for_click,
-                                            );
+                                            if event.click_count() > 1 {
+                                                crate::ross::request_open_permanent(
+                                                    this.mailbox_id,
+                                                    &path_for_click,
+                                                );
+                                            } else {
+                                                crate::ross::request_open(
+                                                    this.mailbox_id,
+                                                    &path_for_click,
+                                                );
+                                            }
                                             cx.focus_self(window);
                                         });
                                     }
@@ -454,7 +461,7 @@ impl Render for ExplorerPanel {
                                 &explorer,
                                 move |this, _, window, cx| {
                                     if !is_dir {
-                                        crate::ross::request_open(
+                                        crate::ross::request_open_permanent(
                                             this.mailbox_id,
                                             &path,
                                         );

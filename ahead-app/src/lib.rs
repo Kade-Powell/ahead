@@ -3,6 +3,7 @@
 pub mod app;
 pub mod code_panel;
 pub mod explorer_panel;
+pub mod ross;
 pub mod session_panel;
 pub mod settings_panel;
 pub mod terminal;

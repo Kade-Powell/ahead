@@ -161,6 +161,7 @@ pub struct Shell {
     pub session: Entity<crate::session_panel::SessionPanel>,
     pub threads: Entity<crate::threads_panel::ThreadsPanel>,
     pub code: Entity<crate::code_panel::CodePanel>,
+    pub code_tabs: Vec<Entity<crate::code_panel::CodePanel>>,
     pub explorer: Entity<crate::explorer_panel::ExplorerPanel>,
     pub debug_bar: Entity<crate::debug_bar::DebugBar>,
     pub terminals: Vec<Entity<crate::terminal_panel::TerminalPanel>>,
@@ -206,6 +207,7 @@ impl Shell {
             branch: branch.to_string(),
             session,
             threads,
+            code_tabs: vec![code.clone()],
             code,
             explorer,
             debug_bar,
@@ -230,6 +232,42 @@ impl Shell {
         }
     }
 
+    fn set_active_code(
+        &mut self,
+        code: Entity<crate::code_panel::CodePanel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.code = code.clone();
+        self.session.update(cx, |session, _| {
+            session.code = Some(code.clone());
+        });
+        self.problems.update(cx, |problems, _| {
+            problems.code = code;
+        });
+    }
+
+    fn configure_code(
+        &mut self,
+        code: Entity<crate::code_panel::CodePanel>,
+        cx: &mut Context<Self>,
+    ) {
+        let shell = cx.entity().downgrade();
+        let shell_for_close = shell.clone();
+        let shell_for_tabs = shell;
+        code.update(cx, |code, _| {
+            code.set_close_handler(move |panel, window, cx| {
+                _ = shell_for_close.update(cx, |shell, cx| {
+                    shell.close_code_tab(panel, window, cx);
+                });
+            });
+            code.set_tab_handler(move |panel, action, window, cx| {
+                _ = shell_for_tabs.update(cx, |shell, cx| {
+                    shell.handle_code_tab_action(panel, action, window, cx);
+                });
+            });
+        });
+    }
+
     fn set_center_layout(
         &mut self,
         settings_active: bool,
@@ -241,27 +279,41 @@ impl Shell {
         self.settings_active = settings_active;
         self.search_active = search_active;
         self.problems_active = problems_active;
-        let code = self.code.clone();
         let settings = self.settings.clone();
         let search = self.search.clone();
         let problems = self.problems.clone();
+        let code_tabs = self.code_tabs.clone();
+        let code_count = code_tabs.len();
+        let active_code_id = self.code.entity_id();
+        let active_code_index = self
+            .code_tabs
+            .iter()
+            .position(|code| code.entity_id() == active_code_id)
+            .unwrap_or(0);
         self.area.update(cx, |area, cx| {
-            let editor_tabs = DockLayout::tabs()
-                .panel_view(panel_handle(code), cx)
-                .panel_view(panel_handle(settings), cx)
-                .panel_view(panel_handle(search), cx)
-                .panel_view(panel_handle(problems), cx)
-                .active_index(if settings_active {
-                    1
-                } else if search_active {
-                    2
-                } else if problems_active {
-                    3
-                } else {
-                    0
-                });
+            let mut editor_tabs = DockLayout::tabs();
+            for code in code_tabs {
+                editor_tabs = editor_tabs.panel_view(panel_handle(code), cx);
+            }
+            let editor_tabs = if settings_active {
+                editor_tabs.panel_view(panel_handle(settings), cx)
+            } else if search_active {
+                editor_tabs.panel_view(panel_handle(search), cx)
+            } else if problems_active {
+                editor_tabs.panel_view(panel_handle(problems), cx)
+            } else {
+                editor_tabs
+            };
+            let active_index = if settings_active || search_active || problems_active
+            {
+                code_count
+            } else {
+                active_code_index
+            };
+            let editor_tabs = editor_tabs.active_index(active_index);
             area.set_center(editor_tabs, window, cx);
         });
+        cx.notify();
     }
 
     fn close_center_panel(
@@ -277,24 +329,159 @@ impl Shell {
         self.settings_active = false;
         self.search_active = false;
         self.problems_active = false;
-        self.area.update(cx, |area, cx| {
-            area.set_center(DockLayout::tabs(), window, cx);
-        });
+        self.set_center_layout(false, false, false, window, cx);
     }
 
     fn poll_explorer_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let explorer_id = self.explorer.read(cx).mailbox_id;
-        let Some(path) = crate::ross::take_open(explorer_id) else {
+        let Some(request) = crate::ross::take_open(explorer_id) else {
             return;
         };
-        let code = self.code.clone();
         let shell = cx.weak_entity();
         window.defer(cx, move |window, cx| {
-            _ = code.update(cx, |code, cx| code.open_file(&path, window, cx));
             _ = shell.update(cx, |shell, cx| {
-                shell.set_center_layout(false, false, false, window, cx);
+                shell.open_file_request(request, window, cx);
             });
         });
+    }
+
+    fn open_file_request(
+        &mut self,
+        request: crate::ross::OpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(code) = self
+            .code_tabs
+            .iter()
+            .find(|code| code.read(cx).file_path == request.path)
+            .cloned()
+        {
+            if request.permanent {
+                code.update(cx, |code, cx| code.promote_preview(cx));
+            }
+            self.set_active_code(code.clone(), cx);
+            self.set_center_layout(false, false, false, window, cx);
+            let focus = code.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            return;
+        }
+
+        let code = if request.permanent {
+            None
+        } else {
+            self.code_tabs
+                .iter()
+                .position(|code| code.read(cx).is_preview)
+        };
+        let code = if let Some(index) = code {
+            let code = self.code_tabs[index].clone();
+            code.update(cx, |code, cx| {
+                code.open_file(&request.path, true, window, cx);
+            });
+            code
+        } else {
+            let (proxy, workspace) = self.code.read_with(cx, |code, _| {
+                (code.proxy.clone(), code.workspace.clone())
+            });
+            let Some(proxy) = proxy else {
+                return;
+            };
+            let code = cx.new(|cx| {
+                crate::code_panel::CodePanel::new(&request.path, window, cx)
+                    .with_proxy(proxy, &workspace)
+            });
+            code.update(cx, |code, cx| {
+                code.is_preview = !request.permanent;
+                cx.notify();
+            });
+            self.configure_code(code.clone(), cx);
+            self.code_tabs.push(code.clone());
+            code
+        };
+
+        self.set_active_code(code.clone(), cx);
+        self.set_center_layout(false, false, false, window, cx);
+        let focus = code.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    }
+
+    fn close_code_tab(
+        &mut self,
+        panel: gpui_kit::component::dock::PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_code_tab_action(
+            panel,
+            crate::code_panel::CodeTabAction::Close,
+            window,
+            cx,
+        );
+    }
+
+    fn handle_code_tab_action(
+        &mut self,
+        panel: gpui_kit::component::dock::PanelId,
+        action: crate::code_panel::CodeTabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.code_tabs.iter().position(|code| {
+            gpui_kit::component::dock::PanelId::from(code.entity_id()) == panel
+        }) else {
+            return;
+        };
+
+        if matches!(action, crate::code_panel::CodeTabAction::Promote) {
+            let code = self.code_tabs[index].clone();
+            code.update(cx, |code, cx| code.promote_preview(cx));
+            self.set_active_code(code, cx);
+            self.set_center_layout(false, false, false, window, cx);
+            return;
+        }
+
+        let target_id = self.code_tabs[index].entity_id();
+        match action {
+            crate::code_panel::CodeTabAction::Close => {
+                self.code_tabs.remove(index);
+            }
+            crate::code_panel::CodeTabAction::CloseOthers => {
+                self.code_tabs.retain(|code| code.entity_id() == target_id);
+            }
+            crate::code_panel::CodeTabAction::CloseLeft => {
+                self.code_tabs.drain(..index);
+            }
+            crate::code_panel::CodeTabAction::CloseRight => {
+                self.code_tabs.truncate(index + 1);
+            }
+            crate::code_panel::CodeTabAction::CloseAll => self.code_tabs.clear(),
+            crate::code_panel::CodeTabAction::Promote => unreachable!(),
+        }
+
+        let active_code = if matches!(
+            action,
+            crate::code_panel::CodeTabAction::CloseOthers
+                | crate::code_panel::CodeTabAction::CloseLeft
+                | crate::code_panel::CodeTabAction::CloseRight
+        ) {
+            self.code_tabs
+                .iter()
+                .find(|code| code.entity_id() == target_id)
+                .cloned()
+        } else if action == crate::code_panel::CodeTabAction::Close {
+            self.code_tabs
+                .get(index.min(self.code_tabs.len().saturating_sub(1)))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(code) = active_code {
+            self.set_active_code(code, cx);
+        } else if self.code_tabs.is_empty() {
+            self.session.update(cx, |session, _| session.code = None);
+        }
+        self.set_center_layout(false, false, false, window, cx);
     }
 
     fn set_bottom_layout(
@@ -1163,13 +1350,8 @@ pub fn launch() {
                                 cx,
                             )
                         });
-                        let shell_for_code = shell.downgrade();
-                        code.update(cx, |code, _| {
-                            code.set_close_handler(move |panel, window, cx| {
-                                _ = shell_for_code.update(cx, |shell, cx| {
-                                    shell.close_center_panel(panel, window, cx);
-                                });
-                            });
+                        shell.update(cx, |shell, cx| {
+                            shell.configure_code(code.clone(), cx);
                         });
                         let shell_for_settings = shell.downgrade();
                         settings.update(cx, |settings, _| {

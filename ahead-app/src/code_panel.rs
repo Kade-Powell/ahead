@@ -41,6 +41,16 @@ pub struct DiagnosticItem {
     pub is_error: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeTabAction {
+    Promote,
+    Close,
+    CloseOthers,
+    CloseAll,
+    CloseLeft,
+    CloseRight,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitLensLine {
     author: String,
@@ -69,12 +79,14 @@ pub struct CodePanel {
     pub proxy: Option<Arc<ProxyClient>>,
     pub workspace: String,
     pub hover_text: Option<String>,
+    pub is_preview: bool,
     git_lens: Option<GitLensLine>,
     git_lens_key: Option<(String, u32, usize)>,
-    pub explorer_id: Option<usize>,
     /// Invalidates asynchronous completion/FIM results after edits or file switches.
     pub request_generation: u64,
+    loading: bool,
     close_handler: Option<Rc<dyn Fn(PanelId, &mut Window, &mut App)>>,
+    tab_handler: Option<Rc<dyn Fn(PanelId, CodeTabAction, &mut Window, &mut App)>>,
     panel_id: PanelId,
     tab_group: Option<WeakEntity<TabGroup>>,
 }
@@ -104,6 +116,9 @@ impl CodePanel {
             |this: &mut Self, _state, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.dirty_rev += 1;
+                    if !this.loading {
+                        this.is_preview = false;
+                    }
                     this.request_generation =
                         this.request_generation.wrapping_add(1);
                     // Zed-style interpolation: when the user types a prefix of
@@ -150,11 +165,13 @@ impl CodePanel {
             proxy: None,
             workspace: String::new(),
             hover_text: None,
+            is_preview: false,
             git_lens: None,
             git_lens_key: None,
-            explorer_id: None,
             request_generation: 0,
+            loading: false,
             close_handler: None,
+            tab_handler: None,
             panel_id: PanelId::from(cx.entity_id()),
             tab_group: None,
         }
@@ -174,6 +191,20 @@ impl CodePanel {
         F: Fn(PanelId, &mut Window, &mut App) + 'static,
     {
         self.close_handler = Some(Rc::new(handler));
+    }
+
+    pub fn set_tab_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(PanelId, CodeTabAction, &mut Window, &mut App) + 'static,
+    {
+        self.tab_handler = Some(Rc::new(handler));
+    }
+
+    pub fn promote_preview(&mut self, cx: &mut Context<Self>) {
+        if self.is_preview {
+            self.is_preview = false;
+            cx.notify();
+        }
     }
 
     fn proxy_path(&self) -> std::path::PathBuf {
@@ -228,17 +259,10 @@ impl CodePanel {
         }
     }
 
-    /// Drain one pending explorer open, if the explorer posted one.
-    /// Runs at render head where `window`/`cx` are already in scope.
-    fn poll_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.explorer_id else { return };
-        if let Some(path) = crate::ross::take_open(id) {
-            self.open_file(&path, window, cx);
-        }
-    }
     pub fn open_file(
         &mut self,
         path: &str,
+        preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -248,11 +272,15 @@ impl CodePanel {
             cx.notify();
             return;
         }
+        self.loading = true;
         self.editor.update(cx, |ed, cx| {
             ed.set_value(text, window, cx);
         });
+        self.loading = false;
         self.file_path = path.to_string();
-        self.saved_rev = self.dirty_rev;
+        self.saved_rev = 0;
+        self.dirty_rev = 0;
+        self.is_preview = preview;
         self.active_line = 1;
         self.request_generation = self.request_generation.wrapping_add(1);
         self.ghost_text = None;
@@ -605,44 +633,91 @@ impl BasePanel for CodePanel {
 }
 
 impl Panel for CodePanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let file_name = std::path::Path::new(&self.file_path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("untitled");
         let dirty = self.dirty_rev != self.saved_rev;
-        let suffix = if dirty { " •" } else { "" };
         let group = self.tab_group.clone();
         let panel_id = self.panel_id;
         let close_handler = self.close_handler.clone();
-        let title = SharedString::from(format!("{}{}", file_name, suffix));
-        h_flex().items_center().gap_1().child(title).child(
-            Button::new(SharedString::from(format!(
-                "close_file_{}",
-                panel_id.as_u64()
-            )))
-            .icon(IconName::X)
-            .ghost()
-            .tooltip(format!("Close {file_name}"))
-            .on_click(move |_, window, cx| {
-                let can_close = group.as_ref().is_some_and(|group| {
-                    group
-                        .read_with(cx, |group, cx| group.context(cx).is_draggable())
-                        .unwrap_or(false)
-                });
-                if can_close {
-                    if let Some(group) = group.as_ref() {
+        let tab_handler = self.tab_handler.clone();
+        let double_tab_handler = tab_handler.clone();
+        let button_tab_handler = tab_handler.clone();
+        let title = SharedString::from(file_name.to_string());
+        let tab_label = div()
+            .when(self.is_preview, |this| this.italic())
+            .child(title)
+            .when(dirty, |this| {
+                this.child(div().text_color(cx.theme().warning).child("•"))
+            });
+        h_flex()
+            .id(("code-tab", panel_id.as_u64()))
+            .items_center()
+            .gap_1()
+            .on_click({
+                let tab_handler = double_tab_handler;
+                move |event, window, cx| {
+                    if event.click_count() > 1 {
+                        if let Some(handler) = tab_handler.as_ref() {
+                            handler(panel_id, CodeTabAction::Promote, window, cx);
+                        }
+                    }
+                }
+            })
+            .context_menu(move |menu, _window, _cx| {
+                let item = |label: &'static str, action: CodeTabAction| {
+                    let tab_handler = tab_handler.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        if let Some(handler) = tab_handler.as_ref() {
+                            handler(panel_id, action, window, cx);
+                        }
+                    })
+                };
+                menu.item(item("Close", CodeTabAction::Close))
+                    .item(item("Close Others", CodeTabAction::CloseOthers))
+                    .separator()
+                    .item(item("Close Left", CodeTabAction::CloseLeft))
+                    .item(item("Close Right", CodeTabAction::CloseRight))
+                    .separator()
+                    .item(item("Close All", CodeTabAction::CloseAll))
+            })
+            .child(tab_label)
+            .child(
+                Button::new(SharedString::from(format!(
+                    "close_file_{}",
+                    panel_id.as_u64()
+                )))
+                .icon(IconName::X)
+                .ghost()
+                .tooltip(format!("Close {file_name}"))
+                .on_click(move |_, window, cx| {
+                    if let Some(handler) = button_tab_handler.as_ref() {
+                        handler(panel_id, CodeTabAction::Close, window, cx);
+                        return;
+                    }
+                    let can_close = group.as_ref().is_some_and(|group| {
+                        group
+                            .read_with(cx, |group, cx| {
+                                group.context(cx).is_draggable()
+                            })
+                            .unwrap_or(false)
+                    });
+                    if can_close {
+                        if let Some(group) = group.as_ref() {
+                            _ = group.update(cx, |group, cx| {
+                                group.close_panel(panel_id, cx)
+                            });
+                        }
+                    } else if let Some(handler) = close_handler.as_ref() {
+                        handler(panel_id, window, cx);
+                    } else if let Some(group) = group.as_ref() {
                         _ = group
                             .update(cx, |group, cx| group.close_panel(panel_id, cx));
                     }
-                } else if let Some(handler) = close_handler.as_ref() {
-                    handler(panel_id, window, cx);
-                } else if let Some(group) = group.as_ref() {
-                    _ = group
-                        .update(cx, |group, cx| group.close_panel(panel_id, cx));
-                }
-            }),
-        )
+                }),
+            )
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -661,10 +736,9 @@ impl Focusable for CodePanel {
 impl Render for CodePanel {
     fn render(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        self.poll_explorer(window, cx);
         self.sync_proxy_diagnostics(cx);
         let dirty = self.dirty_rev != self.saved_rev;
         let border_color = cx.theme().border;
