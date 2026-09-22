@@ -8,11 +8,7 @@ use std::{
     },
 };
 
-use anyhow::{Result, anyhow};
-use crossbeam_channel::{Receiver, Sender};
-use dyn_clone::DynClone;
-use jsonrpc_lite::{Id, JsonRpc, Params};
-use ahead_core::encoding::{offset_utf16_to_utf8, offset_utf8_to_utf16};
+use ahead_core::encoding::{offset_utf8_to_utf16, offset_utf16_to_utf8};
 use ahead_rpc::{
     RpcError,
     core::{CoreRpcHandler, ServerStatusParams},
@@ -20,17 +16,20 @@ use ahead_rpc::{
     plugin::{PluginId, ServerId},
     style::{LineStyle, Style},
 };
-use ropey::{LineType, Rope};
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender};
+use dyn_clone::DynClone;
+use jsonrpc_lite::{Id, JsonRpc, Params};
 use lsp_types::{
     CancelParams, CodeActionProviderCapability, DidChangeTextDocumentParams,
     DidSaveTextDocumentParams, DocumentSelector, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, InitializeResult,
-    LogMessageParams, MessageType, OneOf, Position, ProgressParams, PublishDiagnosticsParams,
-    Range, Registration, RegistrationParams, SemanticTokens, SemanticTokensLegend,
-    SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentSaveRegistrationOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncSaveOptions,
+    LogMessageParams, MessageType, OneOf, Position, ProgressParams,
+    PublishDiagnosticsParams, Range, Registration, RegistrationParams,
+    SemanticTokens, SemanticTokensLegend, SemanticTokensServerCapabilities,
+    ServerCapabilities, ShowMessageParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentSaveRegistrationOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
     VersionedTextDocumentIdentifier,
     notification::{
         Cancel, DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument,
@@ -43,19 +42,17 @@ use lsp_types::{
         DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
         GotoImplementation, GotoTypeDefinition, HoverRequest, Initialize,
         InlayHintRequest, InlineCompletionRequest, PrepareRenameRequest, References,
-        RegisterCapability, Rename, Request, ResolveCompletionItem, SelectionRangeRequest,
-        SemanticTokensFullRequest, SignatureHelpRequest, WorkDoneProgressCreate,
-        WorkspaceSymbolRequest,
+        RegisterCapability, Rename, Request, ResolveCompletionItem,
+        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+        WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
 use parking_lot::Mutex;
+use ropey::{LineType, Rope};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{
-    PluginCatalogRpcHandler,
-    lsp::DocumentFilter,
-};
+use super::{PluginCatalogRpcHandler, lsp::DocumentFilter};
 
 pub enum ResponseHandler<Resp, Error> {
     Chan(Sender<Result<Resp, Error>>),
@@ -997,8 +994,9 @@ impl PluginHostHandler {
                 self.catalog_rpc.core_rpc.cancel(params);
             }
             "experimental/serverStatus" => {
-                let param: ServerStatusParams =
+                let mut param: ServerStatusParams =
                     serde_json::from_value(serde_json::to_value(params)?)?;
+                param.server_name = Some(self.server_id.name.clone());
                 if !param.is_ok() {
                     if let Some(msg) = &param.message {
                         self.core_rpc.show_message(

@@ -19,12 +19,15 @@ use std::{
 use ahead_rpc::{
     RpcError, RpcMessage,
     ahead::{
-        AgentPlanEntry, AgentToolCall, AgentTurnRequestDto, AgentUsage, AheadNotification,
-        AheadRequest, CodeAnchor, ConversationMessage, SessionExportBundle, SessionView, WorkItem,
+        AgentPlanEntry, AgentToolCall, AgentTurnRequestDto, AgentUsage,
+        AheadNotification, AheadRequest, CodeAnchor, ConversationMessage,
+        ExternalAcpAdapter, HarnessKind, SessionExportBundle, SessionView, WorkItem,
         WorkItemStatus,
     },
     core::{CoreNotification, CoreRequest, CoreResponse},
-    dap_types::{DapId, RunDebugConfig, SourceBreakpoint, StackFrame, Stopped, ThreadId},
+    dap_types::{
+        DapId, RunDebugConfig, SourceBreakpoint, StackFrame, Stopped, ThreadId,
+    },
     proxy::{ProxyMessage, ProxyResponse, ProxyRpc, ProxyRpcHandler},
     source_control::{DiffInfo, FileDiff},
     stdio::{read_msg, write_msg},
@@ -49,6 +52,20 @@ pub struct ProxyDiffState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspServerStatus {
+    pub name: String,
+    pub ready: bool,
+    pub quiescent: bool,
+    pub message: Option<String>,
+}
+
+impl LspServerStatus {
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointSummary {
     pub session_id: String,
     pub title: String,
@@ -58,7 +75,8 @@ pub struct CheckpointSummary {
 }
 
 /// 1-indexed changed line ranges for the open file, computed from
-/// `git diff --unified=0` so gutter markers track real edits.
+/// `git diff --unified=0`; deletion hunks have zero live rows and use their
+/// boundary line as the marker anchor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffHunk {
     pub start: u32,
@@ -70,6 +88,7 @@ pub struct DiffHunk {
 pub enum DiffHunkKind {
     Added,
     Modified,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,7 +97,7 @@ pub struct DebugState {
     pub stopped: bool,
     pub reason: String,
     pub frames: Vec<StackFrame>,
-    pub breakpoints: HashSet<u32>,
+    pub breakpoints: HashMap<PathBuf, HashSet<u32>>,
 }
 
 pub struct ProxyClient {
@@ -91,6 +110,7 @@ pub struct ProxyClient {
     diagnostics: Arc<Mutex<HashMap<PathBuf, ProxyDiagnostics>>>,
     diag_version: Arc<Mutex<usize>>,
     diff: Arc<Mutex<ProxyDiffState>>,
+    lsp_servers: Arc<Mutex<HashMap<String, LspServerStatus>>>,
     /// Uncommitted attribution anchors per file, refreshed from the ahead host.
     anchors: Arc<Mutex<HashMap<PathBuf, Vec<CodeAnchor>>>>,
     debug: Arc<Mutex<DebugState>>,
@@ -119,6 +139,7 @@ impl ProxyClient {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             diag_version: Arc::new(Mutex::new(0)),
             diff: Arc::new(Mutex::new(ProxyDiffState::default())),
+            lsp_servers: Arc::new(Mutex::new(HashMap::new())),
             anchors: Arc::new(Mutex::new(HashMap::new())),
             debug: Arc::new(Mutex::new(DebugState::default())),
             debug_configs: Arc::new(Mutex::new(default_debug_configs())),
@@ -134,11 +155,7 @@ impl ProxyClient {
         client.refresh_debug_configs();
         if let Some(child) = Self::spawn_proxy(&client, proxy_rpc) {
             *client._child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-            client.proxy_rpc.initialize(
-                Some(workspace),
-                0,
-                0,
-            );
+            client.proxy_rpc.initialize(Some(workspace), 0, 0);
         }
         client
     }
@@ -197,7 +214,9 @@ impl ProxyClient {
             let mut reader = BufReader::new(stdout);
             loop {
                 let msg: std::io::Result<
-                    Option<RpcMessage<CoreRequest, CoreNotification, serde_json::Value>>,
+                    Option<
+                        RpcMessage<CoreRequest, CoreNotification, serde_json::Value>,
+                    >,
                 > = read_msg(&mut reader);
                 let msg = match msg {
                     Ok(m) => m,
@@ -224,6 +243,28 @@ impl ProxyClient {
             .unwrap_or_else(|e| e.into_inner())
             .get(path)
             .map(|d| d.items.clone())
+    }
+
+    pub fn all_diagnostics(&self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, diagnostics)| !diagnostics.items.is_empty())
+            .map(|(path, diagnostics)| (path.clone(), diagnostics.items.clone()))
+            .collect()
+    }
+
+    pub fn lsp_servers(&self) -> Vec<LspServerStatus> {
+        let mut servers = self
+            .lsp_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.name.cmp(&right.name));
+        servers
     }
 
     pub fn diff(&self) -> ProxyDiffState {
@@ -265,10 +306,7 @@ impl ProxyClient {
                     });
                 }
             }
-            *self
-                .debug_configs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = configs;
+            *self.debug_configs.lock().unwrap_or_else(|e| e.into_inner()) = configs;
         }
     }
 
@@ -326,9 +364,7 @@ impl ProxyClient {
             })
             .collect();
         let Ok(value) = self.proxy_rpc.ahead_request_blocking(
-            AheadRequest::ListAnchorsForPaths {
-                paths: repo_paths,
-            },
+            AheadRequest::ListAnchorsForPaths { paths: repo_paths },
         ) else {
             return;
         };
@@ -365,7 +401,9 @@ impl ProxyClient {
     /// Route one proxy-originated core notification into local state.
     pub fn route_core(&self, notif: CoreNotification) {
         match notif {
-            CoreNotification::CompletionResponse { request_id, resp, .. } => {
+            CoreNotification::CompletionResponse {
+                request_id, resp, ..
+            } => {
                 if let Some(tx) = self
                     .pending_completion
                     .lock()
@@ -381,7 +419,8 @@ impl ProxyClient {
             }
             CoreNotification::PublishDiagnostics { diagnostics } => {
                 let path = diagnostics.uri.to_file_path().unwrap_or_default();
-                let mut version = self.diag_version.lock().unwrap_or_else(|e| e.into_inner());
+                let mut version =
+                    self.diag_version.lock().unwrap_or_else(|e| e.into_inner());
                 *version += 1;
                 self.diagnostics
                     .lock()
@@ -407,6 +446,26 @@ impl ProxyClient {
                     }
                 }
             }
+            CoreNotification::ServerStatus { params } => {
+                let ready = params.is_ok();
+                let quiescent = params.is_quiescent();
+                let message = params.message.clone();
+                let name = params
+                    .server_name
+                    .unwrap_or_else(|| "language-server".to_string());
+                self.lsp_servers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        name.clone(),
+                        LspServerStatus {
+                            name,
+                            ready,
+                            quiescent,
+                            message,
+                        },
+                    );
+            }
             CoreNotification::DapStopped {
                 stopped,
                 stack_frames,
@@ -422,12 +481,17 @@ impl ProxyClient {
                 let mut dbg = self.debug.lock().unwrap_or_else(|e| e.into_inner());
                 dbg.stopped = false;
             }
-            CoreNotification::DapBreakpointsResp { breakpoints, .. } => {
+            CoreNotification::DapBreakpointsResp {
+                path, breakpoints, ..
+            } => {
                 let mut dbg = self.debug.lock().unwrap_or_else(|e| e.into_inner());
-                dbg.breakpoints = breakpoints
-                    .iter()
-                    .filter_map(|b| b.line.map(|l| l as u32))
-                    .collect();
+                dbg.breakpoints.insert(
+                    self.breakpoint_path(&path),
+                    breakpoints
+                        .iter()
+                        .filter_map(|b| b.line.map(|l| l as u32))
+                        .collect(),
+                );
             }
             CoreNotification::AheadNotification { notification } => {
                 self.route_ahead(notification);
@@ -441,12 +505,12 @@ impl ProxyClient {
     pub fn route_ahead(&self, notification: AheadNotification) {
         match notification {
             AheadNotification::ConversationMessageAdded { message } => {
-                let mut conversations = self
-                    .conversations
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let list = conversations.entry(message.session_id.clone()).or_default();
-                if let Some(existing) = list.iter_mut().find(|m| m.id == message.id) {
+                let mut conversations =
+                    self.conversations.lock().unwrap_or_else(|e| e.into_inner());
+                let list =
+                    conversations.entry(message.session_id.clone()).or_default();
+                if let Some(existing) = list.iter_mut().find(|m| m.id == message.id)
+                {
                     *existing = message;
                 } else {
                     list.push(message);
@@ -454,53 +518,53 @@ impl ProxyClient {
             }
             AheadNotification::AgentMessageDelta {
                 session_id,
+                turn_id,
                 delta,
-                ..
             } => {
-                let mut conversations = self
-                    .conversations
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut conversations =
+                    self.conversations.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(list) = conversations.get_mut(&session_id) {
-                    if let Some(last) = list
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.role == "agent" && m.status == "streaming")
-                    {
+                    if let Some(last) = list.iter_mut().rev().find(|m| {
+                        m.role == "agent"
+                            && m.status == "streaming"
+                            && m.turn_id == turn_id
+                    }) {
                         last.content.push_str(&delta);
                     }
                 }
             }
             AheadNotification::AgentTurnState {
                 session_id,
+                turn_id,
+                message_id,
                 state,
-                ..
             } => {
                 let mut streaming = self
                     .streaming_turns
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if state == "streaming" {
-                    streaming.insert(session_id.clone(), state.clone());
-                } else {
+                    streaming.insert(session_id.clone(), turn_id.clone());
+                } else if streaming
+                    .get(&session_id)
+                    .is_some_and(|active| active == &turn_id)
+                {
                     streaming.remove(&session_id);
                 }
-                let mut conversations = self
-                    .conversations
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut conversations =
+                    self.conversations.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(list) = conversations.get_mut(&session_id) {
-                    if let Some(last) = list
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.role == "agent" && m.status == "streaming")
+                    if let Some(message) =
+                        list.iter_mut().find(|m| m.id == message_id)
                     {
-                        last.status = state;
+                        message.status = state;
                     }
                 }
             }
             AheadNotification::AgentPlan {
-                session_id, entries, ..
+                session_id,
+                entries,
+                ..
             } => {
                 self.plans
                     .lock()
@@ -557,37 +621,111 @@ impl ProxyClient {
 
     /// Reopens the newest active durable session for this workspace, or starts
     /// one when the database has no active session yet.
-    pub fn open_work_session(&self, title: &str, workspace: &str) -> Option<String> {
-        if let Ok(value) = self
-            .proxy_rpc
-            .ahead_request_blocking(AheadRequest::ListSessions)
-            && let Ok(sessions) = serde_json::from_value::<Vec<SessionView>>(value)
-        {
-            if let Some(session) = sessions
-                .into_iter()
-                .filter(|session| matches!(session.session.lifecycle, ahead_rpc::ahead::SessionLifecycle::Active))
-                .max_by(|left, right| left.session.created_at.cmp(&right.session.created_at))
-            {
-                return Some(session.session.id);
-            }
+    pub fn open_work_session(
+        &self,
+        title: &str,
+        workspace: &str,
+    ) -> Result<String, RpcError> {
+        let proxy_running = self
+            ._child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if !proxy_running {
+            return Err(RpcError {
+                code: 0,
+                message: "AHEAD proxy is not running or exited during startup"
+                    .to_string(),
+            });
         }
-
-        use ahead_rpc::ahead::{AssistanceMode, WorkKind};
         let value = self
             .proxy_rpc
-            .ahead_request_blocking(AheadRequest::StartWork {
-                work_kind: WorkKind::ProductChange,
-                mode: AssistanceMode::Assist,
-                title: title.to_string(),
-                starting_point: format!("Workspace: {workspace}"),
-                work_item: None,
+            .ahead_request_blocking(AheadRequest::ListSessions)?;
+        let sessions =
+            serde_json::from_value::<Vec<SessionView>>(value).map_err(|error| {
+                RpcError {
+                    code: 0,
+                    message: format!(
+                        "Invalid session list from AHEAD proxy: {error}"
+                    ),
+                }
+            })?;
+        if let Some(session) = sessions
+            .into_iter()
+            .filter(|session| {
+                matches!(
+                    session.session.lifecycle,
+                    ahead_rpc::ahead::SessionLifecycle::Active
+                )
             })
-            .ok()?;
+            .max_by(|left, right| {
+                left.session.created_at.cmp(&right.session.created_at)
+            })
+        {
+            return Ok(session.session.id);
+        }
+
+        let value =
+            self.proxy_rpc
+                .ahead_request_blocking(AheadRequest::StartWork {
+                    work_kind: None,
+                    title: title.to_string(),
+                    starting_point: format!("Workspace: {workspace}"),
+                    work_item: None,
+                    harness: Some(HarnessKind::Ahead),
+                    external_agent_id: None,
+                })?;
         value
             .get("session")
             .and_then(|s| s.get("id"))
             .and_then(|id| id.as_str())
             .map(str::to_string)
+            .ok_or_else(|| RpcError {
+                code: 0,
+                message: "AHEAD host returned no session id".to_string(),
+            })
+    }
+
+    /// Starts a new durable AHEAD session without reopening an existing one.
+    pub fn start_work_session(
+        &self,
+        title: &str,
+        starting_point: &str,
+        harness: HarnessKind,
+        external_agent_id: Option<&str>,
+    ) -> Result<String, RpcError> {
+        let value =
+            self.proxy_rpc
+                .ahead_request_blocking(AheadRequest::StartWork {
+                    work_kind: None,
+                    title: title.to_string(),
+                    starting_point: starting_point.to_string(),
+                    work_item: None,
+                    harness: Some(harness),
+                    external_agent_id: external_agent_id.map(str::to_string),
+                })?;
+        value
+            .get("session")
+            .and_then(|session| session.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| RpcError {
+                code: 0,
+                message: "AHEAD host returned no session id".into(),
+            })
+    }
+
+    pub fn external_acp_adapters(
+        &self,
+    ) -> Result<Vec<ExternalAcpAdapter>, RpcError> {
+        let value = self
+            .proxy_rpc
+            .ahead_request_blocking(AheadRequest::ListExternalAcpAdapters)?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid ACP adapter list from AHEAD proxy: {error}"),
+        })
     }
 
     pub fn session_view(&self, session_id: &str) -> Option<SessionView> {
@@ -601,11 +739,11 @@ impl ProxyClient {
     }
 
     pub fn work_items(&self, session_id: &str) -> Vec<WorkItem> {
-        let Ok(value) = self
-            .proxy_rpc
-            .ahead_request_blocking(AheadRequest::WorkItemList {
-                session_id: session_id.to_string(),
-            })
+        let Ok(value) =
+            self.proxy_rpc
+                .ahead_request_blocking(AheadRequest::WorkItemList {
+                    session_id: session_id.to_string(),
+                })
         else {
             return Vec::new();
         };
@@ -632,19 +770,6 @@ impl ProxyClient {
             })
     }
 
-    pub fn set_mode(
-        &self,
-        session_id: &str,
-        mode: ahead_rpc::ahead::AssistanceMode,
-    ) -> Result<(), RpcError> {
-        self.proxy_rpc
-            .ahead_request_blocking(AheadRequest::SetMode {
-                session_id: session_id.to_string(),
-                mode,
-            })
-            .map(|_| ())
-    }
-
     pub fn set_work_item_status(
         &self,
         item_id: &str,
@@ -666,13 +791,14 @@ impl ProxyClient {
     /// Durable conversation for a session, refreshing from the host first so a
     /// reopened session shows the persisted history.
     pub fn conversation(&self, session_id: &str) -> Vec<ConversationMessage> {
-        if let Ok(value) = self
-            .proxy_rpc
-            .ahead_request_blocking(AheadRequest::ConversationMessages {
+        if let Ok(value) = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::ConversationMessages {
                 session_id: session_id.to_string(),
-            })
-        {
-            if let Ok(messages) = serde_json::from_value::<Vec<ConversationMessage>>(value) {
+            },
+        ) {
+            if let Ok(messages) =
+                serde_json::from_value::<Vec<ConversationMessage>>(value)
+            {
                 self.conversations
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -700,10 +826,11 @@ impl ProxyClient {
             code: 0,
             message: format!("Create shared session directory: {error}"),
         })?;
-        let session_json = serde_json::to_vec_pretty(&bundle).map_err(|error| RpcError {
-            code: 0,
-            message: format!("Serialize session export: {error}"),
-        })?;
+        let session_json =
+            serde_json::to_vec_pretty(&bundle).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Serialize session export: {error}"),
+            })?;
         write_atomic(&directory.join("session.json"), &session_json)?;
 
         let mut session_md = format!(
@@ -718,7 +845,8 @@ impl ProxyClient {
             for item in &bundle.work_items {
                 session_md.push_str(&format!(
                     "- [{}] {}\n",
-                    if matches!(item.status, ahead_rpc::ahead::WorkItemStatus::Done) {
+                    if matches!(item.status, ahead_rpc::ahead::WorkItemStatus::Done)
+                    {
                         "x"
                     } else {
                         " "
@@ -755,12 +883,15 @@ impl ProxyClient {
         Ok(directory.join("session.json"))
     }
 
-    fn session_export(&self, session_id: &str) -> Result<SessionExportBundle, RpcError> {
-        let value = self
-            .proxy_rpc
-            .ahead_request_blocking(AheadRequest::SessionExport {
-                session_id: session_id.to_string(),
-            })?;
+    fn session_export(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionExportBundle, RpcError> {
+        let value =
+            self.proxy_rpc
+                .ahead_request_blocking(AheadRequest::SessionExport {
+                    session_id: session_id.to_string(),
+                })?;
         serde_json::from_value(value).map_err(|error| RpcError {
             code: 0,
             message: format!("Invalid session export: {error}"),
@@ -793,7 +924,8 @@ impl ProxyClient {
             .into_iter()
             .filter_map(|path| {
                 let payload = std::fs::read_to_string(&path).ok()?;
-                let bundle = serde_json::from_str::<SessionExportBundle>(&payload).ok()?;
+                let bundle =
+                    serde_json::from_str::<SessionExportBundle>(&payload).ok()?;
                 Some(CheckpointSummary {
                     session_id: bundle.session.id,
                     title: bundle.session.title,
@@ -809,17 +941,20 @@ impl ProxyClient {
 
     /// Imports one checkpoint into the local store. This only restores durable
     /// readable history; it never starts or resumes the original harness.
-    pub fn restore_checkpoint(&self, path: &PathBuf) -> Result<SessionView, RpcError> {
+    pub fn restore_checkpoint(
+        &self,
+        path: &PathBuf,
+    ) -> Result<SessionView, RpcError> {
         let payload = std::fs::read_to_string(path).map_err(|error| RpcError {
             code: 0,
             message: format!("Read session checkpoint: {error}"),
         })?;
-        let bundle = serde_json::from_str::<SessionExportBundle>(&payload).map_err(|error| {
-            RpcError {
+        let bundle = serde_json::from_str::<SessionExportBundle>(&payload).map_err(
+            |error| RpcError {
                 code: 0,
                 message: format!("Invalid session checkpoint: {error}"),
-            }
-        })?;
+            },
+        )?;
         self.proxy_rpc
             .ahead_request_blocking(AheadRequest::SessionRestore { bundle })
             .and_then(|value| {
@@ -833,7 +968,10 @@ impl ProxyClient {
     pub fn harness_warning(&self, session_id: &str) -> Option<String> {
         let backend = self.harness_backend(session_id)?;
         if backend.starts_with("external-agent") {
-            Some("External ACP: shell and edits are observed, not AHEAD-mediated.".to_string())
+            Some(
+                "External ACP: shell and edits are observed, not AHEAD-mediated."
+                    .to_string(),
+            )
         } else if backend.ends_with("-fresh") {
             Some("The persisted agent thread was unavailable; a fresh thread is active.".to_string())
         } else {
@@ -852,6 +990,23 @@ impl ProxyClient {
             .get("backend")
             .and_then(|backend| backend.as_str())
             .map(str::to_string)
+    }
+
+    pub fn harness_kind(&self, session_id: &str) -> HarnessKind {
+        self.harness_backend(session_id)
+            .filter(|backend| backend.starts_with("external-agent"))
+            .map(|_| HarnessKind::ExternalAcp)
+            .unwrap_or(HarnessKind::Ahead)
+    }
+
+    pub fn external_agent_id(&self, session_id: &str) -> Option<String> {
+        self.harness_backend(session_id)
+            .and_then(|backend| {
+                backend
+                    .strip_prefix("external-agent:")
+                    .map(|id| id.strip_suffix("-fresh").unwrap_or(id).to_string())
+            })
+            .filter(|id| !id.is_empty())
     }
 
     /// Starts a real streamed harness turn. Deltas arrive asynchronously via
@@ -880,7 +1035,12 @@ impl ProxyClient {
             .ahead_request_blocking(AheadRequest::AgentTurnCancel {
                 session_id: session_id.to_string(),
             })
-            .map(|value| value.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false))
+            .map(|value| {
+                value
+                    .get("cancelled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
     }
 
     pub fn is_streaming(&self, session_id: &str) -> bool {
@@ -888,6 +1048,14 @@ impl ProxyClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(session_id)
+    }
+
+    pub fn active_turn_id(&self, session_id: &str) -> Option<String> {
+        self.streaming_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
     }
 
     /// Route one proxy-originated request-style response into pending slots.
@@ -1032,26 +1200,30 @@ impl ProxyClient {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx.clone());
         let pending = self.pending_defs.clone();
-        self.proxy_rpc.get_definition(id, path, position, move |res| {
-            if let Ok(ProxyResponse::GetDefinitionResponse { definition, .. }) = res {
-                let locs = match definition {
-                    GotoDefinitionResponse::Scalar(loc) => vec![loc],
-                    GotoDefinitionResponse::Array(locs) => locs,
-                    GotoDefinitionResponse::Link(links) => links
-                        .into_iter()
-                        .map(|l| Location {
-                            uri: l.target_uri,
-                            range: l.target_range,
-                        })
-                        .collect(),
-                };
-                let _ = tx.send(locs);
-            }
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-        });
+        self.proxy_rpc
+            .get_definition(id, path, position, move |res| {
+                if let Ok(ProxyResponse::GetDefinitionResponse {
+                    definition, ..
+                }) = res
+                {
+                    let locs = match definition {
+                        GotoDefinitionResponse::Scalar(loc) => vec![loc],
+                        GotoDefinitionResponse::Array(locs) => locs,
+                        GotoDefinitionResponse::Link(links) => links
+                            .into_iter()
+                            .map(|l| Location {
+                                uri: l.target_uri,
+                                range: l.target_range,
+                            })
+                            .collect(),
+                    };
+                    let _ = tx.send(locs);
+                }
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+            });
         rx
     }
 
@@ -1072,7 +1244,8 @@ impl ProxyClient {
             position,
             lsp_types::InlineCompletionTriggerKind::Automatic,
             move |res| {
-                if let Ok(ProxyResponse::GetInlineCompletions { completions }) = res {
+                if let Ok(ProxyResponse::GetInlineCompletions { completions }) = res
+                {
                     let text = match completions {
                         InlineCompletionResponse::Array(items) => items
                             .first()
@@ -1131,15 +1304,52 @@ impl ProxyClient {
         dbg.stopped = false;
     }
 
-    pub fn toggle_breakpoint(&self, line: u32) {
+    pub fn breakpoints_for(&self, path: &Path) -> HashSet<u32> {
+        let path = self.breakpoint_path(path);
+        self.debug()
+            .breakpoints
+            .get(&path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn toggle_breakpoint(&self, path: &Path, line: u32) {
+        let path = self.breakpoint_path(path);
         let mut dbg = self.debug.lock().unwrap_or_else(|e| e.into_inner());
-        if !dbg.breakpoints.remove(&line) {
-            dbg.breakpoints.insert(line);
+        let breakpoints = dbg.breakpoints.entry(path.clone()).or_default();
+        if !breakpoints.remove(&line) {
+            breakpoints.insert(line);
+        }
+        if dbg.active {
+            let breakpoints = dbg
+                .breakpoints
+                .get(&path)
+                .into_iter()
+                .flat_map(|lines| lines.iter())
+                .map(|line| SourceBreakpoint {
+                    line: *line as usize,
+                    ..Default::default()
+                })
+                .collect();
+            self.proxy_rpc
+                .dap_set_breakpoints(DapId(0), path, breakpoints);
+        }
+    }
+
+    fn breakpoint_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workspace.join(path)
         }
     }
 }
 
-fn route_proxy_response(proxy_rpc: &ProxyRpcHandler, id: ahead_rpc::RequestId, value: serde_json::Value) {
+fn route_proxy_response(
+    proxy_rpc: &ProxyRpcHandler,
+    id: ahead_rpc::RequestId,
+    value: serde_json::Value,
+) {
     match serde_json::from_value::<ProxyResponse>(value) {
         Ok(response) => proxy_rpc.handle_response(id, Ok(response)),
         Err(error) => eprintln!("invalid proxy response: {error}"),
@@ -1155,7 +1365,9 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), RpcError> {
     };
     let temporary = parent.join(format!(
         ".{}.tmp-{}",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("file"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file"),
         uuid::Uuid::new_v4()
     ));
     std::fs::write(&temporary, contents).map_err(|error| RpcError {
@@ -1222,8 +1434,8 @@ pub fn parse_unified_hunks(text: &str) -> Vec<DiffHunk> {
         let range = plus.split_whitespace().next().unwrap_or("");
         let mut parts = range.split(',');
         let start: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let len: u32 = parts.next().unwrap_or("1").parse().unwrap_or(1);
-        if start == 0 {
+        let new_len: u32 = parts.next().unwrap_or("1").parse().unwrap_or(1);
+        if start == 0 && new_len > 0 {
             continue;
         }
         let old_part = line.split('-').nth(1).unwrap_or("");
@@ -1234,14 +1446,21 @@ pub fn parse_unified_hunks(text: &str) -> Vec<DiffHunk> {
             .unwrap_or("1")
             .parse()
             .unwrap_or(1);
+        let kind = if old_len == 0 {
+            DiffHunkKind::Added
+        } else if new_len == 0 {
+            DiffHunkKind::Deleted
+        } else {
+            DiffHunkKind::Modified
+        };
         hunks.push(DiffHunk {
-            start,
-            len: len.max(1),
-            kind: if old_len == 0 {
-                DiffHunkKind::Added
+            start: start.max(1),
+            len: if matches!(kind, DiffHunkKind::Deleted) {
+                0
             } else {
-                DiffHunkKind::Modified
+                new_len.max(1)
             },
+            kind,
         });
     }
     hunks
@@ -1252,32 +1471,41 @@ fn _assert_core_types(_req: CoreRequest, _resp: CoreResponse) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_unified_hunks, route_proxy_response, write_atomic, ProxyResponse};
+    use super::{
+        ProxyResponse, parse_unified_hunks, route_proxy_response, write_atomic,
+    };
     use ahead_rpc::proxy::ProxyRpcHandler;
     use crossbeam_channel::bounded;
     use lsp_types::{HoverContents, MarkedString, Position};
     use std::path::PathBuf;
 
     #[test]
-    fn parses_added_and_modified_hunks() {
-        let diff =
-            "@@ -10,0 +11,3 @@\n+aaa\n+bbb\n+ccc\n@@ -20,2 +23,2 @@\n-old\n+new\n";
+    fn parses_added_modified_and_deleted_hunks() {
+        let diff = "@@ -10,0 +11,3 @@\n+aaa\n+bbb\n+ccc\n@@ -20,2 +23,2 @@\n-old\n+new\n@@ -30,2 +32,0 @@\n-old\n-older\n";
         let hunks = parse_unified_hunks(diff);
-        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks.len(), 3);
         assert_eq!(hunks[0].start, 11);
         assert_eq!(hunks[0].len, 3);
         assert!(matches!(hunks[0].kind, super::DiffHunkKind::Added));
         assert_eq!(hunks[1].start, 23);
         assert!(matches!(hunks[1].kind, super::DiffHunkKind::Modified));
+        assert_eq!(hunks[2].start, 32);
+        assert_eq!(hunks[2].len, 0);
+        assert!(matches!(hunks[2].kind, super::DiffHunkKind::Deleted));
     }
 
     #[test]
     fn routes_proxy_response_to_pending_callback() {
         let rpc = ProxyRpcHandler::new();
         let (tx, rx) = bounded(1);
-        rpc.get_hover(7, PathBuf::from("src/lib.rs"), Position::new(0, 0), move |result| {
-            tx.send(result).unwrap();
-        });
+        rpc.get_hover(
+            7,
+            PathBuf::from("src/lib.rs"),
+            Position::new(0, 0),
+            move |result| {
+                tx.send(result).unwrap();
+            },
+        );
 
         let response = ProxyResponse::HoverResponse {
             request_id: 7,
@@ -1292,20 +1520,23 @@ mod tests {
         let ProxyResponse::HoverResponse { hover, .. } = response else {
             panic!("expected hover response");
         };
-        assert!(matches!(&hover.contents, HoverContents::Scalar(MarkedString::String(text)) if text == "ok"));
+        assert!(
+            matches!(&hover.contents, HoverContents::Scalar(MarkedString::String(text)) if text == "ok")
+        );
     }
 
     #[test]
     fn publishes_checkpoint_files_atomically() {
-        let directory = std::env::temp_dir().join(format!(
-            "ahead-checkpoint-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let directory = std::env::temp_dir()
+            .join(format!("ahead-checkpoint-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("session.json");
-        write_atomic(&path, br#"{"format_version":"ahead.editor/v0-draft"}"#).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),
-            r#"{"format_version":"ahead.editor/v0-draft"}"#);
+        write_atomic(&path, br#"{"format_version":"ahead.editor/v0-draft"}"#)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"format_version":"ahead.editor/v0-draft"}"#
+        );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -40,7 +40,10 @@ pub enum FileChanged {
     Delete,
 }
 
-#[expect(clippy::large_enum_variant, reason = "completion/signature responses carry payloads by value; consumed once per notification")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "completion/signature responses carry payloads by value; consumed once per notification"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -156,7 +159,10 @@ pub struct CoreRpcHandler {
     tx: Sender<CoreRpc>,
     rx: Receiver<CoreRpc>,
     id: Arc<AtomicU64>,
-    #[expect(clippy::type_complexity, reason = "message-map type alias would hide the channel triple; keep explicit")]
+    #[expect(
+        clippy::type_complexity,
+        reason = "message-map type alias would hide the channel triple; keep explicit"
+    )]
     pending: Arc<Mutex<HashMap<u64, Sender<Result<CoreResponse, RpcError>>>>>,
 }
 
@@ -394,6 +400,8 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerStatusParams {
+    #[serde(default)]
+    pub server_name: Option<String>,
     health: String,
     quiescent: bool,
     pub message: Option<String>,
@@ -402,5 +410,9 @@ pub struct ServerStatusParams {
 impl ServerStatusParams {
     pub fn is_ok(&self) -> bool {
         self.health.as_str() == "ok"
+    }
+
+    pub fn is_quiescent(&self) -> bool {
+        self.quiescent
     }
 }
