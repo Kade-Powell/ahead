@@ -1005,9 +1005,8 @@ impl Render for Shell {
                                     }))
                             )
                             .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(1.))
+                                div()
+                                    .relative()
                                     .child(
                                         active_button(
                                             Button::new("language_servers_btn")
@@ -1023,6 +1022,9 @@ impl Render for Shell {
                                     )
                                     .child(
                                         div()
+                                            .absolute()
+                                            .top(px(3.))
+                                            .right(px(3.))
                                             .w(px(6.))
                                             .h(px(6.))
                                             .rounded_full()
