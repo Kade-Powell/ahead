@@ -211,7 +211,11 @@ impl Shell {
             branch: branch.to_string(),
             session,
             threads,
-            code_tabs: vec![code.clone()],
+            code_tabs: if code.read(cx).file_path.is_empty() {
+                Vec::new()
+            } else {
+                vec![code.clone()]
+            },
             code,
             explorer,
             debug_bar,
@@ -1207,24 +1211,21 @@ pub fn launch() {
         }
     }
 
-    if file_path.is_empty() {
-        file_path = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join("README.md")
-            .to_string_lossy()
-            .to_string();
-    }
-
+    let current_dir =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let explorer_root = root_arg
         .or_else(|| {
-            std::path::Path::new(&file_path)
-                .parent()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_string())
+            if file_path.is_empty() {
+                Some(current_dir.to_string_lossy().to_string())
+            } else {
+                std::path::Path::new(&file_path)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .and_then(|p| p.to_str())
+                    .map(|s| s.to_string())
+            }
         })
-        .unwrap_or_else(|| {
-            "/Users/kpowel859@cable.comcast.com/dev/ahead".to_string()
-        });
+        .unwrap_or_else(|| current_dir.to_string_lossy().to_string());
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
