@@ -441,6 +441,101 @@ impl Shell {
             return;
         };
 
+        let file_path = self.code_tabs[index].read(cx).file_path.clone();
+        let workspace = self.explorer.read(cx).root.clone();
+        let set_status =
+            |shell: &mut Self, status: String, cx: &mut Context<Self>| {
+                if let Some(code) = shell.code_tabs.get(index) {
+                    code.update(cx, |code, cx| {
+                        code.status = status.into();
+                        cx.notify();
+                    });
+                }
+            };
+        match action {
+            crate::code_panel::CodeTabAction::CopyRelativePath => {
+                let relative = crate::explorer_panel::relative_path(
+                    std::path::Path::new(&workspace),
+                    std::path::Path::new(&file_path),
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    relative.to_string_lossy().into_owned(),
+                ));
+                set_status(self, "Copied relative path".to_string(), cx);
+                return;
+            }
+            crate::code_panel::CodeTabAction::CopyAbsolutePath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(file_path.clone()));
+                set_status(self, "Copied absolute path".to_string(), cx);
+                return;
+            }
+            crate::code_panel::CodeTabAction::AddToGitignore => {
+                let status = match crate::explorer_panel::add_to_gitignore(
+                    std::path::Path::new(&workspace),
+                    std::path::Path::new(&file_path),
+                ) {
+                    Ok(true) => "Added to .gitignore".to_string(),
+                    Ok(false) => "Already in .gitignore".to_string(),
+                    Err(error) => format!("Could not update .gitignore: {error}"),
+                };
+                set_status(self, status, cx);
+                return;
+            }
+            crate::code_panel::CodeTabAction::RevealInFinder => {
+                cx.reveal_path(std::path::Path::new(&file_path));
+                return;
+            }
+            crate::code_panel::CodeTabAction::DuplicateFile => {
+                let status = match crate::explorer_panel::duplicate_path(
+                    std::path::Path::new(&file_path),
+                ) {
+                    Ok(destination) => {
+                        format!("Duplicated {}", destination.display())
+                    }
+                    Err(error) => format!("Could not duplicate: {error}"),
+                };
+                self.explorer
+                    .update(cx, |explorer, cx| explorer.refresh(cx));
+                set_status(self, status, cx);
+                return;
+            }
+            crate::code_panel::CodeTabAction::DeleteFile => {
+                if let Err(error) = crate::explorer_panel::delete_path(
+                    std::path::Path::new(&file_path),
+                ) {
+                    set_status(self, format!("Could not delete: {error}"), cx);
+                    return;
+                }
+                self.code_tabs.remove(index);
+                self.explorer
+                    .update(cx, |explorer, cx| explorer.refresh(cx));
+                let active_code = self
+                    .code_tabs
+                    .get(index.min(self.code_tabs.len().saturating_sub(1)))
+                    .cloned();
+                if let Some(code) = active_code {
+                    self.set_active_code(code, cx);
+                } else {
+                    self.session.update(cx, |session, _| session.code = None);
+                }
+                self.set_center_layout(false, false, false, window, cx);
+                return;
+            }
+            crate::code_panel::CodeTabAction::ViewHistory => {
+                let relative = crate::explorer_panel::relative_path(
+                    std::path::Path::new(&workspace),
+                    std::path::Path::new(&file_path),
+                );
+                let command = format!(
+                    "git log --follow --oneline -- {}",
+                    shell_quote(&relative.to_string_lossy()),
+                );
+                self.new_terminal_in(workspace, Some(command), window, cx);
+                return;
+            }
+            _ => {}
+        }
+
         if matches!(action, crate::code_panel::CodeTabAction::Promote) {
             let code = self.code_tabs[index].clone();
             code.update(cx, |code, cx| code.promote_preview(cx));
@@ -464,7 +559,14 @@ impl Shell {
                 self.code_tabs.truncate(index + 1);
             }
             crate::code_panel::CodeTabAction::CloseAll => self.code_tabs.clear(),
-            crate::code_panel::CodeTabAction::Promote => unreachable!(),
+            crate::code_panel::CodeTabAction::Promote
+            | crate::code_panel::CodeTabAction::CopyRelativePath
+            | crate::code_panel::CodeTabAction::CopyAbsolutePath
+            | crate::code_panel::CodeTabAction::AddToGitignore
+            | crate::code_panel::CodeTabAction::RevealInFinder
+            | crate::code_panel::CodeTabAction::DuplicateFile
+            | crate::code_panel::CodeTabAction::DeleteFile
+            | crate::code_panel::CodeTabAction::ViewHistory => return,
         }
 
         let active_code = if matches!(
@@ -577,19 +679,23 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_terminal_in(cwd, Some(recipe), window, cx);
+        self.new_terminal_in(
+            cwd,
+            Some(format!("just {}", shell_quote(&recipe))),
+            window,
+            cx,
+        );
     }
 
     fn new_terminal_in(
         &mut self,
         cwd: String,
-        recipe: Option<String>,
+        command: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
-        let command = recipe.map(|recipe| format!("just {}", shell_quote(&recipe)));
         let terminal = cx.new(|cx| {
             crate::terminal_panel::TerminalPanel::new_with_cwd(terminal_id, cwd, cx)
         });

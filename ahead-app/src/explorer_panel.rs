@@ -9,7 +9,12 @@ use gpui_kit::component::{h_flex, v_flex, ActiveTheme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
-use std::{collections::HashSet, io::Write, process::Stdio};
+use std::{
+    collections::HashSet,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 pub struct ExplorerPanel {
     pub focus: FocusHandle,
@@ -169,14 +174,32 @@ impl ExplorerPanel {
         self.entries = entries;
         self.git_badges = git_badge_map(&self.root);
         let mut tree_paths = HashSet::new();
-        let tree_items =
-            build_tree_items(std::path::Path::new(&self.root), 0, &mut tree_paths);
+        let tree_items = build_tree_items(
+            std::path::Path::new(&self.root),
+            0,
+            &mut tree_paths,
+            None,
+        );
         self.ignored_paths =
             git_ignored_paths(std::path::Path::new(&self.root), &tree_paths);
         self.tree_state.update(cx, |state, cx| {
             state.set_items(tree_items, cx);
         });
         self.status = format!("{} entries", self.entries.len()).into();
+        cx.notify();
+    }
+
+    fn set_all_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        let mut tree_paths = HashSet::new();
+        let tree_items = build_tree_items(
+            Path::new(&self.root),
+            0,
+            &mut tree_paths,
+            Some(expanded),
+        );
+        self.tree_state.update(cx, |state, cx| {
+            state.set_items(tree_items, cx);
+        });
         cx.notify();
     }
 
@@ -215,6 +238,7 @@ fn build_tree_items(
     dir: &std::path::Path,
     depth: usize,
     tree_paths: &mut HashSet<String>,
+    expansion: Option<bool>,
 ) -> Vec<TreeItem> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -235,13 +259,13 @@ fn build_tree_items(
             tree_paths.insert(path_string.clone());
             let is_dir = path.is_dir();
             let children = if is_dir && depth < 2 {
-                build_tree_items(&path, depth + 1, tree_paths)
+                build_tree_items(&path, depth + 1, tree_paths, expansion)
             } else {
                 Vec::new()
             };
             let item = TreeItem::new(path_string, name)
                 .children(children)
-                .expanded(depth == 0);
+                .expanded(expansion.unwrap_or(depth == 0));
             Some(item)
         })
         .collect()
@@ -310,6 +334,92 @@ fn gradient_color(colors: &[Hsla], amount: f32) -> Hsla {
     let index = scaled.floor() as usize;
     let next = (index + 1).min(colors.len() - 1);
     lerp_color(colors[index], colors[next], scaled - index as f32)
+}
+
+pub(crate) fn relative_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn add_to_gitignore(root: &Path, path: &Path) -> Result<bool, String> {
+    let relative = relative_path(root, path);
+    if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        return Err("The workspace root cannot be added to .gitignore".to_string());
+    }
+    let mut entry = relative.to_string_lossy().replace('\\', "/");
+    if path.is_dir() {
+        entry.push('/');
+    }
+    let ignore_path = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&ignore_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(false);
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&entry);
+    updated.push('\n');
+    std::fs::write(ignore_path, updated).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+pub(crate) fn duplicate_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "The file has no parent directory".to_string())?;
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "The file name is not valid UTF-8".to_string())?;
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1..10_000 {
+        let name = match extension {
+            Some(extension) => format!("{} copy {}.{}", stem, index, extension),
+            None => format!("{} copy {}", stem, index),
+        };
+        let destination = parent.join(name);
+        if destination.exists() {
+            continue;
+        }
+        if path.is_dir() {
+            copy_directory(path, &destination)?;
+        } else {
+            std::fs::copy(path, &destination).map_err(|error| error.to_string())?;
+        }
+        return Ok(destination);
+    }
+    Err("Could not find an unused duplicate name".to_string())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::create_dir(destination).map_err(|error| error.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else {
+            std::fs::copy(source_path, destination_path)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_path(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        std::fs::remove_file(path).map_err(|error| error.to_string())
+    }
 }
 
 fn colored_directory_name(
@@ -519,11 +629,20 @@ impl Render for ExplorerPanel {
                     },
                 )
                 .context_menu(
-                    move |_ix, entry, menu, window, _cx| {
+                    move |_ix, entry, menu, window, cx| {
                         let path = entry.item().id.to_string();
                         let is_dir = entry.is_folder();
                         let explorer = explorer.clone();
-                        menu.item(PopupMenuItem::new("Open").on_click(
+                        let root = explorer.read(cx).root.clone();
+                        let relative = relative_path(Path::new(&root), Path::new(&path))
+                            .to_string_lossy()
+                            .into_owned();
+                        let absolute = path.clone();
+                        let reveal_path = path.clone();
+                        let ignore_path = path.clone();
+                        let duplicate_source = path.clone();
+                        let delete_source = path.clone();
+                        let mut menu = menu.item(PopupMenuItem::new("Open").on_click(
                             window.listener_for(
                                 &explorer,
                                 move |this, _, window, cx| {
@@ -536,7 +655,97 @@ impl Render for ExplorerPanel {
                                     }
                                 },
                             ),
-                        ))
+                        ));
+                        menu = menu
+                            .separator()
+                            .item(PopupMenuItem::new("Copy Relative Path").on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        relative.clone(),
+                                    ));
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Copy Absolute Path").on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        absolute.clone(),
+                                    ));
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Reveal in File Manager").on_click(
+                                move |_, _, cx| {
+                                    cx.reveal_path(Path::new(&reveal_path));
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Add to .gitignore").on_click(
+                                window.listener_for(
+                                    &explorer,
+                                    move |this, _, _, cx| {
+                                        let status = match add_to_gitignore(
+                                            Path::new(&this.root),
+                                            Path::new(&ignore_path),
+                                        ) {
+                                            Ok(true) => "Added to .gitignore".into(),
+                                            Ok(false) => "Already in .gitignore".into(),
+                                            Err(error) => format!(
+                                                "Could not update .gitignore: {error}"
+                                            )
+                                            .into(),
+                                        };
+                                        this.status = status;
+                                        cx.notify();
+                                    },
+                                ),
+                            ))
+                            .item(PopupMenuItem::new("Duplicate").on_click(
+                                window.listener_for(
+                                    &explorer,
+                                    move |this, _, _, cx| {
+                                        let status = match duplicate_path(
+                                            Path::new(&duplicate_source),
+                                        ) {
+                                            Ok(destination) => {
+                                                format!("Duplicated {}", destination.display())
+                                            }
+                                            Err(error) => {
+                                                format!("Could not duplicate: {error}")
+                                            }
+                                        };
+                                        this.refresh(cx);
+                                        this.status = status.into();
+                                        cx.notify();
+                                    },
+                                ),
+                            ))
+                            .item(PopupMenuItem::new("Delete").on_click(
+                                window.listener_for(
+                                    &explorer,
+                                    move |this, _, _, cx| {
+                                        let status = match delete_path(Path::new(&delete_source)) {
+                                            Ok(()) => "Deleted".to_string(),
+                                            Err(error) => format!("Could not delete: {error}"),
+                                        };
+                                        this.refresh(cx);
+                                        this.status = status.into();
+                                        cx.notify();
+                                    },
+                                ),
+                            ));
+                        if is_dir {
+                            menu = menu
+                                .separator()
+                                .item(PopupMenuItem::new("Expand All").on_click(
+                                    window.listener_for(&explorer, |this, _, _, cx| {
+                                        this.set_all_expanded(true, cx);
+                                    }),
+                                ))
+                                .item(PopupMenuItem::new("Collapse All").on_click(
+                                    window.listener_for(&explorer, |this, _, _, cx| {
+                                        this.set_all_expanded(false, cx);
+                                    }),
+                                ));
+                        }
+                        menu
                     },
                 )
             })
@@ -552,7 +761,7 @@ impl Render for ExplorerPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_git_badge, GitStatuses};
+    use super::{GitStatuses, record_git_badge, relative_path};
 
     #[test]
     fn propagates_strongest_badge_to_directory_ancestors() {
@@ -571,5 +780,16 @@ mod tests {
         assert!(src_statuses.contains(GitStatuses::MODIFIED));
         assert!(src_statuses.contains(GitStatuses::UNTRACKED));
         assert_eq!(badges.get("/workspace"), Some(&src_statuses));
+    }
+
+    #[test]
+    fn computes_workspace_relative_paths() {
+        assert_eq!(
+            relative_path(
+                std::path::Path::new("/workspace"),
+                std::path::Path::new("/workspace/src/lib.rs"),
+            ),
+            std::path::PathBuf::from("src/lib.rs")
+        );
     }
 }

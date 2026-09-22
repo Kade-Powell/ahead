@@ -16,7 +16,8 @@ use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent, PanelId, TabGroup,
 };
 use gpui_kit::component::input::{
-    Editor, EditorState, InputEvent, RopeExt, TabSize,
+    Copy as CopyAction, Cut as CutAction, Editor, EditorState, InputEvent,
+    Paste as PasteAction, RopeExt, SelectAll, TabSize,
 };
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::text::TextView;
@@ -50,6 +51,13 @@ pub enum CodeTabAction {
     CloseAll,
     CloseLeft,
     CloseRight,
+    CopyRelativePath,
+    CopyAbsolutePath,
+    AddToGitignore,
+    RevealInFinder,
+    DuplicateFile,
+    DeleteFile,
+    ViewHistory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -666,6 +674,7 @@ impl Panel for CodePanel {
         let tab_handler = self.tab_handler.clone();
         let double_tab_handler = tab_handler.clone();
         let button_tab_handler = tab_handler.clone();
+        let file_tab_handler = tab_handler.clone();
         let title = SharedString::from(file_name.to_string());
         let tab_label = div()
             .when(self.is_preview, |this| this.italic())
@@ -689,7 +698,7 @@ impl Panel for CodePanel {
             })
             .context_menu(move |menu, _window, _cx| {
                 let item = |label: &'static str, action: CodeTabAction| {
-                    let tab_handler = tab_handler.clone();
+                    let tab_handler = file_tab_handler.clone();
                     PopupMenuItem::new(label).on_click(move |_, window, cx| {
                         if let Some(handler) = tab_handler.as_ref() {
                             handler(panel_id, action, window, cx);
@@ -703,6 +712,24 @@ impl Panel for CodePanel {
                     .item(item("Close Right", CodeTabAction::CloseRight))
                     .separator()
                     .item(item("Close All", CodeTabAction::CloseAll))
+                    .separator()
+                    .item(item(
+                        "Copy Relative Path",
+                        CodeTabAction::CopyRelativePath,
+                    ))
+                    .item(item(
+                        "Copy Absolute Path",
+                        CodeTabAction::CopyAbsolutePath,
+                    ))
+                    .item(item("Add to .gitignore", CodeTabAction::AddToGitignore))
+                    .item(item(
+                        "Reveal in File Manager",
+                        CodeTabAction::RevealInFinder,
+                    ))
+                    .item(item("Duplicate File", CodeTabAction::DuplicateFile))
+                    .item(item("Delete File", CodeTabAction::DeleteFile))
+                    .separator()
+                    .item(item("View History", CodeTabAction::ViewHistory))
             })
             .child(tab_label)
             .child(
@@ -798,6 +825,8 @@ impl Render for CodePanel {
             .unwrap_or_default();
         let selected_idx = self.selected_completion;
         let code_panel = cx.entity();
+        let tab_handler = self.tab_handler.clone();
+        let panel_id = self.panel_id;
 
         // Native Git gutter: real hunks for this file. Green = added, amber = modified.
         let workspace = if self.workspace.is_empty() {
@@ -1048,7 +1077,81 @@ impl Render for CodePanel {
                         .relative()
                         .bg(editor_bg)
                             .context_menu(move |menu, window, _cx| {
-                                menu.item(
+                                let editor_focus = code_panel
+                                    .read(_cx)
+                                    .editor
+                                    .read(_cx)
+                                    .focus_handle(_cx);
+                                let file_item =
+                                    |label: &'static str, action: CodeTabAction| {
+                                        let tab_handler = tab_handler.clone();
+                                        PopupMenuItem::new(label).on_click(
+                                            move |_, window, cx| {
+                                                if let Some(handler) =
+                                                    tab_handler.as_ref()
+                                                {
+                                                    handler(
+                                                        panel_id, action, window, cx,
+                                                    );
+                                                }
+                                            },
+                                        )
+                                    };
+                                menu.item(PopupMenuItem::new("Cut").on_click({
+                                    let editor_focus = editor_focus.clone();
+                                    move |_, window, cx| {
+                                        editor_focus.dispatch_action(&CutAction, window, cx);
+                                    }
+                                }))
+                                .item(PopupMenuItem::new("Copy").on_click({
+                                    let editor_focus = editor_focus.clone();
+                                    move |_, window, cx| {
+                                        editor_focus.dispatch_action(&CopyAction, window, cx);
+                                    }
+                                }))
+                                .item(PopupMenuItem::new("Paste").on_click({
+                                    let editor_focus = editor_focus.clone();
+                                    move |_, window, cx| {
+                                        editor_focus.dispatch_action(&PasteAction, window, cx);
+                                    }
+                                }))
+                                .item(PopupMenuItem::new("Select All").on_click(
+                                    move |_, window, cx| {
+                                        editor_focus.dispatch_action(&SelectAll, window, cx);
+                                    },
+                                ))
+                                .separator()
+                                .item(file_item(
+                                    "Copy Relative Path",
+                                    CodeTabAction::CopyRelativePath,
+                                ))
+                                .item(file_item(
+                                    "Copy Absolute Path",
+                                    CodeTabAction::CopyAbsolutePath,
+                                ))
+                                .item(file_item(
+                                    "Add to .gitignore",
+                                    CodeTabAction::AddToGitignore,
+                                ))
+                                .item(file_item(
+                                    "Reveal in File Manager",
+                                    CodeTabAction::RevealInFinder,
+                                ))
+                                .item(file_item(
+                                    "Duplicate File",
+                                    CodeTabAction::DuplicateFile,
+                                ))
+                                .item(file_item(
+                                    "Delete File",
+                                    CodeTabAction::DeleteFile,
+                                ))
+                                .separator()
+                                .item(file_item(
+                                    "View History",
+                                    CodeTabAction::ViewHistory,
+                                ))
+                                .separator()
+                                .item(
                                     PopupMenuItem::new("Refresh diagnostics").on_click(
                                         window.listener_for(
                                             &code_panel,
