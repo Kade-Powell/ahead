@@ -51,6 +51,15 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "boolean": {
+                    "type": "string"
+                },
+                "operator": {
+                    "type": "string"
+                },
+                "punctuation": {
+                    "type": "string"
+                },
                 "comment": {
                     "type": "string"
                 },
@@ -148,6 +157,27 @@
                     "type": "string"
                 },
                 "tag": {
+                    "type": "string"
+                },
+                "markup.heading": {
+                    "type": "string"
+                },
+                "markup.bold": {
+                    "type": "string"
+                },
+                "markup.italic": {
+                    "type": "string"
+                },
+                "markup.list": {
+                    "type": "string"
+                },
+                "markup.link.url": {
+                    "type": "string"
+                },
+                "markup.link.label": {
+                    "type": "string"
+                },
+                "markup.link.text": {
                     "type": "string"
                 },
                 "bracket.color.1": {

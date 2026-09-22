@@ -19,9 +19,9 @@
 | Extension answer | `gpui-shell`: JS plugins in-process, host-granted capabilities, default-deny, +13.5 MiB, no WebView/DOM — resolves §15 without VSIX host | npm ecosystem; plugin sandbox must be custom-built around the DOM | No story |
 | Language | All Rust | Rust + JS split; webview memory; two runtimes | All Rust |
 | A11y | Weakest point — must be a spike gate | Best (native platform a11y via webview) | Mediocre |
-| Maturity risk | gpui-kit young (0.6.1, 2026-09-09); upstream Zed reportedly slowed GPUI dev — pin rev, keep Floem branch | Tauri v2 stable + mobile, mature | Mature framework, immature editor story |
+| Maturity risk | gpui-kit young (0.6.6, 2026-09-22); upstream Zed reportedly slowed GPUI dev — pin rev, keep Floem branch | Tauri v2 stable + mobile, mature | Mature framework, immature editor story |
 
-Pins (2026-09-17): `gpui-kit` **0.6.1**, Apache-2.0, `github.com/longbridge/gpui-kit`, `https://gpui-kit.com`.
+Pins (2026-09-22): `gpui-kit` **0.6.6**, Apache-2.0, `github.com/longbridge/gpui-kit`, `https://gpui-kit.com`.
 
 ## Decision
 
@@ -65,8 +65,8 @@ for **full GPUI port**, against Tauri + Leptos/Dioxus/Vue:
 
 ## Spike evidence so far (`../ahead-spike-gpui/spike`, branch `spike/gpui-kit`)
 
-- Resolved pins: `gpui-kit` 0.6.1, `gpui-base` 0.6.1, `gpui-component`
-  0.6.1, `gpui-pre` 0.3.5. `cargo check` passes (~38 s first build).
+- Resolved pins: `gpui-kit` 0.6.6, `gpui-base` 0.6.6, `gpui-component`
+  0.6.6, `gpui-pre` 0.3.6. `cargo check` passes (~38 s first build).
 - API confirmed in vendored source: `Editor::new(&Entity<EditorState>)`,
   `EditorState::new(window, cx).language(..).default_value(..)`,
   per-language `tree-sitter-*` features, `dock/` with panel registry

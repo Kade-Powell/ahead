@@ -140,7 +140,7 @@ lsp-types = { version = "0.95.1", features = ["proposed"] }                     
 ahead-core = { path = "./ahead-core" }
 ahead-rpc  = { path = "./ahead-rpc" }
 
-gpui-kit = { version = "0.6", features = ["tree-sitter-rust"] }
+gpui-kit = { version = "=0.6.6", features = ["tree-sitter-rust"] }
 
 [patch.crates-io]
 regalloc2 = { rev = "5d79e12d0a93b10fc181f4da409b4671dd365228", git = "https://github.com/bytecodealliance/regalloc2" }

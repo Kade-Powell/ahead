@@ -13,5 +13,5 @@ alacritty_terminal = { workspace = true }
 crossbeam-channel = { workspace = true }
 chrono          = { workspace = true }
 gpui-kit        = { workspace = true }
-gpui-kit-assets = "0.6"
+gpui-kit-assets = "=0.6.6"
 uuid            = { version = "1.7", features = ["v4"] }
