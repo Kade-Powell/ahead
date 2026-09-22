@@ -4,7 +4,7 @@ Status: editor/repository direction and Zed extension ecosystem target confirmed
 Prepared: 2026-09-17.
 Audience: AHEAD maintainers.
 Companion: [proposed DTOs](ahead-editor-contracts.ts).
-Follow-up: [HumanLayer-inspired workflows and harness choice](ahead-humanlayer-workflows.md) (2026-09-18 proposal; includes the confirmed Codex harness-fidelity requirement).
+Research provenance: [HumanLayer workflow research and harness evidence](ahead-humanlayer-workflows.md) (dated 2026-09-18; includes the rationale for the confirmed managed-runtime fidelity requirement).
 Workflow review: [SDLC atlas, role diagrams and artifact convention](ahead-workflows.md). Its decision table tracks confirmed requirements, proposed defaults and open questions as the design evolves.
 Agent skills: [AHEAD agent skills](ahead-agent-skills.md) defines built-in procedures, workspace skill discovery, `AGENTS.md` loading, provenance and human-led policy.
 
@@ -14,7 +14,7 @@ Build a native editor for engineers who want to remain responsible for the think
 
 The differentiator should be the quality of working together: an agent can show the relevant code, listen while the engineer reasons aloud, ask a useful question, prepare repetitive work within a stated boundary, and retain the reasoning for the next person. Measure that experience before optimizing autonomous task throughput.
 
-This repository becomes **AHEAD, the editor**, as a maintained fork of Lapce. Replace the existing framework, workflow engine, Pi/VS Code integrations, generated policy and release tooling; no legacy runtime or data compatibility is required. Carry forward the human-led engineering principles through native editor behavior. Derive a separately versioned agent runtime from Codex app-server and keep ACP as a second backend. Treat DeltaDB as a dependency requiring verification, with a concrete Yrs-based collaboration fallback. AHEAD's ecosystem compatibility target is Zed extensions for general language and tooling support; general VS Code extension compatibility is not a target.
+This repository becomes **AHEAD, the editor**, as a maintained fork of Lapce. Replace the existing framework, workflow engine, Pi/VS Code integrations, generated policy and release tooling; no legacy runtime or data compatibility is required. Carry forward the human-led engineering principles through native editor behavior. Preserve the selected agent's real harness; the harness boundary is settled as two tiers in §3.4–3.5 (managed AHEAD runtime vs external ACP agents). Treat DeltaDB as a dependency requiring verification, with a concrete Yrs-based collaboration fallback. AHEAD's ecosystem compatibility target is Zed extensions for general language and tooling support; general VS Code extension compatibility is not a target.
 
 Confirmed requirements: the first usable editor has **streamed, full-duplex voice**, including listening during speech playback and ongoing coding work. Predictions receive the active AHEAD work and task intent, current unsaved code, relevant other open files and recent edits. These are foundation requirements, not later enhancements.
 
@@ -62,6 +62,14 @@ Recommend macOS for the first daily-driver pilot because that is the present dev
 
 Upstream provides reusable editor improvements, but integrating them still requires conflict resolution and regression checks. Preserve upstream history, crate names and module boundaries; keep AHEAD changes concentrated at explicit extension points. Section 12 defines the update strategy.
 
+The 2026-09-21 decision strengthens this reuse boundary: for mature editor
+surfaces, AHEAD will bring down a pinned Zed source checkout and directly
+port/prune the relevant implementation and tests. This applies first to
+multi-file editing, search, source control, terminal/tasks and debugging. Zed
+is not a runtime dependency; preserve its Apache-2.0 notices and record the
+imported revision and AHEAD modifications. AHEAD-specific session, agent
+policy, attribution, voice and collaboration behavior stays native.
+
 ### 3.2 VS Code extensions: an explicit compatibility gap
 
 Lapce currently advertises a WASI plugin system and built-in LSP. A maintainer explicitly declined implementing VS Code extensions in the upstream discussion. Its proxy uses a WASM runtime, not the VS Code extension host. Sharing a language server or a theme does not mean running the original VS Code extension. [Current Lapce features](https://lap.dev/lapce/), [maintainer response](https://github.com/lapce/lapce/discussions/2688), [proxy dependencies](https://github.com/lapce/lapce/blob/master/lapce-proxy/Cargo.toml), [VS Code extension host](https://code.visualstudio.com/api/advanced-topics/extension-host).
@@ -90,15 +98,13 @@ Zed's Rust/WASM extension API is an explicit compatibility boundary, not a reaso
 
 ### 3.4 Own the policy boundary; reuse the agent machinery
 
-Codex app-server is intended for rich product integrations and exposes conversations, streamed turns, approvals, and lifecycle control. Start with its local stdio boundary and generated schema. Pin the runtime revision and protocol; do not couple the editor to unversioned internal Rust structures. [Codex app-server](https://learn.chatgpt.com/docs/app-server).
+The managed AHEAD runtime exposes conversations, streamed turns, approvals, and lifecycle control through its private server protocol. **Managed sessions use the direct local stdio boundary and runtime-owned protocol types** so AHEAD owns the effect boundary; external ACP agents use the adapter boundary in §3.5 for compatibility. Pin the runtime revision and protocol; do not couple the editor to unversioned internal Rust structures. The historical upstream protocol reference remains useful for compatibility work.
 
-Use a maintained AHEAD runtime fork only where the managed policy cannot be enforced through supported configuration and host tools. Candidate patches:
+**Managed-runtime fidelity requirement, confirmed 2026-09-18:** preserve the pinned runtime's model-facing tools, including names, descriptions, schemas/grammars, result/error formats and model-specific tool selection. Retain its instruction layering, conversation/tool-call ordering, compaction, streaming and cancellation. Wire-protocol compatibility alone is not harness reuse. The embedded source's upstream ancestry is provenance; the product/runtime identity is AHEAD. Model-specific guidance remains useful for the behavior we preserve.
 
-- Replace autonomous engineering instructions with the selected AHEAD phase and Learn/Assist profile.
-- Restrict the registered tool set; remove direct mutation and arbitrary command paths from managed sessions.
-- Route reads of open documents, presentation, proposed edits, and approved application through AHEAD.
-- Audit disabled paths such as shell, nested execution, hooks, plugins, subagents, and MCP mutations.
-- Add only provider transports missing from the pinned runtime and actually needed by the pilot.
+Use supported runtime configuration and additive AHEAD context before considering a fork. AHEAD owns the durable work, editor buffers, presentation and attribution; the selected harness owns inference and tool execution. Do not replace native editing tools with proposal-only AHEAD tools. Agent edits follow the user's instruction and existing attribution rules; the conversation has no per-edit approval cards. Runtime sandbox permissions remain distinct from product/design decisions.
+
+The earlier candidate plan to strip direct shell/file tools and replace the native instruction set is withdrawn. Any necessary divergence must identify the missing capability and be checked against the pinned upstream runtime. Removing telemetry, cloud product features or an unused terminal UI is not justification for rewriting core tool or context behavior.
 
 Keep upstream inference streaming, conversation management, cancellation, context handling, and security maintenance where compatible. Do not copy a few loop functions and assume the surrounding runtime can be discarded. Use a separate process so a runtime crash does not take down the editor.
 
@@ -106,13 +112,15 @@ Codex's current official configuration documents already include local Ollama/LM
 
 Both Lapce and the public Codex repository are Apache-2.0 licensed. Preserve license/NOTICE material, attribution, and notices of modifications; check bundled dependencies separately. That license does not grant access to hosted services or brand rights. The public Codex repository is not a blanket license to copy every feature of the desktop product. Retain applicable MIT notices for any Maieutic/AHEAD material actually carried into the editor. [Codex license](https://github.com/openai/codex/blob/main/LICENSE), [Lapce license](https://github.com/lapce/lapce/blob/master/LICENSE).
 
-### 3.5 ACP is a backend option, not a competing product architecture
+### 3.5 ACP is the external-agent compatibility surface
 
-AHEAD owns sessions, modes, code anchors, human gates and presentation regardless of agent. Initially ship one managed runtime and one tested ACP backend. Use ACP's initialization, prompting, cancellation, updates, permissions and filesystem support where available; AHEAD-specific presentation can be an optional tool surface.
+AHEAD owns durable work sessions, task intents, code anchors, human design decisions and presentation regardless of agent. **Settled 2026-09-18:** ACP is the compatibility surface for external agents, not the managed enforcement boundary. The maintained external Codex ACP adapter launches the real Codex App Server and works for streaming, cancellation, resume and conversation, but a live probe showed it ran shell/`edit` tool calls with no permission requests and never routed writes through the client, even in `read-only` mode. AHEAD's managed teaching/assistance lifecycle therefore runs the AHEAD runtime directly; see the [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18). [Codex ACP adapter](https://github.com/agentclientprotocol/codex-acp).
 
-ACP filesystem requests can access unsaved client text. Its advertised capabilities tell an agent which client methods it may use; they do not sandbox an agent's direct operating-system access. A mode label is not proof of enforcement. [ACP overview](https://agentclientprotocol.com/protocol/v1/overview), [filesystem methods](https://agentclientprotocol.com/protocol/v1/file-system), [session modes](https://agentclientprotocol.com/protocol/v1/session-modes).
+Use ACP's initialization, prompting, cancellation, updates, permissions and filesystem support for external agents and for any presentation the adapter actually honors. ACP is the editor-to-agent protocol, not a replacement model tool vocabulary. See the [dated harness research](ahead-humanlayer-workflows.md#harness-research) for the probe evidence and decision rationale.
 
-Managed Assist requires tested mediation and sandboxing. An arbitrary external ACP process may be offered as an explicitly external integration later, but cannot claim AHEAD's enforcement guarantees. Switching backends creates a new backend conversation with an explicit evidence/handoff package; raw hidden state and provider-specific tool history are not assumed portable.
+ACP filesystem requests can access unsaved client text, but the agent may bypass them and use its own process. Advertising capabilities does not sandbox that process, and a mode label is not proof of enforcement — live tests confirmed this. [ACP overview](https://agentclientprotocol.com/protocol/v1/overview), [filesystem methods](https://agentclientprotocol.com/protocol/v1/file-system), [session modes](https://agentclientprotocol.com/protocol/v1/session-modes).
+
+Managed Assist requires tested mediation and sandboxing, which is why the managed tier is the direct App Server with AHEAD's effect boundary. An external ACP process is offered as an explicitly external integration and cannot claim AHEAD's enforcement guarantees. Switching backends creates a new backend conversation with an explicit evidence/handoff package; raw hidden state and provider-specific tool history are not assumed portable.
 
 ### 3.6 DeltaDB is desirable; availability remains a gate
 
@@ -141,13 +149,12 @@ Do not combine investigation and diagnosis, or operations and bugs, simply to re
 
 The editor still opens and edits files without starting a wizard. AHEAD sessions add context when useful; ordinary navigation should not require a process record.
 
-### 4.2 Start Work: five short, resumable steps
+### 4.2 Start Work: four short, resumable steps
 
 1. **Choose work:** select an issue from this repository, resume saved work, or start locally. Show title, status, assignee and project column. Do not require tracker setup for a first local exploration.
-2. **Name the outcome:** choose one of the six labels. Suggest from issue context, but leave the human in control.
-3. **Give your starting point:** one short typed or spoken contribution appropriate to the work. Examples: desired behavior; observed versus expected; an invariant; an unanswered question; a current hypothesis. Preserve authorship and transcript corrections.
-4. **Set the collaboration:** choose the model, private or explicitly shared session, and optional teammates. Show where code and audio will be processed. Do not ask for a session-wide Learn/Assist choice; the first request determines whether the current task is teaching or assistance.
-5. **Begin:** open the relevant file/context and show the next useful reasoning step. Do not front-load the full workflow.
+2. **Describe the outcome and starting point:** one short typed or spoken contribution appropriate to the work. Examples: desired behavior; observed versus expected; an invariant; an unanswered question; a current hypothesis. The host or agent suggests one of the six descriptive work kinds; the human can correct it. Preserve authorship and transcript corrections. The first request creates a teaching task only when the human explicitly asks to learn; all other requests create assistance tasks.
+3. **Set the collaboration:** choose the model, private or explicitly shared session, and optional teammates. Show where code and audio will be processed. Do not ask for a session-wide Learn/Assist choice.
+4. **Begin:** open the relevant file/context and show the next useful reasoning step. Do not front-load the full workflow.
 
 The editor's versioned session policy determines whether the human starting point is sufficient for a particular AI capability. The wizard's text box is not an automatic approval.
 
@@ -235,7 +242,7 @@ The end-to-end pilot is: choose a GitHub issue; explain the outcome aloud; have 
 |---|---|---|
 | Editor | Daily-driver Lapce foundation for two pilot languages; normal Git/terminal/LSP | Broad extension/runtime parity, additional OS certification |
 | Work | Six proposed work categories; native wizard and phase rules, with change/debug/improve polished first | Additional categories only with demonstrated need |
-| AI | Managed Codex-derived runtime; one certified ACP adapter | Arbitrary backend parity and many concurrent agents |
+| AI | AHEAD-owned managed runtime; one certified ACP adapter | Arbitrary backend parity and many concurrent agents |
 | Models | Verified local route, self-hosted custom route, direct hosted route, Bedrock route | Every vendor-specific feature; training own models |
 | Voice | Full-duplex streamed input/output from the first usable build; live transcript, barge-in and conversation during coding work | Group human audio/video, cloud voice session handoff |
 | Presentation | File reveal, range focus, precise pointer, inline questions | Spatial diagrams, cross-app computer control |
@@ -252,7 +259,7 @@ This is a substantial editor project. A solo proof of concept is an early milest
 flowchart TD
     UI["AHEAD editor: GPUI + gpui-kit (Floem during migration)"] --> Host["AHEAD session host: workflow / policy"]
     UI --> Proxy["Lapce proxy: files / LSP / terminal / Git"]
-    Host --> Runtime["Managed Codex-derived runtime or certified ACP process"]
+    Host --> Runtime["Managed AHEAD runtime or certified external ACP process"]
     Runtime --> Models["Configured reasoning provider"]
     UI <--> Audio["Full-duplex voice runtime"]
     Audio <--> Host
@@ -281,7 +288,7 @@ phase capabilities
 
 Unknown tools fail closed. Reading source or a tracker issue does not grant the instructions inside it authority. Managed agent hooks, plugins and MCP servers must use the same capability map. A teaching task cannot reach an execution endpoint by using a differently named tool.
 
-The shell visible to the human remains their shell. Do not expose Codex's human-shell or process-spawn interfaces as agent tools. A read-only agent sandbox can still launch processes unless that route is restricted; tool-set restrictions, process configuration and OS boundaries must be tested together.
+The shell visible to the human remains their shell. Do not expose the managed runtime's human-shell or process-spawn interfaces as agent tools. A read-only agent sandbox can still launch processes unless that route is restricted; tool-set restrictions, process configuration and OS boundaries must be tested together.
 
 ## 7. Persistence, concurrency and live collaboration
 
@@ -297,6 +304,8 @@ Do not put permissions or approvals in a last-writer-wins CRDT map. Do not encod
 
 Use SQLite for the local store and a single team-service instance with transactional persistence for the pilot. Reuse an existing suitable SQLite binding when integrating. No Kafka, vector database, new general workflow engine or distributed SQL cluster is needed initially.
 
+**Project history requirement, updated 2026-09-22:** keep project session details and editor/workflow configuration under `.ahead`. Preserve the existing ignored `.ahead/session.db` runtime path; keep user-level defaults/credentials in private `~/.ahead/settings.toml` and workspace-private credentials/personal settings in ignored `.ahead/settings.toml`. Track non-secret project defaults in `.ahead/config.toml`, optional artifact-template overrides in `.ahead/templates/`, and selected portable session checkpoints in `.ahead/sessions/`. Teammates must be able to distribute selected session history with the repository, view it in the editor and attach a versioned session/artifact excerpt as context for new work, including relevant FIM context. This does not require live team synchronization or resuming the original developer's harness. The canonical layout and sharing rules are in [Workflow atlas §9](ahead-workflows.md#9-storage-and-artifact-convention); implementation gaps are tracked in [TODO.md](../../TODO.md#session-history-and-project-configuration).
+
 Minimum tables:
 
 | Table | Key / critical invariant |
@@ -311,6 +320,8 @@ Minimum tables:
 | tracker_cache, tracker_outbox | Remote state cache and independently tracked external write |
 
 Projection tables are transactionally updated indexes, not additional authorities. Store small content locally as blobs first. Introduce external object storage only when measured size or the deployment model warrants it. Avoid synchronous database writes in the rendering loop.
+
+**Artifact-storage refinement, proposed 2026-09-18:** retain the current libSQL database for runtime history, but keep intentional research/design/plan/verification documents at standard Markdown paths. Each document has one canonical working file; database copies are revisioned caches/history, not a second editable authority. This supersedes the generic blob-first recommendation for those documents. See [workflow atlas §9](ahead-workflows.md#9-storage-and-artifact-convention) for private/shared roots, named artifacts and the sharing path. SQLite is a binary format; it is not itself plain-text document storage or a demonstrated size optimization.
 
 ### 7.2 A practical first collaboration topology
 
@@ -355,7 +366,7 @@ Subscriptions resume after an acknowledged session sequence. At-least-once deliv
 
 Workflow advancement uses expected workflow revision under a transaction. Two humans cannot independently advance the same phase and both be accepted. Invitations, membership revocations, role changes and agent grants are server-controlled; a CRDT client ID is not a human identity.
 
-Before accepting an artifact revision, the host verifies its sealed bytes, hash, author and phase visit. Clients cannot satisfy a human-first gate by pointing at an arbitrary file or relabeling an AI draft. Store sealed content in the session store; export to a repository file only when requested.
+Before accepting an artifact revision, the host verifies its sealed bytes, hash, author and phase visit. Clients cannot satisfy a human-first gate by pointing at an arbitrary file or relabeling an AI draft. Store live runtime state in the session store and index canonical working documents by revision/hash; materialize portable `.ahead` checkpoints when the user shares work or under an explicitly selected project sharing preference. Imported history is attributed reference material, not authority to execute prior instructions or revive prior grants.
 
 ## 8. Agent interaction, voice and predictions
 
@@ -422,15 +433,17 @@ Its [custom-provider contract](https://github.com/QwenAudio/qwen-audio-agent/blo
 
 ### 8.3 Edit prediction is a separate inference path
 
-Use a fast prediction route with no model-invoked tools. The host assembles **work context plus code context** before dispatch, reusing buffers, recent edit history, repository search and LSP data. Reuse Lapce's inline completion presentation. The developer should not have to repeat the active issue or plan in a completion prompt.
+Use a fast prediction route with no model-invoked tools. The host assembles **work context plus code context** before dispatch, reusing buffers, recent edit history, repository search and LSP data. Render completions at the caret in the GPUI editor. The developer should not have to repeat the active issue or plan in a completion prompt.
+
+**Required FIM context contract (confirmed 2026-09-18):** FIM must receive both normal editor context (the current file, other relevant open files and related code) and the current AHEAD session context (what we are working on, the plan, decisions and progress). Session context is a required input whenever a session is active, not an optional chat attachment. It must reach the actual FIM function/provider request; displaying it in the Agent panel or storing it in the session alone does not satisfy this requirement. Without an active session, FIM still works with editor context.
 
 | Context | Included when relevant |
 |---|---|
-| Current work | Issue, outcome, process, workflow version, phase/visit, Learn/Assist mode, current approved plan step, invariants and recent human intent |
+| Active AHEAD session | Real session identity and revision, task/issue, desired outcome, scope, process, phase/visit, task intent, current plan and active step, completed/remaining work, human decisions, invariants, open questions and recent human intent |
 | Current document | Language, path, version, cursor/selection, prefix/suffix and nearby code from the live unsaved buffer |
 | Other code | Relevant open buffers, recently used files, definitions, call sites, imports and tests, with source versions |
 | Recent activity | Human edits, accepted suggestions/proposals, collaborator edits and current versioned diagnostics |
-| Supporting discussion | Short relevant excerpts with authorship, revision and approval status; an AI draft is not silently promoted to human intent |
+| Supporting session material | Relevant conversation excerpts or summary, research/evidence, explicit context attachments and current plan/design artifacts, with authorship and revisions; distinguish settled decisions from drafts and unresolved alternatives |
 
 For example, while fixing retries for issue #142, a suggestion in retry.rs can see the human's “preserve idempotency” invariant, the current plan step, an unsaved request type in another open tab and the failing test. Changing to another issue or plan phase replaces the work context automatically. Reading several files does not require applying edits to several files.
 
@@ -438,9 +451,13 @@ Current/open-file context is consistent with [VS Code's documented suggestions](
 
 Build a compact, versioned PredictionContextSnapshot. Prioritize the active edit and human work constraints, then rank related open-file excerpts and recent edits within token/latency budgets. Cache and update the relevant context as buffers or work change; do not run a full coding agent or repository-wide retrieval for each keystroke. Avoid dumping every open file or the entire conversation. All sources must belong to the permitted project/worktree and pass file exclusions and provider-destination rules, including unsaved buffers and discussion text.
 
+The snapshot combines live editor state with authoritative session state in the host, then passes through the prediction adapter to the FIM model. Include the current plan in full when it fits; otherwise retain its goal, constraints, active step and progress in a faithful summary, with relevant excerpts. Budgeting must not silently drop the active session or its behavioral constraints. Reuse a versioned session summary between keystrokes and refresh it when the plan, decisions or progress change. Current unsaved buffers take precedence over on-disk copies. Session switches must replace all prior session context, and a newer decision must supersede its older form.
+
 A request binds the snapshot hash, model route, policy, scope and target version. Cancel on typing/cursor movement, changes to consumed code/work context, scope or mode. Remote edits to an included document also invalidate it; an unrelated tab need not. Recheck these preconditions at acceptance, and discard late results. One acceptance is one undo group. Predictions must never block input or autoaccept.
 
-Learn disables model predictions. Under strict Assist, predictions operate only in an explicit mechanical scope with an established human contract. Ordinary LSP completion remains available. Broad “predict the next business function” behavior would contradict the current Maieutic principle and needs a separate product decision.
+Teaching tasks disable model predictions; ordinary LSP completion remains available. In assistance tasks, the human writes business logic with FIM and may accept suggestions expressing the session's chosen behavior. Suggestions remain at the human's caret, never apply automatically and do not authorize background agent edits. Record generated-text provenance and human acceptance without relabeling the suggestion as manually typed code. This supersedes the earlier mechanical-only prediction restriction.
+
+Acceptance evidence for this contract must inspect the actual outbound FIM request: an unsaved change in a relevant open file and an active plan/decision must both appear in the assembled context; changing that decision must update the next request and invalidate an older suggestion; switching sessions must remove the previous session's context. Also verify editor-only completion without a session and insertion at the intended caret/replacement range with one undo action. A context-builder unit test or a mocked completion alone does not establish end-to-end support.
 
 Initial targets to measure, not claims: local keystroke-to-paint p95 below 16 ms on the reference machine; prediction results within 300 ms of dispatch for the chosen fast route; cancellation of audible playback within 150 ms locally; remote presence updates within 250 ms on a normal regional connection. Measure context-build time separately from inference, and speech first-audio latency separately from full-answer completion. Voice input must continue during all of them.
 
@@ -450,7 +467,7 @@ Separate reasoning, prediction, realtime voice, STT and TTS routes. Credentials 
 
 Every supported reasoning route must pass: text streaming, multi-step tool calls, cancellation, error propagation, context limits/compaction, denied-tool behavior and restart/resume. Prediction routes need work/open-buffer context, latency and replacement-format tests, not tool calling. Voice routes must demonstrate simultaneous input/output processing, partial transcript/audio delivery, barge-in, playback accounting and conversation during long coding work. Evaluate privacy, supported languages, hardware requirements and model-weight licenses for the exact local/self-hosted route as well as hosted routes.
 
-Ship verified provider/model combinations. Models that lack tools can answer plain questions but cannot promise navigation or edits. “OpenAI compatible” is not proof of Responses API or tool-stream parity. Reuse native Codex routes; add a configured gateway or a small explicit transport for missing protocols after evaluation. Anthropic/Gemini native transports in the DTO are planned options, not claims of current Codex support.
+Ship verified provider/model combinations. Models that lack tools can answer plain questions but cannot promise navigation or edits. “OpenAI compatible” is not proof of Responses API or tool-stream parity. Reuse native managed-runtime routes; add a configured gateway or a small explicit transport for missing protocols after evaluation. Anthropic/Gemini native transports in the DTO are planned options, not claims of current managed-runtime support.
 
 Do not silently fall back from a local/private route to a cloud provider, or from one model to another after partial tool execution. State exactly what failed and retain the turn for safe continuation.
 
@@ -489,11 +506,18 @@ A reviewer can comment on any code range, not only modified lines. Agents can ad
 
 Freeze a review snapshot from the shared buffers plus the full engineering changeset, including unsaved text and relevant untracked files. AHEAD record writes must not invalidate code review. Bind findings, human dispositions and attestations to that snapshot. A change to engineering code makes the previous approval stale while retaining the discussion.
 
-Use a versioned shared-buffer snapshot format designed for the editor. Keep all contributors in implementer_ids and check reviewer independence against the complete set. Do not carry the old review workbench implementation or its disk fingerprint format as a compatibility requirement.
+Use a versioned shared-buffer snapshot format designed for the editor. Keep all contributors in implementer_ids, record the reviewer's relationship to those implementers and the team/repository policy context, and expose whether the recorded review is independent, self-review or unresolved under that policy. Do not impose a universal second-reviewer requirement in the editor, and do not carry the old review workbench implementation or its disk fingerprint format as a compatibility requirement.
+
+The review record should also bind the base and head revisions, optional PR/provider
+reference, explicitly shared session-artifact revisions, per-artifact status
+(`unreviewed`, `reviewed`, `needs-changes` or `not-applicable`), findings and
+dispositions, observed check results and an advisory merge-readiness state. These
+fields describe AHEAD's evidence; they do not become GitHub/GitLab approval,
+branch-protection state or merge authorization.
 
 Show the original AI context and human decisions to reviewers, together with evidence and uncertainty. Store visible explanations and provided reasoning summaries, not assumptions about access to private model reasoning.
 
-For the pilot, reviews happen within the same session against immutable snapshots. Independent review worktrees and cherry-picking fixes are later. Creating a PR, merging and enforcing protected-branch rules remain separate activities. An AHEAD approval record is not evidence that CI ran or a GitHub review was submitted.
+For the pilot, reviews happen within the same session against immutable snapshots. Independent review worktrees and cherry-picking fixes are later. Creating a PR, merging and enforcing protected-branch rules remain separate activities. An AHEAD review record is not evidence that CI ran or a GitHub review was submitted. It may suggest readiness for team merge consideration, but the team or solo contributor applies the repository's normal PR requirements and decides when to merge.
 
 ## 11. DTO and protocol design
 
@@ -537,7 +561,7 @@ Use Rust/serde as the eventual canonical definition and generate JSON Schema and
 | review/capture / attest | Snapshot scope / review intent | Immutable snapshot and authenticated review |
 | collaboration/apply | CollaborationTransaction | Durable transaction sequence |
 
-Use JSON-RPC over local stdio or a private local socket for host/runtime communication. The collaboration service can use authenticated TLS WebSockets for commands/events and CRDT payloads. Keep this separate from Codex's experimental WebSocket server; do not expose the agent runtime directly as the team service.
+Use JSON-RPC over local stdio or a private local socket for host/runtime communication. The collaboration service can use authenticated TLS WebSockets for commands/events and CRDT payloads. Keep this separate from the upstream app-server WebSocket; do not expose the agent runtime directly as the team service.
 
 Voice frames and partial transcripts use a bounded, transient streaming lane, never the durable workflow log. Negotiate binary audio framing where useful; avoid making audio wait behind agent output or database writes. Submitted text and authorized task requests use the ordinary deduplicated session commands. Provider adapters own their WebRTC/WebSocket wire protocol; the editor consumes the normalized voice events above.
 
@@ -577,14 +601,24 @@ ahead/                         this repository: maintained Lapce fork
   lapce-core/                  upstream editing primitives
   lapce-proxy/                 upstream IO plus AHEAD session-host modules
   lapce-rpc/                   editor transport plus AHEAD messages
+  ahead-agent/                 AHEAD-owned agent runtime integration and durable
+                               sessions, external ACP client, side tasks
   docs/development/            editor design and development guidance
   other upstream files        preserved unless an explicit product change requires it
 
-ahead-agent/                   independently pinned Codex-derived runtime source
-  upstream history + small reviewed patch series
+ahead-agent/runtime/           embedded runtime source and small reviewed patch series
 ```
 
-Keep session logic as modules until sharing it with the team-service executable earns a crate boundary. Package the supported agent binary with the editor and record its provenance; its independently pinned upstream does not require preserving the old AHEAD framework.
+`ahead-agent` is its own crate so the editor can integrate deeply with it
+without depending on the file/LSP proxy, and so the harness can be swapped or
+extended independently. It currently holds the external-agent ACP client
+(`acp_client.rs`), the durable streamed-session controller (`session.rs`), the
+read-only side-task delegator (`side_task.rs`) and the `HarnessStore` storage
+boundary (`store.rs`). The managed AHEAD runtime tier lands here too. Keep
+session logic as modules until sharing it with the team-service executable earns
+a further crate boundary. Package the supported agent binary with the editor and
+record its provenance; its independently pinned upstream does not require
+preserving the old AHEAD framework.
 
 There is no required import of old .ahead/runs, policy generation or config schema. Archived material remains accessible outside the product. New editor sessions, phase rules and project settings start with explicit editor-owned versions.
 
@@ -600,7 +634,7 @@ Keep machine credentials, absolute checkout paths, audio settings and runtime ex
 | 1. Solo human-led session | Native wizard/phase rules, explicit teaching and assistance tasks, full-duplex streamed voice and text, file focus, private persistence, one verified voice/coding route | Complete change/debug/teach walkthroughs; interruption and playback checks; no lost unsaved work; unauthorized edits denied |
 | 2. Provider coverage and predictions | Local/self-hosted/hosted/Bedrock verified routes, proposal review, predictions using current work and relevant buffers | Voice remains full duplex on certified routes; contextual predictions demonstrated; stale edits rejected; provider capability tests |
 | 3. Planning handoff and tracker | Issues, configured board/status, plan freeze, pause/resume, external-write outbox | Another engineer resumes; tracker conflicts/unknown outcomes handled without data loss |
-| 4. Collaborative pilot | Two clients, durable shared text/comments/anchors, authenticated actors, snapshot review | Convergence/reconnect/restart/undo tests; independent review tied to exact code |
+| 4. Collaborative pilot | Two clients, durable shared text/comments/anchors, authenticated actors, snapshot review | Convergence/reconnect/restart/undo tests; reviewer relationship, repository policy and review evidence tied to exact code |
 | 5. MVP hardening | Certified ACP backend, install/update path, export/restore, privacy controls | Daily-driver pilot; recovery drill; all below acceptance scenarios pass |
 
 Run the collaboration adapter experiment in milestone 0. Do not wait until milestone 4 to discover that the editor buffer, undo model or filesystem assumptions cannot support it.
@@ -617,7 +651,7 @@ The first implementation should be a narrow rendered vertical slice: open a file
 6. A revoked participant cannot submit new edits or retrieve additional content. Previously downloaded content is acknowledged as non-revocable.
 7. An issue changes remotely after preview; publication does not silently overwrite it. A timed-out create is reconciled before retry.
 8. A planning checkpoint resumes after branch/config changes; old gates and review are not reinterpreted as current authorization.
-9. Review records all implementers, requires appropriate independence, and becomes stale on a code change.
+9. Review records all implementers, the reviewer relationship, pinned base/head and artifact dispositions, labels independence according to the applicable team/repository policy, and becomes stale on a code change.
 10. Voice processes overlapping input during playback and a long coding task; first audio arrives before the full answer. Repeated barge-in, echo, backchannels, stale packets and reconnect cannot restart old speech or accidentally cancel work. Explicit work cancellation is acknowledged separately. Misrecognition, silence, missing mic and device changes have clear recovery; keyboard/text remain complete alternatives.
 11. Local-only configuration produces no hosted model/audio calls. Provider failure does not change routing silently.
 12. Unsupported files, disk-full errors, malformed updates and overlarge payloads produce bounded failures without discarding work.
@@ -655,14 +689,26 @@ The repository replacement and Lapce foundation are settled direction. These rem
 
 ## 16. Built-in agent loop + ACP side tasks (2026-09-17)
 
-Decision (user-confirmed): the primary coding agent is built directly
-into the session host. No ACP round-trip for the primary loop. ACP is
-used only for side tasks to external agents.
+> **Superseded in part, 2026-09-18.** The "built-in primary, ACP side-tasks only"
+> decision was reconsidered three times the next day. First the ACP adapter was
+> made the working streamed transport; then a live guardrail probe showed ACP
+> cannot carry AHEAD's lifecycle. The current decision is **two tiers**: a
+> **managed AHEAD runtime** fork that AHEAD configures and whose effect
+> boundary AHEAD owns (default for explicit teaching and assistance tasks), and **external ACP agents** for
+> compatibility only. The `AheadAgentLoop` below is a deterministic fallback, not
+> the managed runtime. See the
+> [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18)
+> and the guardrail probe results. This section is retained as history.
 
-### What the fork gives us (pinned: `third-party/codex`, tag `rust-v0.152.0`)
+Decision (user-confirmed 2026-09-17, superseded 2026-09-18): the primary coding
+agent is built directly into the session host. No ACP round-trip for the primary
+loop. ACP is used only for side tasks to external agents.
+
+### What the embedded runtime gives us (pinned upstream revision, tag `rust-v0.152.0`)
 
 - Wire framing: no `jsonrpc` header; `{id, method, params?, trace?}` /
-  `{id, result}` / `{id, error}`. Snapshot in `ahead-agent/schemas/`.
+  `{id, result}` / `{id, error}`. Protocol types and export generation live in
+  `ahead-agent/runtime/source/app-server-protocol/`.
 - Lifecycle: `initialize` → `initialized` → `thread/start|resume|fork` →
   `turn/start|steer|interrupt`, streamed `item/*` updates.
 - Approval seam: server-initiated `requestApproval` (command execution,
@@ -683,10 +729,10 @@ used only for side tasks to external agents.
   never/read-only; Assist → on-request/workspace-write.
 - `decide_approval`: Learn always declines; Assist accepts only
   mechanical + in-approved-scope + file/command kinds.
-- `to_codex_turn_params`: serializes a turn in fork `turn/start` shape
+- `ahead_turn_params`: serializes a turn in the fork's `turn/start` shape
   for logging and a future managed runtime; approvals still resolve
   in the host.
-- 50 proxy tests pass, including stale-policy rejection, Codex
+- 50 proxy tests pass, including stale-policy rejection, upstream-compatible
   vocabulary mapping, and closed approval decisions.
 
 ### ACP side tasks only (`AcpDelegator`, `agent-client-protocol` 2.1.0)

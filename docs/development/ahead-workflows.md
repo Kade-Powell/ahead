@@ -1,8 +1,8 @@
 # AHEAD workflow atlas
 
-Status: reviewable product design, 2026-09-18. The requirements in §1 come from the design conversation; the detailed flows and storage convention are proposals until reviewed. These diagrams describe intended behavior, not working product features. Implementation gaps belong in [TODO.md](../../TODO.md).
+Status: reviewable product design, 2026-09-22. The requirements in §1 come from the design conversation; the detailed flows and storage convention are proposals until reviewed. These diagrams describe intended behavior, not working product features. Implementation gaps belong in [TODO.md](../../TODO.md).
 
-This is the entry point for reviewing workflows, human/AI responsibilities and SDLC coverage. [HumanLayer research and adaptation](ahead-humanlayer-workflows.md) contains the product comparison; [Editor MVP](ahead-editor-mvp.md) contains architecture and FIM details. Keep diagrams here rather than maintaining divergent copies in those documents.
+This is the entry point for reviewing workflows, human/AI responsibilities and SDLC coverage. [HumanLayer workflow research](ahead-humanlayer-workflows.md) records dated source observations and decision provenance; [Editor MVP](ahead-editor-mvp.md) contains architecture and FIM details. Keep normative flows and diagrams here rather than maintaining divergent copies in those documents.
 
 ## 1. Requirements and decisions
 
@@ -11,27 +11,38 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | ID | Status | Requirement or proposed choice |
 |---|---|---|
 | W1 | Required | Humans own business behavior and write business logic with explicitly accepted FIM in assistance tasks. FIM receives current/open-file context plus the active work, decisions, plan and relevant attached history. Teaching tasks do not receive edit predictions. |
-| W2 | Required | Preserve the selected Codex harness's model-facing tools and loop behavior. **2026-09-18 decision:** two tiers — a managed Codex App Server runtime (AHEAD owns the effect boundary, default for explicit teaching and assistance tasks) and external ACP agents (compatibility only, no enforcement guarantees). Live probes showed the Codex ACP adapter executes shell/edit tool calls with no permission requests and does not route writes through the client, so ACP alone cannot carry teaching read-only enforcement, mechanical scope or edit attribution. See [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18). |
-| W3 | Required | Store project work/configuration under `.ahead`; let developers browse and attach shared past sessions. User credentials and personal settings remain local. |
+| W2 | Required | Preserve the selected harness's model-facing tools and loop behavior. **2026-09-18 decision:** two tiers — the AHEAD-owned managed runtime (AHEAD owns the effect boundary, default for explicit teaching and assistance tasks) and external ACP agents (compatibility only, no enforcement guarantees). Live probes showed the external ACP adapter executes shell/edit tool calls with no permission requests and does not route writes through the client, so ACP alone cannot carry teaching read-only enforcement, mechanical scope or edit attribution. See [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18). |
+| W3 | Required | Use `.ahead` as a mixed project workspace: track non-secret project configuration, project artifact-template overrides and explicitly shared session checkpoints; ignore credentials, personal settings, databases, caches and private working sessions. Let developers browse and attach shared past sessions. |
 | W4 | Required | Support voice conversation while coding, with Maieutic-style highlighting and pointing, and teaching from actual code. |
 | W5 | Required | Diagram the flows and human/AI roles across the SDLC, including investigation and bug diagnosis. Preserve one discoverable, readable home for design artifacts. |
 | W6 | Proposed detail | Let the agent place debugger breakpoints for a human-selected experiment. Preserve human breakpoints and distinguish editor configuration from running/stepping the program. |
-| W7 | Proposed detail | Retain the current libSQL database for live runtime state; keep working research/design/plan/evidence as named Markdown artifacts, with explicit portable history export for sharing. |
+| W7 | Settled 2026-09-22 | Retain the current libSQL database for live runtime state; produce human-readable research/design/plan/verification/review Markdown as a low-friction byproduct of work. Keep one canonical working copy and publish explicit, revision-pinned checkpoints for sharing. |
 | W8 | Proposed detail | Ordinary pointing never moves the human caret. Explicit navigation or an opted-in follow mode can move the view/caret; typing suspends following. |
 | W9 | Proposed detail | Guided debugging uses user-directed execution by default. The agent may prepare a breakpoint, fixture or observation for a human-selected experiment; it does not silently step or run code. |
-| W10 | Open for review | Shared sessions default to selected checkpoints; the precise project sharing preference and transcript retention choices remain to be settled. |
+| W10 | Settled 2026-09-22 | Working runtime state and full conversation remain private by default. The editor continuously maintains concise human-readable artifacts, then previews and publishes selected artifacts and conversation excerpts into tracked `.ahead/sessions/<id>/` checkpoints at meaningful handoffs. Projects may tune this behavior in tracked `.ahead/config.toml`; publication never includes credentials or silently commits files. |
 | W11 | Settled 2026-09-21 | A session is a durable container, not a binary Learn/Assist mode. Each session contains explicit tasks: `teaching` when the human asks to learn, and `assistance` for everything else. A teaching task may be linked to an assistance task without changing the parent task's effect policy. |
 | W12 | Settled 2026-09-21 | Integrate a graduated diagnosing-bugs workflow into corrective-debugging and investigation tasks: establish a red reproduction loop, minimize it, rank falsifiable hypotheses, instrument or test, fix with regression evidence, then clean up. Redact sensitive diagnostic evidence before persistence or sharing. |
 | W13 | Settled 2026-09-21 | Ship AHEAD-owned skills as built-in `SKILL.md` bundles with startup metadata and progressive body/reference loading. The agent may select relevant assistance skills, but the session host enforces task policy, capabilities and human authorization. End-of-session automated review is a standard review step; it never auto-applies findings or publishes externally. |
 | W14 | Settled 2026-09-21 | Read applicable `AGENTS.md` files from the workspace root through each target directory before selecting skills or taking actions. Discover workspace-local skills from `.agents/skills/`, `.agent/skills/` and `.skills/` plus explicitly configured user roots. These provide extra instructions only within AHEAD's rules; built-ins cannot be silently shadowed, discovered skills do not authorize effects, and scripts/network/credential/external-write behavior remains host-gated. |
+| W15 | Settled 2026-09-22 | Treat pull-request review as a distinct work type over an immutable base/head snapshot. A contributor may review the code and explicitly shared session artifacts, mark each artifact's review status and disposition, and record findings. AHEAD records reviewer identity, reviewer relationship to the implementers, revisions and policy context, then offers an advisory merge-readiness suggestion. The repository/team's normal PR requirements—including whether independent review is required—and the team's or solo contributor's merge timing remain authoritative; AHEAD neither requires a second person universally nor authorizes, blocks or performs the merge. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
 ## 1.1 Task intent replaces the session mode switch
 
 A session is a durable container for work, conversation, artifacts and evidence. It
-does not have a Learn/Assist toggle. Start Work asks for the work outcome and
-starting point; the first request creates an explicit task intent:
+does not have a Learn/Assist toggle or a mode-selection prompt. Starting a session
+asks for one freeform description of what the human is trying to accomplish. AHEAD
+proposes a work profile and task intent from that request; the human can revise the
+request or reject the proposal before the durable session starts. The first request
+then creates an explicit task intent:
+
+This intent-first flow applies only to managed AHEAD sessions. An external ACP
+thread is deliberately a lightweight side thread: the human chooses an installed
+ACP adapter and may provide an optional prompt, then the external agent owns its
+workflow, model choice and effects. External threads remain visible in the unified
+sidebar and conversation shell, but do not inherit AHEAD's profile review,
+phase/step controls or enforcement claims.
 
 - **Teaching:** the human asks to learn a concept, code path or skill. The task
   uses read-only context and presentation tools, records a learning arc, and
@@ -48,8 +59,11 @@ parent for execution, hypotheses and regression evidence. Switching between
 these requests does not create a new session or discard context.
 
 The distinction is task-local, not a UI chip or session-wide state. The panel
-should show the current task intent in its header and conversation cards, but
-must not offer a binary session-mode control.
+should show the current task intent and inferred work profile in its review step,
+header and conversation cards, but must not offer a binary session-mode control.
+After the session starts, the agent helps the human turn an underspecified request
+into a problem statement, constraints and a next step; that clarification does not
+silently expand scope or transfer decision authority to the agent.
 
 ## 2. SDLC map and responsibility legend
 
@@ -59,7 +73,7 @@ The workflow is iterative. Learning, voice, documentation, security, accessibili
 
 ```mermaid
 flowchart TD
-  Need["H: identify outcome, symptom or question"] --> Kind{"H: choose useful starting path"}
+  Need["H: describe outcome, symptom or question"] --> Kind{"A: propose profile; H: confirm or revise"}
   Kind -->|Unknown system or cause| Investigate["H + A: investigate and gather evidence"]
   Kind -->|Feature or product change| Design["H: choose behavior and design; A: explore options"]
   Kind -->|Small understood change| Write["H + F: write; A: requested supporting work"]
@@ -292,13 +306,72 @@ flowchart TD
 
 For an incident, service recovery can precede a known root cause. Keep recovery evidence and the later causal investigation distinguishable. A build, a passed test or a deploy command exiting successfully is not proof of observed production behavior. For retirement, use the same review/delivery loop with consumer migration, data retention and removal criteria instead of a feature rollout.
 
+### 8.1 Pull-request review and merge readiness
+
+Pull-request review is a separate human work type, not an extension of the agent's
+implementation turn. The reviewer opens a base/head pair (or a local equivalent)
+and AHEAD freezes the repository, commit/tree revisions and full-file context used
+for the review. The source PR or provider status may be linked when available, but
+an AHEAD record is not silently treated as a provider review.
+
+The reviewer may be the implementer, another contributor or a designated team
+reviewer. AHEAD records the relationship rather than imposing a universal
+two-person rule. If the repository requires independent review, CODEOWNERS, a
+number of approvals or another branch-protection rule, that requirement remains a
+team/repository responsibility. A solo workflow can satisfy AHEAD's recordkeeping
+without being mislabeled as independent review.
+
+Only explicitly shared session checkpoints are attached to the PR review. Each
+attached artifact is pinned to its revision and can be marked:
+
+| Artifact review status | Meaning |
+|---|---|
+| `unreviewed` | Attached for context, but the reviewer has not assessed it. |
+| `reviewed` | The reviewer assessed it against the current change and found no required correction in that artifact. |
+| `needs-changes` | The artifact or its relationship to the change needs correction or another decision. |
+| `not-applicable` | The reviewer recorded why this artifact does not apply to this change. |
+
+Code and artifact findings retain their author, anchor or artifact revision,
+severity, disposition and later response. The agent can explain the diff, compare
+it with the pinned decisions and produce attributed findings, but it cannot supply
+the final review, approve its own work or resolve a human finding on the human's
+behalf.
+
+AHEAD can suggest **ready for team merge consideration** only from current,
+revision-pinned evidence: review statuses are resolved, required AHEAD findings
+have dispositions, the snapshot is not stale, and known checks are recorded. A
+missing provider check or an unconfigured team rule remains `unknown`, not
+implicitly passing. The suggestion is advisory. Normal PR tooling and team policy
+decide required approvals, CI, branch protection, release controls and when to
+merge; AHEAD does not add a merge button or dictate merge timing.
+
 ## 9. Storage and artifact convention
 
 The current store already uses Turso's `libsql` and opens `.ahead/session.db`. Retain that installed database path and library unless a measured need requires changing them. This refers to the existing SQLite-compatible libSQL implementation; it does not select a migration to Turso's separate rewritten database engine or require Turso Cloud. [libSQL distinction](https://docs.turso.tech/libsql).
 
 SQLite is a binary, page-based database, not a plain-text document format. It gives us transactional/queryable storage; it does not guarantee fewer bytes than Markdown/JSON. Pages, indexes and journals also occupy space. Measure real histories before claiming a size benefit. [SQLite format](https://www.sqlite.org/fileformat.html).
 
-**Proposed split:** database for frequent runtime state; ordinary Markdown for intentional engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. It may cache document content by revision/hash, but that cache is not a second independently editable design document.
+**Canonical split:** database for frequent runtime state; ordinary Markdown for intentional engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. It may cache document content by revision/hash, but that cache is not a second independently editable design document.
+
+`.ahead` is deliberately not wholly ignored. Its boundary is allowlist-based so a
+new private runtime file cannot become shareable merely because it was added under
+that directory:
+
+| Path | Git policy | Purpose |
+|---|---|---|
+| `.ahead/.gitignore` | tracked and created on project setup/open | Default-deny boundary that travels with the project without changing its root `.gitignore`. |
+| `.ahead/config.toml` | tracked | Non-secret project workflow, editor and provider defaults. |
+| `.ahead/templates/` | tracked when present | Project overrides for built-in artifact templates. |
+| `.ahead/sessions/<id>/` | tracked when explicitly published | Portable session checkpoint and selected human-readable artifacts. |
+| `~/.ahead/settings.toml` | outside the repository | Private user-level defaults and credentials. |
+| `.ahead/settings.toml` | ignored | Workspace-private AI connections, credentials and personal overrides. |
+| `.ahead/config.local.toml` | ignored | Checkout-specific non-secret overrides. |
+| `.ahead/local/`, `.ahead/session.db*`, `.ahead/auth.json` | ignored | Private working documents, runtime history, caches and credentials. |
+
+Built-in artifact templates live in `defaults/artifacts/`. A project may override
+a template by placing a file with the same name in `.ahead/templates/`; it need
+not copy every built-in template. Templates are prompts for useful records, not
+forms that must be filled completely.
 
 ```mermaid
 flowchart LR
@@ -322,7 +395,9 @@ Standard paths proposed for implementation:
 ```text
 .ahead/
   config.toml                       shared project/editor/workflow defaults
+  templates/                        optional shared project template overrides
   config.local.toml                 ignored checkout-specific overrides
+  settings.toml                     ignored workspace credentials/personal settings
   session.db                       ignored live database, plus its sidecars
   local/sessions/<id>/              ignored private working documents
     session.md                     entry point, outcome, status, links, next action
@@ -330,15 +405,32 @@ Standard paths proposed for implementation:
     design.md                      chosen behavior, rationale, invariants, open choices
     plan.md                        current slices, responsibility and checks
     verification.md                observed results, revisions and unresolved checks
+    review.md                      snapshot-bound review evidence and dispositions
   sessions/<id>/                   shareable checkpoint using the same document names
     session.json                   format, identity, authors, revision and file manifest
     session.md                     entry point into the shared work
-    research.md / design.md / plan.md / verification.md   only when present
+    research.md / design.md / plan.md / verification.md / review.md   only when present
     conversation.jsonl             selected readable message history when shared
     artifacts/                     larger diagrams, images or supporting evidence
 ```
 
-Only `session.md` is the initial entry point; create the other documents when they contain useful work. Small tasks can keep sections in `session.md`; its links and `session.json` artifact roles identify the canonical location when split. Product-oriented work may add `requirements.md`. Use a consistent `Decisions` section in `design.md` (or the unsplit session document), with status and authorship. Keep diagram source in Markdown/Mermaid; generate rendered outputs only when useful. The current MVP export materializes `session.json`, `session.md` and `conversation.jsonl` under `.ahead/sessions/<session-id>/`; artifact files and revision-pinned attachments remain follow-up work.
+Only `session.md` is created initially. The editor updates its outcome, current
+state, decisions, progress and next action as those facts emerge from normal work.
+Create `research.md`, `design.md`, `plan.md`, `verification.md` or `review.md` on
+first meaningful content, not at session start. Small work keeps those sections in
+`session.md`; its links and `session.json` artifact roles identify the canonical
+location when split. This is documentation as a byproduct of doing the work, not
+a second documentation phase or six empty forms.
+
+Record human decisions and accepted uncertainty at the point they are made;
+record AI research with sources and clear fact/inference boundaries; record plan
+deviations while implementing; and record actual checks and observed outcomes
+without turning passed commands into deployment claims. Product-oriented work may
+add `requirements.md`. Keep diagram source in Markdown/Mermaid; generate rendered
+outputs only when useful. The current MVP export materializes `session.json`,
+`session.md` and `conversation.jsonl` under `.ahead/sessions/<session-id>/`;
+template-driven working artifacts, selected conversation export and revision-pinned
+attachments remain implementation work.
 
 For a working session, each artifact has one active file path: private or explicitly shared. Publishing creates a checkpoint, not a second live editable copy of private work. Explicitly continuing shared work creates a linked working session. If a file is edited externally, index the new revision and surface conflicts with unsaved editor content; never overwrite it from a stale database cache. Persist artifact writes atomically, then reconcile the database hash/index so a crash or external edit cannot leave two apparent authoritative versions.
 
@@ -346,7 +438,7 @@ Human and agent UI links should open the same canonical artifact. Session contex
 
 Shared snapshots are plain-text readable without AHEAD. A database export/backup can remain an optional complete local archive; do not use a live SQLite file as the default Git interchange format. Large logs/audio are not duplicated on every turn or embedded in every checkpoint: preserve selected evidence and its provenance, use explicit retention/export for larger material, and do not claim history is complete after pruning it. No whole-repository compression system or new storage engine is needed for this design.
 
-This refines the previous export-only artifact proposal: working design artifacts become ordinary files too, while the runtime remains database-backed. The `.ahead` ignore migration must keep private roots, database sidecars and credentials excluded. No existing private contents or ignore rules were changed while writing this design.
+This refines the previous export-only artifact proposal: working design artifacts become ordinary files too, while the runtime remains database-backed. AHEAD creates `.ahead/.gitignore` when a project is set up or opened, but never overwrites an existing file. Its default-deny boundary explicitly permits only itself, shared configuration, template overrides and published sessions. Private roots, database sidecars and credentials remain excluded without modifying the project's root `.gitignore`.
 
 ## 10. Implementation status and review scenarios
 
@@ -354,11 +446,11 @@ Source inspection on 2026-09-18, not live end-to-end validation:
 
 - **Harness (updated 2026-09-18, after live validation):** AHEAD now speaks ACP
   v1 over stdio to the maintained `@agentclientprotocol/codex-acp` adapter,
-  which launches the real Codex App Server. `ahead-harness/src/acp_client.rs`
+  which launches the AHEAD agent runtime. `ahead-agent/src/acp_client.rs`
   performs `initialize` → `session/new|load` → `session/prompt`, streams
   `session/update`, answers `session/request_permission` from the current task
   intent and policy,
-  and cancels with `session/cancel`. `ahead-harness/src/session.rs` binds each durable
+  and cancels with `session/cancel`. `ahead-agent/src/session.rs` binds each durable
   AHEAD session to a harness conversation, persists streamed messages, and
   reopens via `session/load`. Live-verified on this machine against Codex
   runtime `0.152.0` (adapter `1.12.0`): streamed reply, durable message rows,

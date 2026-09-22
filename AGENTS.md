@@ -85,7 +85,7 @@
    - All threads (AHEAD work-item threads + external agent tasks) live in this unified list with timestamps (`1m`, `1h`) and close buttons.
 
 5. **BYOK (Bring Your Own Key / Model) AI Connections**:
-   - Dedicated Settings view (`ahead-app/src/settings_panel.rs`) allowing users to bring any model (OpenAI-compatible, Ollama local, Anthropic direct, LM Studio) and persist in `~/.ahead/settings.toml`.
+   - Dedicated Settings view (`ahead-app/src/settings_panel.rs`) allowing users to bring any model (OpenAI-compatible, Ollama local, Anthropic direct, LM Studio). User-level defaults may live in `~/.ahead/settings.toml`; workspace-private connections and credentials live in ignored `.ahead/settings.toml`; shareable non-secret project settings live in tracked `.ahead/config.toml`.
    - AI connection credentials must never be hardcoded and must never be sent to external telemetry.
 
 6. **Shortcut Tooltips on All Controls**:

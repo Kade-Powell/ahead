@@ -1,13 +1,23 @@
 # Developing AHEAD
 
+<img src="../../extra/images/logo.svg" width="64" height="64" alt="AHEAD logo"/>
+
 Audience: AHEAD editor maintainers
 
 This repository is **AHEAD, the editor**, a maintained fork of Lapce. The editor design defines native human-led collaboration, full-duplex streaming voice, governed agent runtime, and contextual predictions.
 
+## Principles, practice & evidence
+
+- [AHEAD Constitution](../../CONSTITUTION.md): The small set of durable principles that defines AHEAD.
+- [Engineering practice](../guide/engineering-practice.md): Practical engineering guidance distilled from the original notes and reading.
+- [Evidence library](../evidence/README.md): Research mapping, evidence strength, limitations, and preserved source notes.
+
 ## Editor design & architecture
 
+- [Brand and theme guide](branding.md): Approved logo, app icons, semantic colors, and theme sources.
 - [Workflow atlas](ahead-workflows.md): Start here to review SDLC flows, human/AI roles, investigation, guided debugging, teaching/voice, decisions and standard artifact locations.
-- [HumanLayer workflow research](ahead-humanlayer-workflows.md): Product comparison and proposed adaptation, harness choice, portable session history and collaboration ideas.
+- [Artifact templates](../../defaults/artifacts/README.md): Built-in low-friction session, research, design, plan, verification and review records, with optional project overrides.
+- [HumanLayer workflow research](ahead-humanlayer-workflows.md): Dated source observations, adopted and rejected ideas, harness probe evidence, and decision provenance. It is not a second workflow specification.
 - [AHEAD Editor MVP](ahead-editor-mvp.md): The product specification and architecture proposal, including native collaboration, streaming voice, agent boundaries, contextual predictions, tracker integration, and delivery gates.
 - [Decision 0005: Zed source reuse and editor parity](decisions/0005-zed-editor-source-reuse.md): Accepted scope for direct Zed source reuse, editor parity, terminal/tasks, debugging, agent context, voice, and deliberate deferrals.
 - [Editor DTO draft](ahead-editor-contracts.ts): Self-contained, type-checkable editor contracts and protocol shapes for sessions, workflow state, anchors, voice events, predictions, and reviews.
@@ -22,7 +32,7 @@ Make sure to use **gpui-kit components whenever possible** (https://gpui-kit.com
 
 This repository preserves Lapce's Git ancestry, crate layout (`lapce-app`, `lapce-core`, `lapce-proxy`, `lapce-rpc`), and directory structure. AHEAD features are concentrated at explicit extension points:
 - **Session host & policy**: Governed workflow phases, explicit teaching tasks, assistance-by-default tasks, and SQLite session persistence.
-- **Built-in skills**: AHEAD-owned progressive-disclosure skills under `ahead-harness/skills/`; human-led teaching, diagnosis, research, design vocabulary, triage, prototyping and automated review.
+- **Built-in skills**: AHEAD-owned progressive-disclosure skills under `ahead-agent/skills/`; human-led teaching, diagnosis, research, design vocabulary, triage, prototyping and automated review.
 - **Workspace skills**: Discover user-provided `SKILL.md` files under `.agents/skills/`, `.agent/skills/` and `.skills/` as extra instructions, subject to AHEAD policy and host authorization.
 - **Workspace instructions**: Read applicable `AGENTS.md` files from the workspace root through each target directory before skill selection or task actions; record their hashes for resumable tasks.
 - **Agent skill architecture**: [AHEAD agent skills](ahead-agent-skills.md) is the canonical catalog, policy, discovery, provenance and implementation-status document.

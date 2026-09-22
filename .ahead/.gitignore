@@ -1,0 +1,8 @@
+# Private and runtime AHEAD state is ignored unless explicitly shareable.
+*
+!.gitignore
+!config.toml
+!templates/
+!templates/**
+!sessions/
+!sessions/**
