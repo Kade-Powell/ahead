@@ -316,12 +316,6 @@ impl Render for ExplorerPanel {
         let green = cx.theme().green;
         let yellow = cx.theme().yellow;
         let red = cx.theme().red;
-        let selection_border = cx.theme().green;
-        if cx.theme().list_active_border != selection_border {
-            let theme = gpui_kit::component::Theme::global_mut(cx);
-            theme.list_active_border = selection_border;
-            theme.tokens.list_active_border = selection_border.into();
-        }
         v_flex()
             .size_full()
             .p_2()

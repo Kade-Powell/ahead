@@ -178,6 +178,20 @@ impl Render for Shell {
     }
 }
 
+fn configure_ahead_theme(cx: &mut App) {
+    let theme = gpui_kit::component::Theme::global_mut(cx);
+
+    let mut dark_theme = (*theme.dark_theme).clone();
+    dark_theme.colors.list_active = Some("#10B98133".into());
+    dark_theme.colors.list_active_border = Some("#10B981".into());
+    theme.dark_theme = std::rc::Rc::new(dark_theme);
+
+    let mut light_theme = (*theme.light_theme).clone();
+    light_theme.colors.list_active = Some("#05966933".into());
+    light_theme.colors.list_active_border = Some("#059669".into());
+    theme.light_theme = std::rc::Rc::new(light_theme);
+}
+
 pub fn launch() {
     let args: Vec<String> = std::env::args().collect();
     let mut file_path = String::new();
@@ -218,6 +232,7 @@ pub fn launch() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            configure_ahead_theme(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             let path = file_path.clone();
             let explorer_root = explorer_root.clone();
