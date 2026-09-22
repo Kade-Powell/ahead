@@ -8,7 +8,7 @@
 //! - The GPUI view renders the parsed grid, cursor, scrollback, alternate screen,
 //!   ANSI colors, truecolor, and text attributes.
 
-use std::time::Duration;
+use std::{ops::Range, rc::Rc, time::Duration};
 
 use alacritty_terminal::event::Event as TerminalEvent;
 use alacritty_terminal::grid::Scroll;
@@ -19,8 +19,9 @@ use alacritty_terminal::vte::ansi::{
     Color as TerminalColor, CursorShape, NamedColor, Rgb,
 };
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::dock::{
+    BasePanel, Panel, PanelControl, PanelEvent, PanelId, TabGroup,
+};
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -64,15 +65,19 @@ struct TerminalPalette {
 
 pub struct TerminalPanel {
     pub focus: FocusHandle,
-    tabs: Vec<TerminalTab>,
-    active_tab: usize,
-    next_tab_id: usize,
+    terminal: TerminalTab,
+    marked_text: Option<String>,
+    scroll_remainder: f32,
+    terminal_size: Option<(usize, usize)>,
+    panel_id: PanelId,
+    tab_group: Option<WeakEntity<TabGroup>>,
+    close_handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    new_terminal_handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 struct TerminalTab {
     id: usize,
     terminal: Option<TerminalBackend>,
-    cwd: String,
     shell_name: String,
     status: SharedString,
 }
@@ -91,7 +96,6 @@ impl TerminalTab {
         Self {
             id,
             terminal,
-            cwd,
             shell_name,
             status,
         }
@@ -103,21 +107,44 @@ impl TerminalTab {
 }
 
 impl TerminalPanel {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new_with_id(id: usize, cx: &mut Context<Self>) -> Self {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "~".to_string());
         let shell =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let tab = TerminalTab::new(1, cwd, &shell);
+        let tab = TerminalTab::new(id, cwd, &shell);
         let panel = Self {
             focus: cx.focus_handle(),
-            tabs: vec![tab],
-            active_tab: 0,
-            next_tab_id: 2,
+            terminal: tab,
+            marked_text: None,
+            scroll_remainder: 0.0,
+            terminal_size: None,
+            panel_id: PanelId::from(cx.entity_id()),
+            tab_group: None,
+            close_handler: None,
+            new_terminal_handler: None,
         };
         panel.start_output_pump(cx);
         panel
+    }
+
+    pub fn terminal_id(&self) -> usize {
+        self.terminal.id
+    }
+
+    pub fn set_close_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(&mut Window, &mut App) + 'static,
+    {
+        self.close_handler = Some(Rc::new(handler));
+    }
+
+    pub fn set_new_terminal_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(&mut Window, &mut App) + 'static,
+    {
+        self.new_terminal_handler = Some(Rc::new(handler));
     }
 
     fn start_output_pump(&self, cx: &mut Context<Self>) {
@@ -129,24 +156,17 @@ impl TerminalPanel {
                 if this
                     .update(cx, |this, cx| {
                         let received = this
-                            .tabs
-                            .iter()
-                            .flat_map(|tab| {
-                                let id = tab.id;
-                                tab.terminal.as_ref().into_iter().flat_map(
-                                    move |terminal| {
-                                        terminal
-                                            .events()
-                                            .try_iter()
-                                            .map(move |event| (id, event))
-                                            .collect::<Vec<_>>()
-                                    },
-                                )
+                            .terminal
+                            .terminal
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|terminal| {
+                                terminal.events().try_iter().collect::<Vec<_>>()
                             })
                             .collect::<Vec<_>>();
                         let had_events = !received.is_empty();
-                        for (tab_id, event) in received {
-                            this.handle_terminal_event(tab_id, event);
+                        for event in received {
+                            this.handle_terminal_event(event);
                         }
                         if had_events {
                             cx.notify();
@@ -161,12 +181,42 @@ impl TerminalPanel {
         .detach();
     }
 
-    fn active_tab(&self) -> Option<&TerminalTab> {
-        self.tabs.get(self.active_tab)
+    fn resize_to_bounds(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        font_size: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let cell_width = (f32::from(font_size) * 0.6).max(1.0);
+        let line_height = (f32::from(font_size) * 1.5).max(1.0);
+        let width = (f32::from(bounds.size.width) - 24.0).max(cell_width);
+        let height = (f32::from(bounds.size.height) - 24.0).max(line_height);
+        let columns = (width / cell_width).floor().max(1.0) as usize;
+        let rows = (height / line_height).floor().max(1.0) as usize;
+
+        if self.terminal_size == Some((columns, rows)) {
+            return;
+        }
+
+        let Some(terminal) = self.terminal.terminal.as_ref() else {
+            return;
+        };
+
+        match terminal.resize(columns, rows) {
+            Ok(()) => {
+                self.terminal_size = Some((columns, rows));
+                cx.notify();
+            }
+            Err(error) => {
+                self.terminal.status =
+                    format!("terminal resize error: {error}").into();
+                cx.notify();
+            }
+        }
     }
 
     fn active_terminal(&self) -> Option<&TerminalBackend> {
-        self.active_tab()?.terminal.as_ref()
+        self.terminal.terminal.as_ref()
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
@@ -175,36 +225,32 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
-    fn send_bytes(&mut self, tab_id: usize, bytes: Vec<u8>) {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-            return;
-        };
-        if let Some(terminal) = tab.terminal.as_ref()
+    fn send_bytes(&mut self, bytes: Vec<u8>) {
+        if let Some(terminal) = self.terminal.terminal.as_ref()
             && let Err(error) = terminal.send(bytes)
         {
-            tab.status = error.into();
+            self.terminal.status = error.into();
         }
     }
 
-    fn handle_terminal_event(&mut self, tab_id: usize, event: TerminalEvent) {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
-            return;
-        };
+    fn handle_terminal_event(&mut self, event: TerminalEvent) {
         match event {
             TerminalEvent::PtyWrite(text) => {
-                if let Some(terminal) = tab.terminal.as_ref()
+                if let Some(terminal) = self.terminal.terminal.as_ref()
                     && let Err(error) = terminal.send(text.into_bytes())
                 {
-                    tab.status = error.into();
+                    self.terminal.status = error.into();
                 }
             }
-            TerminalEvent::Title(title) => tab.shell_name = title,
-            TerminalEvent::ResetTitle => tab.shell_name = "shell".to_string(),
-            TerminalEvent::ChildExit(code) => {
-                tab.status = format!("shell exited ({code})").into();
+            TerminalEvent::Title(title) => self.terminal.shell_name = title,
+            TerminalEvent::ResetTitle => {
+                self.terminal.shell_name = "shell".to_string()
             }
-            TerminalEvent::Exit => tab.status = "terminal closed".into(),
-            TerminalEvent::Bell => tab.status = "bell".into(),
+            TerminalEvent::ChildExit(code) => {
+                self.terminal.status = format!("shell exited ({code})").into();
+            }
+            TerminalEvent::Exit => self.terminal.status = "terminal closed".into(),
+            TerminalEvent::Bell => self.terminal.status = "bell".into(),
             TerminalEvent::Wakeup
             | TerminalEvent::MouseCursorDirty
             | TerminalEvent::ClipboardStore(_, _)
@@ -216,10 +262,8 @@ impl TerminalPanel {
     }
 
     pub fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if let Some(bytes) = terminal_key_bytes(event, self.terminal_mode())
-            && let Some(tab_id) = self.active_tab().map(|tab| tab.id)
-        {
-            self.send_bytes(tab_id, bytes);
+        if let Some(bytes) = terminal_key_bytes(event, self.terminal_mode()) {
+            self.send_bytes(bytes);
             cx.notify();
         }
     }
@@ -235,54 +279,90 @@ impl TerminalPanel {
             terminal.scroll_display(scroll);
         }
     }
+}
 
-    fn activate_tab(
+impl EntityInputHandler for TerminalPanel {
+    fn text_for_range(
         &mut self,
-        tab_id: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
-            self.active_tab = index;
-            window.focus(&self.focus, cx);
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_text
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_text.take().is_some() {
             cx.notify();
         }
     }
 
-    fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = std::env::current_dir()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "~".to_string());
-        let shell =
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let tab_id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.tabs.push(TerminalTab::new(tab_id, cwd, &shell));
-        self.active_tab = self.tabs.len() - 1;
-        window.focus(&self.focus, cx);
-        cx.notify();
-    }
-
-    fn close_tab(
+    fn replace_text_in_range(
         &mut self,
-        tab_id: usize,
+        _: Option<Range<usize>>,
+        text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tabs.len() == 1 {
-            return;
-        }
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
-            return;
-        };
-        self.tabs.remove(index);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if index < self.active_tab {
-            self.active_tab -= 1;
-        }
-        window.focus(&self.focus, cx);
+        self.marked_text = None;
+        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        self.send_bytes(text.into_bytes());
+        window.invalidate_character_coordinates();
         cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = Some(new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -419,13 +499,65 @@ impl BasePanel for TerminalPanel {
     fn panel_name(&self) -> &'static str {
         "ahead_terminal"
     }
+
+    fn on_added_to(
+        &mut self,
+        group: WeakEntity<TabGroup>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.tab_group = Some(group);
+    }
 }
 
 impl Panel for TerminalPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.active_tab()
-            .map(TerminalTab::title)
-            .unwrap_or_else(|| "ahead terminal".to_string())
+        let title = self.terminal.title();
+        let group = self.tab_group.clone();
+        let panel_id = self.panel_id;
+        let close_handler = self.close_handler.clone();
+        h_flex().items_center().gap_1().child(title).child(
+            Button::new("close_terminal_panel")
+                .icon(IconName::X)
+                .ghost()
+                .tooltip("Close Terminal")
+                .on_click(move |_, window, cx| {
+                    if let Some(handler) = close_handler.as_ref() {
+                        handler(window, cx);
+                    } else if let Some(group) = group.as_ref() {
+                        let is_last = group
+                            .read_with(cx, |group, _| group.panels().len() == 1)
+                            .unwrap_or(false);
+                        if is_last {
+                            return;
+                        } else {
+                            _ = group.update(cx, |group, cx| {
+                                group.close_panel(panel_id, cx);
+                            });
+                        }
+                    }
+                }),
+        )
+    }
+    fn toolbar_buttons(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Vec<Button>> {
+        let handler = self.new_terminal_handler.clone();
+        Some(vec![
+            Button::new(SharedString::from(format!(
+                "new_terminal_{}",
+                self.panel_id.as_u64()
+            )))
+            .icon(IconName::Plus)
+            .tooltip("New Terminal")
+            .on_click(move |_, window, cx| {
+                if let Some(handler) = handler.as_ref() {
+                    handler(window, cx);
+                }
+            }),
+        ])
     }
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
         Some(PanelControl::Toolbar)
@@ -483,68 +615,48 @@ impl Render for TerminalPanel {
         let snapshot = self.snapshot();
         let cursor = snapshot.cursor;
         let colors = snapshot.colors;
-        let active_tab_id = self.active_tab().map(|tab| tab.id);
-        let tab_bar = h_flex()
-            .h(px(30.))
-            .items_center()
-            .gap_1()
-            .px_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .children(self.tabs.iter().map(|tab| {
-                let tab_id = tab.id;
-                let is_active = active_tab_id == Some(tab_id);
-                let title = tab.title();
-                let tooltip = format!("Working directory: {}", tab.cwd);
-                let button = Button::new(("terminal_tab", tab_id)).label(title);
-                let button = if is_active {
-                    button.primary()
-                } else {
-                    button.ghost()
-                };
-                h_flex()
-                    .items_center()
-                    .child(button.tooltip(tooltip).on_click(cx.listener(
-                        move |this: &mut Self, _, window, cx| {
-                            this.activate_tab(tab_id, window, cx);
-                        },
-                    )))
-                    .child(
-                        Button::new(("close_terminal_tab", tab_id))
-                            .icon(IconName::X)
-                            .ghost()
-                            .tooltip("Close terminal")
-                            .on_click(cx.listener(
-                                move |this: &mut Self, _, window, cx| {
-                                    this.close_tab(tab_id, window, cx);
-                                },
-                            )),
-                    )
-            }))
-            .child(
-                Button::new("new_terminal_tab")
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .tooltip("New terminal")
-                    .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                        this.new_tab(window, cx);
-                    })),
-            );
+        let terminal_panel = cx.entity();
+        let focus = self.focus.clone();
 
         v_flex()
             .size_full()
             .bg(term_bg)
             .track_focus(&self.focus)
-            .child(tab_bar)
+            .on_key_down(cx.listener(
+                |this: &mut Self, event: &KeyDownEvent, _, cx| {
+                    this.handle_key(event, cx);
+                    cx.stop_propagation();
+                },
+            ))
             // Interactive Terminal Grid: captures keystrokes directly! No input box!
             .child(
                 div()
                     .id("terminal-screen")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .p_3()
                     .bg(term_bg)
-                    .overflow_y_scrollbar()
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, cx| {
+                                terminal_panel.update(cx, |this, cx| {
+                                    this.resize_to_bounds(bounds, mono_size, cx);
+                                });
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(
+                                        bounds,
+                                        terminal_panel.clone(),
+                                    ),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this: &mut Self, _, window, cx| {
@@ -552,18 +664,19 @@ impl Render for TerminalPanel {
                         }),
                     )
                     .on_scroll_wheel(cx.listener(
-                        |this, event: &ScrollWheelEvent, _, cx| {
-                            let lines = event.delta.pixel_delta(px(18.)).y / px(18.);
-                            let delta = lines.round() as i32;
+                        move |this, event: &ScrollWheelEvent, _, cx| {
+                            if event.touch_phase == TouchPhase::Started {
+                                this.scroll_remainder = 0.0;
+                            }
+                            let line_height = mono_size * 1.5;
+                            this.scroll_remainder +=
+                                event.delta.pixel_delta(line_height).y / line_height;
+                            let delta = this.scroll_remainder.trunc() as i32;
+                            this.scroll_remainder -= delta as f32;
                             if delta != 0 {
-                                this.scroll_display(Scroll::Delta(-delta));
+                                this.scroll_display(Scroll::Delta(delta));
                                 cx.notify();
                             }
-                        },
-                    ))
-                    .on_key_down(cx.listener(
-                        |this: &mut Self, event: &KeyDownEvent, _, cx| {
-                            this.handle_key(event, cx);
                         },
                     ))
                     .children(snapshot.rows.into_iter().map(move |line| {
