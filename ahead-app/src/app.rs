@@ -223,7 +223,7 @@ impl Shell {
             right_dock_was_open: true,
             bottom_dock_was_open: true,
             bottom_debug_active: false,
-            debug_visible: true,
+            debug_visible: false,
             active_terminal: 0,
             next_terminal_id: 2,
             settings_active: false,
