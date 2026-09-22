@@ -53,8 +53,8 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
-      - name: Build
-        run: cargo build --frozen
+      - name: Install Ahead with Cargo
+        run: cargo install --path . --bin ahead --profile release-lto --locked
 
       - name: Build as portable
         if: startsWith(matrix.os, 'windows')

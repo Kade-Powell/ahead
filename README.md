@@ -25,8 +25,13 @@ Ahead is an AI-native code editor written in pure Rust, forked from [Lapce](http
 
 ## Installation
 
-Pre-built releases for Windows, Linux and macOS are published on [GitHub releases](https://github.com/Kade-Powell/ahead/releases) — see [installing with a package manager](docs/installing-with-package-manager.md).
-To compile from source, see the [guide](docs/building-from-source.md). On macOS, `just app` produces the `Ahead.app` bundle.
+Install Ahead directly from GitHub with Cargo:
+
+```sh
+cargo install --git https://github.com/Kade-Powell/ahead.git --bin ahead --profile release-lto --locked
+```
+
+This installs the `ahead` executable into `$HOME/.cargo/bin`. See the [build guide](docs/building-from-source.md) for operating-system dependencies and development builds.
 
 ## Contributing
 
