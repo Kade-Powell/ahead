@@ -50,6 +50,32 @@ the app itself.
       arbitrary VS Code extension hosting and symbol outline until the core
       editor parity loop is working.
 
+## Multiplayer collaboration
+
+- [ ] Build a host-authoritative, cloudless multiplayer session for AHEAD chat,
+      code and terminal surfaces. Read and adapt the pinned Zed collaboration
+      patterns from `crates/collab/src/rpc.rs`,
+      `crates/project/src/buffer_store.rs` and
+      `crates/project/src/project.rs`, while keeping AHEAD's session host,
+      policy, attribution and workflow events authoritative; do not import
+      Zed's cloud server, database or LiveKit topology.
+      Use a direct LAN/reachable-host transport with reconnect and stable
+      authenticated participant identities. Share human/agent conversation,
+      live code buffers, presence and revision-aware edits with explicit role
+      policy. The host owns the worktree, agent effects and PTYs: participants
+      may read terminal output but cannot send terminal input, resize, close or
+      control host processes unless a later policy explicitly permits it.
+      Add a checked-in `.ahead/team.toml` allowlist of GitHub names/display
+      names and default roles, let the session owner select members per
+      session, and keep credentials, private keys, local endpoints and runtime
+      state out of the file. Resolve GitHub names to verified identities during
+      invitation, and update `.gitignore` for the shared team manifest without
+      exposing existing private `.ahead` state. Acceptance coverage must prove
+      host/participant chat and code convergence, reconnect/revocation,
+      participant terminal read-only enforcement, role changes, and a complete
+      local/direct session without AHEAD cloud infrastructure; document the
+      reachable-host/NAT limitation.
+
 ## Dependencies (Lapce-org removal; see decision 0006)
 
 - [ ] Decide the extension host (Zed WIT component model on wasmtime 48 vs
