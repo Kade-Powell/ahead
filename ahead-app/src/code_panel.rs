@@ -19,6 +19,7 @@ use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, RopeExt, TabSize,
 };
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -80,6 +81,7 @@ pub struct CodePanel {
     pub workspace: String,
     pub hover_text: Option<String>,
     pub is_preview: bool,
+    show_markdown_preview: bool,
     git_lens: Option<GitLensLine>,
     git_lens_key: Option<(String, u32, usize)>,
     /// Invalidates asynchronous completion/FIM results after edits or file switches.
@@ -166,6 +168,7 @@ impl CodePanel {
             workspace: String::new(),
             hover_text: None,
             is_preview: false,
+            show_markdown_preview: is_markdown_path(path),
             git_lens: None,
             git_lens_key: None,
             request_generation: 0,
@@ -205,6 +208,18 @@ impl CodePanel {
             self.is_preview = false;
             cx.notify();
         }
+    }
+
+    fn toggle_markdown_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !is_markdown_path(&self.file_path) {
+            return;
+        }
+        self.show_markdown_preview = !self.show_markdown_preview;
+        if !self.show_markdown_preview {
+            let focus = self.editor.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
     }
 
     fn proxy_path(&self) -> std::path::PathBuf {
@@ -281,6 +296,7 @@ impl CodePanel {
         self.saved_rev = 0;
         self.dirty_rev = 0;
         self.is_preview = preview;
+        self.show_markdown_preview = is_markdown_path(path);
         self.active_line = 1;
         self.request_generation = self.request_generation.wrapping_add(1);
         self.ghost_text = None;
@@ -519,6 +535,11 @@ impl CodePanel {
 
         if cmd && key == "s" {
             self.save(cx);
+            return;
+        }
+
+        if cmd && key == "e" && is_markdown_path(&self.file_path) {
+            self.toggle_markdown_view(window, cx);
             return;
         }
 
@@ -896,6 +917,25 @@ impl Render for CodePanel {
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .when(self.show_markdown_preview || is_markdown_path(&self.file_path), |el| {
+                                el.child(
+                                    Button::new("toggle_markdown_view")
+                                        .icon(if self.show_markdown_preview {
+                                            IconName::Code
+                                        } else {
+                                            IconName::FileCode
+                                        })
+                                        .ghost()
+                                        .tooltip(if self.show_markdown_preview {
+                                            "Edit Markdown (⌘E)"
+                                        } else {
+                                            "Preview Markdown (⌘E)"
+                                        })
+                                        .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                            this.toggle_markdown_view(window, cx);
+                                        })),
+                                )
+                            })
                             .when(has_diag, |el| {
                                 el.child(
                                     h_flex()
@@ -913,7 +953,7 @@ impl Render for CodePanel {
                     )
             )
             // Editor row: native gutter rail (diff + breakpoints) beside editor
-            .child(
+            .when(!self.show_markdown_preview, |root| root.child(
                 h_flex()
                     .flex_1()
                     .h_full()
@@ -1137,7 +1177,28 @@ impl Render for CodePanel {
                         )
                     })
                     )
-            )
+            ))
+            .when(self.show_markdown_preview, |root| {
+                let markdown = self.editor.read(cx).value().to_string();
+                root.child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .bg(editor_bg)
+                        .p_4()
+                        .child(
+                            TextView::markdown(
+                                SharedString::from(format!(
+                                    "markdown-preview-{}",
+                                    self.panel_id.as_u64()
+                                )),
+                                SharedString::from(markdown),
+                            )
+                            .scrollable(true),
+                        ),
+                )
+            })
             // Footer status strip
             .child(
                 h_flex()
@@ -1184,6 +1245,16 @@ impl Render for CodePanel {
                     )
             )
     }
+}
+
+fn is_markdown_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+        })
 }
 
 fn git_lens_for_line(workspace: &str, path: &str, line: u32) -> Option<GitLensLine> {
@@ -1308,7 +1379,16 @@ fn interpolate_insertion(predicted: &str, typed: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_byte_offset, interpolate_insertion, parse_git_blame};
+    use super::{
+        caret_byte_offset, interpolate_insertion, is_markdown_path, parse_git_blame,
+    };
+
+    #[test]
+    fn recognizes_markdown_extensions() {
+        assert!(is_markdown_path("README.md"));
+        assert!(is_markdown_path("docs/guide.MARKDOWN"));
+        assert!(!is_markdown_path("src/main.rs"));
+    }
 
     #[test]
     fn parses_git_lens_blame_metadata() {
