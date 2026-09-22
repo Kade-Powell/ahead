@@ -28,6 +28,9 @@ the app itself.
       existing proxy/RPC boundary; keep symbol outline explicitly deferred.
 - [ ] Port Zed's project search panel with search/replace, regex, case/word
       filters, result navigation and unsaved-buffer behavior.
+- [ ] Add an optional watch/restart action for parsed just recipes using
+      watchexec's supervisor/process-group and clear-screen support; direct
+      recipe runs should remain the default.
 - [ ] Port a Git source-control/review view with changed files, diffs,
       stage/unstage, commit, branches and conflicts; preserve AHEAD anchors,
       attribution and session trailers.
@@ -37,9 +40,6 @@ the app itself.
 - [ ] Extend the PTY terminal to multiple named tabs, resize/reflow and
       lifecycle-safe sessions. Allow selected terminal output to attach to the
       AHEAD agent panel as context.
-- [ ] Use repository `justfile` recipes and direct `just` commands as the task
-      system; do not add a parallel task-definition format without a concrete
-      missing capability.
 - [ ] Polish the AHEAD agent panel with streamed Markdown/code rendering,
       follow-tail, cancellation, durable reopen/resume and terminal context.
 - [ ] Complete the single-human-plus-agent full-duplex voice journey. Defer

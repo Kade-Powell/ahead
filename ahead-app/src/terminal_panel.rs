@@ -111,9 +111,17 @@ impl TerminalPanel {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "~".to_string());
+        Self::new_with_cwd(id, cwd, cx)
+    }
+
+    pub fn new_with_cwd(
+        id: usize,
+        cwd: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let shell =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let tab = TerminalTab::new(id, cwd, &shell);
+        let tab = TerminalTab::new(id, cwd.into(), &shell);
         let panel = Self {
             focus: cx.focus_handle(),
             terminal: tab,
@@ -131,6 +139,11 @@ impl TerminalPanel {
 
     pub fn terminal_id(&self) -> usize {
         self.terminal.id
+    }
+
+    pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.send_bytes(format!("{command}\r").into_bytes());
+        cx.notify();
     }
 
     pub fn set_close_handler<F>(&mut self, handler: F)

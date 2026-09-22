@@ -1,6 +1,6 @@
 //! Workspace activity bar and editor-side utility panels.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -23,6 +23,7 @@ use crate::proxy_client::ProxyClient;
 pub enum WorkspaceView {
     Explorer,
     Git,
+    Tasks,
     LanguageServers,
 }
 
@@ -30,6 +31,7 @@ pub struct ActivityBar {
     area: Entity<DockArea>,
     explorer: Entity<ExplorerPanel>,
     git: Entity<GitPanel>,
+    tasks: Entity<JustTasksPanel>,
     language_servers: Entity<LanguageServersPanel>,
     active: WorkspaceView,
 }
@@ -40,12 +42,14 @@ impl ActivityBar {
         area: Entity<DockArea>,
         explorer: Entity<ExplorerPanel>,
         git: Entity<GitPanel>,
+        tasks: Entity<JustTasksPanel>,
         language_servers: Entity<LanguageServersPanel>,
     ) -> Self {
         Self {
             area,
             explorer,
             git,
+            tasks,
             language_servers,
             active: WorkspaceView::Explorer,
         }
@@ -61,11 +65,13 @@ impl ActivityBar {
         let area = self.area.clone();
         let explorer = self.explorer.clone();
         let git = self.git.clone();
+        let tasks = self.tasks.clone();
         let language_servers = self.language_servers.clone();
         window.defer(cx, move |window, cx| {
             let panel = match view {
                 WorkspaceView::Explorer => panel_handle(explorer),
                 WorkspaceView::Git => panel_handle(git),
+                WorkspaceView::Tasks => panel_handle(tasks),
                 WorkspaceView::LanguageServers => panel_handle(language_servers),
             };
             area.update(cx, |area, cx| {
@@ -87,6 +93,288 @@ impl ActivityBar {
 
     pub fn active(&self) -> WorkspaceView {
         self.active
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JustTask {
+    pub justfile: PathBuf,
+    pub cwd: PathBuf,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+pub struct JustTasksPanel {
+    pub focus: FocusHandle,
+    root: PathBuf,
+    tasks: Vec<JustTask>,
+    status: SharedString,
+    run_handler: Option<Rc<dyn Fn(String, String, &mut Window, &mut App)>>,
+}
+
+impl JustTasksPanel {
+    pub fn new(root: &str, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self {
+            focus: cx.focus_handle(),
+            root: PathBuf::from(root),
+            tasks: Vec::new(),
+            status: "Looking for justfiles…".into(),
+            run_handler: None,
+        };
+        panel.refresh();
+        panel
+    }
+
+    pub fn set_run_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(String, String, &mut Window, &mut App) + 'static,
+    {
+        self.run_handler = Some(Rc::new(handler));
+    }
+
+    fn refresh(&mut self) {
+        self.tasks = discover_justfiles(&self.root)
+            .into_iter()
+            .flat_map(|justfile| list_just_tasks(&justfile))
+            .collect();
+        self.status = if self.tasks.is_empty() {
+            "No just recipes found".into()
+        } else {
+            format!(
+                "{} recipe{} from justfiles",
+                self.tasks.len(),
+                if self.tasks.len() == 1 { "" } else { "s" }
+            )
+            .into()
+        };
+    }
+
+    fn run_task(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.tasks.get(index) else {
+            return;
+        };
+        let Some(handler) = self.run_handler.as_ref() else {
+            return;
+        };
+        handler(
+            task.name.clone(),
+            task.cwd.to_string_lossy().into_owned(),
+            window,
+            cx,
+        );
+    }
+}
+
+fn discover_justfiles(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_justfiles(root, &mut files);
+    let mut ancestor = root.parent();
+    while let Some(directory) = ancestor {
+        for name in ["justfile", "Justfile", ".justfile"] {
+            let path = directory.join(name);
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        ancestor = directory.parent();
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn collect_justfiles(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file()
+            && matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("justfile" | "Justfile" | ".justfile")
+            )
+        {
+            files.push(path);
+        } else if file_type.is_dir()
+            && !matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".git" | "target" | "node_modules")
+            )
+        {
+            collect_justfiles(&path, files);
+        }
+    }
+}
+
+fn list_just_tasks(justfile: &Path) -> Vec<JustTask> {
+    let Some(cwd) = justfile.parent() else {
+        return Vec::new();
+    };
+    let Some(justfile) = justfile.to_str() else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new("just")
+        .args(["--list", "--justfile", justfile])
+        .current_dir(cwd)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    parse_just_list(
+        &String::from_utf8_lossy(&output.stdout),
+        Path::new(justfile),
+        cwd,
+    )
+}
+
+fn parse_just_list(output: &str, justfile: &Path, cwd: &Path) -> Vec<JustTask> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line == "Available recipes:" {
+                return None;
+            }
+            let (recipe, description) = line.split_once(" # ").map_or(
+                (line, None),
+                |(recipe, description)| {
+                    (recipe, Some(description.trim().to_string()))
+                },
+            );
+            let name = recipe.split_whitespace().next()?.to_string();
+            Some(JustTask {
+                justfile: justfile.to_path_buf(),
+                cwd: cwd.to_path_buf(),
+                name,
+                description,
+            })
+        })
+        .collect()
+}
+
+impl BasePanel for JustTasksPanel {
+    fn panel_name(&self) -> &'static str {
+        "ahead_just_tasks"
+    }
+}
+
+impl Panel for JustTasksPanel {
+    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        "Tasks"
+    }
+
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
+    }
+}
+
+impl EventEmitter<PanelEvent> for JustTasksPanel {}
+
+impl Focusable for JustTasksPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for JustTasksPanel {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let text = cx.theme().sidebar_foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let tasks = self.tasks.clone();
+        let tasks_empty = tasks.is_empty();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .p_3()
+            .track_focus(&self.focus)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border)
+                    .pb_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(IconName::ListTodo)
+                            .child(div().text_color(text).child("Tasks")),
+                    )
+                    .child(
+                        Button::new("refresh_just_tasks")
+                            .icon(IconName::RefreshCw)
+                            .ghost()
+                            .tooltip("Refresh Tasks")
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                this.refresh();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(self.status.clone()),
+            )
+            .child(v_flex().flex_1().min_h_0().overflow_y_scrollbar().children(
+                tasks.into_iter().enumerate().map(|(index, task)| {
+                    let recipe = task.name.clone();
+                    let cwd = task.cwd.to_string_lossy().into_owned();
+                    let description = task.description.unwrap_or_default();
+                    h_flex()
+                        .id(("just_task", index))
+                        .items_start()
+                        .gap_2()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            Button::new(("run_just_task", index))
+                                .icon(IconName::Play)
+                                .label(recipe.clone())
+                                .ghost()
+                                .tooltip(format!("Run just {recipe}"))
+                                .on_click(cx.listener(
+                                    move |this: &mut Self, _, window, cx| {
+                                        this.run_task(index, window, cx);
+                                    },
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(muted)
+                                        .child(cwd),
+                                )
+                                .child(div().text_color(text).child(description)),
+                        )
+                }),
+            ))
+            .when(tasks_empty, |el| {
+                el.child(div().text_color(muted).child(
+                    "Add a justfile with public recipes to use editor tasks.",
+                ))
+            })
     }
 }
 

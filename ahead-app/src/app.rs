@@ -21,8 +21,8 @@ use gpui_kit::*;
 use gpui_kit_assets::IconName;
 
 use crate::workspace_panels::{
-    ActivityBar, GitPanel, LanguageServersPanel, ProblemsPanel, SearchPanel,
-    WorkspaceView,
+    ActivityBar, GitPanel, JustTasksPanel, LanguageServersPanel, ProblemsPanel,
+    SearchPanel, WorkspaceView,
 };
 
 pub struct AgentWorkspacePanel {
@@ -152,6 +152,10 @@ impl Render for AgentWorkspacePanel {
                 .child(div().h_full().w(threads_width).child(threads))
             })
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub struct Shell {
@@ -556,10 +560,34 @@ impl Shell {
     }
 
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
+        self.new_terminal_in(cwd, None, window, cx);
+    }
+
+    fn new_task_terminal(
+        &mut self,
+        recipe: String,
+        cwd: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_terminal_in(cwd, Some(recipe), window, cx);
+    }
+
+    fn new_terminal_in(
+        &mut self,
+        cwd: String,
+        recipe: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
+        let command = recipe.map(|recipe| format!("just {}", shell_quote(&recipe)));
         let terminal = cx.new(|cx| {
-            crate::terminal_panel::TerminalPanel::new_with_id(terminal_id, cx)
+            crate::terminal_panel::TerminalPanel::new_with_cwd(terminal_id, cwd, cx)
         });
         self.configure_terminal(terminal.clone(), cx);
         self.terminals.push(terminal);
@@ -570,8 +598,22 @@ impl Shell {
                 area.toggle_dock(DockPlacement::Bottom, window, cx);
             }
         });
+        let terminal = self.terminals[self.active_terminal].clone();
+        let focus = terminal.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        if let Some(command) = command {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                _ = cx.update_entity(&terminal, |terminal, cx| {
+                    terminal.run_command(&command, cx);
+                });
+            })
+            .detach();
+        }
+        cx.notify();
     }
-
     fn close_terminal(
         &mut self,
         terminal_id: usize,
@@ -784,6 +826,9 @@ impl Shell {
                     self.set_center_layout(false, true, false, window, cx)
                 }
                 "g" if shift => self.show_left_panel(WorkspaceView::Git, window, cx),
+                "k" if shift => {
+                    self.show_left_panel(WorkspaceView::Tasks, window, cx)
+                }
                 "l" if shift => {
                     self.show_left_panel(WorkspaceView::LanguageServers, window, cx)
                 }
@@ -1315,6 +1360,8 @@ pub fn launch() {
                                 cx,
                             )
                         });
+                        let tasks =
+                            cx.new(|cx| JustTasksPanel::new(&explorer_root, cx));
                         let agent_workspace = cx.new(|cx| {
                             AgentWorkspacePanel::new(
                                 session.clone(),
@@ -1327,6 +1374,7 @@ pub fn launch() {
                                 area.clone(),
                                 explorer.clone(),
                                 git.clone(),
+                                tasks.clone(),
                                 language_servers.clone(),
                             )
                         });
@@ -1350,6 +1398,14 @@ pub fn launch() {
                         });
                         shell.update(cx, |shell, cx| {
                             shell.configure_code(code.clone(), cx);
+                        });
+                        let shell_for_tasks = shell.downgrade();
+                        tasks.update(cx, |tasks, _| {
+                            tasks.set_run_handler(move |recipe, cwd, window, cx| {
+                                _ = shell_for_tasks.update(cx, |shell, cx| {
+                                    shell.new_task_terminal(recipe, cwd, window, cx);
+                                });
+                            });
                         });
                         let shell_for_settings = shell.downgrade();
                         settings.update(cx, |settings, _| {
