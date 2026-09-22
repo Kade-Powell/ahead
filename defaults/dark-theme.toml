@@ -26,9 +26,9 @@ red = "#F87171"
 white = "#E2E8F0"
 yellow = "#FBBF24"
 
-primary-background = "#13181E"
+primary-background = "#101512"
 # Background for 'secondary' elements: panels, palette, status bar, completion, hover
-secondary-background = "#0F1318"
+secondary-background = "#0C100E"
 current-background = "#1D2530"
 text = "$white"
 dim-text = "#64748B"
