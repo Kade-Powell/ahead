@@ -9,6 +9,7 @@ use gpui_kit::component::{h_flex, v_flex, ActiveTheme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
+use std::{collections::HashSet, io::Write, process::Stdio};
 
 pub struct ExplorerPanel {
     pub focus: FocusHandle,
@@ -16,6 +17,7 @@ pub struct ExplorerPanel {
     pub entries: Vec<ExplorerEntry>,
     pub status: SharedString,
     git_badges: std::collections::HashMap<String, GitStatuses>,
+    ignored_paths: HashSet<String>,
     pub mailbox_id: usize,
     pub tree_state: Entity<TreeState>,
 }
@@ -150,6 +152,7 @@ impl ExplorerPanel {
             entries: Vec::new(),
             status: "Explorer ready".into(),
             git_badges: badges,
+            ignored_paths: HashSet::new(),
             mailbox_id: cx.entity_id().as_u64() as usize,
             tree_state: cx.new(|cx| TreeState::new(cx)),
         };
@@ -165,7 +168,11 @@ impl ExplorerPanel {
         });
         self.entries = entries;
         self.git_badges = git_badge_map(&self.root);
-        let tree_items = build_tree_items(std::path::Path::new(&self.root), 0);
+        let mut tree_paths = HashSet::new();
+        let tree_items =
+            build_tree_items(std::path::Path::new(&self.root), 0, &mut tree_paths);
+        self.ignored_paths =
+            git_ignored_paths(std::path::Path::new(&self.root), &tree_paths);
         self.tree_state.update(cx, |state, cx| {
             state.set_items(tree_items, cx);
         });
@@ -187,7 +194,7 @@ impl ExplorerPanel {
                 .and_then(|n| n.to_str())
                 .unwrap_or("?")
                 .to_string();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if name == ".git" {
                 continue;
             }
             let is_dir = path.is_dir();
@@ -204,32 +211,84 @@ impl ExplorerPanel {
     }
 }
 
-fn build_tree_items(dir: &std::path::Path, depth: usize) -> Vec<TreeItem> {
+fn build_tree_items(
+    dir: &std::path::Path,
+    depth: usize,
+    tree_paths: &mut HashSet<String>,
+) -> Vec<TreeItem> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<std::path::PathBuf> = read
+    let mut entries: Vec<std::path::PathBuf> = read
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
-    paths.sort();
-    paths
+    entries.sort();
+    entries
         .into_iter()
         .take(400)
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?.to_string();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if name == ".git" {
                 return None;
             }
+            let path_string = path.to_string_lossy().into_owned();
+            tree_paths.insert(path_string.clone());
             let is_dir = path.is_dir();
             let children = if is_dir && depth < 2 {
-                build_tree_items(&path, depth + 1)
+                build_tree_items(&path, depth + 1, tree_paths)
             } else {
                 Vec::new()
             };
-            let item = TreeItem::new(path.to_string_lossy(), name)
+            let item = TreeItem::new(path_string, name)
                 .children(children)
                 .expanded(depth == 0);
             Some(item)
+        })
+        .collect()
+}
+
+fn git_ignored_paths(
+    root: &std::path::Path,
+    paths: &HashSet<String>,
+) -> HashSet<String> {
+    let Ok(mut child) = std::process::Command::new("git")
+        .args(["check-ignore", "--stdin", "-z"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashSet::new();
+    };
+    for path in paths {
+        let Ok(relative) = std::path::Path::new(path).strip_prefix(root) else {
+            continue;
+        };
+        if stdin
+            .write_all(relative.to_string_lossy().as_bytes())
+            .and_then(|_| stdin.write_all(&[0]))
+            .is_err()
+        {
+            return HashSet::new();
+        }
+    }
+    drop(stdin);
+
+    let Ok(output) = child.wait_with_output() else {
+        return HashSet::new();
+    };
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            root.join(String::from_utf8_lossy(path).as_ref())
+                .to_string_lossy()
+                .into_owned()
         })
         .collect()
 }
@@ -351,6 +410,7 @@ impl Render for ExplorerPanel {
                 let explorer = cx.entity();
                 let tree_explorer = explorer.clone();
                 let badges = self.git_badges.clone();
+                let ignored_paths = self.ignored_paths.clone();
                 let text = text;
                 tree(
                     &self.tree_state,
@@ -359,6 +419,7 @@ impl Render for ExplorerPanel {
                         let item = entry.item();
                         let path = item.id.to_string();
                         let is_dir = entry.is_folder();
+                        let ignored = ignored_paths.contains(&path);
                         let statuses =
                             badges.get(&path).copied().unwrap_or_default();
                         let badge =
@@ -377,7 +438,13 @@ impl Render for ExplorerPanel {
                         } else {
                             muted
                         };
-                        let label = if is_dir && !entry.is_expanded() {
+                        let label = if ignored {
+                            div()
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child(item.label.clone())
+                                .into_any_element()
+                        } else if is_dir && !entry.is_expanded() {
                             colored_directory_name(
                                 item.label.clone(),
                                 statuses,
