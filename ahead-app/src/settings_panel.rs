@@ -71,7 +71,6 @@ impl Render for SettingsPanel {
                 v_flex()
                     .gap_1()
                     .p_3()
-                    .rounded_lg()
                     .bg(group)
                     .border_1()
                     .border_color(border)

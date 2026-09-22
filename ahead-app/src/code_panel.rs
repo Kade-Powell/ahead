@@ -959,7 +959,6 @@ impl Render for CodePanel {
                                                 div()
                                                     .w(px(3.))
                                                     .h(px(12.))
-                                                    .rounded_sm()
                                                     .bg(match hunk {
                                                         Some(DiffHunkKind::Added) => gpui_kit::rgb(0x22C55E),
                                                         Some(DiffHunkKind::Modified) => gpui_kit::rgb(0xF59E0B),
@@ -971,7 +970,6 @@ impl Render for CodePanel {
                                                 div()
                                                     .w(px(5.))
                                                     .h(px(8.))
-                                                    .rounded_full()
                                                     .bg(if is_deleted {
                                                         gpui_kit::rgb(0xEF4444)
                                                     } else {
@@ -982,7 +980,6 @@ impl Render for CodePanel {
                                                 div()
                                                     .w(px(2.))
                                                     .h(px(12.))
-                                                    .rounded_sm()
                                                     .bg(if is_agent {
                                                         gpui_kit::rgb(0x8B5CF6)
                                                     } else {
@@ -993,7 +990,6 @@ impl Render for CodePanel {
                                                 div()
                                                     .w(px(5.))
                                                     .h(px(5.))
-                                                    .rounded_full()
                                                     .bg(if is_bp {
                                                         gpui_kit::rgb(0xEF4444)
                                                     } else {
@@ -1048,7 +1044,6 @@ impl Render for CodePanel {
                                         .top(px(28.))
                                         .left(px(8.))
                                         .p_2()
-                                        .rounded_md()
                                         .bg(popup_bg)
                                         .border_1()
                                         .border_color(border_color)
@@ -1070,7 +1065,6 @@ impl Render for CodePanel {
                                 .left(completion_left)
                                 .max_w(px(520.))
                                 .p_2()
-                                .rounded_md()
                                 .bg(if is_dark { gpui_kit::rgb(0x133E2F) } else { gpui_kit::rgb(0xECFDF5) })
                                 .border_1()
                                 .border_color(if is_dark { gpui_kit::rgb(0x059669) } else { gpui_kit::rgb(0xA7F3D0) })
@@ -1102,7 +1096,6 @@ impl Render for CodePanel {
                                 .top(completion_top)
                                 .left(completion_left)
                                 .w(px(320.))
-                                .rounded_lg()
                                 .bg(popup_bg)
                                 .border_1()
                                 .border_color(border_color)
@@ -1118,7 +1111,6 @@ impl Render for CodePanel {
                                                     .items_center()
                                                     .justify_between()
                                                     .p_1()
-                                                    .rounded_md()
                                                     .bg(if is_sel { active_sel_bg } else { popup_bg })
                                                     .child(
                                                         h_flex()

@@ -789,7 +789,6 @@ impl Render for LanguageServersPanel {
                 h_flex()
                     .gap_2()
                     .p_2()
-                    .rounded_lg()
                     .bg(cx.theme().group_box)
                     .child(IconName::Activity)
                     .child(
@@ -825,7 +824,6 @@ impl Render for LanguageServersPanel {
                     .items_center()
                     .gap_2()
                     .p_2()
-                    .rounded_md()
                     .bg(cx.theme().group_box)
                     .child(div().text_color(color).child(icon))
                     .child(div().flex_1().text_color(text).child(name))

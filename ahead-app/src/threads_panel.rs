@@ -198,7 +198,6 @@ impl Render for ThreadsPanel {
                                     .justify_between()
                                     .px_2()
                                     .py_1()
-                                    .rounded_md()
                                     .bg(if is_active { active_bg } else { group_box })
                                     .border_1()
                                     .border_color(if is_active { active_bg } else { border_color })

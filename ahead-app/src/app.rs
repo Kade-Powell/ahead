@@ -9,7 +9,7 @@
 //! - Bottom: StatusBar with shortcut tooltips, branch, dock toggles, and metadata
 
 use gpui_kit::component::TitleBar;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, Panel, PanelControl,
     PanelEvent, PanelStyle, panel_handle,
@@ -861,6 +861,7 @@ impl Render for Shell {
         let active_left = self.activity.read(cx).active();
         let active_icon = gpui_kit::rgb(0x34D399);
         let active_button = |button: Button, active: bool| {
+            let button = button.ghost();
             if active {
                 button.text_color(active_icon)
             } else {
@@ -1027,7 +1028,6 @@ impl Render for Shell {
                                             .right(px(3.))
                                             .w(px(6.))
                                             .h(px(6.))
-                                            .rounded_full()
                                             .bg(lsp_color),
                                     )
                             )
@@ -1138,18 +1138,12 @@ impl Render for Shell {
     }
 }
 
-fn configure_ahead_theme(cx: &mut App) {
+fn configure_ahead_theme(cx: &mut App) -> anyhow::Result<()> {
+    let (dark, light) = crate::theme::default_themes()?;
     let theme = gpui_kit::component::Theme::global_mut(cx);
-
-    let mut dark_theme = (*theme.dark_theme).clone();
-    dark_theme.colors.list_active = Some("#10B98133".into());
-    dark_theme.colors.list_active_border = Some("#10B981".into());
-    theme.dark_theme = std::rc::Rc::new(dark_theme);
-
-    let mut light_theme = (*theme.light_theme).clone();
-    light_theme.colors.list_active = Some("#05966933".into());
-    light_theme.colors.list_active_border = Some("#059669".into());
-    theme.light_theme = std::rc::Rc::new(light_theme);
+    theme.dark_theme = std::rc::Rc::new(dark);
+    theme.light_theme = std::rc::Rc::new(light);
+    Ok(())
 }
 
 pub fn launch() {
@@ -1191,7 +1185,9 @@ pub fn launch() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            configure_ahead_theme(cx);
+            if let Err(error) = configure_ahead_theme(cx) {
+                eprintln!("Failed to load AHEAD themes: {error:#}");
+            }
             gpui_kit::component::Theme::change(
                 gpui_kit::component::ThemeMode::Dark,
                 None,

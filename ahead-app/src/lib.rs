@@ -8,6 +8,7 @@ pub mod session_panel;
 pub mod settings_panel;
 pub mod terminal;
 pub mod terminal_panel;
+mod theme;
 pub mod threads_panel;
 pub mod work_items_panel;
 
