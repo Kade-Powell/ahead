@@ -1,5 +1,5 @@
 Name:           ahead
-Version:        0.4.6
+Version:        0.0.1
 Release:        1
 Summary:        AI-native code editor written in Rust
 License:        Apache-2.0

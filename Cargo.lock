@@ -181,14 +181,14 @@ dependencies = [
 
 [[package]]
 name = "ahead"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "ahead-app",
 ]
 
 [[package]]
 name = "ahead-app"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "ahead-core",
  "ahead-rpc",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "ahead-core"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "ahash",
  "ahead-rpc",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "ahead-proxy"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "ahead-core",
  "ahead-harness",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "ahead-rpc"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "ahead-viewmodel"
-version = "0.4.6"
+version = "0.0.1"
 dependencies = [
  "ahead-rpc",
  "serde",
