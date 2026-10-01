@@ -1,4 +1,4 @@
-printf '\101\110trap '' HUP TERM; echo [?1034hsh-3.2$ printf '\101\110\105\101\104\n'; exit
+printf '\101\110\105\101\104\n'; exit
+[?1034hsh-3.2$ printf '\101\110\105\101\104\n'; exit
 AHEAD
 exit
-xec sleep 60'

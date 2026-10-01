@@ -470,6 +470,7 @@ mod tests {
             ToolRegistry::empty_for_test(),
             Vec::new(),
             ToolMode::CodeModeOnly,
+            super::router::CodeModeAvailability::Available,
             BTreeMap::new(),
             /*tool_namespaces_info*/ None,
             &[],

@@ -4,10 +4,7 @@ use crate::models::PermissionProfile;
 use crate::parse_command::ParsedCommand;
 use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
-use crate::request_permissions::RequestPermissionProfile;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
-use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -85,151 +82,16 @@ pub enum NetworkPolicyRuleAction {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianRiskLevel {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianUserAuthorization {
-    Unknown,
-    Low,
-    Medium,
-    High,
-}
-
-/// Final allow/deny outcome returned by the guardian reviewer.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-pub enum GuardianAssessmentOutcome {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianAssessmentStatus {
-    InProgress,
-    Approved,
-    Denied,
-    TimedOut,
-    Aborted,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianAssessmentDecisionSource {
-    Agent,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalCommandSource {
     Shell,
     UnifiedExec,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[ts(tag = "type", rename_all = "snake_case")]
-pub enum GuardianAssessmentAction {
-    Command {
-        source: ApprovalCommandSource,
-        command: String,
-        cwd: AbsolutePathBuf,
-    },
-    Execve {
-        source: ApprovalCommandSource,
-        program: String,
-        argv: Vec<String>,
-        cwd: AbsolutePathBuf,
-    },
-    /// A child approval for input to an existing command execution item.
-    WriteStdin {
-        approval_id: String,
-        process_id: String,
-        stdin: String,
-        /// Launch directory of the existing terminal, not its current working directory.
-        cwd: PathUri,
-    },
-    ApplyPatch {
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
-    },
-    NetworkAccess {
-        target: String,
-        host: String,
-        protocol: NetworkApprovalProtocol,
-        port: u16,
-    },
-    McpToolCall {
-        server: String,
-        tool_name: String,
-        connector_id: Option<String>,
-        connector_name: Option<String>,
-        tool_title: Option<String>,
-    },
-    RequestPermissions {
-        reason: Option<String>,
-        permissions: RequestPermissionProfile,
-    },
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct NetworkPolicyAmendment {
     pub host: String,
     pub action: NetworkPolicyRuleAction,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
-pub struct GuardianAssessmentEvent {
-    /// Stable identifier for this guardian review lifecycle.
-    pub id: String,
-    /// Thread item being reviewed, when the review maps to a concrete item.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub target_item_id: Option<String>,
-    /// Trusted plugin attribution for command items synthesized from this review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub plugin_id: Option<String>,
-    /// Safe plugin-relative path for command items synthesized from this review.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub script_path: Option<String>,
-    /// Turn ID that this assessment belongs to.
-    /// Uses `#[serde(default)]` for backwards compatibility.
-    #[serde(default)]
-    pub turn_id: String,
-    #[serde(default)]
-    #[ts(type = "number")]
-    pub started_at_ms: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "number")]
-    pub completed_at_ms: Option<i64>,
-    pub status: GuardianAssessmentStatus,
-    /// Coarse risk label. Omitted while the assessment is in progress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub risk_level: Option<GuardianRiskLevel>,
-    /// How directly the transcript authorizes the reviewed action.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub user_authorization: Option<GuardianUserAuthorization>,
-    /// Human-readable explanation of the final assessment. Omitted while in progress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub rationale: Option<String>,
-    /// Source that produced the terminal assessment decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub decision_source: Option<GuardianAssessmentDecisionSource>,
-    /// Canonical action payload that was reviewed.
-    pub action: GuardianAssessmentAction,
 }
 
 /// Distinguishes a command approval from input sent to an existing terminal.
@@ -445,83 +307,4 @@ pub struct ApplyPatchApprovalRequestEvent {
     /// When set, the agent is asking the user to allow writes under this root for the remainder of the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_root: Option<PathBuf>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::EventMsg;
-    use codex_utils_absolute_path::test_support::PathBufExt;
-    use codex_utils_absolute_path::test_support::test_path_buf;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn legacy_guardian_assessment_event_remains_deserializable() {
-        let event: EventMsg = serde_json::from_value(serde_json::json!({
-            "type": "guardian_assessment",
-            "id": "legacy-assessment",
-            "status": "denied",
-            "action": {
-                "type": "mcp_tool_call",
-                "server": "legacy-server",
-                "tool_name": "legacy-tool",
-            },
-        }))
-        .expect("legacy rollout event");
-
-        assert!(matches!(event, EventMsg::GuardianAssessment(_)));
-    }
-
-    #[test]
-    fn guardian_assessment_action_deserializes_command_shape() {
-        let action: GuardianAssessmentAction = serde_json::from_value(serde_json::json!({
-            "type": "command",
-            "source": "shell",
-            "command": "rm -rf /tmp/guardian",
-            "cwd": test_path_buf("/tmp"),
-        }))
-        .expect("guardian action");
-
-        assert_eq!(
-            action,
-            GuardianAssessmentAction::Command {
-                source: ApprovalCommandSource::Shell,
-                command: "rm -rf /tmp/guardian".to_string(),
-                cwd: test_path_buf("/tmp").abs(),
-            }
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn guardian_assessment_action_round_trips_execve_shape() {
-        let value = serde_json::json!({
-            "type": "execve",
-            "source": "shell",
-            "program": "/bin/rm",
-            "argv": ["/usr/bin/rm", "-f", "/tmp/file.sqlite"],
-            "cwd": "/tmp",
-        });
-        let action: GuardianAssessmentAction =
-            serde_json::from_value(value.clone()).expect("guardian action");
-
-        assert_eq!(
-            serde_json::to_value(&action).expect("serialize guardian action"),
-            value
-        );
-
-        assert_eq!(
-            action,
-            GuardianAssessmentAction::Execve {
-                source: ApprovalCommandSource::Shell,
-                program: "/bin/rm".to_string(),
-                argv: vec![
-                    "/usr/bin/rm".to_string(),
-                    "-f".to_string(),
-                    "/tmp/file.sqlite".to_string(),
-                ],
-                cwd: test_path_buf("/tmp").abs(),
-            }
-        );
-    }
 }

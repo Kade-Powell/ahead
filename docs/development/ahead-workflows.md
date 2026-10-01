@@ -10,7 +10,7 @@ Record new agreements here as the design conversation continues. Distinguish a u
 
 | ID | Status | Requirement or proposed choice |
 |---|---|---|
-| W1 | Required | Humans own business behavior and write business logic with explicitly accepted FIM in assistance tasks. FIM receives current/open-file context plus the active work, decisions, plan and relevant attached history. Teaching tasks do not receive edit predictions. |
+| W1 | Required; delegation added 2026-10-01 | Humans own business behavior and, by default, write business logic with explicitly accepted FIM in assistance tasks. They may explicitly hand implementation to a linked external agent thread under W17. FIM receives current/open-file context plus the active work, decisions, plan and relevant attached history. Teaching tasks do not receive edit predictions. |
 | W2 | Required | Preserve the selected harness's model-facing tools and loop behavior. **Updated 2026-09-22:** follow Zed's native-agent split exactly in shape—direct built-in loop through the AHEAD proxy; ACP only for external agent processes. The managed path owns the effect boundary; external ACP remains compatibility-only with no enforcement guarantee. Lifecycle policy and agent-advertised ACP modes are separate. See [native cutover](ahead-humanlayer-workflows.md#native-integration-cutover-2026-09-22). |
 | W3 | Required | Use `.ahead` as a mixed project workspace: track non-secret project configuration, project artifact-template overrides and explicitly shared session checkpoints; ignore credentials, personal settings, databases, caches and private working sessions. Let developers browse and attach shared past sessions. |
 | W4 | Required | Support voice conversation while coding, with Maieutic-style highlighting and pointing, and teaching from actual code. |
@@ -26,6 +26,7 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W14 | Settled 2026-09-21; root convention clarified 2026-09-23 | Follow the open `AGENTS.md` convention for project instructions and the portable Agent Skills package format. Discover workspace skills from `.agents/skills/` (the client guide's widely adopted cross-client location); user skills use AHEAD's `~/.agents/skills/` convention. This repository dogfoods those paths. Zed is a non-normative implementation reference: AHEAD does not load Zed `.rules` or other editor-specific instruction formats. Instructions and skills provide context only within AHEAD's rules; built-ins cannot be silently shadowed, discovered skills do not authorize effects, and scripts/network/credential/external-write behavior remains host-gated. See [the standards boundary](ahead-agent-standards.md). |
 | W15 | Settled 2026-09-22 | Treat pull-request review as a distinct work type over an immutable base/head snapshot. A contributor may review the code and explicitly shared session artifacts, mark each artifact's review status and disposition, and record findings. AHEAD records reviewer identity, reviewer relationship to the implementers, revisions and policy context, then offers an advisory merge-readiness suggestion. The repository/team's normal PR requirements—including whether independent review is required—and the team's or solo contributor's merge timing remain authoritative; AHEAD neither requires a second person universally nor authorizes, blocks or performs the merge. |
 | W16 | Required | Presentation Core is an editor capability available to every supported AHEAD agent implementation and version, across managed models/providers and external adapters. Agent adapters expose the same inspect, highlight, label/note, pointer and speech tools by forwarding requests to the editor; availability does not depend on teaching versus assistance intent. Presentation actions do not edit source files or move the human caret. |
+| W17 | Settled 2026-10-01 | Human implementation remains the default. At any point during implementation, the human may hand work to a new external agent thread with the session context and work directly with that agent. Show it indented beneath the originating AHEAD thread in the unified sidebar. The human returns to the original thread for verification, review and the remaining workflow; child completion does not complete the parent. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
@@ -43,7 +44,9 @@ thread is deliberately a lightweight side thread: the human chooses an installed
 ACP adapter and may provide an optional prompt, then the external agent owns its
 workflow, model choice and effects. External threads remain visible in the unified
 sidebar and conversation shell, but do not inherit AHEAD's profile review,
-phase/step controls or enforcement claims.
+phase/step controls or enforcement claims. Implementation handoffs appear as
+indented children of their originating AHEAD thread (W17); independently started
+external threads remain separate entries.
 
 - **Teaching:** the human asks to learn a concept, code path or skill. The task
   uses read-only context and presentation tools, records a learning arc, and
@@ -66,6 +69,39 @@ After the session starts, the agent helps the human turn an underspecified reque
 into a problem statement, constraints and a next step; that clarification does not
 silently expand scope or transfer decision authority to the agent.
 
+### 1.2 Implementation handoff and child threads
+
+This supports users who prefer to "vibe code" the implementation while staying
+involved throughout the work. The child conversation stays inside AHEAD;
+"external" describes the agent runtime, not a move to another application.
+Delegation changes who writes the code. The human still owns problem framing,
+design decisions, acceptance criteria and review, with agent assistance. Choosing
+agent-written implementation does not skip those parts of the AHEAD workflow.
+
+The human can hand off a specific slice or the remaining implementation, including
+after writing part of it. The external thread receives the outcome, decisions,
+constraints, plan, relevant discussion and artifacts, current code state and
+unfinished work. The human works with the external agent in that child thread and
+can return to the parent at any time, including with a partial prototype.
+
+Keep the child visually attached to its parent in the same sidebar list:
+
+```text
+Add workspace search
+  └─ Prototype search implementation · External agent
+```
+
+The child remains a separate conversation with its own external agent controls.
+The parent retains the AHEAD plan and review steps. On return, inspect the actual
+changes, check results, deviations from the design and unresolved questions in
+the parent. Revisit design when the prototype changes an assumption. Nesting does
+not extend managed enforcement or guaranteed edit attribution to the external
+agent.
+
+Proposed first version: a context snapshot at handoff and a return-to-review
+action, without continuous synchronization of two plans. Worktree isolation and
+handling simultaneous edits remain open implementation choices.
+
 ## 2. SDLC map and responsibility legend
 
 **H** = human engineer/team. **A** = conversational agent. **E** = editor, harness tools, debugger or checks returning actual results. **F** = FIM; it suggests at the caret and never applies on its own. Prefixes remain readable without color.
@@ -82,6 +118,8 @@ flowchart TD
   Investigate -->|Change justified| Design
   Design --> Outline["H + A: outline testable slices"]
   Outline --> Write
+  Write -->|H: hand off implementation| External["H + external agent: implement in linked child thread"]
+  External -->|H: return with changes and evidence| Verify
   Write --> Verify["E: run checks; H + A: inspect evidence"]
   Verify -->|Behavior fails| Investigate
   Verify -->|Ready for judgment| Review["H: judge full change; A: analyze diff and omissions"]
@@ -102,7 +140,7 @@ flowchart TD
 | Investigation and diagnosis | Build/assess the mental model; choose hypotheses and experiments | Trace code, point out counterexamples, prepare observation and summarize results | Findings, predictions, actual observations and limitations |
 | Design | Decide behavior, tradeoffs and code boundaries | Compare alternatives; show diagrams, types and call paths | Design and attributed decisions |
 | Planning | Choose slices, priorities and responsibility | Identify dependencies, files and checks | Plan with outcomes and verification |
-| Implementation | Write business logic and accept FIM deliberately | Suggest at the caret; prepare instructed supporting edits | Diff and authorship |
+| Implementation | Write business logic and accept FIM deliberately by default; explicitly choose any external handoff | Suggest at the caret; prepare instructed supporting edits; external agent implements delegated scope with the human | Diff, available authorship evidence and linked handoff |
 | Verification | Define expected behavior; judge manual/exploratory results | Run instructed checks and expose failures | Code revision, check results and untested areas |
 | Review and security/accessibility | Assess design, risk, usability and acceptance | Trace requirements to changes; challenge assumptions | Findings, dispositions and remaining risk |
 | Release and migration | Select destination, rollout and recovery approach | Prepare/run instructed existing commands; gather outcomes | Release revision, migrations, observed behavior and rollback evidence |
@@ -125,6 +163,8 @@ flowchart TD
   D -->|Yes| P["H + A: outline one runnable slice and checks"]
   P --> H3["H + F: write business logic with current session context"]
   P --> A3["A: perform requested scaffolding, fixtures or wiring"]
+  H3 -->|H: hand off at any point| Child["H + external agent: implement in indented child thread"]
+  Child -->|H: return to original session| E1
   H3 --> E1["E: run the selected checks on the actual revision"]
   A3 --> E1
   E1 --> H4{"H + A: result matches intended behavior?"}
@@ -135,6 +175,10 @@ flowchart TD
 ```
 
 The outline is the single plan card in the conversation. Parallel arrows show distinct responsibilities, not mandatory concurrent agents or permission to edit the same active buffer. Tests for chosen behavior must not become a way for the agent to invent the business specification.
+
+The implementation handoff in §1.2 also applies to the human implementation
+steps in the debugging and maintenance flows below. Their diagrams show the
+default path; delegated work returns to the same verification and review steps.
 
 ## 4. Investigation and bug diagnosis
 
@@ -469,6 +513,15 @@ first meaningful content, not at session start. Small work keeps those sections 
 `session.md`; its links and `session.json` artifact roles identify the canonical
 location when split. This is documentation as a byproduct of doing the work, not
 a second documentation phase or six empty forms.
+
+For implementation handoffs, persist the parent/child relationship so the sidebar
+can restore it after reopening. Record the child link, delegated scope and context
+revision in the parent's `session.md` (or `plan.md` when present). Include the code
+baseline and any unfinished or unsaved work in the handoff context. On return,
+record changed decisions and revision-specific verification evidence in the
+parent's existing artifacts. Handoff context remains private under the same
+publication rules; creating a child does not publish the session to Git or include
+credentials.
 
 Record human decisions and accepted uncertainty at the point they are made;
 record AI research with sources and clear fact/inference boundaries; record plan

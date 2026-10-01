@@ -11,10 +11,20 @@ the app itself.
 
 ## Zed source reuse and editor parity
 
+- [ ] Verify unsupported-file tabs in the rebuilt native app
+      (`ahead-app/src/code_panel.rs`). Open SQLite, UTF-16 and unreadable
+      files through new and reused preview tabs; confirm the explanation,
+      disabled editing/save, unchanged disk bytes, and normal empty-text
+      editing afterward. The 2026-10-01 GPUI checks and all 157 app / 34 core
+      tests pass. The native build succeeded, but UI automation selected a
+      different existing AHEAD process instead of the disposable test instance;
+      native interaction remains unverified.
 - [ ] Broad-use readiness goal (expanded by the user, 2026-09-30): finish and
       exercise every feasible shipped feature before claiming AHEAD is ready
       for daily work. Preserve the native-agent, Turso and hard-fork cleanup
-      goal; no legacy migrations, aliases or backward-compatibility paths.
+      goal. Do not add schema migrations, aliases or live JSONL fallback; the
+      only data-import exception is a safe, one-time import of recognized
+      legacy rollout JSONL into Turso, preserving the source files.
       Use `../zed` as the primary behavior/source reference and retain useful
       Codex model-loop behavior. Work through the detailed gaps below, fixing
       failures as they appear rather than stopping at an audit.
@@ -33,16 +43,17 @@ the app itself.
       across checks where practical; restart only to load changes or test
       lifecycle behavior. Do not bypass required approvals, alter real project
       data, add product features outside this scope, or publish/release.
-- [ ] Restore a clean targeted Clippy gate for `ahead-agent/src/` before calling
-      the build production-ready. On 2026-10-01,
-      `cargo clippy --locked --offline -p ahead-app -p ahead-proxy --lib`
-      stopped on 29 existing `ahead-agent` lint errors (including
-      `runtime_support.rs` missing semicolon and `session.rs` lossy cast), so
-      it did not certify the changed app/proxy code. The broader `-D warnings`
-      attempt stopped even earlier on two retained upstream
-      `codex-utils-path-uri` suggestions. Fix AHEAD-owned errors and decide a
-      scoped policy for pinned upstream warnings; rerun the repo's documented
-      Clippy gate without globally silencing new AHEAD diagnostics.
+- [ ] Finish AHEAD-owned Clippy warning cleanup before calling the build
+      production-ready. On 2026-10-01,
+      `cargo clippy --locked --offline -p ahead-agent -p ahead-app -p ahead-proxy --lib -j 1`
+      passed with zero errors and 80 warnings. Seven redundant metadata clones
+      in `ahead-agent/src/native_client.rs` are removed. DAP/LSP timeout maps
+      no longer use `HashMap::extract_if`, which exceeds the declared Rust
+      1.87 MSRV; six focused proxy timeout tests pass. Verify with an actual
+      Rust 1.87 build and reduce AHEAD-owned warnings. The broader
+      `-D warnings` attempt previously stopped on retained upstream
+      `codex-utils-path-uri` suggestions; decide a scoped policy for pinned
+      upstream warnings without globally silencing new AHEAD diagnostics.
 - [ ] Finish cross-platform storage privacy verification in
       `ahead-proxy/src/ahead/store.rs::SessionStore::open`. Unix creation and
       supported-store reopen now enforce mode 0600 for the database and
@@ -56,7 +67,27 @@ the app itself.
       The Windows path currently checks only the main file kind and does not
       enforce an owner-only DACL. Test concurrent first-open from separate
       processes and retain errors as actionable UI state. Preserve all data;
-      no migration, reset or silent in-memory replacement.
+      no schema migration, reset or silent in-memory replacement.
+- [ ] Verify the safe, one-time legacy AHEAD rollout JSONL import before
+      managed-thread restore. `NativeClient` now checks Turso first, rejects
+      active/archive ambiguity, validates the regular file and canonical
+      workspace, caps stored and decompressed JSONL at 64 MiB / 200,000
+      records, rejects any parse error, and retains the source. `HarnessStore`
+      now exposes an import operation that commits the header, archive state
+      and ordered replay rows atomically and idempotently in Turso. The
+      missing-thread regression covers active/archived Legacy/Paginated plain
+      and compressed restore plus malformed, ambiguous and cross-workspace
+      rejection. A Turso trigger test injects a mid-import failure and checks
+      rollback and retry. The four focused proxy `legacy` tests and the agent
+      bounded-reader test pass in the shared Cargo loop on 2026-10-01. Verify
+      restart/import/restore in the native app before treating migration as
+      end-to-end complete.
+      The retained rollout line reader now enforces exact decompressed-byte
+      limits while streaming plain and compressed JSONL, with an exact-limit
+      CRLF regression. Removed Guardian assessment events now count as parse
+      errors, so a legacy rollout containing one is rejected rather than
+      silently losing that record; the source remains untouched.
+      No live JSONL fallback; preserve every source file for human verification.
 - [ ] Fix cross-language editor highlighting in `ahead-app/src/code_panel.rs`:
       language selection now follows the file type on creation and preview
       reuse, with a passing GPUI switch regression and a dynamic status footer.
@@ -214,8 +245,13 @@ the app itself.
       including staged changes; render/caret movement read a cache, stale or
       closed-buffer replies are discarded, and repository notifications
       invalidate metadata even when the branch/file-status summary is equal.
-      Verify this in rendered GPUI after unlocking the Mac, including external
-      amend/checkout and a linked worktree or opened repository subdirectory.
+      The active-line author/time annotation defaults on and can be disabled
+      in Editor settings (workspace-private `.ahead/settings.toml`). A live
+      disposable GPUI pass on `blame-demo.rs` confirmed the Git icon, author,
+      and relative time on the active line; disabling the setting hid it and
+      restoring it brought it back. The config test covers the on-by-default
+      behavior and persisted opt-out. Still verify external amend/checkout and
+      a linked worktree or opened repository subdirectory.
       Profile large files and many open tabs: whole-file blame currently runs
       per coalesced revision; closing a view discards its result but does not
       interrupt an already-running libgit2 calculation. Add a shared HEAD
@@ -372,10 +408,13 @@ the app itself.
       disposable projects. Do not mark the normal-build wiring as live proof.
 - [ ] Trim the extension-host build to the used WASI Preview 2 interface in
       `Cargo.toml`. `wasmtime-wasi` currently enables unused Preview 1 and
-      `wiggle` through its defaults; AHEAD registers only `p2`. Remove that
-      unused feature after the current native verification pass, check the
-      dependency graph, and rerun host/proxy tests. No Preview 1 compatibility
-      layer is required.
+      `wiggle` through its defaults; AHEAD registers only `p2`, matching Zed's
+      `wasmtime_wasi::p2::add_to_linker_async` path. Workspace dependency now
+      disables defaults and enables only `p2`. Offline `cargo tree --locked`
+      now confirms that single feature; Cargo regenerated the lockfile and
+      removed `wiggle` plus its Preview 1-only dependency chain. Extension-host
+      and proxy tests still need the shared dev build loop to be free. No Preview
+      1 compatibility layer is required.
 - [ ] Port Zed's project search panel with search/replace, keyboard result
       navigation, match highlighting,
       include/exclude globs and paginated results. Clicked matches open at the
@@ -668,6 +707,14 @@ the app itself.
 
 ## Attribution & change tracking
 
+- [ ] Verify `ahead-app/src/code_panel.rs` Git rail click, breakpoint-only
+      hover target and tooltip in one freshly rebuilt native AHEAD process
+      against the disposable multi-language project. The GPUI hitbox test
+      passes, but desktop UI automation could not identify which concurrent
+      AHEAD instance received the click; two `just dev` bundle launches also
+      exited after a macOS LaunchServices error. Do not claim native click
+      fidelity until the diff card opens and a Git click leaves breakpoint
+      state unchanged in that isolated run.
 - [ ] Replace `ahead-app/src/code_panel.rs`'s anchored Git hunk review card
       with Zed-style inline diff expansion in the editor flow. The current
       gpui-kit `EditorState` exposes text decorations but no inserted display
@@ -704,6 +751,13 @@ the app itself.
 
 ## Agent chat panel (`ahead-app/src/session_panel.rs`)
 
+- [ ] Recheck the connection-first model picker in a fresh native window after
+      unlocking macOS. `ahead-app/src/session_panel.rs` now hides the legacy
+      top-level model when a named connection has models; the exact disposable
+      project config passes a focused deduplication test. Confirm the picker
+      has one `deepseek-coder` row with the provider muted beneath it; the last
+      visible window belonged to older AHEAD processes, and the Mac locked
+      before the post-fix UI check.
 - [ ] Verify the settings-to-managed-provider path in a running GPUI app. Settings
       supports editable per-provider model catalogs and authenticated OpenAI-
       compatible `/models` discovery; stale discovery responses are discarded
@@ -752,10 +806,18 @@ the app itself.
       `just dev /absolute/path/to/disposable-project`, never in a real user
       project. Directory-first CLI launch now selects that directory as the
       workspace without opening it as a file; the focused startup regression
-      passes. On 2026-09-30 the current `just dev` binary opened a disposable
-      project in a temporary viewable macOS bundle and restored an empty managed
-      session after process termination. Authenticated multi-tool turns and
-      rendered stream/cancel/retry/compaction remain open.
+      passes. On 2026-10-01 the rebuilt `just dev` app created and restored a
+      managed session in the disposable project. The first read-only send
+      exposed a missing expected policy hash in `ahead-app/src/session_panel.rs`;
+      restoring the active `SessionView` on every attach path fixed that gate.
+      The same prompt then appeared in chat and entered streaming;
+      Stop produced a cancelled turn and a Retry control, both still visible
+      after a fresh `just dev` rebuild and durable-session restore. The selected
+      `deepseek-coder` model reported missing metadata and a network reconnect,
+      so no authenticated answer or tool calls were observed. Verify rendered
+      retry, compaction and multi-tool turns once
+      a reachable provider is configured. Also verify the composer retains a
+      draft when a proxy startup error rejects a turn.
       Durable session title/objective, intent, phase, linked issue, work items,
       recent events and summaries now reach the native model prompt through a
       separate host-populated `session_context`, never by rewriting the user's
@@ -836,14 +898,26 @@ the app itself.
       physical shortcut and add a Quit binding if reproducible. The same
       behavior recurred in the 2026-09-30 temporary schema-test bundle;
       only the specifically identified test processes were stopped for restart.
-- [ ] Make session creation and its harness binding one Turso transaction in
-      `ahead-proxy/src/ahead/{host,store}.rs`. `StartWork` currently commits the
-      session and updates active/voice state before `set_harness_preference`
-      writes the backend binding. A binding failure can return an error after
-      a session was already created. Validate the selected external adapter
-      before writing, roll back the whole creation on failure, and only publish
-      active state after commit. Add a failure-injection regression showing
-      that retry cannot leave an extra or incorrectly typed session.
+- [ ] Verify atomic session/harness creation in the disposable native app.
+      `StartWork` now validates a selected curated ACP adapter's local install
+      marker before writing, inserts the full session and initial harness
+      binding in one immediate Turso transaction, and publishes active/voice
+      state only after commit. A database-trigger failure regression confirms
+      rollback leaves no session or active state and retry creates exactly one
+      correctly bound session; unsupported adapters are rejected before any
+      write. The full `ahead-proxy` library suite passes (182 tests). Still
+      exercise the selected managed and installed-agent paths through the
+      rebuilt `just dev` app and verify session restore.
+- [ ] Add the implementation handoff described in workflow atlas W17 and §1.2:
+      keep human implementation as the default, let the human start a linked
+      external agent thread with current session context, and return to the
+      parent for verification/review. Persist the relationship through
+      `ahead-rpc/src/ahead.rs` and `ahead-proxy/src/ahead/{host,store}.rs`; show
+      the child indented beneath its parent in
+      `ahead-app/src/{workspace_panels,session_panel}.rs`. Verify context transfer,
+      sidebar nesting after reopen, return with partial changes/evidence, and
+      that child completion leaves parent review pending. Resolve unsaved-buffer
+      and concurrent-edit handling before enabling the handoff.
 - [ ] Let each session/thread optionally bind to a Git branch, created from a
       chosen base or selected from existing branches. When a user switches to a
       thread bound to another branch, activate that branch too; leave unbound
@@ -863,6 +937,31 @@ the app itself.
       features clearly.
 
 ## Harness integration (new 2026-09-18)
+
+- [ ] Resolve the optional code-mode host boundary in
+      `ahead-agent/runtime/source/code-mode/src/remote_session.rs` and
+      `ahead-agent/runtime/source/core/src/tools/code_mode/mod.rs`: AHEAD now
+      looks for `codex-code-mode-host` beside its executable, but does not
+      build or bundle that host. The provider's `availability()` checks the
+      adjacent file and `TurnContext` propagates that state. Unavailable
+      `ToolMode::CodeMode` falls back to direct tools only when the in-process
+      fallback is allowed; `CodeModeOnly` remains fail-closed. Verify the
+      model-facing tool specs and worker omit unavailable Code Mode (especially
+      `CodeModeOnly`) in a native turn as an interim safety check. Ship and
+      bundle an AHEAD-owned host with an end-to-end test before claiming support
+      for models whose required tool mode is CodeModeOnly. Native runtime
+      warnings now persist separately from ephemeral reasoning in the latest
+      turn presentation state and appear in the panel warning area after
+      restore; verify that rendered warning path with a model requiring the
+      missing host in a disposable project.
+      `register_code_mode_executors` now gates `exec`/`wait`; the router gates
+      its worker on `TurnContext.code_mode_available`. The AHEAD-owned native
+      regression uses bundled `gpt-5.6-sol` metadata and checks the actual model
+      request, including the valid omission of `tools` when none can be
+      advertised. Planner coverage checks fail-closed mode does not launch a
+      worker. The focused native regression and full agent library suite pass
+      on 2026-10-01 (110 passed, two ignored). This verifies safety, not useful
+      CodeModeOnly agent behavior. Do not depend on a Codex installation layout.
 
 - [ ] Keep regression coverage for retained native-loop behavior in AHEAD-owned
       test targets; do not repair or restore the copied `codex-core` / `codex-mcp`
@@ -884,8 +983,23 @@ the app itself.
 - [ ] Finish the native-runtime closure cut. The 2026-09-30 decision is that
       backward compatibility with retired Codex features is not required;
       do not retain aliases, fixtures or runtime branches just for old formats.
+      On 2026-10-01 the retained source still had 65 Cargo manifests under
+      `ahead-agent/runtime/source/`; it is one root
+      workspace, not a nested one, but the native dependency closure is still
+      far larger than AHEAD's intended surface. Remove whole crates only after
+      tracing their current runtime callers and preserving the model-facing
+      loop, sandbox, persistence and MCP behavior actually used by AHEAD.
+      The copied nested toolchain, Cargo config and standalone Windows setup
+      script are removed; the needed Windows flags live in `.cargo/config.toml`.
       Remove the remaining Guardian replay/safety branches without weakening
-      current AHEAD permissions or deleting user data. Replace plugin attribution and
+      current AHEAD permissions or deleting user data. Removed Guardian feature
+      keys are no longer in the schema whitelist; managed feature requirements
+      now report `auto_review` and `guardian_approval` as unknown rather than
+      silently accepting them. Strict-config regressions cover root and profile
+      feature tables. The copied feature-alias registry and top-level
+      `experimental_use_unified_exec_tool` setting are removed; strict config
+      rejects retired aliases while canonical feature keys remain available.
+      Replace plugin attribution and
       compatibility types, remote execution-environment compatibility and
       analytics providers with AHEAD-owned settings, editor search/filesystem,
       approval, MCP, skills/instruction and memory seams.
@@ -896,8 +1010,8 @@ the app itself.
       resolver and `guardian_policy_config` / `[auto_review].policy` config
       paths. The dormant Guardian v2 feature/config are removed. The four
       Guardian-only Node REPL/reviewer feature toggles are also removed from the
-      active feature registry; their legacy config keys remain accepted but are
-      ignored. The
+      active feature registry; their old keys are no longer whitelisted and
+      strict config validation rejects them. The
       model-instruction schema no longer exposes model-catalog auto-review
       policy or reviewer-specific approval text; stale catalog fields are
       ignored and their policy payloads removed from the bundled catalog. The
@@ -905,19 +1019,23 @@ the app itself.
       are removed. The separate `node_repl_auto_review_required` and
       `node_repl_disabled` fields still flow to MCP request metadata and must
       stay until the retained Node REPL compatibility path is removed or
-      replaced. The legacy `guardian_approval` feature key and `auto_review`
-      feature requirements are now ignored. Model-based automatic-review
+      replaced. The retired `guardian_approval` feature key and `auto_review`
+      feature requirements are now unknown and have no effect. Model-based automatic-review
       selection has been removed from native startup, step changes and MCP
       reviewer selection; AHEAD's sandbox
       and scoped effect checks remain authoritative, while explicit legacy
       AutoReview requests still fail closed. Core approval contexts, request
       DTOs, action formatters and module paths are now AHEAD-owned under
-      `core/src/approval`. Serialized
-      `GuardianAssessment*` DTOs and the `guardian` source marker still need
-      removal; persisted-session compatibility is not required. The unused `GuardianPolicy` context
-      wrapper and special developer-prompt assembly are removed. Legacy source
-      markers remain readable and still affect thread metadata; AHEAD rejects
-      them before session setup. Guardian-specific downstream session-policy,
+      `core/src/approval`. Serialized `GuardianAssessment*` event DTOs and
+      rollout-preservation tests are removed. The typed `Internal::Guardian`
+      and `ThreadSource::GuardianReview` variants are removed; their serialized
+      labels now fail parsing. Direct `Feature("guardian_review")` and
+      `Other("guardian")` values remain fail-closed at manager/delegate
+      boundaries; these checks reject unsupported inputs, not support old
+      sessions. Persisted-session compatibility is not required.
+      The unused `GuardianPolicy` context
+      wrapper and special developer-prompt assembly are removed.
+      Guardian-specific downstream session-policy,
       world-state, remote MCP discovery, tool-planning, prompt-schema and
       analytics branches have now been removed. Keep the create/resume/delegate
       rejection boundaries until unsupported source values cannot enter
@@ -931,10 +1049,12 @@ the app itself.
       retained only to read old sessions. All six cached
       `ahead-agent` `runtime_support::tests` pass for workspace-bounded scope,
       edit-scope/read-only enforcement, traversal rejection and provider
-      settings. The full `codex-features` suite passes (37 tests), the strict
-      config compatibility regression passes (1), and
-      `rtk cargo check --locked --offline -p ahead-agent --lib -j 1` passes with
-      3 warnings. Focused AHEAD approval-journey tests remain open.
+      settings. Before the latest retired-feature cleanup, the full
+      `codex-features` suite passed (37 tests) and
+      `rtk cargo check --locked --offline -p ahead-agent --lib -j 1` passed with
+      3 warnings. Rerun those suites plus the new root/profile strict-config and
+      managed-requirement regressions in the shared Cargo loop. Focused AHEAD
+      approval-journey tests remain open.
       The uncalled Guardian root-snapshot/version API, its answer-evidence
       cache, and the dead AgentControl provider are removed. Normal
       `request_user_input` handling still serializes and returns the host answer;
@@ -961,17 +1081,20 @@ the app itself.
       normal approval behavior while removing `GuardianAssessment*` rollout
       event DTOs and the obsolete legacy-event deserialization regression.
       The unused extension approval-review contributor API and DTOs are
-      removed; serialized Guardian assessment DTOs still need removal. A 2026-09-29 closure audit confirms Zed's
+      removed; serialized Guardian assessment event types and their rollout
+      preservation tests are now removed. A 2026-09-29 closure audit confirms Zed's
       agent/agent-server source has no Guardian path and uses ordinary
       tool-permission settings. The retained runtime rejects
-      `Internal::Guardian`, subagent `Other("guardian")`, and
-      `ThreadSource::GuardianReview` at thread-manager create/resume and direct
-      delegate entry boundaries. Downstream Guardian-only session setup,
+      direct `Feature("guardian_review")` and subagent `Other("guardian")`
+      values at thread-manager create/resume and delegate entry boundaries;
+      serialized Guardian session-source variants are no longer accepted.
+      Downstream Guardian-only session setup,
       policy, world-state, remote MCP discovery, tool routing, prompt-schema
-      and analytics branches are removed; legacy event/source decoding and
-      history metadata remain. Remove the remaining Guardian history/source
-      compatibility DTOs and their parser tests; backward compatibility is not
-      required. JSONL import and its Guardian-history regression are removed.
+      and analytics branches are removed; no Guardian-specific source variant
+      remains, and the generic-input rejection checks stay fail-closed.
+      Backward compatibility is not required. The
+      Guardian-history import regression is removed; the separate
+      safe, one-time legacy-thread import remains tracked above.
       Keep rejection of unsupported automatic-review entry points fail-closed.
       Do not rewrite or delete existing user data during source cleanup.
       The Codex `[analytics]` and profile toggles are removed, and the inert
@@ -1201,11 +1324,14 @@ the app itself.
       Composer-side memory search prefix and bounded replacement parsing pass
       their two focused app tests (re-ran 2026-09-29; 2 passed, 71 filtered;
       `rtk cargo test --locked --offline -p ahead-app --lib memory_ -j 1`).
-      In the disposable native project on 2026-09-29, the rendered composer
-      found a project memory line, attached its relative-path excerpt as
-      context, removed the chip, and found a new line after an external file
-      edit without restarting the app or sending a model turn. User-scope
-      search and the reviewed-replacement journey remain unverified live.
+      In the disposable native project on 2026-10-01, the rendered composer
+      found a synthetic project-memory line after the file was created,
+      attached its project-relative excerpt, refreshed to a changed line after
+      an external edit, and removed the hit after the source was deleted.
+      `/review-project-memory` loaded the current snapshot and review prompt;
+      no model turn was sent. User-scope search/append and the completed
+      reviewed-replacement/stale-write journey remain unverified live; use an
+      isolated test home before touching the real `~/.ahead` memory.
       A message context menu now explicitly saves a selected
       message to the user-chosen project or user file, with bounded,
       message-idempotent append, an 8 KiB note and 32 KiB document cap,
@@ -1282,9 +1408,9 @@ the app itself.
       `LocalThreadStore` and its legacy SQLite feature, rollout backfill/listing
       and SQLite config path, SQLite queue exports, `codex-state` crate, and
       root SQLx/SQLite dependencies are removed. Managed sessions use
-      `TursoThreadStore` only. The JSONL fallback/importer and its dedicated
-      transactional import API are removed; old files are left untouched.
-      No backward compatibility or migration layer is required. The current
+      `TursoThreadStore` only. There is no live JSONL fallback or general
+      migration layer. A safe, one-time import of a recognized legacy rollout
+      remains tracked above; old source files are left untouched. The current
       serial locked/offline library suite passed 100 agent and 138 proxy
       tests, including current-child restore and missing-thread no-fallback
       checks. The follow-up schema cleanup also passed the full 100-agent /
@@ -1467,7 +1593,8 @@ the app itself.
       regression covers model-issued resume after reopening the client and
       database; it does not prove the visible app restore flow. A focused
       `NativeClient` regression covers root-only tool exclusion after
-      restoring a child from current Turso metadata. JSONL import is removed.
+      restoring a child from current Turso metadata. A safe, one-time import of
+      recognized legacy rollouts is tracked above; there is no live fallback.
       Keep visible conversation and model-replay rows separate within `.ahead/session.db`;
       they have distinct UI and replay contracts. Managed turn startup now uses
       the indexed next-message sequence to detect the first message instead of

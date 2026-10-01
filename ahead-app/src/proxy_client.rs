@@ -1404,6 +1404,7 @@ impl ProxyClient {
                     work_item: None,
                     harness: Some(HarnessKind::Ahead),
                     external_agent_id: None,
+                    parent_session_id: None,
                 })?;
         value
             .get("session")
@@ -1552,6 +1553,7 @@ impl ProxyClient {
             };
             let conversation =
                 self.conversation_page(&session_id, None, CONVERSATION_PAGE_SIZE)?;
+            let runtime_state = self.agent_runtime_state(&session_id);
             active = Some(DurableSessionState {
                 view,
                 harness: summary.harness,
@@ -1559,7 +1561,8 @@ impl ProxyClient {
                 work_items: self.work_items(&session_id),
                 conversation: conversation.messages,
                 conversation_has_older: conversation.has_older,
-                harness_warning: self.harness_warning(&session_id),
+                harness_warning: self
+                    .harness_warning(&session_id, runtime_state.as_ref()),
             });
             break;
         }
@@ -1573,6 +1576,7 @@ impl ProxyClient {
         starting_point: &str,
         harness: HarnessKind,
         external_agent_id: Option<&str>,
+        parent_session_id: Option<&str>,
     ) -> Result<String, RpcError> {
         let value =
             self.proxy_rpc
@@ -1583,6 +1587,7 @@ impl ProxyClient {
                     work_item: None,
                     harness: Some(harness),
                     external_agent_id: external_agent_id.map(str::to_string),
+                    parent_session_id: parent_session_id.map(str::to_string),
                 })?;
         value
             .get("session")
@@ -1949,18 +1954,23 @@ impl ProxyClient {
             })
     }
 
-    pub fn harness_warning(&self, session_id: &str) -> Option<String> {
-        let backend = self.harness_backend(session_id)?;
-        if backend.ends_with("-fresh") {
-            Some("The persisted agent thread was unavailable; a fresh thread is active.".to_string())
-        } else if backend.starts_with("external-agent") {
-            Some(
-                "External ACP: AHEAD does not mediate shell/file effects or enforce teaching read-only, path scopes, or CodeAnchor attribution."
-                    .to_string(),
-            )
-        } else {
-            None
+    pub fn harness_warning(
+        &self,
+        session_id: &str,
+        runtime_state: Option<&AgentRuntimeState>,
+    ) -> Option<String> {
+        let mut warnings = Vec::new();
+        if let Some(backend) = self.harness_backend(session_id) {
+            if backend.ends_with("-fresh") {
+                warnings.push("The persisted agent thread was unavailable; a fresh thread is active.".to_string());
+            } else if backend.starts_with("external-agent") {
+                warnings.push("External ACP: AHEAD does not mediate shell/file effects or enforce teaching read-only, path scopes, or CodeAnchor attribution.".to_string());
+            }
         }
+        if let Some(state) = runtime_state {
+            warnings.extend(state.warnings.iter().cloned());
+        }
+        (!warnings.is_empty()).then(|| warnings.join("\n"))
     }
 
     pub fn harness_backend(&self, session_id: &str) -> Option<String> {
@@ -2448,23 +2458,49 @@ impl ProxyClient {
                     definition, ..
                 }) = res
                 {
-                    let locs = match definition {
-                        GotoDefinitionResponse::Scalar(loc) => vec![loc],
-                        GotoDefinitionResponse::Array(locs) => locs,
-                        GotoDefinitionResponse::Link(links) => links
-                            .into_iter()
-                            .map(|l| Location {
-                                uri: l.target_uri,
-                                range: l.target_range,
-                            })
-                            .collect(),
-                    };
-                    let _ = tx.send(locs);
+                    let _ = tx.send(goto_locations(definition));
                 }
                 pending
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
+            });
+        rx
+    }
+
+    pub fn request_references(
+        self: &Arc<Self>,
+        path: PathBuf,
+        position: Position,
+    ) -> Receiver<Vec<Location>> {
+        let (tx, rx) = unbounded();
+        self.proxy_rpc.get_references(path, position, move |res| {
+            let references = match res {
+                Ok(ProxyResponse::GetReferencesResponse { references }) => {
+                    references
+                }
+                _ => Vec::new(),
+            };
+            let _ = tx.send(references);
+        });
+        rx
+    }
+
+    pub fn request_implementations(
+        self: &Arc<Self>,
+        path: PathBuf,
+        position: Position,
+    ) -> Receiver<Vec<Location>> {
+        let (tx, rx) = unbounded();
+        self.proxy_rpc
+            .go_to_implementation(path, position, move |res| {
+                let locations = match res {
+                    Ok(ProxyResponse::GotoImplementationResponse {
+                        resp, ..
+                    }) => resp.map(goto_locations).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let _ = tx.send(locations);
             });
         rx
     }
@@ -2659,6 +2695,20 @@ impl ProxyClient {
         } else {
             self.workspace.join(path)
         }
+    }
+}
+
+fn goto_locations(response: GotoDefinitionResponse) -> Vec<Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Link(links) => links
+            .into_iter()
+            .map(|link| Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            })
+            .collect(),
     }
 }
 
@@ -3092,6 +3142,7 @@ mod tests {
                 "Do not duplicate",
                 "request",
                 HarnessKind::Ahead,
+                None,
                 None,
             )
             .expect_err("closed connection cannot submit a new session");

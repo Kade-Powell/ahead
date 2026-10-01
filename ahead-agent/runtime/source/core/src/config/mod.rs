@@ -71,7 +71,6 @@ use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
-use codex_install_context::InstallContext;
 use codex_mcp::DEFAULT_OPTIONAL_MCP_STARTUP_GRACE;
 use codex_mcp::McpConfig;
 use codex_mcp::McpProtocolMode;
@@ -2615,7 +2614,6 @@ pub fn resolve_bootstrap_respect_system_proxy(
     let configured_features = Features::from_sources(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
-            experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
         },
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
@@ -2944,7 +2942,6 @@ impl Config {
         let configured_features = Features::from_sources(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
-                experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
             },
             FeatureConfigSource {
                 ..Default::default()
@@ -3559,9 +3556,7 @@ impl Config {
         )
         .await?;
         let compact_prompt = compact_prompt.or(file_compact_prompt);
-        let zsh_path = default_zsh_path
-            .or_else(|| InstallContext::current().bundled_zsh_path())
-            .map(AbsolutePathBuf::into_path_buf);
+        let zsh_path = default_zsh_path.map(AbsolutePathBuf::into_path_buf);
 
         let review_model = override_review_model.or(cfg.review_model);
 

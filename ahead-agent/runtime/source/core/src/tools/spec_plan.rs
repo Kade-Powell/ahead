@@ -56,6 +56,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::router::CodeModeAvailability;
 use crate::tools::router::ToolRouter;
 use crate::tools::tool_namespaces_info::collect_tool_namespaces_info;
 use ahead_model_auth::AuthManager;
@@ -466,6 +467,11 @@ pub(crate) fn finalize_tool_router(
         registry,
         model_visible_specs,
         tool_mode,
+        if turn_context.code_mode_available {
+            CodeModeAvailability::Available
+        } else {
+            CodeModeAvailability::Unavailable
+        },
         code_mode_tool_names,
         tool_namespaces_info,
         &child_management_tools,
@@ -763,7 +769,9 @@ fn register_code_mode_executors(
     registry: &mut ToolRegistry,
 ) -> BTreeMap<String, ToolName> {
     let tool_mode = effective_tool_mode(turn_context, model_info);
-    if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
+    if !turn_context.code_mode_available
+        || !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
+    {
         return BTreeMap::new();
     }
 

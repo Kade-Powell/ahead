@@ -36,7 +36,8 @@ pub use acp_client::{
     HarnessFileChange, HarnessPlanEntry, HarnessSink, run_editor_mcp_stdio,
 };
 pub use adapters::{
-    external_acp_adapters, external_agent_config, set_external_acp_adapter_installed,
+    external_acp_adapter_is_installed, external_acp_adapters, external_agent_config,
+    set_external_acp_adapter_installed,
 };
 pub use instructions::{
     MemoryScope, MemorySource, memory_sources,
@@ -48,8 +49,8 @@ pub use runtime_support::{
 };
 pub use session::{HarnessController, HarnessNotificationSink};
 pub use store::{
-    HarnessStore, InstructionFileSource, NativeAgentEdgeStatus, NativeThreadHeader,
-    NativeThreadHeaderPageRequest, NativeThreadRelationFilter,
-    NativeThreadReplayPage, NativeThreadSnapshot, NativeThreadSortDirection,
-    NativeThreadTimestampSort,
+    HarnessStore, InstructionFileSource, LegacyNativeThreadImport,
+    NativeAgentEdgeStatus, NativeThreadHeader, NativeThreadHeaderPageRequest,
+    NativeThreadRelationFilter, NativeThreadReplayPage, NativeThreadSnapshot,
+    NativeThreadSortDirection, NativeThreadTimestampSort,
 };

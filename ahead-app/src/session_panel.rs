@@ -30,7 +30,7 @@ use gpui_kit::component::message::{
 };
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::progress::ProgressCircle;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
@@ -81,6 +81,7 @@ fn config_option_update_is_current(
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelSpec {
     pub name: String,
+    pub provider_name: Option<String>,
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
     pub context_window: u32,
@@ -90,10 +91,51 @@ impl Default for ModelSpec {
     fn default() -> Self {
         Self {
             name: "AHEAD default".into(),
+            provider_name: None,
             provider_id: None,
             model_id: None,
             context_window: 32_768,
         }
+    }
+}
+
+impl SelectItem for ModelSpec {
+    type Value = ModelSpec;
+
+    fn title(&self) -> SharedString {
+        match &self.provider_name {
+            Some(provider) => format!("{} · {provider}", self.name).into(),
+            None => self.name.clone().into(),
+        }
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(self.name.clone())
+                .into_any_element(),
+        )
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        v_flex()
+            .min_w_0()
+            .child(div().truncate().child(self.name.clone()))
+            .when_some(self.provider_name.clone(), |item, provider| {
+                item.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(provider),
+                )
+            })
+    }
+
+    fn value(&self) -> &Self::Value {
+        self
     }
 }
 
@@ -240,7 +282,7 @@ pub struct SessionPanel {
     pub focus: FocusHandle,
     workspace: std::path::PathBuf,
     pub chat_input: Entity<TextareaState>,
-    pub model_select: Entity<SelectState<Vec<String>>>,
+    pub model_select: Entity<SelectState<Vec<ModelSpec>>>,
     pub selected_model: usize,
     pub models: Vec<ModelSpec>,
     model_config_warning: Option<String>,
@@ -272,6 +314,7 @@ pub struct SessionPanel {
     pub session_id: Option<String>,
     pub external_agent_id: Option<String>,
     thread_launcher: Option<WeakEntity<crate::threads_panel::ThreadsPanel>>,
+    shell: Option<WeakEntity<crate::app::Shell>>,
     /// Last durable conversation fetched from the host (streamed + reopen).
     pub conversation: Vec<ahead_rpc::ahead::ConversationMessage>,
     conversation_has_older: bool,
@@ -467,10 +510,10 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
         .get("provider")
         .and_then(toml::Value::as_str)
         .unwrap_or("openai-compatible");
-    let active_prefix = ai
+    let active_connection = ai
         .get("active_connection")
         .and_then(toml::Value::as_str)
-        .map(|name| format!("{} · ", name.trim()));
+        .map(str::trim);
     let mut models = Vec::new();
     if let Some(connections) = ai.get("connections").and_then(toml::Value::as_array)
     {
@@ -507,7 +550,8 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
                 .filter(|model| !model.is_empty());
             for model in configured_models {
                 models.push(ModelSpec {
-                    name: format!("{connection_name} · {model}"),
+                    name: model.to_string(),
+                    provider_name: Some(connection_name.to_string()),
                     provider_id: Some(provider_id.clone()),
                     model_id: Some(model.to_string()),
                     context_window,
@@ -515,11 +559,16 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
             }
         }
     }
-    if let Some(model) = ai.get("model").and_then(toml::Value::as_str) {
+    if let Some(model) = ai
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .filter(|_| models.is_empty())
+    {
         let model = model.trim();
         if !model.is_empty() {
             models.push(ModelSpec {
                 name: model.to_string(),
+                provider_name: Some("OpenAI-compatible server".into()),
                 provider_id: Some(provider_id_for(
                     "OpenAI-compatible server",
                     provider,
@@ -529,11 +578,10 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
             });
         }
     }
-    if let Some(active_prefix) = active_prefix {
-        if let Some(index) = models
-            .iter()
-            .position(|model| model.name.starts_with(&active_prefix))
-        {
+    if let Some(active_connection) = active_connection {
+        if let Some(index) = models.iter().position(|model| {
+            model.provider_name.as_deref() == Some(active_connection)
+        }) {
             models.rotate_left(index);
         }
     }
@@ -659,25 +707,25 @@ impl SessionPanel {
             });
 
         let model_select =
-            cx.new(|cx| SelectState::new(Vec::<String>::new(), None, window, cx));
+            cx.new(|cx| SelectState::new(Vec::<ModelSpec>::new(), None, window, cx));
         cx.subscribe_in(
             &model_select,
             window,
             |this: &mut Self,
              _state,
-             event: &SelectEvent<Vec<String>>,
+             event: &SelectEvent<Vec<ModelSpec>>,
              _window,
              cx| {
-                if let SelectEvent::Confirm(Some(name)) = event {
+                if let SelectEvent::Confirm(Some(model)) = event {
                     if let Some(idx) =
-                        this.models.iter().position(|m| &m.name == name)
+                        this.models.iter().position(|candidate| candidate == model)
                     {
                         this.selected_model = idx;
                         this.invalidate_skill_catalog();
                         if this.show_commands {
                             this.load_skill_catalog(cx);
                         }
-                        this.status = format!("Model: {name}").into();
+                        this.status = format!("Model: {}", model.title()).into();
                         cx.notify();
                     }
                 }
@@ -776,6 +824,7 @@ impl SessionPanel {
             session_id: None,
             external_agent_id: None,
             thread_launcher: None,
+            shell: None,
             conversation: Vec::new(),
             conversation_has_older: false,
             loading_older_messages: false,
@@ -842,6 +891,7 @@ impl SessionPanel {
             .as_ref()
             .and_then(|proxy| proxy.session_view(&session_id))
         {
+            ahead_viewmodel::adopt_session(&mut self.session, view.clone());
             self.active_work_title = view.session.title;
             self.active_work_kind = view.session.work_kind;
             self.active_task_intent = view.task.intent;
@@ -928,6 +978,30 @@ impl SessionPanel {
         cx.notify();
     }
 
+    pub fn set_shell(&mut self, shell: Entity<crate::app::Shell>) {
+        self.shell = Some(shell.downgrade());
+    }
+
+    fn has_unsaved_code(&self, cx: &App) -> bool {
+        self.shell
+            .as_ref()
+            .and_then(|shell| {
+                shell
+                    .read_with(cx, |shell, cx| {
+                        shell
+                            .code_tabs
+                            .iter()
+                            .any(|tab| tab.read(cx).has_unsaved_changes())
+                    })
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                self.code
+                    .as_ref()
+                    .is_some_and(|code| code.read(cx).has_unsaved_changes())
+            })
+    }
+
     pub fn set_open_settings_handler<F>(&mut self, handler: F)
     where
         F: Fn(&mut Window, &mut App) + 'static,
@@ -999,10 +1073,8 @@ impl SessionPanel {
                         })
                     })
                     .unwrap_or(0);
-                let model_names =
-                    models.iter().map(|model| model.name.clone()).collect();
                 panel.model_select.update(cx, |select, cx| {
-                    select.set_items(model_names, window, cx);
+                    select.set_items(models.clone(), window, cx);
                     select.set_selected_index(
                         Some(IndexPath::new(selected_model)),
                         window,
@@ -1053,13 +1125,39 @@ impl SessionPanel {
         }
     }
 
+    fn open_implementation_handoff(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(threads), Some(session_id)) =
+            (self.thread_launcher.clone(), self.session_id.clone())
+        else {
+            self.status = "AHEAD thread is unavailable for handoff".into();
+            cx.notify();
+            return;
+        };
+        if self.has_unsaved_code(cx) {
+            self.status = "Save or discard open unsaved buffers before handing off implementation".into();
+            cx.notify();
+            return;
+        }
+        if let Err(error) = threads.update(cx, |threads, cx| {
+            threads.open_implementation_handoff(&session_id, window, cx);
+        }) {
+            self.status = format!("Could not open handoff: {error}").into();
+            cx.notify();
+        }
+    }
+
     /// Applies a durable snapshot fetched off the GPUI foreground thread.
     pub fn restore_durable_session(
         &mut self,
         state: crate::proxy_client::DurableSessionState,
         cx: &mut Context<Self>,
     ) {
-        let session_id = state.view.session.id;
+        let session_id = state.view.session.id.clone();
+        ahead_viewmodel::adopt_session(&mut self.session, state.view.clone());
         if self.session_id.as_deref() != Some(session_id.as_str()) {
             self.invalidate_skill_catalog();
             self.reset_voice_context_for_session_change();
@@ -1107,6 +1205,7 @@ impl SessionPanel {
     pub fn attach_session(&mut self, session_id: String, cx: &mut Context<Self>) {
         if let Some(proxy) = self.proxy.clone() {
             if let Some(view) = proxy.session_view(&session_id) {
+                ahead_viewmodel::adopt_session(&mut self.session, view.clone());
                 if self.session_id.as_deref() != Some(session_id.as_str()) {
                     self.invalidate_skill_catalog();
                     self.reset_voice_context_for_session_change();
@@ -1143,6 +1242,7 @@ impl SessionPanel {
             self.clear_session_presentation(&previous_session_id, cx);
         }
         self.session_id = None;
+        self.session.active = None;
         self.external_agent_id = None;
         self.active_work_title = "AHEAD work session".to_string();
         self.active_work_kind = ahead_rpc::ahead::WorkKind::ProductChange;
@@ -1415,7 +1515,12 @@ impl SessionPanel {
 
     /// Starts a real harness turn without blocking the UI while the managed
     /// runtime initializes or accepts the request.
-    fn start_agent_turn(&mut self, text: String, cx: &mut Context<Self>) {
+    fn start_agent_turn(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(proxy), Some(session_id)) =
             (self.proxy.clone(), self.session_id.clone())
         else {
@@ -1446,6 +1551,7 @@ impl SessionPanel {
             self.attached_files.clone(),
             self.attached_memories.clone(),
         );
+        let draft = text.clone();
         let request = ahead_rpc::ahead::AgentTurnRequestDto {
             session_id: session_id.clone(),
             thread_id: format!("thread-{session_id}"),
@@ -1487,11 +1593,14 @@ impl SessionPanel {
         }
         self.status = "Starting turn…".into();
         self.turn_starting = true;
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move { proxy.agent_turn(request) })
                 .await;
-            let _ = this.update(cx, |panel, cx| {
+            let _ = this.update_in(cx, |panel, window, cx| {
+                if panel.session_id.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
                 match result {
                     Ok(turn_id) => {
                         panel.turn_starting = false;
@@ -1512,6 +1621,11 @@ impl SessionPanel {
                     Err(error) => {
                         panel.turn_starting = false;
                         panel.streaming = false;
+                        if panel.chat_input.read(cx).value().is_empty() {
+                            panel.chat_input.update(cx, |input, cx| {
+                                input.set_value(draft, window, cx);
+                            });
+                        }
                         if panel
                             .memory_review
                             .as_ref()
@@ -1795,8 +1909,9 @@ impl SessionPanel {
             self.conversation_has_older = page.has_older;
         }
         self.streaming = proxy.is_streaming(session_id);
-        self.harness_warning = proxy.harness_warning(session_id);
         let runtime_state = proxy.agent_runtime_state(session_id);
+        self.harness_warning =
+            proxy.harness_warning(session_id, runtime_state.as_ref());
         self.plan_entries = runtime_state
             .as_ref()
             .map(|state| state.plan.clone())
@@ -2584,6 +2699,14 @@ impl SessionPanel {
             cx.notify();
             return;
         }
+        if !self.session.active.as_ref().is_some_and(|view| {
+            self.session_id.as_deref() == Some(view.session.id.as_str())
+                && !view.session.policy.sha256.is_empty()
+        }) {
+            self.status = "Session policy unavailable — message was not sent".into();
+            cx.notify();
+            return;
+        }
         if self.streaming || self.turn_starting {
             self.status = "Wait for the current turn to finish".into();
             cx.notify();
@@ -2593,7 +2716,7 @@ impl SessionPanel {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.conversation_scroller
             .update(cx, |state, cx| state.scroll_to_end(cx));
-        self.start_agent_turn(text, cx);
+        self.start_agent_turn(text, window, cx);
         cx.notify();
     }
 
@@ -2673,6 +2796,11 @@ impl SessionPanel {
             let (next_id, _) = ahead_viewmodel::next_phase(&view.workflow.phase.id);
             match proxy.advance_phase(&session_id, view.workflow.revision, next_id) {
                 Ok(updated) => {
+                    ahead_viewmodel::apply_workflow(
+                        &mut self.session,
+                        &session_id,
+                        updated.clone(),
+                    );
                     self.phase_id = updated.workflow.phase.id;
                     self.work_items = proxy.work_items(&session_id);
                     self.status = "Workflow phase advanced".into();
@@ -2761,6 +2889,20 @@ impl Render for SessionPanel {
         let text_color = cx.theme().sidebar_foreground;
         let bg_color = cx.theme().background;
         let card_bg = cx.theme().group_box;
+        let can_handoff = self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
+            && self.session.active.as_ref().is_some_and(|view| {
+                view.task.intent == ahead_rpc::ahead::TaskIntent::Assistance
+            });
+        let parent_thread = self.session_id.as_deref().and_then(|session_id| {
+            self.thread_launcher.as_ref().and_then(|threads| {
+                threads
+                    .read_with(cx, |threads, _| {
+                        threads.parent_thread_for(session_id)
+                    })
+                    .ok()
+                    .flatten()
+            })
+        });
 
         let model = self
             .models
@@ -3612,6 +3754,32 @@ impl Render for SessionPanel {
                                         this.export_checkpoint(cx)
                                     })),
                             )
+                            .when(can_handoff, |actions| actions.child(
+                                Button::new("handoff_implementation")
+                                    .icon(IconName::ArrowRight)
+                                    .label("Hand off")
+                                    .tooltip("Hand off implementation to an external agent")
+                                    .disabled(self.streaming || self.turn_starting)
+                                    .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                        this.open_implementation_handoff(window, cx);
+                                    })),
+                            ))
+                            .when_some(parent_thread.clone(), |actions, parent_thread| {
+                                let threads = self.thread_launcher.clone();
+                                actions.child(
+                                    Button::new("return_to_ahead_review")
+                                        .icon(IconName::ArrowLeft)
+                                        .label("Return to review")
+                                        .tooltip("Return to the originating AHEAD thread for verification and review")
+                                        .on_click(move |_, _, cx| {
+                                            if let Some(threads) = &threads {
+                                                threads.update(cx, |threads, cx| {
+                                                    threads.select_thread(&parent_thread, cx);
+                                                }).log_err();
+                                            }
+                                        }),
+                                )
+                            })
                     ))
                     .when(chat_available && self.model_config_warning.is_none() && self.harness_warning.is_none(), |bar| {
                         bar.child(
@@ -4273,6 +4441,16 @@ impl Render for SessionPanel {
                                     .flex_shrink_0()
                                     .gap_2()
                                     .items_center()
+                                    .child(
+                                        Button::new("add_context_btn")
+                                            .icon(IconName::File)
+                                            .ghost()
+                                            .flex_shrink_0()
+                                            .tooltip("Attach files from computer")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.attach_files(window, cx);
+                                            })),
+                                    )
                                     // Context window budget
                                     .child(
                                         h_flex()
@@ -4402,6 +4580,7 @@ mod tests {
         rank_slash_groups, safe_external_url, skill_catalog_key, skill_slash_label,
         slash_command_query, voice_update_is_current,
     };
+    use gpui_kit::component::select::SelectItem;
     use gpui_kit::{Focusable, TestAppContext};
     use std::collections::HashMap;
 
@@ -4581,18 +4760,21 @@ mod tests {
     fn skill_catalog_key_tracks_session_and_selected_model() {
         let first_model = super::ModelSpec {
             name: "Model A".into(),
+            provider_name: None,
             provider_id: Some("provider-a".into()),
             model_id: Some("model-a".into()),
             context_window: 8_192,
         };
         let second_model = super::ModelSpec {
             name: "Model B".into(),
+            provider_name: None,
             provider_id: Some("provider-a".into()),
             model_id: Some("model-b".into()),
             context_window: 8_192,
         };
         let provider_changed_model = super::ModelSpec {
             name: "Model A via provider B".into(),
+            provider_name: None,
             provider_id: Some("provider-b".into()),
             model_id: Some("model-a".into()),
             context_window: 8_192,
@@ -5165,6 +5347,7 @@ mod tests {
             r#"
             [ai]
             provider = "openai-compatible"
+            model = "qwen2.5-coder"
             [[ai.connections]]
             name = "Local"
             provider_id = "local"
@@ -5186,6 +5369,26 @@ mod tests {
                 .iter()
                 .all(|model| { model.provider_id.as_deref() == Some("local") })
         );
+        assert_eq!(models[0].name, "qwen2.5-coder");
+        assert_eq!(models[0].provider_name.as_deref(), Some("Local"));
+        assert_eq!(models[0].title().as_ref(), "qwen2.5-coder · Local");
+    }
+
+    #[test]
+    fn connection_model_replaces_legacy_top_level_model() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[ai]\nmodel = 'deepseek-coder'\n[[ai.connections]]\nname = 'OpenAI-compatible server'\nprovider_id = 'openai-compatible'\nmodel = 'deepseek-coder'\nmodels = ['deepseek-coder']\n",
+        )
+        .expect("settings");
+        let (models, warning) = super::configured_models(workspace.path());
+        assert!(warning.is_none());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "deepseek-coder");
+        assert_eq!(models[0].provider_id.as_deref(), Some("openai-compatible"));
     }
 
     #[cfg(unix)]
@@ -5308,6 +5511,33 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
     }
 
+    #[gpui_kit::test]
+    fn missing_session_policy_keeps_the_composer_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_path_buf(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            SessionPanel::new(workspace.path().to_path_buf(), window, cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proxy = Some(proxy);
+            panel.session_id = Some("session-without-policy".into());
+            panel.harness_kind = ahead_rpc::ahead::HarnessKind::ExternalAcp;
+            panel.chat_input.update(cx, |input, cx| {
+                input.set_value("Keep this draft", window, cx);
+            });
+            panel.send_chat(window, cx);
+            assert_eq!(panel.chat_input.read(cx).value(), "Keep this draft");
+            assert!(!panel.turn_starting);
+            assert_eq!(
+                panel.status.as_ref(),
+                "Session policy unavailable — message was not sent"
+            );
+        });
+    }
+
     #[gpui_kit::test(iterations = 20)]
     fn model_picker_reload_preserves_late_choice_and_session_status(
         cx: &mut TestAppContext,
@@ -5326,18 +5556,17 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|window, cx| {
             SessionPanel::new(workspace.path().to_path_buf(), window, cx)
         });
-        let model_select = panel.update_in(cx, |panel, window, cx| {
-            assert!(panel.model_config_loaded);
-            assert_eq!(panel.selected_model, 0);
-            panel.reload_configured_models(window, cx);
-            panel.model_select.clone()
-        });
+        let (model_select, second_model) =
+            panel.update_in(cx, |panel, window, cx| {
+                assert!(panel.model_config_loaded);
+                assert_eq!(panel.selected_model, 0);
+                panel.reload_configured_models(window, cx);
+                (panel.model_select.clone(), panel.models[1].clone())
+            });
         model_select.update(cx, |_, cx| {
-            cx.emit(
-                gpui_kit::component::select::SelectEvent::<Vec<String>>::Confirm(
-                    Some("Second · shared".into()),
-                ),
-            );
+            cx.emit(gpui_kit::component::select::SelectEvent::<
+                Vec<super::ModelSpec>,
+            >::Confirm(Some(second_model)));
         });
         panel.update(cx, |panel, _| {
             assert_eq!(panel.selected_model, 1);
@@ -5358,7 +5587,8 @@ mod tests {
             let selected = panel.models.get(panel.selected_model).expect("choice");
             assert_eq!(selected.provider_id.as_deref(), Some("second"));
             assert_eq!(selected.model_id.as_deref(), Some("shared"));
-            assert_eq!(selected.name, "Renamed second · shared");
+            assert_eq!(selected.name, "shared");
+            assert_eq!(selected.provider_name.as_deref(), Some("Renamed second"));
             assert_eq!(selected.context_window, 64000);
             assert_eq!(panel.selected_model, 0);
             assert_eq!(
@@ -5366,8 +5596,8 @@ mod tests {
                     .model_select
                     .read(cx)
                     .selected_value()
-                    .map(String::as_str),
-                Some("Renamed second · shared")
+                    .map(|model| model.name.as_str()),
+                Some("shared")
             );
             assert_eq!(panel.session_id.as_deref(), Some("new-external-session"));
             assert_eq!(

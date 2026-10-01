@@ -21,6 +21,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::setting::{
     SettingGroup, SettingItem, SettingPage, Settings,
 };
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -40,6 +41,15 @@ struct AiConnection {
 
 fn parse_toml_value(content: &str) -> Option<toml::Value> {
     content.parse::<toml::Table>().ok().map(toml::Value::Table)
+}
+
+pub(crate) fn inline_blame_enabled(workspace: &Path) -> bool {
+    ahead_core::config::read_ahead_config(workspace, "settings.toml")
+        .ok()
+        .flatten()
+        .and_then(|content| parse_toml_value(&content))
+        .and_then(|config| config.get("editor")?.get("inline-blame")?.as_bool())
+        .unwrap_or(true)
 }
 
 fn model_catalog(value: &str) -> Vec<String> {
@@ -388,6 +398,7 @@ fn merge_ai_config(existing: &str, ai_config: &str) -> Result<String, String> {
 fn save_ai_config(
     workspace: &Path,
     ai_config: &str,
+    inline_blame: bool,
 ) -> Result<[Option<SystemTime>; 3], String> {
     let path = SettingsPanel::config_path(workspace);
     let parent = path.parent().ok_or("settings path has no parent")?;
@@ -397,7 +408,16 @@ fn save_ai_config(
     let existing = ahead_core::config::read_ahead_config(workspace, "settings.toml")
         .map_err(|error| error.to_string())?
         .unwrap_or_else(|| DEFAULT_SETTINGS.to_string());
-    let content = merge_ai_config(&existing, ai_config)?;
+    let mut content = parse_toml_value(&merge_ai_config(&existing, ai_config)?)
+        .ok_or("merged settings are invalid TOML")?;
+    let root = content.as_table_mut().ok_or("settings must be a table")?;
+    let editor = root
+        .entry("editor")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or("editor settings must be a table")?;
+    editor.insert("inline-blame".into(), toml::Value::Boolean(inline_blame));
+    let content = toml::to_string(&content).map_err(|error| error.to_string())?;
     write_user_config(&path, &content).map_err(|error| error.to_string())?;
     Ok(SettingsPanel::settings_modified(workspace))
 }
@@ -406,6 +426,7 @@ struct PendingSettingsSave {
     workspace: PathBuf,
     generation: u64,
     ai_config: String,
+    inline_blame: bool,
 }
 
 struct LoadedSettings {
@@ -415,6 +436,7 @@ struct LoadedSettings {
     setup_required: bool,
     modified: [Option<SystemTime>; 3],
     status: String,
+    inline_blame: bool,
 }
 
 fn load_settings(
@@ -455,6 +477,7 @@ fn load_settings(
         setup_required,
         modified,
         status,
+        inline_blame: inline_blame_enabled(workspace),
     })
 }
 
@@ -476,6 +499,7 @@ pub struct SettingsPanel {
     mcp_busy: bool,
     pub status: SharedString,
     pub effective_source: SharedString,
+    inline_blame: bool,
     setup_required: bool,
     suppress_autosave: bool,
     loaded: bool,
@@ -553,6 +577,7 @@ impl SettingsPanel {
             mcp_busy: false,
             status: "Loading workspace settings…".into(),
             effective_source: "Loading…".into(),
+            inline_blame: true,
             setup_required: false,
             suppress_autosave: false,
             loaded: false,
@@ -809,6 +834,7 @@ impl SettingsPanel {
             workspace: self.workspace.clone(),
             generation: self.save_generation,
             ai_config,
+            inline_blame: self.inline_blame,
         });
         self.status = "Saving workspace settings…".into();
         self.start_pending_save(window, cx);
@@ -828,7 +854,11 @@ impl SettingsPanel {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    save_ai_config(&request.workspace, &request.ai_config)
+                    save_ai_config(
+                        &request.workspace,
+                        &request.ai_config,
+                        request.inline_blame,
+                    )
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -1000,6 +1030,7 @@ impl SettingsPanel {
                         this.setup_required = loaded.setup_required;
                         this.settings_modified = loaded.modified;
                         this.status = loaded.status.into();
+                        this.inline_blame = loaded.inline_blame;
                         this.load_connection_into_inputs(window, cx);
                         this.loaded = true;
                         if let Some(handler) = this.save_handler.clone() {
@@ -1250,6 +1281,27 @@ mod tests {
     };
     use fs4::fs_std::FileExt;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn inline_blame_defaults_on_and_persists_with_ai_settings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let settings = workspace.path().join(".ahead/settings.toml");
+        assert!(super::inline_blame_enabled(workspace.path()));
+        std::fs::create_dir_all(settings.parent().expect("settings directory"))
+            .expect("create settings directory");
+        std::fs::write(&settings, "[editor]\nwrap-style = 'editor-width'\n")
+            .expect("write settings");
+        super::save_ai_config(workspace.path(), "[ai]\nmodel = 'test'\n", false)
+            .expect("save settings");
+        assert!(!super::inline_blame_enabled(workspace.path()));
+        let saved = std::fs::read_to_string(settings).expect("read settings");
+        let config = parse_toml_value(&saved).expect("valid settings");
+        assert_eq!(
+            config["editor"]["wrap-style"].as_str(),
+            Some("editor-width")
+        );
+        assert_eq!(config["ai"]["model"].as_str(), Some("test"));
+    }
 
     #[test]
     fn settings_lock_serializes_independent_writers() {
@@ -1970,6 +2022,7 @@ impl SettingsPanel {
         let card = cx.theme().sidebar;
         let _group = cx.theme().group_box;
         let is_dark = cx.theme().mode.is_dark();
+        let settings_panel = cx.entity();
 
         v_flex()
             .w_full()
@@ -2081,6 +2134,39 @@ impl SettingsPanel {
                                         cx.notify();
                                     })),
                             ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .bg(card)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(IconName::Code)
+                            .child(
+                                div()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_size(px(12.))
+                                    .text_color(text)
+                                    .child("EDITOR"),
+                            ),
+                    )
+                    .child(
+                        Switch::new("settings_inline_blame")
+                            .checked(self.inline_blame)
+                            .label("Show author on active line")
+                            .tooltip("Show or hide the Git author and time beside the active line")
+                            .on_change(move |enabled, window, cx| {
+                                settings_panel.update(cx, |panel, cx| {
+                                    panel.inline_blame = *enabled;
+                                    panel.save_config(window, cx);
+                                });
+                            }),
                     ),
             )
             // Section 2: AI Connections & BYOK (Bring Your Own Key)

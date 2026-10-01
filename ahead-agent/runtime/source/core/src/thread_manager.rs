@@ -54,7 +54,6 @@ use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -97,23 +96,20 @@ use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
 
-fn reject_legacy_guardian_source(
+fn reject_unsupported_guardian_source(
     session_source: &SessionSource,
     thread_source: Option<&ThreadSource>,
 ) -> CodexResult<()> {
-    let is_legacy_guardian = matches!(
-        session_source,
-        SessionSource::Internal(InternalSessionSource::Guardian)
-    ) || matches!(
+    let is_unsupported_guardian = matches!(
         session_source,
         SessionSource::SubAgent(SubAgentSource::Other(source))
-            if source == crate::approval::LEGACY_GUARDIAN_SOURCE
-    ) || matches!(thread_source, Some(ThreadSource::GuardianReview));
+            if source == crate::approval::UNSUPPORTED_GUARDIAN_SOURCE
+    ) || thread_source
+        .is_some_and(|source| source.as_str() == "guardian_review");
 
-    if is_legacy_guardian {
+    if is_unsupported_guardian {
         return Err(CodexErr::InvalidRequest(
-            "Guardian-marked threads are legacy history only and cannot be executed by AHEAD"
-                .to_string(),
+            "Automatic-review sources are not supported by AHEAD".to_string(),
         ));
     }
 
@@ -948,7 +944,10 @@ impl ThreadManager {
                     "failed to read persisted AHEAD thread {thread_id}: {err}"
                 )),
             })?;
-        reject_legacy_guardian_source(&stored_thread.source, stored_thread.thread_source.as_ref())?;
+        reject_unsupported_guardian_source(
+            &stored_thread.source,
+            stored_thread.thread_source.as_ref(),
+        )?;
         let history_items = if stored_thread.history_mode == ThreadHistoryMode::Paginated {
             self.state
                 .load_latest_model_context(LoadThreadHistoryParams {
@@ -2038,7 +2037,7 @@ impl ThreadManagerState {
             reserved_thread_id,
         } = options;
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
-        reject_legacy_guardian_source(&session_source, thread_source.as_ref())?;
+        reject_unsupported_guardian_source(&session_source, thread_source.as_ref())?;
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),

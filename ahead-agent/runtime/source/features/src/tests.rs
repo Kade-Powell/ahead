@@ -23,18 +23,20 @@ fn transcript_v2_resolves_explicit_config_overrides() {
 }
 
 #[test]
-fn removed_guardian_feature_keys_are_accepted_but_ignored() {
+fn removed_guardian_feature_keys_are_not_known() {
     let defaults = Features::with_defaults();
     let mut features = defaults.clone();
-    let entries = BTreeMap::from([
-        ("guardian_reuse_parent_compaction".to_string(), true),
-        ("guardian_enhanced_node_repl_transcripts".to_string(), true),
-        ("guardian_node_repl_transcript_images".to_string(), true),
-        ("guardian_ext".to_string(), true),
-    ]);
+    let keys = [
+        "guardian_reuse_parent_compaction",
+        "guardian_enhanced_node_repl_transcripts",
+        "guardian_node_repl_transcript_images",
+        "guardian_ext",
+        "guardian_approval",
+    ];
+    let entries = keys.iter().map(|key| ((*key).to_string(), true)).collect();
 
-    for key in entries.keys() {
-        assert!(crate::is_known_feature_key(key));
+    for key in keys {
+        assert!(!crate::is_known_feature_key(key));
     }
     features.apply_map(&entries);
 
@@ -192,14 +194,6 @@ fn from_sources_ignores_removed_terminal_resize_reflow_feature_key() {
 }
 
 #[test]
-fn image_generation_extension_alias_is_supported() {
-    assert_eq!(
-        feature_for_key("imagegenext"),
-        Some(Feature::ImageGeneration)
-    );
-}
-
-#[test]
 fn image_generation_toggle_controls_extension_backed_generation() {
     let mut entries = BTreeMap::new();
     entries.insert("image_generation".to_string(), false);
@@ -214,15 +208,20 @@ fn image_generation_toggle_controls_extension_backed_generation() {
 }
 
 #[test]
-fn canonical_image_generation_toggle_wins_over_extension_alias() {
-    for (canonical, alias) in [(false, true), (true, false)] {
-        let entries = BTreeMap::from([
-            ("image_generation".to_string(), canonical),
-            ("imagegenext".to_string(), alias),
-        ]);
-        let mut features = Features::with_defaults();
-        features.apply_map(&entries);
-        assert_eq!(features.enabled(Feature::ImageGeneration), canonical);
+fn retired_feature_aliases_are_not_known() {
+    for key in [
+        "enable_experimental_windows_sandbox",
+        "experimental_use_unified_exec_tool",
+        "request_permissions",
+        "web_search",
+        "imagegenext",
+        "collab",
+        "memory_tool",
+        "telepathy",
+        "codex_hooks",
+    ] {
+        assert_eq!(feature_for_key(key), None, "{key}");
+        assert!(!crate::is_known_feature_key(key), "{key}");
     }
 }
 
@@ -257,24 +256,6 @@ fn remote_control_config_is_ignored() {
     features.apply_map(&entries);
 
     assert_eq!(features.enabled(Feature::RemoteControl), false);
-}
-
-#[test]
-fn telepathy_is_legacy_alias_for_chronicle() {
-    assert_eq!(feature_for_key("chronicle"), Some(Feature::Chronicle));
-    assert_eq!(feature_for_key("telepathy"), Some(Feature::Chronicle));
-}
-
-#[test]
-fn collab_is_legacy_alias_for_multi_agent() {
-    assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
-    assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
-}
-
-#[test]
-fn codex_hooks_is_legacy_alias_for_hooks() {
-    assert_eq!(feature_for_key("hooks"), Some(Feature::CodexHooks));
-    assert_eq!(feature_for_key("codex_hooks"), Some(Feature::CodexHooks));
 }
 
 #[test]

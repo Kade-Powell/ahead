@@ -409,6 +409,9 @@ pub struct SessionListItem {
     /// Latest durable chat message, or creation time before the first turn.
     pub updated_at: Timestamp,
     pub backend: Option<String>,
+    /// Originating AHEAD session for a delegated external implementation.
+    #[serde(default)]
+    pub parent_session_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,6 +1038,8 @@ pub struct AgentRuntimeState {
     pub usage: Option<AgentUsage>,
     #[serde(default)]
     pub commands: Vec<AgentCommand>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,6 +1154,9 @@ pub enum AheadRequest {
         harness: Option<HarnessKind>,
         #[serde(default)]
         external_agent_id: Option<String>,
+        /// Set only when explicitly handing implementation from an AHEAD session.
+        #[serde(default)]
+        parent_session_id: Option<Id>,
     },
     /// Lists AHEAD's supported external ACP agents and their install state.
     ListExternalAcpAdapters,

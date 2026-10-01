@@ -56,7 +56,11 @@
   does not yet reproduce Zed's true inline expansion, which inserts deleted
   rows into the editor display map; the gpui-kit editor lacks that block
   mechanism. `TODO.md` tracks the remaining editor work. No Zed source was
-  copied.
+  copied. A root binary rebuild passed and the continuous rail was visible
+  in the disposable project, but the native click result was inconclusive:
+  multiple AHEAD windows shared one app identity and two `just dev` bundle
+  launches aborted after a macOS LaunchServices error. The isolated native
+  click/hover check is tracked in `TODO.md`.
 
 - 2026-10-01: compared Zed's background diff update and snapshot replacement
   in `crates/buffer_diff/src/buffer_diff.rs` at
@@ -1090,6 +1094,19 @@
   remains in `TODO.md`. No provider turn was sent and no real workspace database was
   opened or changed. Workspace formatting and whitespace checks passed.
 
+- 2026-10-01: clarified managed restore after the explicit one-time legacy
+  import exception. Turso remains the only live thread store: only when a
+  requested thread is absent may AHEAD import one uniquely located, regular
+  legacy rollout from its configured runtime home. The importer checks the
+  thread metadata and canonical workspace, bounds plain and compressed input,
+  commits the header and ordered replay rows atomically, and leaves source
+  files untouched. It rejects malformed, symlinked, out-of-root,
+  cross-workspace and active/archive-ambiguous sources; it adds no schema
+  migration or live JSONL fallback. Focused plain/compressed, archive/history,
+  rejection and rollback tests are present but remain unrun until the shared
+  Cargo loop is available. See `TODO.md` and
+  `ahead-agent-standards.md#filesystem-placement` for the current contract.
+
 - 2026-09-30: reviewed `crates/agent/src/thread_store.rs::load_thread`
   and `crates/agent/src/agent.rs::create_subagent_thread` at
   `418f89714891f9d8105a3e92e60b9a7a5084d232`. Zed loads the selected thread
@@ -1546,3 +1563,32 @@ Targeted Clippy did not reach a clean result: `-D warnings` failed on two
 retained path-URI suggestions, and the repository-policy run stopped on 29
 existing `ahead-agent` errors. This is tracked separately in `TODO.md`, not
 counted as a passed lint gate.
+
+## Targeted lint and rollout-import verification (2026-10-01)
+
+After the retained-feature cleanup, the focused agent/app/proxy Clippy gate
+passed with zero errors and 80 warnings. Seven AHEAD metadata `clone_on_copy`
+errors were removed; the DAP and LSP timeout paths now use Rust 1.87-compatible
+map operations while preserving callback-after-unlock behavior. All six focused
+proxy timeout tests pass. The proxy test target also needed the existing
+workspace `zstd` dependency declared for its compressed-rollout fixture.
+
+Four focused proxy legacy-import tests pass for plain/compressed source,
+unsafe-source rejection, and atomic/idempotent Turso import. The agent's
+bounded-reader test also passes. These are local tests, not a native app
+restart/import/restore observation. The remaining Clippy warnings, actual
+Rust 1.87 compilation, and native journey remain in `TODO.md`.
+
+The complete app library suite passed 161 tests. The complete proxy suite
+passed 185 tests with local-loopback permission for its disposable model/FIM
+fixtures; in the restricted sandbox, 178 passed and seven could not bind
+loopback sockets. The full agent suite passed 110 tests with two opt-in tests
+ignored. A native managed-turn regression originally expected a `tools` array
+for bundled `gpt-5.6-sol`; the actual request omitted it because that model's
+retained metadata requires CodeModeOnly and AHEAD has no bundled Code Mode host.
+The regression now checks the optional wire shape and excludes unavailable
+`exec`/`wait` tools. This is fail-closed, not a claim that the model can use
+tools in AHEAD. Zed's pinned `crates/agent/src/thread.rs` (around line 4139)
+collects the turn's available tools into each direct `LanguageModelRequest`;
+AHEAD must either ship the retained host or make a deliberate model-mode
+decision before offering equivalent functionality for CodeModeOnly models.

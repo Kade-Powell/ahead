@@ -475,7 +475,6 @@ pub struct ConfigToml {
     pub notice: Option<Notice>,
 
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
-    pub experimental_use_unified_exec_tool: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
 }

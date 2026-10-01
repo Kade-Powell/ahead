@@ -174,6 +174,10 @@ pub enum HarnessEvent {
         acp_session_id: String,
         text: String,
     },
+    Warning {
+        acp_session_id: String,
+        message: String,
+    },
     ContextCompacted {
         acp_session_id: String,
     },
@@ -268,6 +272,17 @@ pub type HarnessSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
 type PendingSender = mpsc::Sender<Result<Value, String>>;
 /// Correlates JSON-RPC ids with the caller waiting on each response.
 type PendingMap = Arc<Mutex<HashMap<u64, PendingSender>>>;
+
+struct ReaderState {
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: PendingMap,
+    sink: HarnessSink,
+    policy_modes: Arc<Mutex<HashMap<String, String>>>,
+    config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
+    editor_mcp_state: Arc<Mutex<AcpEditorMcpState>>,
+    pending_editor_buffer_snapshots: PendingEditorBufferSnapshots,
+    pending_editor_presentations: PendingEditorPresentations,
+}
 
 /// Configuration for launching a harness process.
 #[derive(Debug, Clone)]
@@ -567,29 +582,25 @@ impl HarnessClient {
 
         Self::start_reader(
             stdout,
-            stdin,
-            pending,
-            sink,
-            policy_modes,
-            config_options,
-            harness.editor_mcp_state.clone(),
-            harness.pending_editor_buffer_snapshots.clone(),
-            harness.pending_editor_presentations.clone(),
+            ReaderState {
+                stdin,
+                pending,
+                sink,
+                policy_modes,
+                config_options,
+                editor_mcp_state: harness.editor_mcp_state.clone(),
+                pending_editor_buffer_snapshots: harness
+                    .pending_editor_buffer_snapshots
+                    .clone(),
+                pending_editor_presentations: harness
+                    .pending_editor_presentations
+                    .clone(),
+            },
         );
         Ok(harness)
     }
 
-    fn start_reader(
-        stdout: std::process::ChildStdout,
-        stdin: Arc<Mutex<ChildStdin>>,
-        pending: PendingMap,
-        sink: HarnessSink,
-        policy_modes: Arc<Mutex<HashMap<String, String>>>,
-        config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
-        editor_mcp_state: Arc<Mutex<AcpEditorMcpState>>,
-        pending_editor_buffer_snapshots: PendingEditorBufferSnapshots,
-        pending_editor_presentations: PendingEditorPresentations,
-    ) {
+    fn start_reader(stdout: std::process::ChildStdout, state: ReaderState) {
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -600,19 +611,9 @@ impl HarnessClient {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                Self::route_message(
-                    msg,
-                    &stdin,
-                    &pending,
-                    &sink,
-                    &policy_modes,
-                    &config_options,
-                    &editor_mcp_state,
-                    &pending_editor_buffer_snapshots,
-                    &pending_editor_presentations,
-                );
+                Self::route_message(msg, &state);
             }
-            if let Ok(mut pending) = pending.lock() {
+            if let Ok(mut pending) = state.pending.lock() {
                 for (_, sender) in pending.drain() {
                     drop(sender.send(Err(
                         "ACP agent closed its stdout during a request".to_string(),
@@ -622,17 +623,17 @@ impl HarnessClient {
         });
     }
 
-    fn route_message(
-        msg: Value,
-        stdin: &Arc<Mutex<ChildStdin>>,
-        pending: &PendingMap,
-        sink: &HarnessSink,
-        policy_modes: &Arc<Mutex<HashMap<String, String>>>,
-        config_options: &Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
-        editor_mcp_state: &Arc<Mutex<AcpEditorMcpState>>,
-        pending_editor_buffer_snapshots: &PendingEditorBufferSnapshots,
-        pending_editor_presentations: &PendingEditorPresentations,
-    ) {
+    fn route_message(msg: Value, state: &ReaderState) {
+        let ReaderState {
+            stdin,
+            pending,
+            sink,
+            policy_modes,
+            config_options,
+            editor_mcp_state,
+            pending_editor_buffer_snapshots,
+            pending_editor_presentations,
+        } = state;
         let method = msg.get("method").and_then(Value::as_str);
         let id = msg.get("id").cloned();
 
@@ -722,7 +723,7 @@ impl HarnessClient {
                                 if state.connections.contains_key(&connection_id) {
                                     state
                                         .legacy_initialized_connections
-                                        .insert(connection_id.clone());
+                                        .insert(connection_id);
                                 }
                             }
                             Err(error) => {
@@ -1527,10 +1528,13 @@ impl HarnessClient {
                 .filter(|(session_id, _)| session_id == acp_session_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            request_keys
-                .into_iter()
-                .filter_map(|key| requests.remove(&key))
-                .collect::<Vec<_>>()
+            let mut senders = Vec::new();
+            for key in request_keys {
+                if let Some(sender) = requests.remove(&key) {
+                    senders.push(sender);
+                }
+            }
+            senders
         });
         if let Ok(senders) = requests {
             for sender in senders {
@@ -1897,7 +1901,7 @@ fn handle_editor_tool_call_for_server(
             sink,
         ) {
             Ok(buffers) => buffers,
-            Err(error) => return editor_tool_result(false, error.to_string()),
+            Err(error) => return editor_tool_result(false, error),
         };
         return match read_editor_buffer_from_snapshots(
             &arguments,

@@ -89,16 +89,65 @@ foo = true"#;
 }
 
 #[test]
-fn strict_config_accepts_removed_guardian_feature_keys() {
+fn strict_config_rejects_removed_guardian_feature_keys() {
     let path = Path::new("/tmp/config.toml");
 
-    for contents in [
-        "[features]\nguardian_ext = true\n",
-        "[profiles.work.features]\nguardian_reuse_parent_compaction = true\n",
+    for key in [
+        "guardian_approval",
+        "guardian_reuse_parent_compaction",
+        "guardian_enhanced_node_repl_transcripts",
+        "guardian_node_repl_transcript_images",
+        "guardian_ext",
     ] {
+        let contents = format!("[features]\n{key} = true\n");
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, &contents)
+            .expect("removed Guardian feature key should be rejected");
         assert_eq!(
-            config_error_from_ignored_toml_fields::<ConfigToml>(path, contents),
-            None
+            error.message,
+            format!("unknown configuration field `features.{key}`")
+        );
+    }
+
+    let contents = "[profiles.work.features]\nguardian_ext = true\n";
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents)
+        .expect("removed profile feature key should be rejected");
+    assert_eq!(
+        error.message,
+        "unknown configuration field `profiles.work.features.guardian_ext`"
+    );
+}
+
+#[test]
+fn strict_config_rejects_retired_feature_aliases() {
+    let path = Path::new("/tmp/config.toml");
+    for key in [
+        "enable_experimental_windows_sandbox",
+        "experimental_use_unified_exec_tool",
+        "request_permissions",
+        "web_search",
+        "imagegenext",
+        "collab",
+        "memory_tool",
+        "telepathy",
+        "codex_hooks",
+    ] {
+        let contents = format!("[features]\n{key} = true\n");
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, &contents)
+            .expect("retired alias should be rejected");
+        assert_eq!(
+            error.message,
+            format!("unknown configuration field `features.{key}`")
+        );
+    }
+
+    for contents in [
+        "experimental_use_unified_exec_tool = true\n",
+        "[profiles.work]\nexperimental_use_unified_exec_tool = true\n",
+        "[profiles.work.features]\ncollab = true\n",
+    ] {
+        assert!(
+            config_error_from_ignored_toml_fields::<ConfigToml>(path, contents).is_some(),
+            "{contents}"
         );
     }
 }

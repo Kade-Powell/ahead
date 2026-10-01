@@ -8,7 +8,14 @@ use pretty_assertions::assert_eq;
 use super::ProcessOwnedCodeModeSession;
 use super::ProcessOwnedCodeModeSessionProvider;
 use super::connection::ConnectionError;
+use super::default_host_program;
 use crate::NoopCodeModeSessionDelegate;
+
+#[test]
+fn default_host_program_is_next_to_the_ahead_executable() {
+    let executable = std::env::current_exe().expect("test executable path");
+    assert_eq!(default_host_program().parent(), executable.parent());
+}
 
 #[test]
 fn provider_reuses_its_live_process_host() {

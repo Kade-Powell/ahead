@@ -797,7 +797,7 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
 }
 
 #[tokio::test]
-async fn spawn_internal_guardian_session_is_rejected() {
+async fn start_thread_rejects_unsupported_guardian_review_source() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -810,23 +810,18 @@ async fn spawn_internal_guardian_session_is_rejected() {
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
-    let parent = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
-        .await
-        .expect("start parent thread");
     let result = manager
-        .spawn_internal_session(
-            parent.thread_id,
-            StartThreadOptions {
-                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
-                ..StartThreadOptions::new(config)
-            },
-        )
+        .start_thread(StartThreadOptions {
+            thread_source: Some(codex_protocol::protocol::ThreadSource::Feature(
+                "guardian_review".to_string(),
+            )),
+            ..StartThreadOptions::new(config)
+        })
         .await;
     assert!(
         result
             .err()
-            .is_some_and(|error| error.to_string().contains("legacy history only"))
+            .is_some_and(|error| error.to_string().contains("not supported by AHEAD"))
     );
 
     manager

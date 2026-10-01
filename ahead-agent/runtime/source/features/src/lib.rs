@@ -15,7 +15,6 @@ use std::collections::BTreeSet;
 use toml::Table;
 
 mod feature_configs;
-mod legacy;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CodeModeHostConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
@@ -32,8 +31,6 @@ pub use feature_configs::SleepToolConfigToml;
 pub use feature_configs::SleepToolMode;
 pub use feature_configs::TokenBudgetConfigToml;
 pub use feature_configs::ToolRegistryConfigToml;
-use legacy::LegacyFeatureToggles;
-pub use legacy::{legacy_feature_keys, legacy_ignored_feature_keys};
 
 /// High-level lifecycle stage for a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +385,6 @@ pub struct FeatureOverrides {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FeatureConfigSource<'a> {
     pub features: Option<&'a FeaturesToml>,
-    pub experimental_use_unified_exec_tool: Option<bool>,
 }
 
 impl FeatureOverrides {
@@ -487,9 +483,6 @@ impl Features {
     /// Apply a table of key -> bool toggles (e.g. from TOML).
     pub fn apply_map(&mut self, m: &BTreeMap<String, bool>) {
         for (k, v) in m {
-            if legacy::is_legacy_ignored_feature_key(k) {
-                continue;
-            }
             match k.as_str() {
                 "web_search_request" => {
                     self.record_legacy_usage_force(
@@ -534,9 +527,6 @@ impl Features {
                 | "plugin_hooks" => {
                     continue;
                 }
-                "guardian_approval" => {
-                    continue;
-                }
                 "skill_env_var_dependency_prompt" => {
                     continue;
                 }
@@ -551,17 +541,10 @@ impl Features {
                 }
                 _ => {}
             }
-            if k == "imagegenext" && m.contains_key(Feature::ImageGeneration.key()) {
-                self.record_legacy_usage(k, Feature::ImageGeneration);
-                continue;
-            }
             match feature_for_key(k) {
                 Some(feat) => {
                     if matches!(feat, Feature::TuiAppServer) {
                         continue;
-                    }
-                    if k != feat.key() {
-                        self.record_legacy_usage(k.as_str(), feat);
                     }
                     if *v {
                         self.enable(feat);
@@ -584,11 +567,6 @@ impl Features {
         let mut features = Features::with_defaults();
 
         for source in [base, profile] {
-            LegacyFeatureToggles {
-                experimental_use_unified_exec_tool: source.experimental_use_unified_exec_tool,
-            }
-            .apply(&mut features);
-
             if let Some(feature_entries) = source.features {
                 features.apply_toml(feature_entries);
             }
@@ -667,15 +645,6 @@ fn web_search_details() -> &'static str {
 
 /// Keys accepted in `[features]` tables.
 pub fn feature_for_key(key: &str) -> Option<Feature> {
-    for spec in FEATURES {
-        if spec.key == key {
-            return Some(spec.id);
-        }
-    }
-    legacy::feature_for_key(key)
-}
-
-pub fn canonical_feature_for_key(key: &str) -> Option<Feature> {
     FEATURES
         .iter()
         .find(|spec| spec.key == key)
@@ -684,9 +653,7 @@ pub fn canonical_feature_for_key(key: &str) -> Option<Feature> {
 
 /// Returns `true` if the provided string matches a known `[features]` key.
 pub fn is_known_feature_key(key: &str) -> bool {
-    key == "tool_registry"
-        || feature_for_key(key).is_some()
-        || legacy::is_legacy_ignored_feature_key(key)
+    key == "tool_registry" || feature_for_key(key).is_some()
 }
 
 /// Deserializable features table for TOML.

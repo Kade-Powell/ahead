@@ -23,6 +23,17 @@ pub struct NativeThreadSnapshot {
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One legacy rollout imported as a single durable thread-store transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyNativeThreadImport {
+    pub thread_id: String,
+    pub create_params: Value,
+    pub rollout_items: Vec<Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Fields needed to list a native thread without loading its replay items.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeThreadHeader {
@@ -226,6 +237,14 @@ pub trait HarnessStore: Send + Sync {
         _thread_id: &str,
         _create_params: Value,
     ) -> Result<()> {
+        anyhow::bail!("native thread persistence is unavailable")
+    }
+
+    /// Imports a legacy rollout once; the header and replay rows must commit atomically.
+    fn import_legacy_native_thread(
+        &self,
+        _import: LegacyNativeThreadImport,
+    ) -> Result<bool> {
         anyhow::bail!("native thread persistence is unavailable")
     }
 

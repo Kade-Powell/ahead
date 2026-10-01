@@ -5,7 +5,7 @@
 //! Uses local embedded databases through the Turso/libSQL client.
 //! Corresponds to Section 7.1 of `ahead-editor-mvp.md`.
 
-use ahead_agent::InstructionFileSource;
+use ahead_agent::{InstructionFileSource, LegacyNativeThreadImport};
 use ahead_rpc::ahead::{
     AgentRuntimeState, ApprovalRecord, CodeAnchor, ConversationMessage,
     ConversationMessageCursor, ConversationMessagePage, ConversationSummary,
@@ -1148,7 +1148,11 @@ impl SessionStore {
                                 SELECT MAX(messages.created_at)
                                 FROM conversation_messages AS messages
                                 WHERE messages.session_id = sessions.id
-                            ), sessions.created_at)) AS updated_at
+                            ), sessions.created_at)) AS updated_at,
+                            (SELECT parent.session_id
+                             FROM session_tasks AS child
+                             JOIN session_tasks AS parent ON parent.id = child.parent_task_id
+                             WHERE child.session_id = sessions.id LIMIT 1) AS parent_session_id
                      FROM sessions
                      JOIN workflow_state
                        ON workflow_state.session_id = sessions.id
@@ -1176,6 +1180,7 @@ impl SessionStore {
                         created_at: row.get(3)?,
                         backend: row.get(4)?,
                         updated_at: row.get(5)?,
+                        parent_session_id: row.get(6)?,
                     })
                 })();
                 match item {
@@ -1207,6 +1212,38 @@ impl SessionStore {
     }
 
     pub fn insert_session(&mut self, view: &SessionView) -> Result<()> {
+        self.insert_session_inner(view, None)
+    }
+
+    pub(crate) fn insert_session_with_harness_binding(
+        &mut self,
+        view: &SessionView,
+        backend: &str,
+    ) -> Result<()> {
+        self.insert_session_inner(view, Some(backend))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_harness_binding_failure_for_test(
+        &self,
+        fail: bool,
+    ) -> Result<()> {
+        let sql = if fail {
+            "CREATE TRIGGER reject_test_harness_binding
+             BEFORE INSERT ON harness_bindings
+             BEGIN SELECT RAISE(ABORT, 'injected harness binding failure'); END;"
+        } else {
+            "DROP TRIGGER IF EXISTS reject_test_harness_binding;"
+        };
+        self.block_on(self.conn.execute_batch(sql))?;
+        Ok(())
+    }
+
+    fn insert_session_inner(
+        &mut self,
+        view: &SessionView,
+        initial_backend: Option<&str>,
+    ) -> Result<()> {
         let session = &view.session;
         let lifecycle_json = serde_json::to_string(&session.lifecycle)?;
         let policy_json = serde_json::to_string(&session.policy)?;
@@ -1233,9 +1270,12 @@ impl SessionStore {
         }
 
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
-
-            self.conn.execute(
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let result = async {
+                transaction.execute(
                 "INSERT INTO sessions (id, project_id, worktree_id, work_kind, title, owner_id, lifecycle_json, policy_json, revision, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
@@ -1252,7 +1292,7 @@ impl SessionStore {
                 ],
             ).await?;
 
-            self.conn.execute(
+                transaction.execute(
                 "INSERT INTO session_tasks (id, session_id, intent, work_kind, title, objective, parent_task_id, learning_arc_id, created_at, completed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
@@ -1270,7 +1310,7 @@ impl SessionStore {
             ).await?;
 
             if let Some(arc) = &view.learning_arc {
-                self.conn.execute(
+                    transaction.execute(
                     "INSERT INTO learning_arcs (id, task_id, mission, current_concept_id, state, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
@@ -1284,7 +1324,7 @@ impl SessionStore {
                     ],
                 ).await?;
                 for record in &arc.records {
-                    self.conn.execute(
+                        transaction.execute(
                         "INSERT INTO learning_records (id, arc_id, kind, content, source_refs_json, created_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![
@@ -1299,7 +1339,7 @@ impl SessionStore {
                 }
             }
 
-            self.conn.execute(
+                transaction.execute(
                 "INSERT INTO workflow_state (session_id, revision, definition_version, phase_id, phase_title, phase_visit, primary_work_item_json, current_artifact_ids_json, approvals_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
@@ -1315,14 +1355,40 @@ impl SessionStore {
                 ],
             ).await?;
 
-            for (p_id, p_json, role_str) in participant_tuples {
-                self.conn.execute(
+                for (p_id, p_json, role_str) in participant_tuples {
+                    transaction.execute(
                     "INSERT INTO participants (id, session_id, participant_json, role) VALUES (?1, ?2, ?3, ?4)",
                     params![p_id, session.id.clone(), p_json, role_str],
                 ).await?;
             }
 
-            self.conn.execute("COMMIT", ()).await?;
+                if let Some(backend) = initial_backend {
+                    transaction
+                        .execute(
+                        "INSERT INTO harness_bindings
+                            (session_id, acp_session_id, backend, updated_at)
+                         VALUES (?1, '', ?2, ?3)",
+                        params![
+                            session.id.clone(),
+                            backend.to_string(),
+                            chrono::Utc::now().to_rfc3339(),
+                        ],
+                        )
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => transaction.commit().await?,
+                Err(error) => {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("rolling back AHEAD session creation")?;
+                    return Err(error);
+                }
+            }
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -2593,6 +2659,92 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn import_legacy_native_thread(
+        &self,
+        import: &LegacyNativeThreadImport,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            import
+                .create_params
+                .get("thread_id")
+                .and_then(Value::as_str)
+                == Some(import.thread_id.as_str()),
+            "legacy native thread id does not match its create parameters"
+        );
+        let create_params_json = serde_json::to_string(&import.create_params)?;
+        let item_json = import
+            .rollout_items
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let thread_id = import.thread_id.clone();
+        let created_at = import.created_at.to_rfc3339();
+        let updated_at = import.updated_at.to_rfc3339();
+        let archived_at = import
+            .archived_at
+            .as_ref()
+            .map(chrono::DateTime::to_rfc3339);
+        self.block_on(async {
+            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            let result = async {
+                let inserted = self
+                    .conn
+                    .execute(
+                        "INSERT INTO agent_runtime_threads
+                            (thread_id, create_params_json, archived, archived_at,
+                             created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(thread_id) DO NOTHING",
+                        params![
+                            thread_id.clone(),
+                            create_params_json,
+                            if import.archived_at.is_some() {
+                                1_i64
+                            } else {
+                                0_i64
+                            },
+                            archived_at,
+                            created_at,
+                            updated_at,
+                        ],
+                    )
+                    .await?;
+                if inserted == 0 {
+                    self.conn.execute("COMMIT", ()).await?;
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                for (ordinal, item) in item_json.iter().enumerate() {
+                    let ordinal = i64::try_from(ordinal)
+                        .context("legacy rollout has too many records")?;
+                    self.conn
+                        .execute(
+                            "INSERT INTO agent_runtime_thread_items
+                                (thread_id, ordinal, item_json)
+                             VALUES (?1, ?2, ?3)",
+                            params![thread_id.clone(), ordinal, item.clone()],
+                        )
+                        .await?;
+                }
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(true)
+            }
+            .await;
+            match result {
+                Ok(imported) => Ok(imported),
+                Err(error) => {
+                    if let Err(rollback_error) =
+                        self.conn.execute("ROLLBACK", ()).await
+                    {
+                        return Err(error.context(format!(
+                            "rollback also failed: {rollback_error}"
+                        )));
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
+
     pub fn append_native_thread_items(
         &self,
         thread_id: &str,
@@ -3694,6 +3846,13 @@ impl ahead_agent::HarnessStore for SharedSessionStore {
             .create_native_thread(thread_id, &create_params)
     }
 
+    fn import_legacy_native_thread(
+        &self,
+        import: LegacyNativeThreadImport,
+    ) -> Result<bool> {
+        self.0.read().import_legacy_native_thread(&import)
+    }
+
     fn append_native_thread_items(
         &self,
         thread_id: &str,
@@ -3850,6 +4009,7 @@ mod tests {
                 description: "Review current changes".to_string(),
                 input: None,
             }],
+            warnings: vec!["Code Mode host unavailable".to_string()],
         };
         store.set_agent_runtime_state(&session.session.id, &expected)?;
         drop(store);
@@ -6145,7 +6305,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_native_threads_do_not_import_legacy_rollout_files() -> Result<()> {
+    fn legacy_rollouts_import_into_turso_before_thread_restore() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         fs::create_dir(workspace.path().join(".ahead"))?;
         let database_path = workspace.path().join(".ahead/session.db");
@@ -6162,50 +6322,269 @@ mod tests {
 
         for directory in ["sessions", "archived_sessions"] {
             for history_mode in ["legacy", "paginated"] {
-                let thread_id = uuid::Uuid::new_v4().to_string();
+                for compressed in [false, true] {
+                    let thread_id = uuid::Uuid::new_v4().to_string();
+                    let rollout_dir = workspace
+                        .path()
+                        .join(".ahead/runtime")
+                        .join(directory)
+                        .join("2025/01/03");
+                    fs::create_dir_all(&rollout_dir)?;
+                    let rollout_path = rollout_dir.join(format!(
+                        "rollout-2025-01-03T12-00-00-{thread_id}.jsonl"
+                    ));
+                    let meta = serde_json::json!({
+                        "timestamp": "2025-01-03T12:00:00Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "session_id": thread_id,
+                            "id": thread_id,
+                            "timestamp": "2025-01-03T12:00:00Z",
+                            "cwd": workspace.path(),
+                            "originator": "ahead-test",
+                            "cli_version": "test",
+                            "source": "cli",
+                            "model_provider": "openai",
+                            "history_mode": history_mode
+                        }
+                    });
+                    let contents = format!("{meta}\n");
+                    let source_path = if compressed {
+                        rollout_path.with_extension("jsonl.zst")
+                    } else {
+                        rollout_path
+                    };
+                    let source_bytes = if compressed {
+                        zstd::stream::encode_all(contents.as_bytes(), 3)?
+                    } else {
+                        contents.into_bytes()
+                    };
+                    fs::write(&source_path, &source_bytes)?;
+
+                    client
+                        .load_session(
+                            &thread_id,
+                            workspace.path(),
+                            "read-only",
+                            None,
+                            Some("openai"),
+                        )
+                        .expect("import and resume legacy JSONL thread");
+                    let snapshot = store
+                        .read()
+                        .load_native_thread(&thread_id)?
+                        .context("legacy rollout was not imported")?;
+                    assert_eq!(snapshot.archived, directory == "archived_sessions");
+                    assert_eq!(snapshot.rollout_items.len(), 1);
+                    assert_eq!(snapshot.create_params["thread_id"], thread_id);
+                    assert_eq!(snapshot.create_params["history_mode"], history_mode);
+                    assert_eq!(fs::read(&source_path)?, source_bytes);
+                }
+            }
+        }
+        client.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_legacy_rollouts_are_rejected_without_modifying_sources() -> Result<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        let other_workspace = tempfile::tempdir()?;
+        fs::create_dir_all(workspace.path().join(".ahead"))?;
+        let database_path = workspace.path().join(".ahead/session.db");
+        let store = Arc::new(parking_lot::RwLock::new(SessionStore::open(
+            &database_path,
+        )?));
+        let config =
+            ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
+        let client = ahead_agent::NativeClient::spawn(
+            &config,
+            Arc::new(SharedSessionStore(store.clone())),
+            Arc::new(|_| {}),
+        )?;
+
+        for invalid_case in ["ambiguous", "malformed", "out-of-scope"] {
+            let thread_id = uuid::Uuid::new_v4().to_string();
+            let cwd = if invalid_case == "out-of-scope" {
+                other_workspace.path()
+            } else {
+                workspace.path()
+            };
+            let meta = serde_json::json!({
+                "timestamp": "2025-01-03T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": thread_id,
+                    "id": thread_id,
+                    "timestamp": "2025-01-03T12:00:00Z",
+                    "cwd": cwd,
+                    "originator": "ahead-test",
+                    "cli_version": "test",
+                    "source": "cli",
+                    "model_provider": "openai"
+                }
+            });
+            let mut sources = Vec::new();
+            let directories: &[&str] = if invalid_case == "ambiguous" {
+                &["sessions", "archived_sessions"]
+            } else {
+                &["sessions"]
+            };
+            for directory in directories {
                 let rollout_dir = workspace
                     .path()
                     .join(".ahead/runtime")
                     .join(directory)
                     .join("2025/01/03");
                 fs::create_dir_all(&rollout_dir)?;
-                let rollout_path = rollout_dir
+                let path = rollout_dir
                     .join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
-                let meta = serde_json::json!({
-                    "timestamp": "2025-01-03T12:00:00Z",
-                    "type": "session_meta",
-                    "payload": {
-                        "session_id": thread_id,
-                        "id": thread_id,
-                        "timestamp": "2025-01-03T12:00:00Z",
-                        "cwd": workspace.path(),
-                        "originator": "ahead-test",
-                        "cli_version": "test",
-                        "source": "cli",
-                        "model_provider": "test-provider",
-                        "history_mode": history_mode
-                    }
-                });
-                let contents = format!("{meta}\n");
-                fs::write(&rollout_path, &contents)?;
-
-                client
-                    .load_session(
-                        &thread_id,
-                        workspace.path(),
-                        "read-only",
-                        None,
-                        None,
-                    )
-                    .expect_err(
-                        "a missing Turso thread must not fall back to JSONL",
-                    );
-                assert!(store.read().load_native_thread(&thread_id)?.is_none());
-                assert_eq!(fs::read_to_string(&rollout_path)?, contents);
+                let contents = if invalid_case == "malformed" {
+                    format!("{meta}\nnot valid JSON\n")
+                } else {
+                    format!("{meta}\n")
+                };
+                fs::write(&path, &contents)?;
+                sources.push((path, contents));
+            }
+            client
+                .load_session(
+                    &thread_id,
+                    workspace.path(),
+                    "read-only",
+                    None,
+                    Some("openai"),
+                )
+                .expect_err("unsafe rollout must not be imported");
+            assert!(store.read().load_native_thread(&thread_id)?.is_none());
+            for (path, contents) in sources {
+                assert_eq!(fs::read_to_string(path)?, contents);
             }
         }
         assert!(store.read().list_native_thread_headers()?.is_empty());
         client.shutdown();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_legacy_session_root_is_rejected_without_import() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        fs::create_dir_all(workspace.path().join(".ahead"))?;
+        let database_path = workspace.path().join(".ahead/session.db");
+        let store = Arc::new(parking_lot::RwLock::new(SessionStore::open(
+            &database_path,
+        )?));
+        let config =
+            ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
+        let client = ahead_agent::NativeClient::spawn(
+            &config,
+            Arc::new(SharedSessionStore(store.clone())),
+            Arc::new(|_| {}),
+        )?;
+
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        let runtime_home = workspace.path().join(".ahead/runtime");
+        let target_directory =
+            runtime_home.join("rollout-store/sessions/2025/01/03");
+        fs::create_dir_all(&target_directory)?;
+        let source = target_directory
+            .join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
+        let meta = serde_json::json!({
+            "timestamp": "2025-01-03T12:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": thread_id,
+                "id": thread_id,
+                "timestamp": "2025-01-03T12:00:00Z",
+                "cwd": workspace.path(),
+                "originator": "ahead-test",
+                "cli_version": "test",
+                "source": "cli",
+                "model_provider": "openai"
+            }
+        });
+        let contents = format!("{meta}\n");
+        fs::write(&source, &contents)?;
+        std::os::unix::fs::symlink(
+            runtime_home.join("rollout-store/sessions"),
+            runtime_home.join("sessions"),
+        )?;
+
+        let error = client
+            .load_session(
+                &thread_id,
+                workspace.path(),
+                "read-only",
+                None,
+                Some("openai"),
+            )
+            .expect_err("symlinked legacy session root must be rejected");
+        assert!(format!("{error:#}").contains("must not be symlinks"));
+        assert!(store.read().load_native_thread(&thread_id)?.is_none());
+        assert_eq!(fs::read_to_string(source)?, contents);
+        client.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_native_thread_import_is_atomic_and_idempotent() -> Result<()> {
+        let store = SessionStore::in_memory()?;
+        let created_at =
+            chrono::DateTime::parse_from_rfc3339("2025-01-03T12:00:00Z")?
+                .with_timezone(&chrono::Utc);
+        let updated_at = created_at + chrono::Duration::minutes(5);
+        let import = LegacyNativeThreadImport {
+            thread_id: "legacy-thread".into(),
+            create_params: serde_json::json!({
+                "thread_id": "legacy-thread",
+                "history_mode": "legacy"
+            }),
+            rollout_items: vec![
+                serde_json::json!({"type": "user_message", "text": "hello"}),
+                serde_json::json!({"type": "assistant_message", "text": "hi"}),
+            ],
+            created_at: created_at.clone(),
+            updated_at: updated_at.clone(),
+            archived_at: Some(updated_at),
+        };
+        store.block_on(async {
+            store
+                .conn
+                .execute(
+                    "CREATE TRIGGER reject_legacy_import_item
+                     BEFORE INSERT ON agent_runtime_thread_items
+                     WHEN NEW.ordinal = 1
+                     BEGIN SELECT RAISE(ABORT, 'injected import failure'); END",
+                    (),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert!(store.import_legacy_native_thread(&import).is_err());
+        assert!(store.load_native_thread("legacy-thread")?.is_none());
+
+        store.block_on(async {
+            store
+                .conn
+                .execute("DROP TRIGGER reject_legacy_import_item", ())
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert!(store.import_legacy_native_thread(&import)?);
+        assert!(!store.import_legacy_native_thread(&import)?);
+        let snapshot = store
+            .load_native_thread("legacy-thread")?
+            .context("imported native thread missing")?;
+        assert_eq!(snapshot.rollout_items, import.rollout_items);
+        assert!(snapshot.archived);
+        assert_eq!(snapshot.archived_at, import.archived_at);
+        let header = store
+            .load_native_thread_header("legacy-thread")?
+            .context("imported native thread header missing")?;
+        assert_eq!(header.created_at, Some(import.created_at));
+        assert_eq!(header.updated_at, Some(import.updated_at));
         Ok(())
     }
 

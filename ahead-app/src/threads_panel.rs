@@ -40,6 +40,7 @@ pub struct AgentThread {
     pub kind: ThreadKind,
     pub time_str: String,
     pub is_active: bool,
+    pub parent_session_id: Option<String>,
 }
 
 fn title_from_request(request: &str) -> String {
@@ -105,6 +106,34 @@ fn thread_from_summary(
         kind,
         time_str,
         is_active,
+        parent_session_id: summary.session.parent_session_id,
+    }
+}
+
+fn order_linked_threads(threads: &mut Vec<AgentThread>) {
+    let original = std::mem::take(threads);
+    // ponytail: one-level scan is enough while only AHEAD sessions can parent handoffs.
+    for thread in original.iter().filter(|thread| {
+        thread.parent_session_id.as_ref().is_none_or(|parent_id| {
+            !original.iter().any(|candidate| {
+                matches!(
+                    &candidate.kind,
+                    ThreadKind::Ahead { item_id, .. } if item_id == parent_id
+                )
+            })
+        })
+    }) {
+        threads.push(thread.clone());
+        if let ThreadKind::Ahead { item_id, .. } = &thread.kind {
+            threads.extend(
+                original
+                    .iter()
+                    .filter(|child| {
+                        child.parent_session_id.as_deref() == Some(item_id.as_str())
+                    })
+                    .cloned(),
+            );
+        }
     }
 }
 
@@ -115,6 +144,7 @@ struct SessionCreation {
     harness: ahead_rpc::ahead::HarnessKind,
     external_agent_id: Option<String>,
     external_agent_name: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 struct AdapterChange {
@@ -144,6 +174,7 @@ pub struct ThreadsPanel {
     show_new_session: bool,
     new_thread_kind: ahead_rpc::ahead::HarnessKind,
     pending_thread_removal: Option<String>,
+    handoff_parent_session_id: Option<String>,
 }
 
 impl ThreadsPanel {
@@ -200,6 +231,7 @@ impl ThreadsPanel {
             show_new_session: false,
             new_thread_kind: ahead_rpc::ahead::HarnessKind::Ahead,
             pending_thread_removal: None,
+            handoff_parent_session_id: None,
         }
     }
 
@@ -254,6 +286,7 @@ impl ThreadsPanel {
                 self.threads.push(thread);
             }
         }
+        order_linked_threads(&mut self.threads);
         self.error = None;
         cx.notify();
     }
@@ -323,6 +356,7 @@ impl ThreadsPanel {
                         },
                         time_str: "imported".into(),
                         is_active: true,
+                        parent_session_id: None,
                     });
                 }
                 if let Some(session_panel) = self.session_panel.clone() {
@@ -374,6 +408,7 @@ impl ThreadsPanel {
             kind,
             time_str: "now".into(),
             is_active: true,
+            parent_session_id: None,
         }];
         if let Some(session_panel) = self.session_panel.clone() {
             session_panel.update(cx, |panel, cx| {
@@ -420,6 +455,22 @@ impl ThreadsPanel {
         }
         self.error = None;
         cx.notify();
+    }
+
+    pub fn parent_thread_for(&self, session_id: &str) -> Option<String> {
+        let parent_id =
+            self.threads.iter().find_map(|thread| match &thread.kind {
+                ThreadKind::External { item_id, .. } if item_id == session_id => {
+                    thread.parent_session_id.as_deref()
+                }
+                _ => None,
+            })?;
+        self.threads.iter().find_map(|thread| match &thread.kind {
+            ThreadKind::Ahead { item_id, .. } if item_id == parent_id => {
+                Some(thread.id.clone())
+            }
+            _ => None,
+        })
     }
 
     fn remove_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -552,6 +603,7 @@ impl ThreadsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.handoff_parent_session_id = None;
         self.new_thread_kind = harness_kind;
         self.new_session_generation = self.new_session_generation.wrapping_add(1);
         self.external_adapter_catalog_loading = false;
@@ -570,6 +622,27 @@ impl ThreadsPanel {
         if harness_kind == ahead_rpc::ahead::HarnessKind::ExternalAcp {
             self.load_external_adapter_catalog(window, cx);
         }
+    }
+
+    pub fn open_implementation_handoff(
+        &mut self,
+        parent_session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.threads.iter().any(|thread| {
+            matches!(
+                &thread.kind,
+                ThreadKind::Ahead { item_id, .. } if item_id == parent_session_id
+            )
+        }) {
+            self.error = Some("The originating AHEAD thread is unavailable".into());
+            cx.notify();
+            return;
+        }
+        self.open_new_thread(ahead_rpc::ahead::HarnessKind::ExternalAcp, window, cx);
+        self.handoff_parent_session_id = Some(parent_session_id.to_string());
+        cx.notify();
     }
 
     fn load_external_adapter_catalog(
@@ -815,6 +888,8 @@ impl ThreadsPanel {
 
     fn close_new_session(&mut self, cx: &mut Context<Self>) {
         self.show_new_session = false;
+        self.handoff_parent_session_id = None;
+        self.handoff_parent_session_id = None;
         self.new_session_generation = self.new_session_generation.wrapping_add(1);
         self.external_adapter_catalog_loading = false;
         self.wizard_step = 0;
@@ -860,6 +935,7 @@ impl ThreadsPanel {
                         &request.starting_point,
                         request.harness,
                         request.external_agent_id.as_deref(),
+                        request.parent_session_id.as_deref(),
                     );
                     (request, result)
                 })
@@ -913,10 +989,19 @@ impl ThreadsPanel {
                     .unwrap_or_else(|| adapter_id.clone());
                 let request = starting_point.trim();
                 let (title, starting_point) = if request.is_empty() {
-                    (
-                        format!("{display_name} side thread"),
-                        format!("External agent side thread using {display_name}"),
-                    )
+                    if self.handoff_parent_session_id.is_some() {
+                        (
+                            "Implementation handoff".to_string(),
+                            "Continue the agreed implementation".to_string(),
+                        )
+                    } else {
+                        (
+                            format!("{display_name} side thread"),
+                            format!(
+                                "External agent side thread using {display_name}"
+                            ),
+                        )
+                    }
                 } else {
                     (title_from_request(request), request.to_string())
                 };
@@ -954,6 +1039,7 @@ impl ThreadsPanel {
                 harness: new_thread_kind,
                 external_agent_id,
                 external_agent_name,
+                parent_session_id: self.handoff_parent_session_id.clone(),
             },
         ))
     }
@@ -1026,8 +1112,10 @@ impl ThreadsPanel {
                 kind: thread_kind,
                 time_str: "now".into(),
                 is_active: activate,
+                parent_session_id: request.parent_session_id,
             },
         );
+        order_linked_threads(&mut self.threads);
         if !activate {
             return;
         }
@@ -1038,6 +1126,7 @@ impl ThreadsPanel {
             });
         }
         self.show_new_session = false;
+        self.handoff_parent_session_id = None;
         self.wizard_step = 0;
         self.error = None;
     }
@@ -1305,9 +1394,19 @@ impl ThreadsPanel {
                     )
                     .child(
                         Textarea::new(&self.starting_point_input)
-                            .aria_label("What the external side agent should do")
+                            .aria_label(if self.handoff_parent_session_id.is_some() {
+                                "What the external agent should implement"
+                            } else {
+                                "What the external side agent should do"
+                            })
                             .disabled(session_creation_pending),
                     )
+                    .when(self.handoff_parent_session_id.is_some(), |content| content.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child("The agent will receive the current AHEAD task, plan, and recent discussion. Return to the parent thread to verify and review its changes."),
+                    ))
                     .child(
                         div().flex_1().min_w_0().max_w(px(420.)).child(
                             Select::new(&self.external_adapter_select)
@@ -1356,7 +1455,11 @@ impl ThreadsPanel {
                         div()
                             .font_weight(gpui_kit::FontWeight::BOLD)
                             .text_color(text)
-                            .child("New External Agent Thread"),
+                            .child(if self.handoff_parent_session_id.is_some() {
+                                "Hand off implementation"
+                            } else {
+                                "New External Agent Thread"
+                            }),
                     )
                     .child(
                         Button::new("cancel_external_session")
@@ -1385,6 +1488,8 @@ impl ThreadsPanel {
                         .icon(IconName::Play)
                         .label(if session_creation_pending {
                             "Starting…"
+                        } else if self.handoff_parent_session_id.is_some() {
+                            "Start implementation thread"
                         } else {
                             "Start external side thread"
                         })
@@ -1551,6 +1656,7 @@ impl Render for ThreadsPanel {
                                     thread.kind,
                                     ThreadKind::External { .. }
                                 );
+                                let is_child = thread.parent_session_id.is_some();
                                 let panel = cx.entity();
                                 let removal_action = if is_external {
                                     Button::new(SharedString::from(format!(
@@ -1659,6 +1765,7 @@ impl Render for ThreadsPanel {
                                     .justify_between()
                                     .px_2()
                                     .py_1()
+                                    .when(is_child, |row| row.ml_4())
                                     .bg(if is_active { active_bg } else { group_box })
                                     .border_1()
                                     .border_color(if is_active { active_bg } else { border_color })
@@ -1719,13 +1826,49 @@ impl Render for ThreadsPanel {
 #[cfg(test)]
 mod tests {
     use super::{
-        ThreadsPanel, relative_time, thread_from_summary, title_from_request,
+        AgentThread, ThreadKind, ThreadsPanel, order_linked_threads, relative_time,
+        thread_from_summary, title_from_request,
     };
     use crate::proxy_client::{DurableSessionSummary, ProxyClient};
     use ahead_rpc::ahead::{
         ExternalAcpAdapter, HarnessKind, SessionLifecycle, SessionListItem,
     };
     use gpui_kit::TestAppContext;
+
+    #[test]
+    fn implementation_child_stays_beneath_parent_after_restore() {
+        let parent = AgentThread {
+            id: "ahead-parent".into(),
+            title: "Design search".into(),
+            kind: ThreadKind::Ahead {
+                item_id: "parent".into(),
+                shared: false,
+            },
+            time_str: "1m".into(),
+            is_active: false,
+            parent_session_id: None,
+        };
+        let child = AgentThread {
+            id: "external-child".into(),
+            title: "Implement search".into(),
+            kind: ThreadKind::External {
+                item_id: "child".into(),
+                harness: "Pi".into(),
+            },
+            time_str: "now".into(),
+            is_active: true,
+            parent_session_id: Some("parent".into()),
+        };
+        let mut threads = vec![child, parent];
+        order_linked_threads(&mut threads);
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ahead-parent", "external-child"]
+        );
+    }
 
     #[gpui_kit::test]
     fn failed_session_creation_renders_error_without_losing_input(
@@ -1868,6 +2011,7 @@ mod tests {
                 },
                 time_str: "now".into(),
                 is_active: true,
+                parent_session_id: None,
             });
             for succeeded in [false, true] {
                 panel.new_thread(window, cx);
@@ -2118,6 +2262,7 @@ mod tests {
                     created_at: "2026-09-01T12:00:00Z".into(),
                     updated_at,
                     backend: None,
+                    parent_session_id: None,
                 },
                 harness: HarnessKind::Ahead,
                 external_agent_id: None,

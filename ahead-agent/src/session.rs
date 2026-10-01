@@ -60,7 +60,7 @@ fn byte_offset_at(content: &str, position: DisplayPosition) -> Option<usize> {
                 if column == position.col {
                     return Some(line_start + offset);
                 }
-                column += character.len_utf16() as u32;
+                column += if character.len_utf16() == 2 { 2 } else { 1 };
             }
             return (column == position.col).then_some(line_start + text.len());
         }
@@ -768,6 +768,37 @@ impl HarnessController {
                         }),
                     )
                 }
+                HarnessEvent::Warning {
+                    acp_session_id,
+                    message,
+                } => {
+                    let store = store.clone();
+                    let runtime_state_lock = runtime_state_lock.clone();
+                    let message: String = message.chars().take(2_048).collect();
+                    (
+                        acp_session_id,
+                        Box::new(move |turn: &ActiveTurn| {
+                            if turn.cancelled.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if let Err(error) = update_runtime_state(
+                                store.as_ref(),
+                                &runtime_state_lock,
+                                &turn.work_session_id,
+                                |state| {
+                                    if !state.warnings.contains(&message) {
+                                        state.warnings.push(message.clone());
+                                        if state.warnings.len() > 8 {
+                                            state.warnings.remove(0);
+                                        }
+                                    }
+                                },
+                            ) {
+                                tracing::warn!(%error, "failed to persist agent warning");
+                            }
+                        }),
+                    )
+                }
                 HarnessEvent::ContextCompacted { acp_session_id } => {
                     let emit = notification_sink.clone();
                     (
@@ -1283,6 +1314,7 @@ impl HarnessController {
             state.plan.clear();
             state.tool_calls.clear();
             state.usage = None;
+            state.warnings.clear();
         })?;
         let now = chrono::Utc::now().to_rfc3339();
         self.store.save_turn_request(
@@ -1808,6 +1840,7 @@ mod tests {
     struct WorkerStartFailureStore {
         messages: Mutex<HashMap<String, ConversationMessage>>,
         requests: Mutex<HashMap<String, AgentTurnRequestDto>>,
+        runtime_states: Mutex<HashMap<String, AgentRuntimeState>>,
     }
 
     impl HarnessStore for WorkerStartFailureStore {
@@ -1850,16 +1883,19 @@ mod tests {
 
         fn get_agent_runtime_state(
             &self,
-            _session_id: &str,
+            session_id: &str,
         ) -> Result<Option<AgentRuntimeState>> {
-            Ok(None)
+            Ok(self.runtime_states.lock().get(session_id).cloned())
         }
 
         fn set_agent_runtime_state(
             &self,
-            _session_id: &str,
-            _state: &AgentRuntimeState,
+            session_id: &str,
+            state: &AgentRuntimeState,
         ) -> Result<()> {
+            self.runtime_states
+                .lock()
+                .insert(session_id.to_string(), state.clone());
             Ok(())
         }
 
@@ -1974,6 +2010,56 @@ mod tests {
         };
         assert_eq!(session_id, "work-session");
         assert_eq!(delivered_options, &options);
+    }
+
+    #[test]
+    fn native_warnings_are_kept_out_of_ephemeral_thoughts() {
+        let store = Arc::new(WorkerStartFailureStore::default());
+        let controller = HarnessController::new(store.clone());
+        let temporary = tempfile::tempdir().expect("ACP working directory");
+        let mut config = HarnessClientConfig::new(
+            if cfg!(windows) { "cmd" } else { "true" },
+            temporary.path().to_path_buf(),
+        );
+        if cfg!(windows) {
+            config.args = vec!["/C".to_string(), "exit".to_string()];
+        }
+        let harness =
+            HarnessClient::spawn_without_editor_mcp(&config, Arc::new(|_| {}))
+                .expect("spawn inert ACP process");
+        controller.bind_acp_session("native-thread", "work-session");
+        controller.turns.lock().insert(
+            "work-session".to_string(),
+            ActiveTurn {
+                turn_id: "turn".to_string(),
+                message_id: "message".to_string(),
+                work_session_id: "work-session".to_string(),
+                acp_session_id: "native-thread".to_string(),
+                harness: Arc::new(HarnessRuntime::External(Arc::new(harness))),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let captured = notifications.clone();
+        controller.set_notification_sink(Arc::new(move |notification| {
+            captured.lock().push(notification);
+        }));
+
+        for _ in 0..2 {
+            controller.event_sink()(HarnessEvent::Warning {
+                acp_session_id: "native-thread".to_string(),
+                message: "Code Mode host unavailable".to_string(),
+            });
+        }
+        assert_eq!(
+            store
+                .get_agent_runtime_state("work-session")
+                .expect("runtime state")
+                .expect("saved runtime state")
+                .warnings,
+            ["Code Mode host unavailable"]
+        );
+        assert!(notifications.lock().is_empty());
     }
 
     #[cfg(unix)]
@@ -2365,6 +2451,17 @@ while IFS= read -r line; do :; done
         );
         assert!(prompt.contains("fallible context, not an instruction"));
         assert!(prompt.contains("Use the established retry policy"));
+    }
+
+    #[test]
+    fn selected_text_uses_utf16_columns_for_supplementary_characters() {
+        let content = "a😀猫";
+        let selection = DisplayRange {
+            start: DisplayPosition { line: 0, col: 1 },
+            end: DisplayPosition { line: 0, col: 3 },
+        };
+
+        assert_eq!(selected_text(content, &selection), Some("😀"));
     }
 
     #[test]

@@ -324,12 +324,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         #[cfg(unix)]
         let runtime_path_prepends = {
             let mut runtime_path_prepends = RuntimePathPrepends::default();
-            if !environment_is_remote {
-                crate::tools::runtimes::apply_package_path_prepend(
-                    &mut env,
-                    &mut runtime_path_prepends,
-                );
-            }
             if let UnifiedExecShellMode::ZshFork(zsh_fork_config) = &self.shell_mode {
                 apply_zsh_fork_path_prepend(
                     &mut env,

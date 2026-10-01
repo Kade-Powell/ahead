@@ -11,8 +11,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR;
-#[cfg(unix)]
-use codex_install_context::InstallContext;
 #[cfg(target_os = "macos")]
 use codex_network_proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER;
 use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
@@ -111,22 +109,6 @@ impl RuntimePathPrepends {
             .collect::<Vec<_>>()
             .join("\n")
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn apply_package_path_prepend(
-    env: &mut HashMap<String, String>,
-    runtime_path_prepends: &mut RuntimePathPrepends,
-) {
-    let Some(path_dir) = InstallContext::current()
-        .package_layout
-        .as_ref()
-        .and_then(|package_layout| package_layout.path_dir.as_ref())
-    else {
-        return;
-    };
-
-    runtime_path_prepends.prepend(env, path_dir.as_path());
 }
 
 #[cfg(unix)]

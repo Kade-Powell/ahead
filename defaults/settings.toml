@@ -9,6 +9,7 @@ file-explorer-double-click = false
 auto-reload-plugin = false
 
 [editor]
+inline-blame = true
 font-family = "monospace"
 font-size = 13
 code-glance-font-size = 2

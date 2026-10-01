@@ -83,13 +83,6 @@ pub use crate::approvals::ApprovalCommandSource;
 pub use crate::approvals::ElicitationAction;
 pub use crate::approvals::ExecApprovalRequestEvent;
 pub use crate::approvals::ExecPolicyAmendment;
-pub use crate::approvals::GuardianAssessmentAction;
-pub use crate::approvals::GuardianAssessmentDecisionSource;
-pub use crate::approvals::GuardianAssessmentEvent;
-pub use crate::approvals::GuardianAssessmentOutcome;
-pub use crate::approvals::GuardianAssessmentStatus;
-pub use crate::approvals::GuardianRiskLevel;
-pub use crate::approvals::GuardianUserAuthorization;
 pub use crate::approvals::NetworkApprovalContext;
 pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
@@ -1338,9 +1331,6 @@ pub enum EventMsg {
     /// Provider-owned authentication recovery has completed for the current turn.
     AuthRecoveryCompleted(AuthRecoveryEvent),
 
-    /// Warning issued by the guardian automatic approval reviewer.
-    GuardianWarning(WarningEvent),
-
     /// Realtime conversation lifecycle start event.
     RealtimeConversationStarted(RealtimeConversationStartedEvent),
 
@@ -1464,9 +1454,6 @@ pub enum EventMsg {
     ElicitationRequest(ElicitationRequestEvent),
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
-
-    /// Structured lifecycle event for a guardian-reviewed approval request.
-    GuardianAssessment(GuardianAssessmentEvent),
 
     /// Notification advising the user that something they are using has been
     /// deprecated and should be phased out.
@@ -2706,7 +2693,6 @@ pub enum SessionSource {
 pub enum ThreadSource {
     User,
     Subagent,
-    GuardianReview,
     Feature(String),
     MemoryConsolidation,
 }
@@ -2716,7 +2702,6 @@ impl ThreadSource {
         match self {
             ThreadSource::User => "user",
             ThreadSource::Subagent => "subagent",
-            ThreadSource::GuardianReview => "guardian_review",
             ThreadSource::Feature(feature) => feature,
             ThreadSource::MemoryConsolidation => "memory_consolidation",
         }
@@ -2750,7 +2735,7 @@ impl FromStr for ThreadSource {
         match value {
             "user" => Ok(ThreadSource::User),
             "subagent" => Ok(ThreadSource::Subagent),
-            "guardian_review" => Ok(ThreadSource::GuardianReview),
+            "guardian_review" => Err("guardian_review is not an AHEAD thread source".to_string()),
             "memory_consolidation" => Ok(ThreadSource::MemoryConsolidation),
             other => Ok(ThreadSource::Feature(other.to_string())),
         }
@@ -2762,7 +2747,6 @@ impl FromStr for ThreadSource {
 #[ts(rename_all = "snake_case")]
 pub enum InternalSessionSource {
     MemoryConsolidation,
-    Guardian,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2916,7 +2900,6 @@ impl fmt::Display for InternalSessionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
-            InternalSessionSource::Guardian => f.write_str("guardian"),
         }
     }
 }
@@ -4298,6 +4281,12 @@ mod tests {
             source
         );
         Ok(())
+    }
+
+    #[test]
+    fn removed_guardian_session_sources_are_rejected() {
+        assert!("guardian_review".parse::<ThreadSource>().is_err());
+        assert!(serde_json::from_value::<InternalSessionSource>(json!("guardian")).is_err());
     }
 
     #[test]

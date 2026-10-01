@@ -1419,10 +1419,8 @@ where
             tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
             continue;
         }
-        if !file_matches.is_empty() {
-            if !on_file_matches(path, file_matches) {
-                return Err(FileSearchError::Cancelled);
-            }
+        if !file_matches.is_empty() && !on_file_matches(path, file_matches) {
+            return Err(FileSearchError::Cancelled);
         }
         if limit_reached {
             break;

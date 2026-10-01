@@ -180,7 +180,7 @@ pub(crate) fn mcp_servers_for_workspace(
                 );
                 anyhow::ensure!(
                     env_vars.iter().all(|variable| {
-                        variable.source().map_or(true, |source| source == "local")
+                        variable.source().is_none_or(|source| source == "local")
                     }),
                     "AHEAD MCP server `{id}` references an unsupported non-local environment variable source"
                 );
@@ -404,7 +404,7 @@ pub fn set_mcp_server_approval(
                 anyhow::ensure!(
                     env_vars.iter().all(|variable| variable
                         .source()
-                        .map_or(true, |source| source == "local")),
+                        .is_none_or(|source| source == "local")),
                     "MCP server has a non-local environment variable source"
                 );
             }
@@ -592,7 +592,7 @@ fn write_mcp_settings_at(directory: &std::fs::File, content: &str) -> Result<()>
         match unlinkat(directory, temporary_name.as_str(), AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => {}
             Err(error) => {
-                tracing::warn!(%error, "failed to remove temporary AHEAD MCP settings")
+                tracing::warn!(%error, "failed to remove temporary AHEAD MCP settings");
             }
         }
     }

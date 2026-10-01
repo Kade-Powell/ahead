@@ -259,6 +259,19 @@ pub fn set_external_acp_adapter_installed(
     set_external_acp_adapter_installed_at(adapter_id, installed, &user_agents_dir)
 }
 
+/// Checks an installed marker without loading or refreshing the ACP registry.
+pub fn external_acp_adapter_is_installed(adapter_id: &str) -> Result<bool> {
+    let user_agents_dir = external_agents_user_dir()?;
+    external_acp_adapter_is_installed_at(adapter_id, &user_agents_dir)
+}
+
+fn external_acp_adapter_is_installed_at(
+    adapter_id: &str,
+    user_agents_dir: &Path,
+) -> Result<bool> {
+    Ok(installation_marker(user_agents_dir, adapter_id)?.is_file())
+}
+
 fn set_external_acp_adapter_installed_at(
     adapter_id: &str,
     installed: bool,
@@ -436,6 +449,7 @@ impl InstallLock {
         let file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .with_context(|| {
                 format!("opening ACP adapter lock {}", path.display())
@@ -450,6 +464,7 @@ impl InstallLock {
         let file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .with_context(|| {
                 format!("opening ACP registry lock {}", path.display())
@@ -688,9 +703,20 @@ mod tests {
             vec!["pi-acp", "codex-acp", "claude-acp"]
         );
         assert!(adapters.iter().all(|entry| !entry.adapter.installed));
+        assert!(
+            !external_acp_adapter_is_installed_at("claude-acp", storage.path())
+                .expect("check local install marker")
+        );
+        assert!(
+            external_acp_adapter_is_installed_at("custom", storage.path()).is_err()
+        );
 
         set_external_acp_adapter_installed_at("claude-acp", true, storage.path())
             .expect("install supported agent");
+        assert!(
+            external_acp_adapter_is_installed_at("claude-acp", storage.path())
+                .expect("read local install marker")
+        );
         let adapters =
             curated_adapters(&[], storage.path()).expect("updated catalog");
         assert!(
@@ -704,6 +730,10 @@ mod tests {
 
         set_external_acp_adapter_installed_at("claude-acp", false, storage.path())
             .expect("remove supported agent");
+        assert!(
+            !external_acp_adapter_is_installed_at("claude-acp", storage.path())
+                .expect("read removed install marker")
+        );
         assert!(
             curated_adapters(&[], storage.path())
                 .expect("catalog after removal")

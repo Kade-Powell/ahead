@@ -1641,12 +1641,15 @@ impl Render for LanguageServersPanel {
             .child(div().text_color(muted).child("Workspace language services"))
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .gap_2()
                     .p_2()
                     .bg(cx.theme().group_box)
                     .child(IconName::Activity)
                     .child(
                         v_flex()
+                            .min_w_0()
                             .gap_1()
                             .child(
                                 div()
@@ -1655,6 +1658,8 @@ impl Render for LanguageServersPanel {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(px(11.))
                                     .text_color(muted)
                                     .child(self.root.clone()),
@@ -1675,6 +1680,8 @@ impl Render for LanguageServersPanel {
                     .map(|language| format!("{language} language server"))
                     .unwrap_or_else(|| server.name.clone());
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_2()
                     .p_2()
@@ -1683,18 +1690,33 @@ impl Render for LanguageServersPanel {
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w_0()
                             .gap_1()
-                            .child(div().text_color(text).child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(text)
+                                    .child(name),
+                            )
                             .when_some(server.message.clone(), |el, message| {
                                 el.child(
                                     div()
+                                        .min_w_0()
+                                        .truncate()
                                         .text_size(px(11.))
                                         .text_color(muted)
                                         .child(message),
                                 )
                             }),
                     )
-                    .child(div().text_size(px(11.)).text_color(color).child(state))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(color)
+                            .child(state),
+                    )
             }))
             .when(servers.is_empty(), |el| {
                 el.child(

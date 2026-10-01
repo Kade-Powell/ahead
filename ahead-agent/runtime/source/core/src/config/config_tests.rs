@@ -5804,10 +5804,13 @@ async fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn legacy_toggles_map_to_features() -> std::io::Result<()> {
+async fn canonical_unified_exec_toggle_maps_to_feature() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
-        experimental_use_unified_exec_tool: Some(true),
+        features: Some(FeaturesToml::from(BTreeMap::from([(
+            "unified_exec".to_string(),
+            true,
+        )]))),
         ..Default::default()
     };
 
@@ -5824,45 +5827,37 @@ async fn legacy_toggles_map_to_features() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn legacy_unified_exec_disable_flags_do_not_disable_command_execution() -> std::io::Result<()>
-{
-    for cfg in [
-        ConfigToml {
-            features: Some(FeaturesToml::from(BTreeMap::from([(
-                "unified_exec".to_string(),
-                false,
-            )]))),
-            ..Default::default()
-        },
-        ConfigToml {
-            experimental_use_unified_exec_tool: Some(false),
-            ..Default::default()
-        },
-    ] {
-        let codex_home = TempDir::new()?;
-        let mut config = Config::load_from_base_config_with_overrides(
-            cfg,
-            ConfigOverrides::default(),
-            codex_home.abs(),
-        )
-        .await?;
+async fn unified_exec_disable_flag_does_not_disable_command_execution() -> std::io::Result<()> {
+    let cfg = ConfigToml {
+        features: Some(FeaturesToml::from(BTreeMap::from([(
+            "unified_exec".to_string(),
+            false,
+        )]))),
+        ..Default::default()
+    };
+    let codex_home = TempDir::new()?;
+    let mut config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
 
-        assert!(config.features.enabled(Feature::UnifiedExec));
-        assert!(config.features.enabled(Feature::ShellTool));
+    assert!(config.features.enabled(Feature::UnifiedExec));
+    assert!(config.features.enabled(Feature::ShellTool));
 
-        config
-            .features
-            .disable(Feature::UnifiedExec)
-            .expect("legacy unified-exec toggle should normalize successfully");
-        assert!(config.features.enabled(Feature::UnifiedExec));
+    config
+        .features
+        .disable(Feature::UnifiedExec)
+        .expect("unified-exec toggle should normalize successfully");
+    assert!(config.features.enabled(Feature::UnifiedExec));
 
-        config
-            .features
-            .disable(Feature::ShellTool)
-            .expect("shell tool should remain independently configurable");
-        assert!(!config.features.enabled(Feature::ShellTool));
-        assert!(config.features.enabled(Feature::UnifiedExec));
-    }
+    config
+        .features
+        .disable(Feature::ShellTool)
+        .expect("shell tool should remain independently configurable");
+    assert!(!config.features.enabled(Feature::ShellTool));
+    assert!(config.features.enabled(Feature::UnifiedExec));
 
     Ok(())
 }
@@ -10325,75 +10320,36 @@ include_instructions = false
     Ok(())
 }
 
-#[tokio::test]
-async fn legacy_guardian_feature_is_ignored() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-guardian_approval = true
-"#,
+#[test]
+fn removed_guardian_feature_requirements_are_reported_as_unknown() -> std::io::Result<()> {
+    let defaults = codex_features::Features::with_defaults();
+    let mut warnings = Vec::new();
+    let managed = super::managed_features::ManagedFeatures::from_configured_with_warnings(
+        defaults.clone(),
+        Some(Sourced::new(
+            codex_config::FeatureRequirementsToml {
+                entries: BTreeMap::from([
+                    ("auto_review".to_string(), false),
+                    ("guardian_approval".to_string(), false),
+                ]),
+            },
+            RequirementSource::Unknown,
+        )),
+        &mut warnings,
     )?;
 
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
-
+    assert_eq!(managed.get(), &defaults);
+    assert_eq!(warnings.len(), 2);
     assert!(
-        config
-            .features
-            .enabled_features()
+        warnings
             .iter()
-            .all(|feature| feature.key() != "guardian_approval")
+            .any(|warning| warning.contains("`auto_review`"))
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_reviewer_config_does_not_change_approval_policy() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"approval_policy = "on-request"
-approvals_reviewer = "guardian_subagent"
-"#,
-    )?;
-
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
-
-    assert_eq!(
-        config.permissions.approval_policy.value(),
-        AskForApproval::OnRequest
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("`guardian_approval`"))
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn smart_approvals_alias_is_ignored() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-smart_approvals = true
-"#,
-    )?;
-
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
-
-    let serialized = tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
-    assert!(serialized.contains("smart_approvals = true"));
-    assert!(!serialized.contains("guardian_approval"));
-
     Ok(())
 }
 
@@ -11091,7 +11047,7 @@ shell_tool = false
 }
 
 #[tokio::test]
-async fn feature_requirements_warn_on_collab_legacy_alias() -> std::io::Result<()> {
+async fn feature_requirements_ignore_retired_collab_alias() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
 
     let config = ConfigBuilder::without_managed_config_for_tests()
@@ -11107,11 +11063,13 @@ collab = true
         .build()
         .await?;
 
-    assert!(config.features.enabled(Feature::Collab));
+    assert_eq!(
+        config.features.enabled(Feature::Collab),
+        codex_features::Features::with_defaults().enabled(Feature::Collab)
+    );
     assert!(
         config.startup_warnings.iter().any(|warning| {
-            warning.contains("Using legacy `features` requirement `collab`")
-                && warning.contains("prefer canonical feature key `multi_agent`")
+            warning.contains("Ignoring unknown `features` requirement `collab`")
         }),
         "{:?}",
         config.startup_warnings

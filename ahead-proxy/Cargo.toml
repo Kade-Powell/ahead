@@ -59,3 +59,4 @@ sys-locale = "0.3"
 
 [dev-dependencies]
 ahead-agent = { path = "../ahead-agent", features = ["test-support"] }
+zstd = { workspace = true }

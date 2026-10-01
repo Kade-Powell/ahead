@@ -48,6 +48,42 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn bounded_rollout_loader_limits_decompressed_compressed_data() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(2);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "bounded compressed data")?;
+    let contents = fs::read_to_string(&rollout_path)?.replace('\n', "\r\n");
+    fs::write(&rollout_path, contents)?;
+    let decompressed_bytes = fs::metadata(&rollout_path)?.len();
+    compress_now(&rollout_path)?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_with_limits(&rollout_path, decompressed_bytes, 2)
+            .await?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert!(
+        RolloutRecorder::load_rollout_items_with_limits(
+            &rollout_path,
+            decompressed_bytes - 1,
+            usize::MAX,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        RolloutRecorder::load_rollout_items_with_limits(&rollout_path, u64::MAX, 1,)
+            .await
+            .is_err()
+    );
+    assert!(compressed_rollout_path(&rollout_path).exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_session_meta_line_stops_before_invalid_utf8_tail() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(16);

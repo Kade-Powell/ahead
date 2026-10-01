@@ -261,6 +261,7 @@ impl StepContext {
                 ToolRegistry::empty_for_test(),
                 Vec::new(),
                 ToolMode::Direct,
+                crate::tools::router::CodeModeAvailability::Unavailable,
                 BTreeMap::new(),
                 /*tool_namespaces_info*/ None,
                 &[],

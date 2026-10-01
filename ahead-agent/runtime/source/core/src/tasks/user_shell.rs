@@ -23,8 +23,6 @@ use crate::shell::Shell;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 use crate::tools::runtimes::RuntimePathPrepends;
-#[cfg(unix)]
-use crate::tools::runtimes::apply_package_path_prepend;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::runtimes::strip_managed_proxy_env;
 use crate::user_shell_command::user_shell_command_record_item;
@@ -394,58 +392,13 @@ fn prepare_user_shell_exec_command(
     shell_environment_set: &HashMap<String, String>,
     exec_env_map: &mut HashMap<String, String>,
 ) -> Vec<String> {
-    #[cfg(unix)]
-    {
-        prepare_user_shell_exec_command_with_path_prepend(
-            display_command,
-            shell,
-            shell_snapshot,
-            shell_environment_set,
-            exec_env_map,
-            apply_package_path_prepend,
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        maybe_wrap_shell_lc_with_snapshot(
-            display_command,
-            shell,
-            shell_snapshot,
-            shell_environment_set,
-            exec_env_map,
-            // On non-Unix targets, arg0 has already prepended the package path
-            // to the process PATH before create_env() builds exec_env_map.
-            // RuntimePathPrepends is only needed for Unix shell snapshot replay.
-            &RuntimePathPrepends::default(),
-        )
-    }
-}
-
-/// Prepares a user-shell command after adding runtime-owned PATH entries.
-///
-/// The callback mutates the live exec environment for commands that are not
-/// wrapped with a shell snapshot and records only the runtime-owned entries so
-/// snapshot wrapping can reapply them after restoring the user's snapshot PATH.
-#[cfg(unix)]
-fn prepare_user_shell_exec_command_with_path_prepend(
-    display_command: &[String],
-    shell: &Shell,
-    shell_snapshot: Option<&AbsolutePathBuf>,
-    shell_environment_set: &HashMap<String, String>,
-    exec_env_map: &mut HashMap<String, String>,
-    prepend_runtime_path: impl FnOnce(&mut HashMap<String, String>, &mut RuntimePathPrepends),
-) -> Vec<String> {
-    let explicit_env_overrides = shell_environment_set.clone();
-    let mut runtime_path_prepends = RuntimePathPrepends::default();
-    prepend_runtime_path(exec_env_map, &mut runtime_path_prepends);
     maybe_wrap_shell_lc_with_snapshot(
         display_command,
         shell,
         shell_snapshot,
-        &explicit_env_overrides,
+        shell_environment_set,
         exec_env_map,
-        &runtime_path_prepends,
+        &RuntimePathPrepends::default(),
     )
 }
 
@@ -474,7 +427,3 @@ async fn persist_user_shell_output(
         .inject_no_new_turn(vec![output_item], Some(turn_context))
         .await;
 }
-
-#[cfg(all(test, unix))]
-#[path = "user_shell_tests.rs"]
-mod tests;

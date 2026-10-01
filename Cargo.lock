@@ -417,6 +417,7 @@ dependencies = [
  "trash",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -1965,11 +1966,11 @@ version = "0.0.1"
 dependencies = [
  "codex-code-mode-protocol",
  "codex-http-client",
- "codex-install-context",
  "codex-otel",
  "codex-protocol",
  "futures",
  "http-body-util",
+ "pretty_assertions",
  "prost",
  "reqwest 0.12.28",
  "serde_json",
@@ -2093,7 +2094,6 @@ dependencies = [
  "codex-history",
  "codex-hooks",
  "codex-http-client",
- "codex-install-context",
  "codex-mcp",
  "codex-model-provider",
  "codex-model-provider-info",
@@ -2370,17 +2370,6 @@ dependencies = [
  "tracing-opentelemetry",
  "windows-sys 0.52.0",
  "zstd",
-]
-
-[[package]]
-name = "codex-install-context"
-version = "0.0.1"
-dependencies = [
- "codex-utils-absolute-path",
- "codex-utils-home-dir",
- "semver",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -7911,12 +7900,6 @@ checksum = "40a8225d44241fd324a8af2806ba635fc7c8a7e9a7de4d5cf3ef54e71f5926fc"
 dependencies = [
  "leak",
 ]
-
-[[package]]
-name = "leb128"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
 
 [[package]]
 name = "leb128fmt"
@@ -14510,7 +14493,6 @@ dependencies = [
  "url",
  "wasmtime",
  "wasmtime-wasi-io",
- "wiggle",
  "windows-sys 0.61.2",
  "winx",
 ]
@@ -14526,15 +14508,6 @@ dependencies = [
  "futures",
  "tracing",
  "wasmtime",
-]
-
-[[package]]
-name = "wast"
-version = "35.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef140f1b49946586078353a453a1d28ba90adfc54dde75710bc1931de204d68"
-dependencies = [
- "leb128",
 ]
 
 [[package]]
@@ -14895,46 +14868,6 @@ dependencies = [
  "libredox",
  "wasite",
  "web-sys",
-]
-
-[[package]]
-name = "wiggle"
-version = "48.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "002e6d7e0b03be510904ded45f8519de70d6b35612b91aaa8f690ee72903c941"
-dependencies = [
- "bitflags 2.13.2",
- "thiserror 2.0.20",
- "tracing",
- "wasmtime",
- "wasmtime-environ",
- "wiggle-macro",
-]
-
-[[package]]
-name = "wiggle-generate"
-version = "48.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb5ae7980829d9a4ef554db0a6fa229bffcb3f7373b26436fbf8c40611b84fa6"
-dependencies = [
- "heck 0.5.0",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "wasmtime-environ",
- "witx",
-]
-
-[[package]]
-name = "wiggle-macro"
-version = "48.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdabe565e5c7917c24d94a4b9537681c2bd5db0d7467a34b710b0036218066f1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "wiggle-generate",
 ]
 
 [[package]]
@@ -15747,18 +15680,6 @@ dependencies = [
  "serde_json",
  "unicode-ident",
  "wasmparser",
-]
-
-[[package]]
-name = "witx"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e366f27a5cabcddb2706a78296a40b8fcc451e1a6aba2fc1d94b4a01bdaaef4b"
-dependencies = [
- "anyhow",
- "log",
- "thiserror 1.0.69",
- "wast",
 ]
 
 [[package]]

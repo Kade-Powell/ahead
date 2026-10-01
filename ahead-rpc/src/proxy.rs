@@ -1396,6 +1396,7 @@ mod tests {
             work_item: None,
             harness: Some(HarnessKind::Ahead),
             external_agent_id: None,
+            parent_session_id: None,
         }
     }
 

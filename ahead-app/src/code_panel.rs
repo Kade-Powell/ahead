@@ -35,7 +35,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use sha2::Digest;
 
-use crate::app::{GoToDefinition, SaveFile};
+use crate::app::{FindReferences, GoToDefinition, GoToImplementation, SaveFile};
 use crate::proxy_client::{LspCompletion, ProxyClient};
 use ahead_rpc::source_control::{BlameHunk, DiffHunkKind, GitFileState};
 
@@ -52,6 +52,12 @@ pub struct DiagnosticItem {
     pub line: u32,
     pub message: String,
     pub is_error: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NavigationResults {
+    title: &'static str,
+    locations: Vec<lsp_types::Location>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +125,8 @@ pub struct CodePanel {
     presentation_decorations: TextDecorationCollection,
     presentation: Option<ActivePresentation>,
     pointer_overlay_position: Option<(f32, f32)>,
+    inline_blame_position: Option<(u32, f32, f32)>,
+    inline_blame_enabled: bool,
     pub file_path: String,
     file_error: Option<FileOpenError>,
     pub saved_rev: usize,
@@ -149,6 +157,7 @@ pub struct CodePanel {
     diagnostic_task: Option<Task<()>>,
     pub workspace: String,
     pub hover_text: Option<String>,
+    navigation_results: Option<NavigationResults>,
     hover_chord_deadline: Option<Instant>,
     pub is_preview: bool,
     show_markdown_preview: bool,
@@ -288,6 +297,8 @@ impl CodePanel {
             presentation_decorations,
             presentation: None,
             pointer_overlay_position: None,
+            inline_blame_position: None,
+            inline_blame_enabled: true,
             file_path: path.to_string(),
             file_error,
             saved_rev: 0,
@@ -315,6 +326,7 @@ impl CodePanel {
             diagnostic_task: None,
             workspace: String::new(),
             hover_text: None,
+            navigation_results: None,
             hover_chord_deadline: None,
             is_preview: false,
             show_markdown_preview: is_markdown_path(path),
@@ -357,6 +369,12 @@ impl CodePanel {
         }));
         self.proxy = Some(proxy);
         self.workspace = workspace.to_string();
+        self.set_inline_blame_enabled(
+            crate::settings_panel::inline_blame_enabled(std::path::Path::new(
+                workspace,
+            )),
+            cx,
+        );
         if !self.file_path.is_empty()
             && self.is_text_available()
             && let Some(proxy) = self.proxy.as_ref()
@@ -368,6 +386,17 @@ impl CodePanel {
             proxy.refresh_anchors(&[self.proxy_path()]);
         }
         self
+    }
+
+    pub(crate) fn set_inline_blame_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_blame_enabled != enabled {
+            self.inline_blame_enabled = enabled;
+            cx.notify();
+        }
     }
 
     pub fn release_buffer(&mut self) {
@@ -445,7 +474,10 @@ impl CodePanel {
         cx: &mut Context<Self>,
     ) -> Option<async_channel::Receiver<Result<bool, String>>> {
         let proxy = self.proxy.as_ref()?;
-        if !proxy.editor_recovery_available() || self.file_path.is_empty() || !self.is_text_available() {
+        if !proxy.editor_recovery_available()
+            || self.file_path.is_empty()
+            || !self.is_text_available()
+        {
             return None;
         }
         if self.recovery_revision == 0 && !self.dirty {
@@ -493,7 +525,9 @@ impl CodePanel {
         if let Some(error) = &self.file_error
             && !matches!(error, FileOpenError::Read(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
-            return Err(format!("{error} Unsaved recovery remains in the database."));
+            return Err(format!(
+                "{error} Unsaved recovery remains in the database."
+            ));
         }
         let content = snapshot.contents.ok_or("Recovery was already cleared")?;
         if self.recovery_id != snapshot.buffer_id {
@@ -507,11 +541,10 @@ impl CodePanel {
         self.recovery_reply = None;
         self.file_error = None;
         self.suppress_completion_for_next_edit = true;
-        self.editor
-            .update(cx, |editor, cx| {
-                editor.set_disabled(false, cx);
-                editor.replace_all(content, window, cx);
-            });
+        self.editor.update(cx, |editor, cx| {
+            editor.set_disabled(false, cx);
+            editor.replace_all(content, window, cx);
+        });
         self.is_preview = false;
         self.status = if self.recovery_conflict {
             "Recovered unsaved edits. The disk file changed; review before overwriting it."
@@ -629,7 +662,10 @@ impl CodePanel {
         std::path::PathBuf::from(&self.file_path)
     }
 
-    pub fn turn_context(&self, cx: &App) -> Option<ahead_rpc::ahead::TurnEditorContext> {
+    pub fn turn_context(
+        &self,
+        cx: &App,
+    ) -> Option<ahead_rpc::ahead::TurnEditorContext> {
         if !self.is_text_available() {
             return None;
         }
@@ -686,6 +722,10 @@ impl CodePanel {
         })
     }
 
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.dirty
+    }
+
     pub fn open_file(
         &mut self,
         path: &str,
@@ -713,7 +753,9 @@ impl CodePanel {
             self.recovery_reply = None;
             self.recovery_conflict = false;
         }
-        self.saved_sha256 = disk_text.as_ref().ok()
+        self.saved_sha256 = disk_text
+            .as_ref()
+            .ok()
             .map(|text| format!("{:x}", sha2::Sha256::digest(text.as_bytes())));
         let text = match disk_text {
             Ok(text) => {
@@ -749,17 +791,20 @@ impl CodePanel {
         self.git_key = None;
         self.git_state = GitFileState::default();
         self.show_completions = false;
-        if self.is_text_available() && let Some(proxy) = self.proxy.as_ref() {
+        if self.is_text_available()
+            && let Some(proxy) = self.proxy.as_ref()
+        {
             proxy.sync_editor_snapshot(
                 self.proxy_path(),
                 self.editor.read(cx).value().to_string(),
             );
             proxy.refresh_anchors(&[self.proxy_path()]);
         }
-        self.status = self.file_error.as_ref().map_or_else(
-            || format!("Opened {path}"),
-            |error| error.to_string(),
-        ).into();
+        self.status = self
+            .file_error
+            .as_ref()
+            .map_or_else(|| format!("Opened {path}"), |error| error.to_string())
+            .into();
         cx.notify();
     }
 
@@ -1464,6 +1509,11 @@ impl CodePanel {
         let ctrl = modifiers.control;
         let alt = modifiers.alt;
 
+        if key == "escape" && self.navigation_results.take().is_some() {
+            cx.notify();
+            return;
+        }
+
         if self
             .hover_chord_deadline
             .take()
@@ -1510,6 +1560,16 @@ impl CodePanel {
         // F12: go to definition via proxy.
         if key == "f12" && !primary && !ctrl && !alt && !modifiers.shift {
             self.go_to_definition(cx);
+            return;
+        }
+
+        if key == "f12" && modifiers.shift && !primary && !ctrl && !alt {
+            self.find_references(cx);
+            return;
+        }
+
+        if key == "f12" && (primary || ctrl) && !modifiers.shift && !alt {
+            self.go_to_implementation(cx);
             return;
         }
 
@@ -1599,6 +1659,72 @@ impl CodePanel {
         .detach();
     }
 
+    fn find_references(&mut self, cx: &mut Context<Self>) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let path = self.proxy_path();
+        let position = self.cursor_position(cx);
+        let receiver = proxy.request_references(path.clone(), position);
+        self.request_navigation("References", path, position, receiver, cx);
+    }
+
+    fn go_to_implementation(&mut self, cx: &mut Context<Self>) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let path = self.proxy_path();
+        let position = self.cursor_position(cx);
+        let receiver = proxy.request_implementations(path.clone(), position);
+        self.request_navigation("Implementations", path, position, receiver, cx);
+    }
+
+    fn request_navigation(
+        &mut self,
+        title: &'static str,
+        path: std::path::PathBuf,
+        position: lsp_types::Position,
+        receiver: crossbeam_channel::Receiver<Vec<lsp_types::Location>>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.request_generation;
+        cx.spawn(async move |this, cx| {
+            let locations = cx
+                .background_spawn(async move { receiver.recv().unwrap_or_default() })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.request_generation != generation
+                    || this.proxy_path() != path
+                    || this.cursor_position(cx) != position
+                {
+                    return;
+                }
+                if locations.is_empty() {
+                    this.status = format!("No {title} from proxy").into();
+                } else {
+                    this.status =
+                        format!("Found {} {title}", locations.len()).into();
+                    this.navigation_results =
+                        Some(NavigationResults { title, locations });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_navigation_location(
+        &mut self,
+        location: lsp_types::Location,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation_results = None;
+        match definition_open_request(&location) {
+            Ok(request) => cx.emit(request),
+            Err(error) => self.status = error.into(),
+        }
+        cx.notify();
+    }
 }
 
 fn completion_edit(
@@ -1760,6 +1886,15 @@ fn definition_open_request(
     })
 }
 
+fn navigation_location_label(location: &lsp_types::Location) -> String {
+    let path = location
+        .uri
+        .to_file_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| location.uri.to_string());
+    format!("{path}:{}", location.range.start.line + 1)
+}
+
 fn unique_quote_range(
     text: &str,
     quote: &str,
@@ -1842,9 +1977,12 @@ impl Panel for CodePanel {
         let button_tab_handler = tab_handler.clone();
         let file_tab_handler = tab_handler.clone();
         let title = SharedString::from(file_name.to_string());
-        let tab_label = div()
+        let tab_label = h_flex()
+            .min_w_0()
+            .items_center()
+            .gap_1()
             .when(self.is_preview, |this| this.italic())
-            .child(title)
+            .child(div().min_w_0().truncate().child(title))
             .when(dirty, |this| {
                 this.child(div().text_color(cx.theme().warning).child("•"))
             });
@@ -1961,11 +2099,18 @@ impl Render for CodePanel {
                 .size_full()
                 .bg(cx.theme().background)
                 .track_focus(&self.focus)
-                .child(Empty::new().header(
-                    EmptyHeader::new()
-                        .title(EmptyTitle::new().child("File cannot be opened as text"))
-                        .description(EmptyDescription::new().child(error.to_string())),
-                ))
+                .child(
+                    Empty::new().header(
+                        EmptyHeader::new()
+                            .title(
+                                EmptyTitle::new()
+                                    .child("File cannot be opened as text"),
+                            )
+                            .description(
+                                EmptyDescription::new().child(error.to_string()),
+                            ),
+                    ),
+                )
                 .into_any_element();
         }
         self.sync_proxy_diagnostics(cx);
@@ -2033,6 +2178,7 @@ impl Render for CodePanel {
             .map(|(start, _)| start..start);
         let pointer_editor = self.editor.clone();
         let pointer_panel = cx.entity();
+        let inline_blame_panel = cx.entity();
         let presentation_overlay = self.presentation.clone().map(|presentation| {
             let line = presentation_line.unwrap_or(1) as f32;
             let top = scroll_offset.y + line_height * line + px(4.);
@@ -2062,15 +2208,23 @@ impl Render for CodePanel {
             + line_height * (cursor_position.line as f32 + 1.0)
             + px(8.);
         let completion_left = px(42. + cursor_position.character as f32 * 7.2);
-        let git_lens = self
-            .git_state
-            .blame
-            .iter()
-            .find(|hunk| {
-                (hunk.start..hunk.start.saturating_add(hunk.len))
-                    .contains(&(self.active_line as usize))
+        let inline_blame = self
+            .inline_blame_enabled
+            .then(|| {
+                self.git_state.blame.iter().find(|hunk| {
+                    (hunk.start..hunk.start.saturating_add(hunk.len))
+                        .contains(&(self.active_line as usize))
+                })
             })
-            .map(blame_label);
+            .flatten();
+        let inline_blame_range = inline_blame
+            .and_then(|_| line_end_offset(&editor_text, self.active_line))
+            .map(|offset| offset..offset);
+        let inline_blame_text = inline_blame.map(inline_blame_label);
+        let inline_blame_details = inline_blame.map(blame_label);
+        let inline_blame_position = self
+            .inline_blame_position
+            .filter(|(line, _, _)| *line == self.active_line);
         let hover_text = self.hover_text.clone();
         v_flex()
             .size_full()
@@ -2121,6 +2275,14 @@ impl Render for CodePanel {
             }))
             .capture_action(cx.listener(|this: &mut Self, _: &GoToDefinition, _, cx| {
                 this.go_to_definition(cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this: &mut Self, _: &FindReferences, _, cx| {
+                this.find_references(cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this: &mut Self, _: &GoToImplementation, _, cx| {
+                this.go_to_implementation(cx);
                 cx.stop_propagation();
             }))
             .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, window, cx| {
@@ -2204,7 +2366,7 @@ impl Render for CodePanel {
                     .min_h_0()
                     .child(
                         div()
-                            .w(px(32.))
+                            .w(px(38.))
                             .h_full()
                             .relative()
                             .overflow_hidden()
@@ -2269,6 +2431,7 @@ impl Render for CodePanel {
                                                         gpui_kit::Hsla::transparent_black()
                                                     })
                                             )
+                                            .child(div().w(px(6.)))
                                             .child(
                                                 div()
                                                     .id(("breakpoint-hover", ln as usize))
@@ -2349,7 +2512,15 @@ impl Render for CodePanel {
                         .min_w_0()
                         .relative()
                         .bg(editor_bg)
-                            .context_menu(move |menu, window, _cx| {
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this: &mut Self, event: &MouseUpEvent, _, cx| {
+                                    if event.modifiers.platform || event.modifiers.control {
+                                        this.go_to_definition(cx);
+                                    }
+                                }),
+                            )
+                        .context_menu(move |menu, window, _cx| {
                                 let editor_focus = code_panel
                                     .read(_cx)
                                     .editor
@@ -2524,6 +2695,93 @@ impl Render for CodePanel {
                                     )
                                     .absolute()
                                     .inset_0(),
+                                )
+                            })
+                            .when_some(self.navigation_results.clone(), |el, results| {
+                                let locations = results.locations;
+                                el.child(
+                                    v_flex()
+                                        .id("navigation-results")
+                                        .absolute()
+                                        .top(px(8.))
+                                        .right(px(12.))
+                                        .w(px(420.))
+                                        .max_h(px(360.))
+                                        .overflow_y_scroll()
+                                        .bg(popup_bg)
+                                        .border_1()
+                                        .border_color(border_color)
+                                        .rounded_md()
+                                        .shadow_md()
+                                        .child(
+                                            h_flex()
+                                                .justify_between()
+                                                .items_center()
+                                                .p_2()
+                                                .child(results.title)
+                                                .child(
+                                                    Button::new("close-navigation-results")
+                                                        .icon(IconName::X)
+                                                        .ghost()
+                                                        .tooltip("Close navigation results")
+                                                        .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                            this.navigation_results = None;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        )
+                                        .children(locations.into_iter().enumerate().map(|(index, location)| {
+                                            let label = navigation_location_label(&location);
+                                            Button::new(("navigation-location", index))
+                                                .ghost()
+                                                .w_full()
+                                                .justify_start()
+                                                .px_2()
+                                                .py_1()
+                                                .child(label)
+                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                    this.open_navigation_location(location.clone(), cx);
+                                                }))
+                                        })),
+                                )
+                            })
+                            .when_some(inline_blame_range, |el, range| {
+                                let editor = self.editor.clone();
+                                let panel = inline_blame_panel.clone();
+                                let line = self.active_line;
+                                el.child(
+                                    canvas(
+                                        move |bounds, _, cx| {
+                                            editor.read(cx).range_to_bounds(&range).map(|target| {
+                                                let origin = target.origin - bounds.origin;
+                                                (line, origin.x.as_f32(), origin.y.as_f32())
+                                            })
+                                        },
+                                        move |_, position, _, cx| {
+                                            panel.update(cx, |panel, cx| {
+                                                if panel.inline_blame_position != position {
+                                                    panel.inline_blame_position = position;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                            })
+                            .when_some(inline_blame_position.zip(inline_blame_text), |el, ((_, left, top), label)| {
+                                el.child(
+                                    h_flex()
+                                        .absolute()
+                                        .top(px(top))
+                                        .left(px(left + 28.))
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(IconName::GitBranch)
+                                        .child(label),
                                 )
                             })
                             .when_some(presentation_overlay, |el, (presentation, top)| {
@@ -2725,19 +2983,14 @@ impl Render for CodePanel {
                         "{} · Ln {}, Col {}",
                         file_name, self.active_line, active_column
                     ))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .when_some(git_lens, |el, label| {
-                                el.child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(label),
-                                )
-                            })
-                    )
+                    .when_some(inline_blame_details, |el, label| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(label),
+                        )
+                    })
             )
             .into_any_element()
     }
@@ -2765,6 +3018,46 @@ fn blame_label(hunk: &BlameHunk) -> String {
         "{} · {} · {} ({})",
         commit.author, date, commit.subject, short_id
     )
+}
+
+fn line_end_offset(text: &str, line: u32) -> Option<usize> {
+    let mut offset = 0;
+    for (index, content) in text.split('\n').enumerate() {
+        if index + 1 == line as usize {
+            return Some(offset + content.len());
+        }
+        offset += content.len() + 1;
+    }
+    None
+}
+
+fn inline_blame_label(hunk: &BlameHunk) -> String {
+    let Some(commit) = &hunk.commit else {
+        return "Uncommitted changes".to_string();
+    };
+    format!(
+        "{}, {}",
+        commit.author,
+        relative_blame_time(commit.timestamp, chrono::Utc::now().timestamp())
+    )
+}
+
+fn relative_blame_time(timestamp: i64, now: i64) -> String {
+    let seconds = now.saturating_sub(timestamp);
+    let (count, unit) = if seconds < 60 {
+        return "just now".to_string();
+    } else if seconds < 3_600 {
+        (seconds / 60, "minute")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "hour")
+    } else if seconds < 2_592_000 {
+        (seconds / 86_400, "day")
+    } else if seconds < 31_536_000 {
+        (seconds / 2_592_000, "month")
+    } else {
+        (seconds / 31_536_000, "year")
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
 }
 
 /// Converts an LSP UTF-16 position to a byte offset in `text`.
@@ -2840,8 +3133,8 @@ mod tests {
     use crate::proxy_client::LspCompletion;
     use crate::ross::{OpenColumn, OpenLocation};
     use ahead_rpc::plugin::PluginId;
-    use gpui_kit::Focusable;
     use gpui_kit::component::input::Undo;
+    use gpui_kit::{Focusable, VisualContext};
 
     #[test]
     fn file_open_accepts_utf8_and_preserves_read_failures() {
@@ -2864,12 +3157,19 @@ mod tests {
             &b"truncated \xf0\x9f"[..],
         ] {
             std::fs::write(path, bytes).expect("unsupported data");
-            assert!(matches!(read_editor_file(path), Err(FileOpenError::UnsupportedText)));
+            assert!(matches!(
+                read_editor_file(path),
+                Err(FileOpenError::UnsupportedText)
+            ));
             assert_eq!(std::fs::read(path).expect("unchanged file"), bytes);
         }
         std::fs::remove_file(path).expect("remove fixture");
-        assert!(matches!(read_editor_file(path), Err(FileOpenError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound));
-        let denied = FileOpenError::Read(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            matches!(read_editor_file(path), Err(FileOpenError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        let denied = FileOpenError::Read(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ));
         assert!(denied.to_string().contains("permission denied"));
     }
 
@@ -2886,24 +3186,34 @@ mod tests {
         let text = directory.path().join("empty.txt");
         std::fs::write(&text, "").expect("empty text");
         let missing = directory.path().join("missing.txt");
-        let proxy = crate::proxy_client::ProxyClient::new_for_test(directory.path().to_owned());
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
         let rpc = proxy.rpc_for_test();
         proxy.enable_editor_recovery();
         let (panel, cx) = cx.add_window_view(|window, cx| {
-            CodePanel::new(binary.to_str().expect("path"), window, cx)
-                .with_proxy(proxy.clone(), directory.path().to_str().expect("workspace"), cx)
+            CodePanel::new(binary.to_str().expect("path"), window, cx).with_proxy(
+                proxy.clone(),
+                directory.path().to_str().expect("workspace"),
+                cx,
+            )
         });
         panel.update_in(cx, |panel, window, cx| {
             assert!(!panel.is_text_available());
+            assert!(!panel.editor.read(cx).is_editable());
             assert!(panel.turn_context(cx).is_none());
             panel.save(window, cx);
             assert!(panel.queue_recovery(false, true, cx).is_none());
         });
-        assert!(rpc.rx().try_recv().is_err(), "blocked tab must not reach the proxy");
+        assert!(
+            rpc.rx().try_recv().is_err(),
+            "blocked tab must not reach the proxy"
+        );
 
         panel.update_in(cx, |panel, window, cx| {
             panel.open_file(text.to_str().expect("path"), true, window, cx);
             assert!(panel.is_text_available());
+            assert!(panel.editor.read(cx).is_editable());
             assert!(panel.editor.read(cx).value().is_empty());
         });
         assert!(rpc.rx().try_iter().any(|message| matches!(message,
@@ -2915,24 +3225,35 @@ mod tests {
                 panel.open_file(path.to_str().expect("path"), true, window, cx);
                 assert_eq!(panel.file_path, path.to_str().expect("path"));
                 assert!(!panel.is_text_available());
+                assert!(!panel.editor.read(cx).is_editable());
                 assert!(!panel.dirty);
                 assert!(panel.turn_context(cx).is_none());
                 panel.save(window, cx);
+                window.focus(&panel.focus, cx);
             });
             cx.update(|window, cx| window.draw(cx).clear(cx));
             assert!(cx.debug_bounds("file-open-error").is_some());
             cx.simulate_keystrokes("x cmd-v cmd-s");
             assert!(!panel.read_with(cx, |panel, _| panel.dirty));
-            assert!(!rpc.rx().try_iter().any(|message| matches!(message,
-                ProxyRpc::Notification(ProxyNotification::EditorSnapshot { .. }) |
-                ProxyRpc::Request(_, ProxyRequest::SaveEditorBuffer { .. })
-            )), "blocked tabs cannot publish or save empty buffers");
+            assert!(
+                !rpc.rx().try_iter().any(|message| matches!(
+                    message,
+                    ProxyRpc::Notification(ProxyNotification::EditorSnapshot { .. })
+                        | ProxyRpc::Request(
+                            _,
+                            ProxyRequest::SaveEditorBuffer { .. }
+                        )
+                )),
+                "blocked tabs cannot publish or save empty buffers"
+            );
         }
         assert_eq!(std::fs::read(&binary).expect("binary unchanged"), bytes);
         assert!(!missing.exists());
         panel.update_in(cx, |panel, window, cx| {
             panel.open_file(text.to_str().expect("path"), true, window, cx);
-            panel.editor.update(cx, |editor, cx| editor.replace_all("unsaved", window, cx));
+            panel
+                .editor
+                .update(cx, |editor, cx| editor.replace_all("unsaved", window, cx));
         });
         panel.update_in(cx, |panel, window, cx| {
             assert!(panel.dirty);
@@ -2940,6 +3261,50 @@ mod tests {
             assert_eq!(panel.file_path, text.to_str().expect("path"));
             assert_eq!(panel.editor.read(cx).value().as_ref(), "unsaved");
         });
+    }
+
+    #[gpui_kit::test]
+    fn file_open_recovery_preserves_missing_text_without_unlocking_binary_files(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("missing.txt");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let snapshot = ahead_rpc::file::EditorRecoverySnapshot {
+            buffer_id: "recovered-buffer".into(),
+            revision: 1,
+            path: "missing.txt".into(),
+            contents: Some("recovered text".into()),
+            saved_sha256: Some("previous version".into()),
+        };
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .restore_recovery(snapshot.clone(), window, cx)
+                .expect("recover missing file");
+            assert!(panel.is_text_available());
+            assert!(panel.editor.read(cx).is_editable());
+            assert!(panel.recovery_conflict);
+        });
+        assert!(panel.read_with(cx, |panel, _| panel.dirty));
+        assert!(!path.exists(), "recovery never creates the disk file");
+
+        let binary = directory.path().join("session.db");
+        std::fs::write(&binary, b"SQLite format 3\0").expect("binary fixture");
+        let blocked = cx.new_window_entity(|window, cx| {
+            CodePanel::new(binary.to_str().expect("path"), window, cx)
+        });
+        blocked.update_in(cx, |panel, window, cx| {
+            assert!(panel.restore_recovery(snapshot, window, cx).is_err());
+            assert!(!panel.is_text_available());
+            assert!(!panel.dirty);
+        });
+        assert_eq!(
+            std::fs::read(binary).expect("unchanged binary"),
+            b"SQLite format 3\0"
+        );
     }
 
     #[test]
@@ -3722,7 +4087,11 @@ mod tests {
             panel.editor.update(cx, |editor, cx| {
                 editor.set_selected_range(1..5, cx);
             });
-            panel.turn_context(cx).expect("text context").selection.expect("editor selection")
+            panel
+                .turn_context(cx)
+                .expect("text context")
+                .selection
+                .expect("editor selection")
         });
         assert_eq!(selection.start.col, 1);
         assert_eq!(selection.end.col, 3);
@@ -3775,6 +4144,18 @@ mod tests {
         );
         hunk.commit = None;
         assert_eq!(blame_label(&hunk), "Uncommitted changes");
+    }
+
+    #[test]
+    fn inline_blame_tracks_line_end_and_relative_author_time() {
+        assert_eq!(super::line_end_offset("αβ\nlast\n", 1), Some(4));
+        assert_eq!(super::line_end_offset("αβ\nlast\n", 2), Some(9));
+        assert_eq!(super::line_end_offset("αβ\nlast\n", 3), Some(10));
+        assert_eq!(super::line_end_offset("", 1), Some(0));
+        assert_eq!(super::line_end_offset("a", 2), None);
+        assert_eq!(super::relative_blame_time(100, 100), "just now");
+        assert_eq!(super::relative_blame_time(100, 3_700), "1 hour ago");
+        assert_eq!(super::relative_blame_time(100, 7_300), "2 hours ago");
     }
 
     #[gpui_kit::test(iterations = 10)]
@@ -3969,7 +4350,10 @@ mod tests {
         let breakpoint = cx
             .debug_bounds("breakpoint-target-1")
             .expect("breakpoint target");
-        assert!(change.origin.x + change.size.width <= breakpoint.origin.x);
+        assert!(
+            breakpoint.origin.x - (change.origin.x + change.size.width)
+                >= gpui_kit::px(8.)
+        );
         cx.simulate_click(change.center(), Default::default());
         assert!(proxy.breakpoints_for(&path).is_empty());
         assert_eq!(

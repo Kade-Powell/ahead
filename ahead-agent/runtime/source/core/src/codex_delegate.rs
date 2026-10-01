@@ -64,10 +64,9 @@ pub(crate) async fn run_codex_thread_interactive(
             "Codex delegates require approval policy `never`".to_string(),
         ));
     }
-    if subagent_source.kind() == crate::approval::LEGACY_GUARDIAN_SOURCE {
+    if subagent_source.kind() == crate::approval::UNSUPPORTED_GUARDIAN_SOURCE {
         return Err(CodexErr::InvalidRequest(
-            "Guardian-marked threads are legacy history only and cannot be executed by AHEAD"
-                .to_string(),
+            "Automatic-review delegates are not supported by AHEAD".to_string(),
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);

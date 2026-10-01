@@ -550,15 +550,39 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        Self::load_rollout_items_with_limits(path, u64::MAX, usize::MAX).await
+    }
+
+    /// Loads a rollout while bounding decompressed bytes and non-empty records.
+    pub async fn load_rollout_items_with_limits(
+        path: &Path,
+        max_bytes: u64,
+        max_records: usize,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
         let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
+        let mut total_bytes = 0u64;
+        let mut record_count = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
         let mut saw_non_empty_line = false;
-        while let Some(line) = reader.next_line().await? {
+        loop {
+            let remaining_bytes = max_bytes.saturating_sub(total_bytes);
+            let line_limit = usize::try_from(remaining_bytes).unwrap_or(usize::MAX);
+            let Some((line, line_bytes)) = reader.next_line_with_limit(line_limit).await? else {
+                break;
+            };
+            total_bytes = total_bytes.saturating_add(u64::try_from(line_bytes).unwrap_or(u64::MAX));
+            if total_bytes > max_bytes {
+                return Err(IoError::other("rollout exceeds the byte import limit"));
+            }
             if line.trim().is_empty() {
                 continue;
+            }
+            record_count = record_count.saturating_add(1);
+            if record_count > max_records {
+                return Err(IoError::other("rollout exceeds the record import limit"));
             }
             saw_non_empty_line = true;
             let mut value: Value = match serde_json::from_str(&line) {

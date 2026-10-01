@@ -441,11 +441,22 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    ordered `Thread.messages` transcript and persisted UI scroll position
    (`crates/agent/src/thread.rs`, `crates/agent/src/db.rs`), while AHEAD bounds
    the rendered durable-chat window in Turso.
-   Managed replay is Turso-only. New turns do not write Codex rollout files,
-   and missing threads do not search, import or migrate JSONL from
-   `sessions/` or `archived_sessions/`. Existing files are left untouched.
-   The hard fork does not support old Codex/AHEAD storage formats. This
-   supersedes the earlier JSONL migration plan.
+   Managed replay is Turso-only after restore. New turns do not write rollout
+   files. Before restoring a missing Turso thread, `NativeClient` may perform
+   one safe, one-time import from the configured AHEAD runtime home: exactly
+   one regular JSONL (`.jsonl` or `.jsonl.zst`) candidate under `sessions/` or
+   `archived_sessions/`, with the requested thread ID in its first session
+   metadata record and a canonical workspace path matching the requested
+   workspace. Stored and decompressed data are bounded to 64 MiB and 200,000
+   non-empty records. Malformed or unsupported records (including removed
+   Guardian assessment events) reject the whole import; symlinked, out-of-root,
+   cross-workspace or active-and-archived ambiguous sources are rejected
+   without changing the source. Turso inserts the thread header and ordered
+   replay records in one
+   idempotent transaction. The source remains in place, and resumed history is
+   read from Turso only; there is no live JSONL fallback or schema migration.
+   Focused integration tests are tracked in `TODO.md` until run in the shared
+   Cargo loop.
    Before choosing resume-time dynamic tools, `NativeClient` reads the
    durable thread header through `TursoThreadStore`. Restored children do
    not receive the root-only `spawn_agent` tool. Child lifecycle edges are
@@ -485,10 +496,12 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    well. `ProjectSortKey` stays because the normal-build project-list params
    still name it. The storage-neutral `ThreadStore` and `LiveThread` contracts
    remain for the retained core loop; AHEAD injects `TursoThreadStore` as its
-   only durable managed-session backend. Guardian source markers still parse
-   in the retained protocol, but AHEAD rejects them at thread-manager
-   create/resume and direct delegate boundaries. These old-format markers
-   are pruning work, not a supported history-compatibility contract. The
+   only durable managed-session backend. The typed `Internal::Guardian` and
+   `ThreadSource::GuardianReview` variants are removed, and their old
+   serialized labels fail parsing. Direct `Feature("guardian_review")` and
+   `SubAgentSource::Other("guardian")` values are still rejected at
+   create/resume/delegate boundaries; these are fail-closed input guards, not
+   history compatibility. The
    unreachable Guardian-specific session setup, policy, world-state, remote
    MCP discovery, tool routing and prompt-schema branches have been removed;
    only fail-closed entry checks and legacy history/source handling remain.
@@ -851,16 +864,17 @@ delete = "deny"
 
 Requests that reach the reviewer now go to the human after explicit
 permission hooks; the disabled Guardian review executor and per-app Codex
-reviewer override are removed. Legacy `approvals_reviewer` and
-`required_on_models` selector fields are ignored rather than normalized:
+reviewer override are removed. `approvals_reviewer` and `required_on_models`
+are not recognized selectors and cannot route a request to a reviewer:
 there is no reviewer enum or selector in config, profiles, managed
-requirements, analytics, MCP policy or runtime state. Old session JSON
-remains readable because unknown reviewer fields are ignored. The
-model-specific required-review constraint is removed; managed
-`auto_review.ignore_rules` remains because it removes executable prefix
-allow-rules for selected models. Legacy Guardian session-source markers and
-tool-filter branches still remain, but are queued for removal under the
-hard-fork decision. Current AHEAD restore and permissions must stay tested.
+requirements, analytics, MCP policy or runtime state. Reading old session JSON
+is not a compatibility promise. The model-specific required-review constraint
+is removed; managed `auto_review.ignore_rules` remains because it removes
+executable prefix allow-rules for selected models. Guardian session-source
+variants are removed; their old serialized labels fail parsing. Direct
+`guardian_review` feature and `guardian` subagent inputs remain rejection-only
+boundary guards, not supported session formats. Current AHEAD restore and
+permissions must stay tested.
 Legacy `persist=always` metadata is reduced to approval of that call, and the
 copied runtime no longer writes approval rules into Codex user or project
 config.
@@ -1072,7 +1086,11 @@ selected-root discovery only materializes bounded `SKILL.md` files; it does not
 parse plugin manifests, MCP declarations or `agents/openai.yaml` sidecars.
 The native bootstrap also disables Codex product features for code mode,
 web search, multi-agent routing and MCP apps. Four Guardian-only feature keys
-are no longer runtime features; old config values are accepted and ignored.
+are no longer runtime features; strict config validation rejects those retired
+keys instead of whitelisting them. AHEAD also removed the copied feature-alias
+registry and the top-level `experimental_use_unified_exec_tool` setting.
+`[features]` and managed requirements use canonical keys; strict validation
+rejects retired aliases instead of silently mapping them to active behavior.
 The copied managed
 network proxy, MITM, SOCKS, DNS, certificate and credential-broker engine is
 deleted. A small fail-closed compatibility surface remains only for serialized
@@ -1147,8 +1165,9 @@ circuit breaker are removed. Its unused analytics event model and orphan
 plugin-install/external-import telemetry facts are also deleted; no event is
 sent or persisted. The extension API no longer exposes approval-review
 contributors or their assessment/input/error DTOs; serialized Guardian
-assessment events remain in the copied protocol and are scheduled for
-removal, not supported legacy history. The uncalled root
+assessment event types are removed. An old assessment record rejects the
+entire optional one-time rollout import rather than being silently dropped.
+The uncalled root
 snapshot/version API, Guardian answer-evidence cache and dead AgentControl
 provider are removed; ordinary `request_user_input` keeps returning the same
 serialized host response. Approval contexts, request DTOs and formatters now
@@ -1163,22 +1182,27 @@ the bundled catalog's long review policy is removed. The unused
 well. The separate `node_repl_auto_review_required` and `node_repl_disabled`
 fields still flow to MCP request metadata and remain until that compatibility
 path is removed or replaced. The catalog on-request message is shared, and
-permission prompt assembly no longer has a reviewer-selection branch. Legacy
-automatic-review config values normalize to user approval.
+permission prompt assembly no longer has a reviewer-selection branch. Retired
+reviewer config keys do not select or normalize to a policy; managed
+`auto_review.ignore_rules` remains a distinct fail-closed executable-prefix
+filter.
 The retained inference client and API wrapper now use only `/responses`; the
 dedicated Guardian and classifier routes and the `free_guardian` config switch
 are removed. The dormant Guardian v2 feature/config schema is removed too. The
-four Guardian-only toggles are absent from the feature registry and remain only
-as ignored compatibility keys for old config files. The
+four Guardian-only toggles are absent from the feature registry, and strict
+config validation rejects their old keys. The
 model-instruction schema and bundled catalog no longer carry Guardian policy
 instructions or reviewer-specific approval text. The command-source enum used
 by the retained approval serialization path is now the generic
 `ApprovalCommandSource`. Approval contexts, action DTOs, annotation types and
 formatters now live under AHEAD's `core/src/approval` module. Strict legacy
-review remains fail-closed. Serialized `GuardianAssessment*` events and the
-legacy `guardian` session-source marker still need pruning. The legacy
+review remains fail-closed. Serialized `GuardianAssessment*` event types and
+rollout-preservation tests are removed. Typed Guardian session-source variants
+are also removed; generic `guardian` strings remain blocked at runtime
+boundaries rather than being supported as a session format. The legacy
 `guardian_approval` feature key and `auto_review` feature requirements are
-ignored; model-specific automatic-review selection is absent from native
+unknown, have no effect, and are covered by strict-config and managed-requirement
+regressions. Model-specific automatic-review selection is absent from native
 session startup, step changes and MCP reviewer selection. Explicit legacy
 automatic-review requests continue to fail closed.
 Guardian-specific downstream session-policy/prompt branches are removed;

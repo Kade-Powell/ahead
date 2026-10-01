@@ -40,6 +40,8 @@ gpui_kit::actions!(
         SaveFile,
         GoToFile,
         GoToDefinition,
+        FindReferences,
+        GoToImplementation,
         StartDebugging,
         StopDebugging,
         ToggleBreakpoint,
@@ -745,6 +747,8 @@ pub struct Shell {
     pub search: Entity<SearchPanel>,
     pub agent_workspace: Entity<AgentWorkspacePanel>,
     pub activity: Entity<ActivityBar>,
+    workspace_name: String,
+    worktree_name: String,
     pub threads_visible: bool,
     pub chat_zoomed: bool,
     left_dock_was_open: bool,
@@ -803,6 +807,8 @@ impl Shell {
         activity: Entity<ActivityBar>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (workspace_name, worktree_name) =
+            workspace_git_names(&explorer.read(cx).root);
         let initial_file_path =
             std::path::PathBuf::from(code.read(cx).file_path.clone());
         let recent_files = if initial_file_path.as_os_str().is_empty() {
@@ -878,6 +884,8 @@ impl Shell {
             search,
             agent_workspace,
             activity,
+            workspace_name,
+            worktree_name,
             threads_visible: true,
             chat_zoomed: false,
             left_dock_was_open: true,
@@ -2575,6 +2583,13 @@ impl Render for Shell {
             .map(|proxy| proxy.diff().branch)
             .filter(|branch| !branch.is_empty())
             .unwrap_or_else(|| "No branch".to_string());
+        let has_branch = branch != "No branch";
+        let worktree_name =
+            if self.worktree_name == self.workspace_name && has_branch {
+                branch.clone()
+            } else {
+                self.worktree_name.clone()
+            };
         let border = cx.theme().border;
         let text = cx.theme().sidebar_foreground;
         let area_right = self.area.clone();
@@ -2638,7 +2653,39 @@ impl Render for Shell {
                                 .role(Role::Image)
                                 .aria_label("AHEAD")
                                 .child(ahead_icon(px(24.), cx)),
-                        ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(text)
+                                .child(self.workspace_name.clone()),
+                        )
+                        .when(has_branch, |bar| {
+                            bar.child(div().w(px(1.)).h(px(14.)).bg(border))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(IconName::Folder)
+                                        .child(worktree_name),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("/"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .text_size(px(12.))
+                                        .text_color(text)
+                                        .child(IconName::GitBranch)
+                                        .child(branch.clone()),
+                                )
+                        }),
                 ),
             )
             .child(div().flex_1().child(self.area.clone()))
@@ -2911,6 +2958,55 @@ impl Drop for Shell {
     }
 }
 
+fn workspace_git_names(root: &str) -> (String, String) {
+    let fallback = std::path::Path::new(root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Workspace")
+        .to_string();
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel", "--git-common-dir"])
+        .current_dir(root)
+        .output();
+    let Ok(output) = output else {
+        return (fallback.clone(), fallback);
+    };
+    if !output.status.success() {
+        return (fallback.clone(), fallback);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let Some(worktree_path) = lines.next().map(std::path::PathBuf::from) else {
+        return (fallback.clone(), fallback);
+    };
+    let Some(common_dir) = lines.next().map(std::path::PathBuf::from) else {
+        return (fallback.clone(), fallback);
+    };
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        std::path::Path::new(root).join(common_dir)
+    };
+    let workspace_path = common_dir
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+    let workspace_name = workspace_path
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or(&fallback)
+        .to_string();
+    let worktree_path = worktree_path.canonicalize().unwrap_or(worktree_path);
+    let worktree_name = worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&fallback)
+        .to_string();
+    (workspace_name, worktree_name)
+}
+
 fn configure_ahead_theme(cx: &mut App) -> anyhow::Result<()> {
     let (dark, light) = crate::theme::default_themes()?;
     let theme = gpui_kit::component::Theme::global_mut(cx);
@@ -3127,6 +3223,16 @@ pub fn launch() {
                     None,
                 ),
                 KeyBinding::new("f12", GoToDefinition, None),
+                KeyBinding::new("shift-f12", FindReferences, None),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-f12"
+                    } else {
+                        "ctrl-f12"
+                    },
+                    GoToImplementation,
+                    None,
+                ),
                 KeyBinding::new("f5", StartDebugging, None),
                 KeyBinding::new("shift-f5", StopDebugging, None),
                 KeyBinding::new("f9", ToggleBreakpoint, None),
@@ -3156,6 +3262,8 @@ pub fn launch() {
                 Menu::new("Go").items([
                     MenuItem::action("Go to File", GoToFile),
                     MenuItem::action("Go to Definition", GoToDefinition),
+                    MenuItem::action("Find All References", FindReferences),
+                    MenuItem::action("Go to Implementation", GoToImplementation),
                 ]),
                 Menu::new("Run").items([
                     MenuItem::action("Start or Continue Debugging", StartDebugging),
@@ -3319,21 +3427,9 @@ pub fn launch() {
                             )
                             .with_proxy(proxy.clone())
                         });
-                        let session_for_settings = session.downgrade();
                         settings.update(cx, |settings, cx| {
                             settings.watch_config_changes(window, cx);
                             settings.load_mcp_server_declarations(cx);
-                            settings.set_save_handler(move |window, cx| {
-                                if let Err(error) =
-                                    session_for_settings.update(cx, |session, cx| {
-                                        session.reload_configured_models(window, cx);
-                                    })
-                                {
-                                    eprintln!(
-                                        "AHEAD model picker reload failed: {error}"
-                                    );
-                                }
-                            });
                         });
                         let terminal = cx.new(|cx| {
                             crate::terminal_panel::TerminalPanel::new_with_cwd(
@@ -3406,6 +3502,47 @@ pub fn launch() {
                                 activity.clone(),
                                 cx,
                             )
+                        });
+                        session
+                            .update(cx, |panel, _| panel.set_shell(shell.clone()));
+                        let shell_for_settings_reload = shell.downgrade();
+                        let session_for_settings_reload = session.downgrade();
+                        let workspace_for_settings_reload = explorer_root.clone();
+                        settings.update(cx, |settings, _| {
+                            settings.set_save_handler(move |window, cx| {
+                                if let Err(error) = session_for_settings_reload
+                                    .update(cx, |session, cx| {
+                                        session.reload_configured_models(window, cx)
+                                    })
+                                {
+                                    eprintln!(
+                                        "AHEAD model picker reload failed: {error}"
+                                    );
+                                }
+                                let inline_blame =
+                                    crate::settings_panel::inline_blame_enabled(
+                                        std::path::Path::new(
+                                            &workspace_for_settings_reload,
+                                        ),
+                                    );
+                                if let Err(error) = shell_for_settings_reload.update(
+                                    cx,
+                                    |shell, cx| {
+                                        for code in &shell.code_tabs {
+                                            code.update(cx, |code, cx| {
+                                                code.set_inline_blame_enabled(
+                                                    inline_blame,
+                                                    cx,
+                                                )
+                                            });
+                                        }
+                                    },
+                                ) {
+                                    eprintln!(
+                                        "AHEAD inline blame reload failed: {error}"
+                                    );
+                                }
+                            });
                         });
                         Shell::install_window_close_handler(&shell, window, cx);
                         shell.update(cx, |shell, cx| {

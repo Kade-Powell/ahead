@@ -38,7 +38,8 @@ use codex_protocol::{
     plan_tool::StepStatus,
     protocol::{
         AskForApproval, EventMsg, FileChange, Op, ReviewDecision, SessionSource,
-        SkillScope, SubAgentActivityKind, SubAgentSource, ThreadSettingsOverrides,
+        SkillScope, SubAgentActivityKind, SubAgentSource, ThreadMemoryMode,
+        ThreadSettingsOverrides,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsResponse,
@@ -47,7 +48,10 @@ use codex_protocol::{
     turn_input::{StartIfIdleSubmission, TurnInputRequest},
     user_input::UserInput,
 };
-use codex_thread_store::{ReadThreadParams, ThreadStore};
+use codex_rollout::{RolloutItem, RolloutRecorder};
+use codex_thread_store::{
+    CreateThreadParams, ReadThreadParams, ThreadPersistenceMetadata, ThreadStore,
+};
 use codex_utils_absolute_path::AbsolutePathBuf;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -71,10 +75,33 @@ use crate::{
         AgentScope, McpServerPolicy, file_change_allowed, mcp_servers_for_workspace,
         path_is_allowed, permission_profile, prepare_runtime_home,
     },
-    store::HarnessStore,
+    store::{HarnessStore, LegacyNativeThreadImport},
     turso_agent_graph_store::TursoAgentGraphStore,
     turso_thread_store::TursoThreadStore,
 };
+
+const MAX_LEGACY_ROLLOUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LEGACY_ROLLOUT_RECORDS: usize = 200_000;
+
+fn validate_legacy_rollout_directories(root: &Path, path: &Path) -> Result<()> {
+    let relative_path = path
+        .strip_prefix(root)
+        .context("legacy rollout is outside the runtime session root")?;
+    let parent = relative_path
+        .parent()
+        .context("legacy rollout has no session directory")?;
+    let mut directory = root.to_path_buf();
+    for component in parent.components() {
+        directory.push(component);
+        let metadata = std::fs::symlink_metadata(&directory)
+            .context("inspecting legacy AHEAD session directory")?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "legacy AHEAD session directories must not be symlinks"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct NativeClientConfig {
@@ -276,8 +303,7 @@ impl NativeClient {
         for feature in AHEAD_DISABLED_FEATURES {
             config.features.disable(*feature).map_err(|error| {
                 anyhow!(
-                    "AHEAD native runtime cannot disable Codex product feature {:?}: {error}",
-                    feature
+                    "AHEAD native runtime cannot disable Codex product feature {feature:?}: {error}"
                 )
             })?;
         }
@@ -484,7 +510,6 @@ impl NativeClient {
         let parsed = ThreadId::from_string(thread_id).map_err(|error| {
             anyhow!("invalid AHEAD thread id `{thread_id}`: {error}")
         })?;
-        let (is_subagent, dynamic_tools) = self.dynamic_tools_for_resume(parsed)?;
         let config = self.runtime.block_on(Self::build_config(
             &self.runtime_home,
             cwd,
@@ -492,6 +517,12 @@ impl NativeClient {
             model_provider,
             mcp_server_policy(mode_id, false),
         ))?;
+        self.import_legacy_thread_if_missing(
+            parsed,
+            cwd,
+            &config.model_provider_id,
+        )?;
+        let (is_subagent, dynamic_tools) = self.dynamic_tools_for_resume(parsed)?;
         let resumed = self
             .runtime
             .block_on(self.manager.resume_thread_by_id_with_tools(
@@ -509,6 +540,194 @@ impl NativeClient {
             .lock()
             .insert(thread_id.to_string(), u8::from(is_subagent));
         self.set_session_selection(thread_id, cwd, mode_id, model, model_provider)
+    }
+
+    fn import_legacy_thread_if_missing(
+        &self,
+        thread_id: ThreadId,
+        cwd: &Path,
+        fallback_model_provider: &str,
+    ) -> Result<()> {
+        let thread_id_text = thread_id.to_string();
+        if self
+            .store
+            .load_native_thread_header(&thread_id_text)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let (active, archived) = self.runtime.block_on(async {
+            let active = codex_rollout::find_thread_path_by_id_str(
+                &self.runtime_home,
+                &thread_id_text,
+            )
+            .await
+            .context("searching legacy AHEAD session rollouts")?;
+            let archived = codex_rollout::find_archived_thread_path_by_id_str(
+                &self.runtime_home,
+                &thread_id_text,
+            )
+            .await
+            .context("searching archived AHEAD session rollouts")?;
+            Ok::<_, anyhow::Error>((active, archived))
+        })?;
+        let (path, is_archived) = match (active, archived) {
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {
+                bail!(
+                    "legacy AHEAD thread {thread_id} has both active and archived rollout files"
+                )
+            }
+            (Some(path), None) => (path, false),
+            (None, Some(path)) => (path, true),
+        };
+
+        validate_legacy_rollout_directories(&self.runtime_home, &path)?;
+        let before = std::fs::symlink_metadata(&path)
+            .context("inspecting legacy AHEAD rollout")?;
+        anyhow::ensure!(
+            before.file_type().is_file(),
+            "legacy AHEAD rollout must be a regular file"
+        );
+        let runtime_root = self
+            .runtime_home
+            .canonicalize()
+            .context("resolving AHEAD runtime session root")?;
+        let canonical_path = path
+            .canonicalize()
+            .context("resolving legacy AHEAD rollout path")?;
+        anyhow::ensure!(
+            canonical_path.starts_with(&runtime_root),
+            "legacy AHEAD rollout is outside the runtime session root"
+        );
+        anyhow::ensure!(
+            canonical_path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(
+                    |name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
+                ),
+            "legacy AHEAD rollout must be JSONL"
+        );
+        anyhow::ensure!(
+            before.len() <= MAX_LEGACY_ROLLOUT_BYTES,
+            "legacy AHEAD rollout exceeds the {} MiB import limit",
+            MAX_LEGACY_ROLLOUT_BYTES / (1024 * 1024)
+        );
+        let before_modified = before
+            .modified()
+            .context("reading legacy AHEAD rollout modification time")?;
+        let (items, loaded_thread_id, parse_errors) = self
+            .runtime
+            .block_on(RolloutRecorder::load_rollout_items_with_limits(
+                &canonical_path,
+                MAX_LEGACY_ROLLOUT_BYTES,
+                MAX_LEGACY_ROLLOUT_RECORDS,
+            ))
+            .context("reading legacy AHEAD rollout")?;
+        anyhow::ensure!(
+            parse_errors == 0,
+            "legacy AHEAD rollout contains {parse_errors} malformed or unsupported records"
+        );
+        anyhow::ensure!(
+            items.len() <= MAX_LEGACY_ROLLOUT_RECORDS,
+            "legacy AHEAD rollout exceeds the {MAX_LEGACY_ROLLOUT_RECORDS} record import limit"
+        );
+        anyhow::ensure!(
+            loaded_thread_id == Some(thread_id),
+            "legacy AHEAD rollout metadata does not match thread {thread_id}"
+        );
+        let meta = items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(line) => Some(&line.meta),
+            _ => None,
+        });
+        let Some(meta) = meta else {
+            bail!("legacy AHEAD rollout has no session metadata")
+        };
+        anyhow::ensure!(
+            meta.id == thread_id,
+            "legacy AHEAD session metadata does not match thread {thread_id}"
+        );
+        let expected_cwd = cwd
+            .canonicalize()
+            .context("resolving requested AHEAD workspace")?;
+        let rollout_cwd = meta
+            .cwd
+            .canonicalize()
+            .context("resolving legacy AHEAD workspace metadata")?;
+        anyhow::ensure!(
+            expected_cwd == rollout_cwd,
+            "legacy AHEAD rollout belongs to a different workspace"
+        );
+
+        validate_legacy_rollout_directories(&self.runtime_home, &path)?;
+        let after = std::fs::symlink_metadata(&path)
+            .context("rechecking legacy AHEAD rollout")?;
+        let canonical_after = path.canonicalize().ok();
+        anyhow::ensure!(
+            after.file_type().is_file()
+                && after.len() == before.len()
+                && after.modified().ok() == Some(before_modified)
+                && canonical_after.as_deref() == Some(canonical_path.as_path()),
+            "legacy AHEAD rollout changed while it was being imported"
+        );
+        let created_at = chrono::DateTime::parse_from_rfc3339(&meta.timestamp)
+            .context("parsing legacy AHEAD session creation time")?
+            .with_timezone(&chrono::Utc);
+        let updated_at =
+            chrono::DateTime::<chrono::Utc>::from(before_modified).max(created_at);
+        let memory_mode = match meta.memory_mode.as_deref() {
+            None | Some("enabled") => ThreadMemoryMode::Enabled,
+            Some("disabled") => ThreadMemoryMode::Disabled,
+            Some(value) => bail!("unsupported legacy AHEAD memory mode `{value}`"),
+        };
+        let create_params = CreateThreadParams {
+            session_id: meta.session_id,
+            thread_id,
+            extra_config: None,
+            forked_from_id: meta.forked_from_id,
+            parent_thread_id: meta.parent_thread_id,
+            source: meta.source.clone(),
+            thread_source: meta.thread_source.clone(),
+            originator: meta.originator.clone(),
+            base_instructions: meta.base_instructions.clone().unwrap_or_default(),
+            dynamic_tools: meta.dynamic_tools.clone().unwrap_or_default(),
+            selected_capability_roots: meta.selected_capability_roots.clone(),
+            multi_agent_version: meta.multi_agent_version,
+            history_mode: meta.history_mode,
+            history_base: meta.history_base,
+            subagent_history_start_ordinal: meta.subagent_history_start_ordinal,
+            initial_window_id: meta
+                .context_window
+                .as_ref()
+                .map(|window| window.window_id.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(meta.cwd.clone()),
+                model_provider: meta
+                    .model_provider
+                    .clone()
+                    .filter(|provider| !provider.trim().is_empty())
+                    .unwrap_or_else(|| fallback_model_provider.to_string()),
+                memory_mode,
+            },
+        };
+        let rollout_items =
+            codex_rollout::persisted_rollout_items(&items, meta.history_mode)
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.store
+            .import_legacy_native_thread(LegacyNativeThreadImport {
+                thread_id: thread_id_text,
+                create_params: serde_json::to_value(create_params)?,
+                rollout_items,
+                created_at,
+                updated_at,
+                archived_at: is_archived.then_some(updated_at),
+            })?;
+        Ok(())
     }
 
     fn dynamic_tools_for_resume(
@@ -676,13 +895,13 @@ impl NativeClient {
                     bail!("AHEAD agent did not start the turn: {reason:?}");
                 }
             }
-            self.consume_turn(
+            Box::pin(self.consume_turn(
                 thread_id,
                 thread_id,
                 &thread,
                 &settings.mode_id,
                 false,
-            )
+            ))
             .await
         })
     }
@@ -754,11 +973,11 @@ impl NativeClient {
                         });
                     }
                 }
-                EventMsg::Warning(event) | EventMsg::GuardianWarning(event) => {
+                EventMsg::Warning(event) => {
                     if !is_child_thread {
-                        (self.sink)(HarnessEvent::AgentThought {
+                        (self.sink)(HarnessEvent::Warning {
                             acp_session_id: thread_id.to_string(),
-                            text: format!("\nWarning: {}\n", event.message),
+                            message: event.message,
                         });
                     }
                 }
@@ -1102,8 +1321,11 @@ impl NativeClient {
                                     format!("AHEAD agent settings for `{runtime_thread_id}` are missing")
                                 })?;
                             Some(
-                                self.read_skill_resource(&settings, event.arguments)
-                                    .await,
+                                Box::pin(self.read_skill_resource(
+                                    &settings,
+                                    event.arguments,
+                                ))
+                                .await,
                             )
                         }
                         AHEAD_PRESENT_CODE_TOOL
@@ -1126,13 +1348,13 @@ impl NativeClient {
                             }
                         }
                         AHEAD_SPAWN_AGENT_TOOL => Some(
-                            self.handle_spawn_agent_tool(
+                            Box::pin(self.handle_spawn_agent_tool(
                                 runtime_thread_id,
                                 thread_id,
                                 mode_id,
                                 call_id.clone(),
                                 event.arguments,
-                            )
+                            ))
                             .await,
                         ),
                         _ => None,
@@ -1257,15 +1479,14 @@ impl NativeClient {
             "in_progress",
             "subagent",
         );
-        let result = self
-            .run_subagent_turn(
-                parent_thread_id,
-                acp_session_id,
-                mode_id,
-                &label,
-                arguments,
-            )
-            .await;
+        let result = Box::pin(self.run_subagent_turn(
+            parent_thread_id,
+            acp_session_id,
+            mode_id,
+            &label,
+            arguments,
+        ))
+        .await;
         self.tool_event(
             acp_session_id,
             call_id,
@@ -1351,17 +1572,16 @@ impl NativeClient {
                 {
                     child
                 } else {
-                    self.manager
-                        .resume_thread_by_id_with_tools(
-                            parsed_child_id,
-                            config,
-                            ahead_dynamic_tools(false),
-                        )
-                        .await
-                        .map_err(|error| {
-                            anyhow!("failed to resume AHEAD subagent: {error}")
-                        })?
-                        .thread
+                    Box::pin(self.manager.resume_thread_by_id_with_tools(
+                        parsed_child_id,
+                        config,
+                        ahead_dynamic_tools(false),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        anyhow!("failed to resume AHEAD subagent: {error}")
+                    })?
+                    .thread
                 };
                 self.threads
                     .lock()
@@ -1382,13 +1602,13 @@ impl NativeClient {
                     dynamic_tools: ahead_dynamic_tools(false),
                     ..StartThreadOptions::new(config)
                 };
-                let child = self
-                    .manager
-                    .spawn_subagent_session(parent_id, options)
-                    .await
-                    .map_err(|error| {
-                        anyhow!("failed to create AHEAD subagent thread: {error}")
-                    })?;
+                let child = Box::pin(
+                    self.manager.spawn_subagent_session(parent_id, options),
+                )
+                .await
+                .map_err(|error| {
+                    anyhow!("failed to create AHEAD subagent thread: {error}")
+                })?;
                 let child_session_id = child.thread_id.to_string();
                 self.threads
                     .lock()
@@ -1594,8 +1814,10 @@ impl NativeClient {
             })?;
         self.runtime.block_on(async {
             thread.submit(Op::Compact).await?;
-            self.consume_turn(thread_id, thread_id, &thread, &mode_id, false)
-                .await
+            Box::pin(
+                self.consume_turn(thread_id, thread_id, &thread, &mode_id, false),
+            )
+            .await
         })
     }
 
@@ -1701,7 +1923,7 @@ impl NativeClient {
                     "AHEAD agent threads did not finish shutdown"
                 ),
                 Err(error) => {
-                    tracing::error!(%error, "AHEAD agent shutdown deadline elapsed")
+                    tracing::error!(%error, "AHEAD agent shutdown deadline elapsed");
                 }
             }
         });
@@ -1966,9 +2188,17 @@ impl NativeClient {
             };
             let disk_paths: Box<dyn Iterator<Item = PathBuf> + '_> =
                 if let Some(files) = indexed_files.as_ref() {
-                    Box::new(files.iter().cloned().filter(|path| {
-                        ahead_core::search::is_agent_visible_path(&workspace, path)
-                    }))
+                    Box::new(
+                        files
+                            .iter()
+                            .filter(|path| {
+                                ahead_core::search::is_agent_visible_path(
+                                    &workspace,
+                                    path,
+                                )
+                            })
+                            .cloned(),
+                    )
                 } else {
                     Box::new(ahead_core::search::agent_workspace_paths(&workspace))
                 };
@@ -2049,14 +2279,13 @@ impl NativeClient {
             None => None,
         };
 
-        let snapshot = self
-            .load_skill_snapshot(
-                &settings.cwd,
-                settings.model.as_deref(),
-                settings.model_provider.as_deref(),
-                false,
-            )
-            .await?;
+        let snapshot = Box::pin(self.load_skill_snapshot(
+            &settings.cwd,
+            settings.model.as_deref(),
+            settings.model_provider.as_deref(),
+            false,
+        ))
+        .await?;
         let contents = snapshot
             .read_package_resource(package, resource)
             .await
@@ -2133,7 +2362,7 @@ fn file_search_query_fingerprint(
         hasher.update([0]);
     }
     let mut buffers = overrides.iter().collect::<Vec<_>>();
-    buffers.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    buffers.sort_unstable_by_key(|(left, _)| *left);
     for (path, contents) in buffers {
         update_search_hash(&mut hasher, path.to_string_lossy().as_bytes());
         update_search_hash(&mut hasher, contents.as_bytes());
@@ -2322,15 +2551,20 @@ fn page_skill_resource_result(
     let mut upper = contents.len();
     let mut best = None;
     while lower < upper {
-        let end =
-            contents.ceil_char_boundary(lower.midpoint(upper).saturating_add(1));
+        let mut end = lower.midpoint(upper).saturating_add(1).min(contents.len());
+        while !contents.is_char_boundary(end) {
+            end += 1;
+        }
         let candidate =
             response(end, Some(skill_resource_cursor(resource, contents, end)));
         if candidate.len() <= MAX_SKILL_RESOURCE_PAGE_BYTES {
             lower = end;
             best = Some(candidate);
         } else {
-            upper = contents.floor_char_boundary(end.saturating_sub(1));
+            upper = end.saturating_sub(1);
+            while !contents.is_char_boundary(upper) {
+                upper -= 1;
+            }
         }
     }
     best.context("skill resource response budget leaves no room for contents")
@@ -3398,6 +3632,35 @@ mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn bounded_legacy_rollout_loader_enforces_byte_and_record_limits() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let bytes_path = directory.path().join("bytes.jsonl");
+        std::fs::write(&bytes_path, "oversized\n")?;
+        let runtime = Builder::new_current_thread().enable_all().build()?;
+        let bytes_error = runtime
+            .block_on(RolloutRecorder::load_rollout_items_with_limits(
+                &bytes_path,
+                4,
+                10,
+            ))
+            .expect_err("oversized line must fail before parsing");
+        assert!(bytes_error.to_string().contains("byte limit"));
+
+        let records_path = directory.path().join("records.jsonl");
+        std::fs::write(&records_path, "{}\n{}\n")?;
+        let records_error = runtime
+            .block_on(RolloutRecorder::load_rollout_items_with_limits(
+                &records_path,
+                16,
+                1,
+            ))
+            .expect_err("record limit must stop rollout loading");
+        assert!(records_error.to_string().contains("record import limit"));
+        Ok(())
     }
 
     #[derive(Default)]
@@ -4680,7 +4943,7 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_streams_a_responses_api_turn_in_process() {
+    fn native_agent_streams_code_mode_only_without_unavailable_host_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
         let address = listener.local_addr().expect("mock model address");
         let server = std::thread::spawn(move || {
@@ -4747,7 +5010,7 @@ mod tests {
         std::fs::write(
             workspace.join(".ahead/settings.toml"),
             format!(
-                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"ahead-test\"\n"
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.6-sol\"\n"
             ),
         )
         .expect("write test model config");
@@ -4771,7 +5034,7 @@ mod tests {
             .expect("spawn native client"),
         );
         let thread_id = client
-            .new_session(&workspace, "read-only", Some("ahead-test"), Some("mock"))
+            .new_session(&workspace, "read-only", Some("gpt-5.6-sol"), Some("mock"))
             .expect("create native session");
         client
             .set_scope(&thread_id, &workspace, &[], false)
@@ -4838,6 +5101,20 @@ mod tests {
                 .all(|text| !text.contains("<apps_instructions>")),
             "AHEAD must not inject hosted Apps instructions"
         );
+        assert_eq!(request["model"].as_str(), Some("gpt-5.6-sol"));
+        let tool_names = request
+            .get("tools")
+            .map(|tools| tools.as_array().expect("model tools must be an array"))
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !tool_names
+                .iter()
+                .any(|name| matches!(*name, "exec" | "wait")),
+            "CodeModeOnly must not advertise tools without its host: {tool_names:?}"
+        );
         client.shutdown();
         drop(client);
         let reopened = NativeClient::spawn(
@@ -4851,7 +5128,7 @@ mod tests {
                 &thread_id,
                 &workspace,
                 "read-only",
-                Some("ahead-test"),
+                Some("gpt-5.6-sol"),
                 Some("mock"),
             )
             .expect("resume native thread from harness store");

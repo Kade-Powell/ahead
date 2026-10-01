@@ -7,7 +7,7 @@ use std::{
 
 use crate::store::InstructionFileSource;
 pub use ahead_rpc::ahead::MemoryScope;
-use ahead_rpc::ahead::{RepoPath, TurnEditorContext};
+use ahead_rpc::ahead::TurnEditorContext;
 use anyhow::{Context, Result, bail};
 use codex_extension_api::{
     LoadUserInstructionsFuture, LoadedUserInstructions, UserInstructionsProvider,
@@ -142,13 +142,13 @@ fn target_instruction_context_for_paths(
 
         for directory in directories {
             let Some(source_path) = ahead_core::search::resolve_open_buffer_path(
-                &workspace_root,
+                workspace_root,
                 &directory.join("AGENTS.md"),
             ) else {
                 continue;
             };
             let Some(relative_source) =
-                source_path.strip_prefix(&workspace_root).ok()
+                source_path.strip_prefix(workspace_root).ok()
             else {
                 continue;
             };
@@ -201,7 +201,7 @@ fn target_instruction_context_for_paths(
         .map(|entry| InstructionFileSource {
             path: entry.source.clone(),
             content_sha256: entry.sha256.clone(),
-            targets: entry.targets.iter().cloned().map(RepoPath::from).collect(),
+            targets: entry.targets.clone(),
         })
         .collect();
     let scope_note = if include_workspace_root {
@@ -335,6 +335,7 @@ fn read_target_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahead_rpc::ahead::RepoPath;
 
     fn turn_context(
         active_path: &str,

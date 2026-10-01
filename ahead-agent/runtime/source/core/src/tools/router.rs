@@ -70,10 +70,17 @@ pub(crate) fn tool_log_payload<'a>(
 }
 
 /// One finalized tool plan: its advertised surfaces and matching executable runtimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodeModeAvailability {
+    Available,
+    Unavailable,
+}
+
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Arc<[ToolSpec]>,
     tool_mode: ToolMode,
+    code_mode_availability: CodeModeAvailability,
     code_mode_tool_names: BTreeMap<String, ToolName>,
     tool_namespaces_info: Option<TurnToolNamespacesInfo>,
     can_manage_children: bool,
@@ -102,6 +109,7 @@ impl ToolRouter {
         registry: ToolRegistry,
         model_visible_specs: Vec<ToolSpec>,
         tool_mode: ToolMode,
+        code_mode_availability: CodeModeAvailability,
         code_mode_tool_names: BTreeMap<String, ToolName>,
         tool_namespaces_info: Option<TurnToolNamespacesInfo>,
         child_management_tools: &[ToolName],
@@ -110,6 +118,7 @@ impl ToolRouter {
             registry,
             model_visible_specs: model_visible_specs.into(),
             tool_mode,
+            code_mode_availability,
             code_mode_tool_names,
             tool_namespaces_info,
             can_manage_children: false,
@@ -131,7 +140,8 @@ impl ToolRouter {
 
     /// Code Mode still needs its dispatcher when the nested tool set is empty.
     pub(crate) fn requires_code_mode_worker(&self) -> bool {
-        matches!(self.tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
+        self.code_mode_availability == CodeModeAvailability::Available
+            && matches!(self.tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
     }
 
     /// The normalized nested identities chosen after exclusions and collisions.

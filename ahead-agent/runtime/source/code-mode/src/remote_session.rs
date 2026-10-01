@@ -18,7 +18,6 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::SessionId;
-use codex_install_context::InstallContext;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
@@ -29,6 +28,18 @@ use self::connection::SessionCleanup;
 use crate::NoopCodeModeSessionDelegate;
 
 mod connection;
+
+fn default_host_program() -> PathBuf {
+    let name = if cfg!(windows) {
+        "codex-code-mode-host.exe"
+    } else {
+        "codex-code-mode-host"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
 
 pub(crate) type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
@@ -55,7 +66,7 @@ impl ProcessOwnedCodeModeSessionProvider {
 
 impl Default for ProcessOwnedCodeModeSessionProvider {
     fn default() -> Self {
-        Self::with_host_program(InstallContext::current().code_mode_host_program())
+        Self::with_host_program(default_host_program())
     }
 }
 
@@ -241,9 +252,7 @@ impl ProcessOwnedCodeModeSession {
     pub fn new() -> Self {
         Self::with_host(
             Arc::new(NoopCodeModeSessionDelegate),
-            Arc::new(OwnedCodeModeHost::new(
-                InstallContext::current().code_mode_host_program(),
-            )),
+            Arc::new(OwnedCodeModeHost::new(default_host_program())),
             CodeModeSessionCellExecutionLimits::default(),
         )
     }

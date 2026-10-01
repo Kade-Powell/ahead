@@ -769,11 +769,22 @@ artifacts after repeated graph/profile changes; when target growth exhausts
 disk, `just clean` is the explicit workspace-scoped reset and the following
 build is cold.
 
-The hard fork retains only the dependency closure needed by the loop. The Codex
+The hard fork currently retains the dependency closure needed by its implemented
+loop, which is still broader than AHEAD's desired agent surface: the retained
+source has 65 crate manifests. There is no second Cargo workspace, but the
+copied subcrates have not all been reshaped into AHEAD-owned modules. The nested
+toolchain, Cargo config and standalone Windows setup script were removed; the
+root toolchain and `.cargo/config.toml` now govern builds. The Codex
 CLI/TUI, App Server binary, desktop downloader, update daemon, analytics export,
 cloud-task/config/chat product surfaces and 35 unreachable crates are gone. The
-copied source is approximately 28 MB after also deleting generated App Server
-TypeScript/JSON schemas, export tooling and Codex feedback-upload code. Two tiny helper modes remain in
+copied source also excludes generated App Server TypeScript/JSON schemas,
+export tooling, Codex feedback-upload code and Codex package-layout detection.
+The optional code-mode host is resolved beside the AHEAD executable rather than
+through a Codex installation; no Codex-managed PATH or bundled zsh is injected.
+The host is not yet bundled. When the runtime reports an unavailable Code Mode
+host, AHEAD stores bounded warnings with the latest turn's presentation state and
+shows it in the agent panel's warning area rather than treating it as reasoning.
+Two tiny helper modes remain in
 `ahead-proxy` because the native sandbox re-executes the current binary for
 command and filesystem isolation.
 

@@ -497,9 +497,16 @@ impl PluginServerRpcHandler {
         if state.stopped {
             return;
         }
-        let expired = state
+        let expired_ids = state
             .pending
-            .extract_if(|_, pending| pending.deadline <= now)
+            .iter()
+            .filter_map(|(id, request)| {
+                (request.deadline <= now).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        let expired = expired_ids
+            .into_iter()
+            .filter_map(|id| state.pending.remove(&id).map(|pending| (id, pending)))
             .collect::<Vec<_>>();
         drop(state);
         for (id, pending) in expired {
@@ -1177,10 +1184,7 @@ impl PluginHostHandler {
                     ImplementationProviderCapability::Simple(is_capable) => {
                         *is_capable
                     }
-                    ImplementationProviderCapability::Options(_) => {
-                        // todo
-                        false
-                    }
+                    ImplementationProviderCapability::Options(_) => true,
                 })
                 .unwrap_or(false),
             FoldingRangeRequest::METHOD => self

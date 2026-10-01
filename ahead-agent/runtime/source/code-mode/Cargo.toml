@@ -12,7 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 codex-code-mode-protocol = { workspace = true }
 codex-http-client = { workspace = true }
-codex-install-context = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 futures = { workspace = true }
@@ -26,3 +25,7 @@ tonic = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

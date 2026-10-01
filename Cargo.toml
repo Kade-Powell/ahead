@@ -168,7 +168,7 @@ wasmtime          = { version = "48", default-features = false, features = [
     "incremental-cache",
     "parallel-compilation",
 ] }
-wasmtime-wasi     = "48"
+wasmtime-wasi     = { version = "48", default-features = false, features = ["p2"] }
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
 
@@ -203,7 +203,6 @@ codex-git-utils = { path = "ahead-agent/runtime/source/git-utils" }
 codex-history = { path = "ahead-agent/runtime/source/history" }
 codex-hooks = { path = "ahead-agent/runtime/source/hooks" }
 codex-http-client = { path = "ahead-agent/runtime/source/http-client" }
-codex-install-context = { path = "ahead-agent/runtime/source/install-context" }
 codex-keyring-store = { path = "ahead-agent/runtime/source/keyring-store" }
 ahead-model-auth = { path = "ahead-agent/runtime/source/login" }
 codex-mcp = { path = "ahead-agent/runtime/source/codex-mcp" }

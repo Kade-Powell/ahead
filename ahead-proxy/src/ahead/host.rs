@@ -173,16 +173,65 @@ impl AheadSessionHost {
                 work_item,
                 harness,
                 external_agent_id,
+                parent_session_id,
             } => {
-                let view =
-                    self.start_work(work_kind, title, starting_point, work_item)?;
-                if let Some(harness) = harness {
-                    self.set_harness_preference(
-                        &view.session.id,
-                        harness,
-                        external_agent_id.as_deref(),
-                    )?;
-                }
+                let parent = if let Some(parent_session_id) =
+                    parent_session_id.as_deref()
+                {
+                    anyhow::ensure!(
+                        harness == Some(HarnessKind::ExternalAcp),
+                        "Implementation handoff requires an external agent"
+                    );
+                    anyhow::ensure!(
+                        external_agent_id.is_some(),
+                        "Choose an installed external agent for the handoff"
+                    );
+                    let parent = self
+                        .get_session(parent_session_id)?
+                        .context("Parent AHEAD session not found")?;
+                    let parent_backend =
+                        self.store.read().get_harness_binding(parent_session_id)?;
+                    anyhow::ensure!(
+                        !parent_backend.as_ref().is_some_and(
+                            |(_, backend)| backend.starts_with("external-agent")
+                        ),
+                        "Implementation handoff requires an AHEAD parent session"
+                    );
+                    anyhow::ensure!(
+                        matches!(parent.session.lifecycle, SessionLifecycle::Active),
+                        "Parent AHEAD session must be active"
+                    );
+                    anyhow::ensure!(
+                        parent.task.intent == TaskIntent::Assistance,
+                        "Teaching tasks cannot hand off implementation"
+                    );
+                    Some(parent)
+                } else {
+                    None
+                };
+                let backend = harness
+                    .map(|harness| {
+                        Self::selected_harness_backend(
+                            harness,
+                            external_agent_id.as_deref(),
+                        )
+                    })
+                    .transpose()?;
+                let starting_point = if let Some(parent) = &parent {
+                    self.implementation_handoff_context(parent, &starting_point)?
+                } else {
+                    starting_point
+                };
+                let view = self.start_work_with_binding(
+                    work_kind.or_else(|| {
+                        parent.as_ref().map(|view| view.session.work_kind)
+                    }),
+                    title,
+                    starting_point,
+                    work_item,
+                    backend.as_deref(),
+                    parent.as_ref().map(|view| view.task.id.as_str()),
+                )?;
                 Ok(serde_json::to_value(view)?)
             }
             AheadRequest::ListExternalAcpAdapters => {
@@ -705,9 +754,32 @@ impl AheadSessionHost {
         starting_point: String,
         work_item: Option<GithubIssueRef>,
     ) -> Result<SessionView> {
+        self.start_work_with_binding(
+            requested_work_kind,
+            title,
+            starting_point,
+            work_item,
+            None,
+            None,
+        )
+    }
+
+    fn start_work_with_binding(
+        &self,
+        requested_work_kind: Option<WorkKind>,
+        title: String,
+        starting_point: String,
+        work_item: Option<GithubIssueRef>,
+        initial_backend: Option<&str>,
+        parent_task_id: Option<&str>,
+    ) -> Result<SessionView> {
         let work_kind = requested_work_kind
             .unwrap_or_else(|| WorkKind::infer_from_request(&starting_point));
-        let intent = TaskIntent::infer_from_request(&starting_point);
+        let intent = if parent_task_id.is_some() {
+            TaskIntent::Assistance
+        } else {
+            TaskIntent::infer_from_request(&starting_point)
+        };
         let initial_phase = Self::initial_phase(work_kind, intent);
         let session_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -757,7 +829,7 @@ impl AheadSessionHost {
             work_kind,
             title: title.clone(),
             objective: starting_point.clone(),
-            parent_task_id: None,
+            parent_task_id: parent_task_id.map(str::to_string),
             learning_arc_id: learning_arc.as_ref().map(|arc| arc.id.clone()),
             created_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
@@ -793,7 +865,11 @@ impl AheadSessionHost {
 
         {
             let mut store = self.store.write();
-            store.insert_session(&view)?;
+            if let Some(backend) = initial_backend {
+                store.insert_session_with_harness_binding(&view, backend)?;
+            } else {
+                store.insert_session(&view)?;
+            }
         }
 
         {
@@ -813,21 +889,27 @@ impl AheadSessionHost {
         Ok(view)
     }
 
-    fn set_harness_preference(
-        &self,
-        session_id: &str,
+    fn selected_harness_backend(
         harness: HarnessKind,
         external_agent_id: Option<&str>,
-    ) -> Result<()> {
-        let backend = match harness {
-            HarnessKind::Ahead => "ahead-pending".to_string(),
-            HarnessKind::ExternalAcp => external_agent_id
-                .map(|id| format!("external-agent:{id}"))
-                .unwrap_or_else(|| "external-agent-pending".to_string()),
-        };
-        self.store
-            .write()
-            .set_harness_binding(session_id, "", &backend)
+    ) -> Result<String> {
+        match harness {
+            HarnessKind::Ahead => Ok("ahead-pending".to_string()),
+            HarnessKind::ExternalAcp => {
+                let Some(adapter_id) = external_agent_id else {
+                    return Ok("external-agent-pending".to_string());
+                };
+                anyhow::ensure!(
+                    !adapter_id.trim().is_empty() && adapter_id == adapter_id.trim(),
+                    "External ACP adapter ID must not be empty or padded"
+                );
+                anyhow::ensure!(
+                    ahead_agent::external_acp_adapter_is_installed(adapter_id)?,
+                    "ACP agent `{adapter_id}` is not installed in AHEAD"
+                );
+                Ok(format!("external-agent:{adapter_id}"))
+            }
+        }
     }
 
     fn initial_phase(work_kind: WorkKind, intent: TaskIntent) -> WorkflowPhase {
@@ -900,6 +982,7 @@ impl AheadSessionHost {
                     backend: store
                         .get_harness_binding(id)?
                         .map(|(_, backend)| backend),
+                    parent_session_id: None,
                 });
             }
         }
@@ -1480,6 +1563,44 @@ impl AheadSessionHost {
         if !durable.is_empty() {
             context.push_str("Durable work state:\n");
             context.push_str(&durable);
+        }
+        Ok(context)
+    }
+
+    fn implementation_handoff_context(
+        &self,
+        parent: &SessionView,
+        delegated_scope: &str,
+    ) -> Result<String> {
+        let mut context = format!(
+            "Implement the delegated work in this AHEAD workspace. The human owns design decisions and will return to the parent AHEAD session for verification and review.\nParent session: {}\nDelegated scope: {}\n\n",
+            parent.session.id,
+            if delegated_scope.trim().is_empty() {
+                "Continue the agreed implementation"
+            } else {
+                delegated_scope.trim()
+            },
+        );
+        context.push_str(&self.durable_session_context(parent)?);
+        let store = self.store.read();
+        if let Some(runtime) = store.get_agent_runtime_state(&parent.session.id)? {
+            if !runtime.plan.is_empty() {
+                context.push_str("\nCurrent plan:\n");
+                for step in runtime.plan {
+                    context.push_str(&format!(
+                        "- [{}] {}\n",
+                        step.status, step.content
+                    ));
+                }
+            }
+        }
+        let page = store.list_messages_page(&parent.session.id, None, 20)?;
+        if !page.messages.is_empty() {
+            context.push_str("\nRecent parent conversation:\n");
+            for message in page.messages {
+                let excerpt: String = message.content.chars().take(1200).collect();
+                context.push_str(&format!("{}: {}\n", message.role, excerpt));
+            }
         }
         Ok(context)
     }
@@ -2302,11 +2423,12 @@ mod tests {
         let value = host
             .handle_request(AheadRequest::StartWork {
                 work_kind: Some(WorkKind::ProductChange),
-                title: "External agent thread".to_string(),
-                starting_point: "Verify the external thread boundary".to_string(),
+                title: "Managed agent thread".to_string(),
+                starting_point: "Verify the managed thread boundary".to_string(),
                 work_item: None,
-                harness: Some(HarnessKind::ExternalAcp),
-                external_agent_id: Some("codex-acp".to_string()),
+                harness: Some(HarnessKind::Ahead),
+                external_agent_id: None,
+                parent_session_id: None,
             })
             .unwrap();
         let session_id = value
@@ -2321,7 +2443,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             status.get("backend").and_then(serde_json::Value::as_str),
-            Some("external-agent:codex-acp")
+            Some("ahead-pending")
         );
         assert_eq!(
             host.harness()
@@ -2330,6 +2452,120 @@ mod tests {
                 .get("acp_session_id"),
             Some(&serde_json::Value::String(String::new()))
         );
+    }
+
+    #[test]
+    fn implementation_handoff_keeps_parent_link_and_context() -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let parent = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Workspace search".into(),
+            "Search open and saved files".into(),
+            None,
+        )?;
+        let context = host.implementation_handoff_context(
+            &parent,
+            "Prototype the search results",
+        )?;
+        let child = host.start_work_with_binding(
+            Some(parent.session.work_kind),
+            "Search prototype".into(),
+            context,
+            None,
+            Some("external-agent-pending"),
+            Some(&parent.task.id),
+        )?;
+
+        assert_eq!(
+            child.task.parent_task_id.as_deref(),
+            Some(parent.task.id.as_str())
+        );
+        assert!(
+            child
+                .task
+                .objective
+                .contains("Prototype the search results")
+        );
+        assert!(child.task.objective.contains("Search open and saved files"));
+        assert_eq!(
+            host.list_sessions()?
+                .into_iter()
+                .find(|item| item.id == child.session.id)
+                .and_then(|item| item.parent_session_id),
+            Some(parent.session.id),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_harness_binding_rolls_back_session_before_retry() -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let request = || AheadRequest::StartWork {
+            work_kind: Some(WorkKind::ProductChange),
+            title: "Retryable session".to_string(),
+            starting_point: "Create one correctly bound session".to_string(),
+            work_item: None,
+            harness: Some(HarnessKind::Ahead),
+            external_agent_id: None,
+            parent_session_id: None,
+        };
+        host.store
+            .write()
+            .set_harness_binding_failure_for_test(true)?;
+
+        let error = host
+            .handle_request(request())
+            .expect_err("injected binding failure must abort creation");
+        assert!(
+            error
+                .to_string()
+                .contains("injected harness binding failure")
+        );
+        assert!(host.list_sessions()?.is_empty());
+        assert!(host.active_sessions.read().is_empty());
+        assert!(host.active_session_id.read().is_none());
+        assert!(host.active_voice_sessions.read().is_empty());
+
+        host.store
+            .write()
+            .set_harness_binding_failure_for_test(false)?;
+        let value = host.handle_request(request())?;
+        let session_id = value
+            .get("session")
+            .and_then(|session| session.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .context("created session id is missing")?;
+        assert_eq!(host.list_sessions()?.len(), 1);
+        assert_eq!(
+            host.store
+                .read()
+                .get_harness_binding(session_id)?
+                .map(|(_, backend)| backend),
+            Some("ahead-pending".to_string())
+        );
+        assert_eq!(host.active_session_id.read().as_deref(), Some(session_id));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_external_adapter_is_rejected_before_session_creation()
+    -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let error = host
+            .handle_request(AheadRequest::StartWork {
+                work_kind: Some(WorkKind::ProductChange),
+                title: "Invalid adapter selection".to_string(),
+                starting_point: "Do not persist this session".to_string(),
+                work_item: None,
+                harness: Some(HarnessKind::ExternalAcp),
+                external_agent_id: Some("not-curated".to_string()),
+                parent_session_id: None,
+            })
+            .expect_err("unsupported ACP adapters must be rejected");
+        assert!(error.to_string().contains("not supported by AHEAD"));
+        assert!(host.list_sessions()?.is_empty());
+        assert!(host.active_session_id.read().is_none());
+        Ok(())
     }
 
     #[test]
@@ -2759,6 +2995,7 @@ mod tests {
                 description: "Review current changes".to_string(),
                 input: Some(r#"{"hint":"path"}"#.to_string()),
             }],
+            warnings: vec!["Code Mode host unavailable".to_string()],
         };
         host.store
             .read()

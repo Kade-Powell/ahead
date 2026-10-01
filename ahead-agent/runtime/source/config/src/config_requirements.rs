@@ -3072,22 +3072,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_reviewer_and_model_review_requirements_are_ignored() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-approvals_reviewer = "guardian_subagent"
-allowed_approvals_reviewers = ["guardian_subagent"]
-
-[auto_review]
-required_on_models = ["legacy-model"]
-"#,
-        )?;
-
-        assert!(requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn deserialize_allowed_windows_sandbox_implementations() -> Result<()> {
         let toml_str = r#"
             [windows]

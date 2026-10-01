@@ -221,7 +221,6 @@ async fn network_approval_uses_published_task_authority_within_same_turn() {
                 event = events.recv() => {
                     match event.expect("approval event").msg {
                         EventMsg::ExecApprovalRequest(approval) => break approval,
-                        EventMsg::GuardianAssessment(_) => panic!("expected the current user reviewer"),
                         _ => {}
                     }
                 }

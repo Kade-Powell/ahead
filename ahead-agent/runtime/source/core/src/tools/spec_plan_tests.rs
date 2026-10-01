@@ -2141,6 +2141,29 @@ async fn code_mode_only_exposes_code_executor_and_hides_nested_tools() {
         code_mode_only.namespace_function_names("codex_app"),
         Vec::<String>::new().as_slice()
     );
+
+    let unavailable_code_mode = probe_with(
+        |turn| {
+            set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+            turn.code_mode_available = false;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "lookup",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    unavailable_code_mode.assert_visible_lacks(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+        "codex_app",
+    ]);
+    assert_eq!(unavailable_code_mode.tool_mode, ToolMode::CodeModeOnly);
+    assert!(!unavailable_code_mode.requires_code_mode_worker);
 }
 
 #[tokio::test]

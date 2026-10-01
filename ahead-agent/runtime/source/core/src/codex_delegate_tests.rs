@@ -217,7 +217,7 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 }
 
 #[tokio::test]
-async fn legacy_guardian_delegates_are_rejected_and_review_delegates_inherit_extensions() {
+async fn unsupported_guardian_delegates_are_rejected_and_review_delegates_inherit_extensions() {
     let (mut parent_session, parent_ctx, _rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let thread_starts = Arc::new(AtomicUsize::new(0));
@@ -247,7 +247,7 @@ async fn legacy_guardian_delegates_are_rejected_and_review_delegates_inherit_ext
     .await;
     assert!(matches!(
         result,
-        Err(error) if error.to_string().contains("legacy history only")
+        Err(error) if error.to_string().contains("not supported by AHEAD")
     ));
     assert_eq!(thread_starts.load(Ordering::SeqCst), 0);
 

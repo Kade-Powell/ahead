@@ -1,7 +1,5 @@
 use crate::types::RawMcpServerConfig;
 use codex_features::FEATURES;
-use codex_features::legacy_feature_keys;
-use codex_features::legacy_ignored_feature_keys;
 use codex_protocol::protocol::GranularApprovalConfig;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
@@ -128,16 +126,6 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
         validation
             .properties
             .insert(feature.key.to_string(), schema_gen.subschema_for::<bool>());
-    }
-    for legacy_key in legacy_feature_keys() {
-        validation
-            .properties
-            .insert(legacy_key.to_string(), schema_gen.subschema_for::<bool>());
-    }
-    for legacy_key in legacy_ignored_feature_keys() {
-        validation
-            .properties
-            .insert(legacy_key.to_string(), schema_gen.subschema_for::<bool>());
     }
     validation.properties.insert(
         "tool_registry".to_string(),

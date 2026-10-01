@@ -5,6 +5,11 @@ native agent. AHEAD maintains it as a hard fork; there is no automatic upstream
 sync. The upstream baseline and initial AHEAD patch commit are recorded in
 [`../SOURCE_BASELINE.toml`](../SOURCE_BASELINE.toml).
 
+These crates belong to the repository-root Cargo workspace, not a nested
+workspace. Build and format from the AHEAD root, whose toolchain and Cargo
+configuration are authoritative. The package boundaries here are still a
+transitional dependency closure, not AHEAD's final agent-module design.
+
 The live application supplies its Turso-backed thread store and owns durable
 session state, editor tools, policy, and attribution. The copied `codex-state`
 crate and its SQLite/SQLx dependency path have been removed from this hard fork.

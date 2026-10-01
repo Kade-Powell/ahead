@@ -726,12 +726,16 @@ impl DapRpcHandler {
     }
 
     fn expire_requests(&self, now: Instant) {
-        let expired = self
-            .server_pending
-            .lock()
-            .extract_if(|_, pending| pending.deadline <= now)
-            .map(|(_, pending)| pending)
+        let mut pending = self.server_pending.lock();
+        let expired_ids = pending
+            .iter()
+            .filter_map(|(id, request)| (request.deadline <= now).then_some(*id))
             .collect::<Vec<_>>();
+        let expired = expired_ids
+            .into_iter()
+            .filter_map(|id| pending.remove(&id))
+            .collect::<Vec<_>>();
+        drop(pending);
         for pending in expired {
             let error = Self::timeout_error(pending.command);
             self.report_timeout(&error);
