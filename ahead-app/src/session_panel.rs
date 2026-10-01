@@ -2800,6 +2800,9 @@ impl Render for SessionPanel {
             );
             Some((name, description))
         });
+        let has_context_attachments = active_editor_context.is_some()
+            || !self.attached_files.is_empty()
+            || !self.attached_memories.is_empty();
         let context_window = self
             .harness_context_window
             .unwrap_or(u64::from(model.context_window));
@@ -4045,88 +4048,81 @@ impl Render for SessionPanel {
                     .bg(card_bg)
                     .border_1()
                     .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .when_some(active_editor_context, |attachments, (active_name, active_context_description)| attachments.child(
-                                        Attachment::new()
-                                            .id("att_current_editor")
-                                            .status(AttachmentStatus::Complete)
-                                            .content(
-                                                AttachmentContent::new()
-                                                    .title(AttachmentTitle::new(active_name))
-                                                    .description(AttachmentDescription::new(
-                                                        active_context_description,
-                                                    )),
-                                            ),
-                                    ))
-                                    .children(self.attached_files.iter().enumerate().map(|(index, file)| {
-                                        let name = std::path::Path::new(&file.path)
-                                            .file_name()
-                                            .and_then(|name| name.to_str())
-                                            .unwrap_or(&file.path)
-                                            .to_string();
-                                        Attachment::new()
-                                            .id(SharedString::from(format!("att_file_{index}")))
-                                            .status(AttachmentStatus::Complete)
-                                            .content(
-                                                AttachmentContent::new()
-                                                    .title(AttachmentTitle::new(name))
-                                                    .description(AttachmentDescription::new(
-                                                        format!("{} · attached context", file.path),
-                                                    )),
-                                            )
-                                            .actions(AttachmentActions::new().child(
-                                                Button::new(SharedString::from(format!("remove_attached_file_{index}")))
-                                                    .icon(IconName::X)
-                                                    .ghost()
-                                                    .tooltip("Remove attached file")
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.remove_attached_file(index, cx);
-                                                    })),
-                                            ))
-                                    }))
-                                    .children(self.attached_memories.iter().enumerate().map(|(index, memory)| {
-                                        let title = format!("{} memory", memory.scope.as_str());
-                                        Attachment::new()
-                                            .id(SharedString::from(format!("att_memory_{index}")))
-                                            .status(AttachmentStatus::Complete)
-                                            .content(
-                                                AttachmentContent::new()
-                                                    .title(AttachmentTitle::new(title))
-                                                    .description(AttachmentDescription::new(
-                                                        format!("{}:{} · {}", memory.source, memory.line, memory.excerpt),
-                                                    )),
-                                            )
-                                            .actions(AttachmentActions::new().child(
-                                                Button::new(SharedString::from(format!("remove_attached_memory_{index}")))
-                                                    .icon(IconName::X)
-                                                    .ghost()
-                                                    .tooltip("Remove memory context")
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.remove_attached_memory(index, cx);
-                                                    })),
-                                            ))
-                                    }))
-                            )
-                            .child(
-                                Button::new("add_context_btn")
-                                    .icon(IconName::Plus)
-                                    .flex_shrink_0()
-                                    .tooltip("Attach files from computer")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.attach_files(window, cx);
-                                    })),
-                            ),
-                    )
+                    .when(has_context_attachments, |composer| {
+                        composer.child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .when_some(active_editor_context, |attachments, (active_name, active_context_description)| attachments.child(
+                                            Attachment::new()
+                                                .id("att_current_editor")
+                                                .status(AttachmentStatus::Complete)
+                                                .content(
+                                                    AttachmentContent::new()
+                                                        .title(AttachmentTitle::new(active_name))
+                                                        .description(AttachmentDescription::new(
+                                                            active_context_description,
+                                                        )),
+                                                ),
+                                        ))
+                                        .children(self.attached_files.iter().enumerate().map(|(index, file)| {
+                                            let name = std::path::Path::new(&file.path)
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .unwrap_or(&file.path)
+                                                .to_string();
+                                            Attachment::new()
+                                                .id(SharedString::from(format!("att_file_{index}")))
+                                                .status(AttachmentStatus::Complete)
+                                                .content(
+                                                    AttachmentContent::new()
+                                                        .title(AttachmentTitle::new(name))
+                                                        .description(AttachmentDescription::new(
+                                                            format!("{} · attached context", file.path),
+                                                        )),
+                                                )
+                                                .actions(AttachmentActions::new().child(
+                                                    Button::new(SharedString::from(format!("remove_attached_file_{index}")))
+                                                        .icon(IconName::X)
+                                                        .ghost()
+                                                        .tooltip("Remove attached file")
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.remove_attached_file(index, cx);
+                                                        })),
+                                                ))
+                                        }))
+                                        .children(self.attached_memories.iter().enumerate().map(|(index, memory)| {
+                                            let title = format!("{} memory", memory.scope.as_str());
+                                            Attachment::new()
+                                                .id(SharedString::from(format!("att_memory_{index}")))
+                                                .status(AttachmentStatus::Complete)
+                                                .content(
+                                                    AttachmentContent::new()
+                                                        .title(AttachmentTitle::new(title))
+                                                        .description(AttachmentDescription::new(
+                                                            format!("{}:{} · {}", memory.source, memory.line, memory.excerpt),
+                                                        )),
+                                                )
+                                                .actions(AttachmentActions::new().child(
+                                                    Button::new(SharedString::from(format!("remove_attached_memory_{index}")))
+                                                        .icon(IconName::X)
+                                                        .ghost()
+                                                        .tooltip("Remove memory context")
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.remove_attached_memory(index, cx);
+                                                        })),
+                                                ))
+                                        }))
+                                ),
+                        )
+                    })
                     .when(self.show_commands || self.show_context_menu, |composer| {
                         composer.child(command_palette)
                     })
