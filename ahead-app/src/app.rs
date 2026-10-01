@@ -1993,7 +1993,7 @@ impl Shell {
         } else if self.code_tabs.is_empty() {
             self.session.update(cx, |session, _| session.code = None);
         }
-        self.set_center_layout(false, false, false, window, cx);
+        self.refresh_center_layout(window, cx);
     }
 
     fn set_bottom_layout(
