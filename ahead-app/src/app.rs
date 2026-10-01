@@ -31,7 +31,25 @@ use crate::workspace_panels::{
     SearchPanel, WorkspaceView,
 };
 
-gpui_kit::actions!(ahead, [Quit, CloseWindow, RecoverUnsavedChanges]);
+gpui_kit::actions!(
+    ahead,
+    [
+        Quit,
+        CloseWindow,
+        RecoverUnsavedChanges,
+        SaveFile,
+        GoToFile,
+        GoToDefinition,
+        StartDebugging,
+        StopDebugging,
+        ToggleBreakpoint,
+        StepOver,
+        StepInto,
+        StepOut,
+        MinimizeWindow,
+        ZoomWindow,
+    ]
+);
 
 #[derive(Default)]
 struct QuitInProgress(bool);
@@ -215,6 +233,50 @@ fn request_close_window(_: &CloseWindow, cx: &mut App) {
                 shell.update(cx, |shell, cx| shell.request_window_close(window, cx))
             }) {
                 eprintln!("Closing window: {error}");
+            }
+        }
+    });
+}
+
+fn request_shell_command(command: ShellShortcut, cx: &mut App) {
+    let active = cx.active_window();
+    cx.defer(move |cx| {
+        if let Some((window, shell)) = editor_windows(cx)
+            .into_iter()
+            .find(|(window, _)| Some(*window) == active)
+        {
+            if let Err(error) = window.update(cx, |_, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.run_shell_command(command, window, cx);
+                })
+            }) {
+                eprintln!("AHEAD could not run menu command: {error}");
+            }
+        }
+    });
+}
+
+fn minimize_window(_: &MinimizeWindow, cx: &mut App) {
+    let active = cx.active_window();
+    cx.defer(move |cx| {
+        if let Some(window) = active {
+            if let Err(error) = window.update(cx, |_, window, _| {
+                window.minimize_window();
+            }) {
+                eprintln!("AHEAD could not minimize the window: {error}");
+            }
+        }
+    });
+}
+
+fn zoom_window(_: &ZoomWindow, cx: &mut App) {
+    let active = cx.active_window();
+    cx.defer(move |cx| {
+        if let Some(window) = active {
+            if let Err(error) = window.update(cx, |_, window, _| {
+                window.zoom_window();
+            }) {
+                eprintln!("AHEAD could not zoom the window: {error}");
             }
         }
     });
@@ -2962,6 +3024,29 @@ pub fn launch() {
             cx.on_action(request_quit);
             cx.on_action(request_close_window);
             cx.on_action(request_recovery);
+            cx.on_action(|_: &GoToFile, cx| {
+                request_shell_command(ShellShortcut::QuickOpen, cx);
+            });
+            cx.on_action(|_: &StartDebugging, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f5", false), cx);
+            });
+            cx.on_action(|_: &StopDebugging, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f5", true), cx);
+            });
+            cx.on_action(|_: &ToggleBreakpoint, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f9", false), cx);
+            });
+            cx.on_action(|_: &StepOver, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f10", false), cx);
+            });
+            cx.on_action(|_: &StepInto, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f11", false), cx);
+            });
+            cx.on_action(|_: &StepOut, cx| {
+                request_shell_command(ShellShortcut::DebugKey("f11", true), cx);
+            });
+            cx.on_action(minimize_window);
+            cx.on_action(zoom_window);
             cx.on_app_quit(|cx| {
                 let executor = cx.background_executor().clone();
                 let windows = editor_windows(cx);
@@ -3023,14 +3108,68 @@ pub fn launch() {
                     CloseWindow,
                     None,
                 ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-s"
+                    } else {
+                        "ctrl-s"
+                    },
+                    SaveFile,
+                    None,
+                ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-p"
+                    } else {
+                        "ctrl-p"
+                    },
+                    GoToFile,
+                    None,
+                ),
+                KeyBinding::new("f12", GoToDefinition, None),
+                KeyBinding::new("f5", StartDebugging, None),
+                KeyBinding::new("shift-f5", StopDebugging, None),
+                KeyBinding::new("f9", ToggleBreakpoint, None),
+                KeyBinding::new("f10", StepOver, None),
+                KeyBinding::new("f11", StepInto, None),
+                KeyBinding::new("shift-f11", StepOut, None),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-m"
+                    } else {
+                        "ctrl-m"
+                    },
+                    MinimizeWindow,
+                    None,
+                ),
             ]);
             cx.set_menus([
                 Menu::new("AHEAD").items([MenuItem::action("Quit AHEAD", Quit)]),
                 Menu::new("File").items([
+                    MenuItem::action("Save", SaveFile),
+                    MenuItem::separator(),
                     MenuItem::action(
                         "Recover Unsaved Changes",
                         RecoverUnsavedChanges,
                     ),
+                ]),
+                Menu::new("Go").items([
+                    MenuItem::action("Go to File", GoToFile),
+                    MenuItem::action("Go to Definition", GoToDefinition),
+                ]),
+                Menu::new("Run").items([
+                    MenuItem::action("Start or Continue Debugging", StartDebugging),
+                    MenuItem::action("Stop Debugging", StopDebugging),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Breakpoint", ToggleBreakpoint),
+                    MenuItem::action("Step Over", StepOver),
+                    MenuItem::action("Step Into", StepInto),
+                    MenuItem::action("Step Out", StepOut),
+                ]),
+                Menu::new("Window").items([
+                    MenuItem::action("Minimize", MinimizeWindow),
+                    MenuItem::action("Zoom", ZoomWindow),
+                    MenuItem::separator(),
                     MenuItem::action("Close Window", CloseWindow),
                 ]),
             ]);

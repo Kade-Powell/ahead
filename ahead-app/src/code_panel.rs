@@ -35,6 +35,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use sha2::Digest;
 
+use crate::app::{GoToDefinition, SaveFile};
 use crate::proxy_client::{LspCompletion, ProxyClient};
 use ahead_rpc::source_control::{BlameHunk, DiffHunkKind, GitFileState};
 
@@ -1508,48 +1509,7 @@ impl CodePanel {
 
         // F12: go to definition via proxy.
         if key == "f12" && !primary && !ctrl && !alt && !modifiers.shift {
-            if let Some(proxy) = self.proxy.clone() {
-                let path = self.proxy_path();
-                let pos = self.cursor_position(cx);
-                let generation = self.request_generation;
-                let rx = proxy.request_definition(path.clone(), pos);
-                cx.spawn(async move |this, cx| {
-                    let locs = cx
-                        .background_spawn(
-                            async move { rx.recv().unwrap_or_default() },
-                        )
-                        .await;
-                    let _ = this.update(cx, |this: &mut Self, cx| {
-                        if this.request_generation != generation
-                            || this.proxy_path() != path
-                            || this.cursor_position(cx) != pos
-                        {
-                            return;
-                        }
-                        if let Some(loc) = locs.first() {
-                            match definition_open_request(loc) {
-                                Ok(request) => {
-                                    this.status = if locs.len() > 1 {
-                                        format!(
-                                            "Opening first of {} definitions",
-                                            locs.len()
-                                        )
-                                        .into()
-                                    } else {
-                                        "Opening definition".into()
-                                    };
-                                    cx.emit(request);
-                                }
-                                Err(error) => this.status = error.into(),
-                            }
-                        } else {
-                            this.status = "No definition from proxy".into();
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
-            }
+            self.go_to_definition(cx);
             return;
         }
 
@@ -1594,6 +1554,51 @@ impl CodePanel {
             cx.notify();
         }
     }
+
+    fn go_to_definition(&mut self, cx: &mut Context<Self>) {
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let path = self.proxy_path();
+        let pos = self.cursor_position(cx);
+        let generation = self.request_generation;
+        let rx = proxy.request_definition(path.clone(), pos);
+        cx.spawn(async move |this, cx| {
+            let locs = cx
+                .background_spawn(async move { rx.recv().unwrap_or_default() })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.request_generation != generation
+                    || this.proxy_path() != path
+                    || this.cursor_position(cx) != pos
+                {
+                    return;
+                }
+                if let Some(loc) = locs.first() {
+                    match definition_open_request(loc) {
+                        Ok(request) => {
+                            this.status = if locs.len() > 1 {
+                                format!(
+                                    "Opening first of {} definitions",
+                                    locs.len()
+                                )
+                                .into()
+                            } else {
+                                "Opening definition".into()
+                            };
+                            cx.emit(request);
+                        }
+                        Err(error) => this.status = error.into(),
+                    }
+                } else {
+                    this.status = "No definition from proxy".into();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
 }
 
 fn completion_edit(
@@ -2109,6 +2114,14 @@ impl Render for CodePanel {
                     cx.notify();
                     cx.stop_propagation();
                 }
+            }))
+            .capture_action(cx.listener(|this: &mut Self, _: &SaveFile, window, cx| {
+                this.save(window, cx);
+                cx.stop_propagation();
+            }))
+            .capture_action(cx.listener(|this: &mut Self, _: &GoToDefinition, _, cx| {
+                this.go_to_definition(cx);
+                cx.stop_propagation();
             }))
             .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, window, cx| {
                 this.interrupt_speech();
