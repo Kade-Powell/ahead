@@ -2363,6 +2363,10 @@ impl Render for CodePanel {
         let editor_bg = cx.theme().background;
         let breakpoint_style =
             ButtonCustomVariant::new(cx).hover(cx.theme().danger.opacity(0.22));
+        let comment_accent = cx.theme().magenta;
+        let comment_marker_style = ButtonCustomVariant::new(cx)
+            .foreground(comment_accent)
+            .hover(comment_accent.opacity(0.16));
         let popup_bg = cx.theme().popover;
         let active_sel_bg = popup_bg.blend(cx.theme().list_active);
         let file_name = std::path::Path::new(&self.file_path)
@@ -2430,7 +2434,7 @@ impl Render for CodePanel {
             comment_ends.insert(end);
         }
         let selected_comment_target = self.selected_code_comment(cx);
-        let comment_popover = self.comment_popover_line.map(|line| {
+        let visible_comments = self.comment_popover_line.map(|line| {
             let comments = self
                 .code_comments
                 .iter()
@@ -2650,7 +2654,7 @@ impl Render for CodePanel {
                     .min_h_0()
                     .child(
                         div()
-                            .w(px(56.))
+                            .w(px(49.))
                             .h_full()
                             .relative()
                             .overflow_hidden()
@@ -2720,7 +2724,6 @@ impl Render for CodePanel {
                                                         gpui_kit::Hsla::transparent_black()
                                                     })
                                             )
-                                            .child(div().w(px(6.)))
                                             .child(
                                                 div()
                                                     .id(("breakpoint-hover", ln as usize))
@@ -2796,7 +2799,11 @@ impl Render for CodePanel {
                                                     .h(line_height)
                                                     .relative()
                                                     .border_l_2()
-                                                    .border_color(if has_comment_range { cx.theme().primary } else { gpui_kit::Hsla::transparent_black() })
+                                                    .border_color(if has_comment_range {
+                                                        comment_accent
+                                                    } else {
+                                                        gpui_kit::Hsla::transparent_black()
+                                                    })
                                                     .when(is_comment_end, |rail| rail.child(
                                                         div()
                                                             .absolute()
@@ -2804,11 +2811,12 @@ impl Render for CodePanel {
                                                             .left(px(0.))
                                                             .w(px(6.))
                                                             .h(px(3.))
-                                                            .bg(cx.theme().primary)
+                                                            .bg(comment_accent)
                                                     ))
                                                     .when(comment_count > 0, |rail| rail.child(
                                                         Button::new(("comment-marker", ln as usize))
                                                             .icon(IconName::MessageSquare)
+                                                            .custom(comment_marker_style)
                                                             .with_size(px(16.))
                                                             .w(px(16.))
                                                             .h(line_height)
@@ -2823,6 +2831,7 @@ impl Render for CodePanel {
                                                     .when(comment_count == 0, |rail| rail.when_some(draft_target, |rail, target| rail.child(
                                                         Button::new(("add-comment-marker", ln as usize))
                                                             .icon(IconName::MessageSquarePlus)
+                                                            .custom(comment_marker_style)
                                                             .with_size(px(16.))
                                                             .w(px(16.))
                                                             .h(line_height)
@@ -2951,114 +2960,6 @@ impl Render for CodePanel {
                                     .context_menu(|menu, _, _| menu)
                                     .h_full()
                             )
-                            .when_some(comment_popover, |el, (line, comments)| {
-                                let top = gutter_top + line_height * (line.saturating_sub(1)) as f32;
-                                el.child(
-                                    v_flex()
-                                        .id("inline_code_comments")
-                                        .debug_selector(|| "inline-code-comments".into())
-                                        .absolute()
-                                        .top(top)
-                                        .left(px(12.))
-                                        .w(px(380.))
-                                        .max_h(px(340.))
-                                        .overflow_y_scroll()
-                                        .p_2()
-                                        .gap_2()
-                                        .bg(popup_bg)
-                                        .border_1()
-                                        .border_color(border_color)
-                                        .rounded_md()
-                                        .shadow_md()
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(h_flex().gap_1().child(IconName::MessageSquare).child(format!("Code comments · line {line}")))
-                                                .child(
-                                                    Button::new("close_inline_comments")
-                                                        .icon(IconName::X)
-                                                        .tooltip("Close code comments")
-                                                        .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                                            this.comment_popover_line = None;
-                                                            this.comment_draft_target = None;
-                                                            cx.notify();
-                                                        }))
-                                                )
-                                        )
-                                        .children(comments.into_iter().map(|comment| {
-                                            let reference_comment = comment.clone();
-                                            let resolve_id = comment.id.clone();
-                                            let source_changed = format!("{:x}", sha2::Sha256::digest(editor_text.as_bytes())) != comment.source_sha256;
-                                            v_flex()
-                                                .gap_1()
-                                                .p_2()
-                                                .border_l_2()
-                                                .border_color(cx.theme().primary)
-                                                .child(div().text_size(px(11.)).text_color(text_color).child(format!("{} · lines {}–{}", comment.actor_id, comment.range.start.line + 1, comment.range.end.line + 1)))
-                                                .child(div().text_size(px(11.)).text_color(text_color).child(comment.quote.chars().take(220).collect::<String>()))
-                                                .when(source_changed, |card| card.child(div().text_size(px(10.)).text_color(cx.theme().warning).child("Source changed since this comment")))
-                                                .child(div().text_size(px(12.)).child(comment.body.clone()))
-                                                .child(h_flex()
-                                                    .gap_1()
-                                                    .child(
-                                                        Button::new(SharedString::from(format!("attach-inline-{}", comment.id)))
-                                                            .ghost()
-                                                            .icon(IconName::MessageSquare)
-                                                            .label("Attach to chat")
-                                                            .tooltip("Attach this comment to the AHEAD chat composer")
-                                                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
-                                                                this.reference_code_comment(&reference_comment, window, cx);
-                                                            }))
-                                                    )
-                                                    .child(
-                                                        Button::new(SharedString::from(format!("resolve-inline-{}", comment.id)))
-                                                            .ghost()
-                                                            .icon(IconName::MessageSquareCheck)
-                                                            .label("Resolve")
-                                                            .tooltip("Resolve this code comment")
-                                                            .disabled(self.comment_pending)
-                                                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
-                                                                this.resolve_code_comment(resolve_id.clone(), window, cx);
-                                                            }))
-                                                    )
-                                                )
-                                        }))
-                                        .when_some(self.comment_draft_target.clone(), |card, target| card.child(
-                                            v_flex()
-                                                .gap_2()
-                                                .p_2()
-                                                .border_l_2()
-                                                .border_color(cx.theme().primary)
-                                                .child(div().text_size(px(11.)).child(format!("Selected lines {}–{}", target.range.start.line + 1, target.range.end.line + 1)))
-                                                .child(div().text_size(px(11.)).text_color(text_color).child(target.quote.chars().take(220).collect::<String>()))
-                                                .child(Textarea::new(&self.comment_input).aria_label("Code comment").w_full())
-                                                .child(h_flex().gap_1()
-                                                    .child(
-                                                        Button::new("save_inline_code_comment")
-                                                            .primary()
-                                                            .icon(IconName::Send)
-                                                            .label(if self.comment_pending { "Saving…" } else { "Save comment" })
-                                                            .tooltip("Save comment in this AHEAD session")
-                                                            .disabled(self.comment_pending || self.comment_input.read(cx).value().trim().is_empty())
-                                                            .on_click(cx.listener(|this: &mut Self, _, window, cx| this.save_code_comment(window, cx)))
-                                                    )
-                                                    .child(
-                                                        Button::new("cancel_inline_code_comment")
-                                                            .ghost()
-                                                            .label("Cancel")
-                                                            .tooltip("Discard comment draft")
-                                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                                                this.comment_draft_target = None;
-                                                                this.comment_popover_line = None;
-                                                                cx.notify();
-                                                            }))
-                                                    )
-                                                )
-                                        ))
-                                        .when_some(self.comment_error.clone(), |card, error| card.child(div().text_size(px(11.)).text_color(cx.theme().danger).child(error)))
-                                )
-                            })
                             .when_some(expanded_hunk, |el, hunk| {
                                 let top = gutter_top + line_height * (hunk.start + hunk.len).saturating_sub(1) as f32;
                                 let new_lines: Vec<_> = editor_text.lines()
@@ -3392,6 +3293,119 @@ impl Render for CodePanel {
                         )
                     })
                     )
+                    .when_some(visible_comments, |el, (line, comments)| {
+                        el.child(
+                            v_flex()
+                                .id("inline_code_comments")
+                                .debug_selector(|| "inline-code-comments".into())
+                                .w(px(260.))
+                                .min_w_0()
+                                .h_full()
+                                .overflow_x_hidden()
+                                .overflow_y_scroll()
+                                .p_2()
+                                .gap_2()
+                                .bg(popup_bg)
+                                .border_l_1()
+                                .border_color(border_color)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_color(comment_accent)
+                                                        .child(IconName::MessageSquare),
+                                                )
+                                                .child(format!("Code comments · line {line}")),
+                                        )
+                                        .child(
+                                            Button::new("close_inline_comments")
+                                                .icon(IconName::X)
+                                                .tooltip("Close code comments")
+                                                .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                    this.comment_popover_line = None;
+                                                    this.comment_draft_target = None;
+                                                    cx.notify();
+                                                }))
+                                        )
+                                )
+                                .children(comments.into_iter().map(|comment| {
+                                    let reference_comment = comment.clone();
+                                    let resolve_id = comment.id.clone();
+                                    let source_changed = format!("{:x}", sha2::Sha256::digest(editor_text.as_bytes())) != comment.source_sha256;
+                                    v_flex()
+                                        .gap_1()
+                                        .p_2()
+                                        .border_l_2()
+                                        .border_color(comment_accent)
+                                        .child(div().text_size(px(11.)).text_color(text_color).child(format!("{} · lines {}–{}", comment.actor_id, comment.range.start.line + 1, comment.range.end.line + 1)))
+                                        .child(div().min_w_0().truncate().text_size(px(11.)).text_color(cx.theme().muted_foreground).child(comment.path.clone()))
+                                        .when(source_changed, |card| card.child(div().text_size(px(10.)).text_color(cx.theme().warning).child("Source changed since this comment")))
+                                        .child(div().text_size(px(12.)).child(comment.body.clone()))
+                                        .child(h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new(SharedString::from(format!("attach-inline-{}", comment.id)))
+                                                    .ghost()
+                                                    .icon(IconName::MessageSquare)
+                                                    .label("Attach to chat")
+                                                    .tooltip("Attach this comment to the AHEAD chat composer")
+                                                    .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                                        this.reference_code_comment(&reference_comment, window, cx);
+                                                    }))
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("resolve-inline-{}", comment.id)))
+                                                    .ghost()
+                                                    .icon(IconName::MessageSquareCheck)
+                                                    .label("Resolve")
+                                                    .tooltip("Resolve this code comment")
+                                                    .disabled(self.comment_pending)
+                                                    .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                                        this.resolve_code_comment(resolve_id.clone(), window, cx);
+                                                    }))
+                                            )
+                                        )
+                                }))
+                                .when_some(self.comment_draft_target.clone(), |card, target| card.child(
+                                    v_flex()
+                                        .gap_2()
+                                        .p_2()
+                                        .border_l_2()
+                                        .border_color(comment_accent)
+                                        .child(div().text_size(px(11.)).child(format!("Selected lines {}–{}", target.range.start.line + 1, target.range.end.line + 1)))
+                                        .child(div().min_w_0().truncate().text_size(px(11.)).text_color(cx.theme().muted_foreground).child(target.path.clone()))
+                                        .child(Textarea::new(&self.comment_input).aria_label("Code comment").w_full())
+                                        .child(h_flex().gap_1()
+                                            .child(
+                                                Button::new("save_inline_code_comment")
+                                                    .primary()
+                                                    .icon(IconName::Send)
+                                                    .label(if self.comment_pending { "Saving…" } else { "Save comment" })
+                                                    .tooltip("Save comment in this AHEAD session")
+                                                    .disabled(self.comment_pending || self.comment_input.read(cx).value().trim().is_empty())
+                                                    .on_click(cx.listener(|this: &mut Self, _, window, cx| this.save_code_comment(window, cx)))
+                                            )
+                                            .child(
+                                                Button::new("cancel_inline_code_comment")
+                                                    .ghost()
+                                                    .label("Cancel")
+                                                    .tooltip("Discard comment draft")
+                                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                        this.comment_draft_target = None;
+                                                        this.comment_popover_line = None;
+                                                        cx.notify();
+                                                    }))
+                                            )
+                                        )
+                                ))
+                                .when_some(self.comment_error.clone(), |card, error| card.child(div().text_size(px(11.)).text_color(cx.theme().danger).child(error)))
+                        )
+                    })
             ))
             .when(self.show_markdown_preview, |root| {
                 let markdown = self.editor.read(cx).value().to_string();
@@ -4798,8 +4812,7 @@ mod tests {
             .debug_bounds("breakpoint-target-1")
             .expect("breakpoint target");
         assert!(
-            breakpoint.origin.x - (change.origin.x + change.size.width)
-                >= gpui_kit::px(8.)
+            breakpoint.origin.x >= change.origin.x + change.size.width
         );
         cx.simulate_click(change.center(), Default::default());
         assert!(proxy.breakpoints_for(&path).is_empty());

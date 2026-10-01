@@ -680,8 +680,8 @@ the app itself.
 ## Multiplayer collaboration
 
 - [ ] Finish session code comments in `ahead-app/src/code_panel.rs` and
-      `ahead-app/src/session_panel.rs`: gutter range rails, an inline reading and
-      writing popover, resolution, the session-wide navigator, and clickable
+      `ahead-app/src/session_panel.rs`: gutter range rails, an editor side panel
+      for reading and writing, resolution, the session-wide navigator, and clickable
       chat references are implemented locally. Add diff-hunk anchors,
       stale-range relocation, explicit attachment to a linked implementation
       child, review dispositions and live multi-client visibility/permissions.
