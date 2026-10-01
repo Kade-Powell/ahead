@@ -16,10 +16,10 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W4 | Required | Support voice conversation while coding, with Maieutic-style highlighting and pointing, and teaching from actual code. |
 | W5 | Required | Diagram the flows and human/AI roles across the SDLC, including investigation and bug diagnosis. Preserve one discoverable, readable home for design artifacts. |
 | W6 | Proposed detail | Let the agent place debugger breakpoints for a human-selected experiment. Preserve human breakpoints and distinguish editor configuration from running/stepping the program. |
-| W7 | Settled 2026-09-22 | Retain the current libSQL database for live runtime state; produce human-readable research/design/plan/verification/review Markdown as a low-friction byproduct of work. Keep one canonical working copy and publish explicit, revision-pinned checkpoints for sharing. |
+| W7 | Settled 2026-09-22; document root clarified 2026-10-01 | Retain libSQL for live session state. Sessions create lasting, topic-named research/design/plan/verification/review Markdown in the configured project documentation root (default `docs/`), grouped by document purpose rather than session ID. |
 | W8 | Proposed detail | Ordinary pointing never moves the human caret. Explicit navigation or an opted-in follow mode can move the view/caret; typing suspends following. |
 | W9 | Proposed detail | Guided debugging uses user-directed execution by default. The agent may prepare a breakpoint, fixture or observation for a human-selected experiment; it does not silently step or run code. |
-| W10 | Settled 2026-09-22 | Working runtime state and full conversation remain private by default. The editor continuously maintains concise human-readable artifacts, then previews and publishes selected artifacts and conversation excerpts into tracked `.ahead/sessions/<id>/` checkpoints at meaningful handoffs. Projects may tune this behavior in tracked `.ahead/config.toml`; publication never includes credentials or silently commits files. |
+| W10 | Settled 2026-09-22; retention clarified 2026-10-01 | Working runtime state and conversation remain private by default. Archiving hides a session; 30 days later AHEAD deletes its database history, including comments and agent runtime records. Explicit session checkpoints remain separate exports under `.ahead/sessions/<id>/`; lasting documentation belongs under the configured documentation root and is not deleted with a session. Publication never silently commits files or includes credentials. |
 | W11 | Settled 2026-09-21 | A session is a durable container, not a binary Learn/Assist mode. Each session contains explicit tasks: `teaching` when the human asks to learn, and `assistance` for everything else. A teaching task may be linked to an assistance task without changing the parent task's effect policy. |
 | W12 | Settled 2026-09-21 | Integrate a graduated diagnosing-bugs workflow into corrective-debugging and investigation tasks: establish a red reproduction loop, minimize it, rank falsifiable hypotheses, instrument or test, fix with regression evidence, then clean up. Redact sensitive diagnostic evidence before persistence or sharing. |
 | W13 | Settled 2026-09-21 | Ship AHEAD-owned skills as built-in `SKILL.md` bundles with startup metadata and progressive body/reference loading. The agent may select relevant assistance skills, but the session host enforces task policy, capabilities and human authorization. End-of-session automated review is a standard review step; it never auto-applies findings or publishes externally. |
@@ -27,6 +27,7 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W15 | Settled 2026-09-22 | Treat pull-request review as a distinct work type over an immutable base/head snapshot. A contributor may review the code and explicitly shared session artifacts, mark each artifact's review status and disposition, and record findings. AHEAD records reviewer identity, reviewer relationship to the implementers, revisions and policy context, then offers an advisory merge-readiness suggestion. The repository/team's normal PR requirements—including whether independent review is required—and the team's or solo contributor's merge timing remain authoritative; AHEAD neither requires a second person universally nor authorizes, blocks or performs the merge. |
 | W16 | Required | Presentation Core is an editor capability available to every supported AHEAD agent implementation and version, across managed models/providers and external adapters. Agent adapters expose the same inspect, highlight, label/note, pointer and speech tools by forwarding requests to the editor; availability does not depend on teaching versus assistance intent. Presentation actions do not edit source files or move the human caret. |
 | W17 | Settled 2026-10-01 | Human implementation remains the default. At any point during implementation, the human may hand work to a new external agent thread with the session context and work directly with that agent. Show it indented beneath the originating AHEAD thread in the unified sidebar. The human returns to the original thread for verification, review and the remaining workflow; child completion does not complete the parent. |
+| W18 | Settled 2026-10-01; local slice implemented | Session participants select code and write comments in an editor popover. A gutter icon and range rail expose open comments; the session panel lists them for navigation, chat attachment and resolution. Comments retain author, range, quote and source hash and expire with the archived session after 30 days. Opening a changed source avoids selecting the stale range. Live multi-client sync, diff-hunk anchoring, stale-range relocation and explicit child-thread attachment remain implementation work. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
@@ -341,8 +342,8 @@ final transcript stays as a draft until the user adds it to the composer,
 reviews or corrects it, and sends it through the selected harness. These are
 source-level behaviors; the interactive native and ACP journeys still need
 validation, including OS permissions and unavailable on-device languages.
-Persistent inline discussion is not implemented; the current code note is
-attached to a transient presentation cue.
+Session code comments are persistent until the session expires; presentation
+code notes remain transient and serve a separate teaching purpose.
 
 Teaching tasks can use a small loop: **human prediction/explanation → verified visible example → agent hint or challenge → human experiment/explanation → evidence and next concept**. Ask a useful question when it develops understanding; answer straightforward factual questions directly. The former extension's exact word limits and mandatory quiz cadence are not automatically AHEAD requirements.
 
@@ -420,6 +421,20 @@ it with the pinned decisions and produce attributed findings, but it cannot supp
 the final review, approve its own work or resolve a human finding on the human's
 behalf.
 
+Under W18, a participant selects a code range and writes the comment in a
+floating editor card. A gutter icon marks its start, a rail marks its covered
+lines, and a cap marks its end. Clicking the icon opens the card for reading,
+resolution or attaching a stable reference to the human/agent chat. The session
+panel lists open comments and can navigate back to the editor card. The stored
+quote and source hash identify the revision being discussed; when the source
+hash changes, navigation opens the original line without selecting stale code.
+Resolved comments disappear from the gutter and open-comments list but remain
+in session history until archive expiry. The UI does not yet relocate stale
+ranges, anchor diff hunks or sync automatically across clients; collaborators
+can refresh the list. A linked implementation child receives a comment only
+when a human explicitly carries its reference into that chat; review
+disposition stays in the originating AHEAD session.
+
 AHEAD can suggest **ready for team merge consideration** only from current,
 revision-pinned evidence: review statuses are resolved, required AHEAD findings
 have dispositions, the snapshot is not stale, and known checks are recorded. A
@@ -434,7 +449,7 @@ The current store already uses Turso's `libsql` and opens `.ahead/session.db`. R
 
 The session database is transactional and queryable, not a plain-text document format; it does not guarantee fewer bytes than Markdown/JSON. Measure real histories before claiming a size benefit.
 
-**Canonical split:** database for frequent runtime state; ordinary Markdown for intentional engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. It may cache document content by revision/hash, but that cache is not a second independently editable design document.
+**Canonical split:** database for session runtime state; ordinary Markdown for lasting engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. Documents are topic-named and grouped by purpose in a project documentation root, default `docs/`. Set `[documentation] root = "engineering"` in tracked `.ahead/config.toml` to use another workspace-relative root. The session context passes this root to the managed agent and FIM; the human and external agent may create documents there during work. A session ID is provenance, not a documentation directory.
 
 `.ahead` is deliberately not wholly ignored. Its boundary is allowlist-based so a
 new private runtime file cannot become shareable merely because it was added under
@@ -446,6 +461,7 @@ that directory:
 | `.ahead/config.toml` | tracked | Non-secret project workflow/editor/provider defaults; MCP declarations remain inert until local opt-in. |
 | `.ahead/templates/` | tracked when present | Project overrides for built-in artifact templates. |
 | `.ahead/sessions/<id>/` | tracked when explicitly published | Portable session checkpoint and selected human-readable artifacts. |
+| `docs/{research,design,plans,verification,reviews}/` by default | tracked when committed | Canonical lasting documents, named for their subject. `[documentation].root` changes the root. |
 | `~/.ahead/settings.toml` | outside the repository | Private user-level defaults and credentials. |
 | `.ahead/settings.toml` | ignored | Workspace-private AI connections, credentials and personal overrides. |
 | `.ahead/config.local.toml` | ignored | Checkout-specific non-secret overrides. |
@@ -482,64 +498,56 @@ flowchart LR
   History --> Context
 ```
 
-Standard paths proposed for implementation:
+Standard paths and roles:
 
 ```text
+docs/                             configurable lasting-document root
+  research/                       topic-named research documents
+  design/                         topic-named design and decision documents
+  plans/                          topic-named implementation plans
+  verification/                   topic-named check and outcome records
+  reviews/                        topic-named review findings
 .ahead/
   config.toml                       shared project/editor/workflow defaults
   templates/                        optional shared project template overrides
   config.local.toml                 ignored checkout-specific overrides
   settings.toml                     ignored workspace credentials/personal settings
   session.db                       ignored live database, plus its sidecars
-  local/sessions/<id>/              ignored private working documents
-    session.md                     entry point, outcome, status, links, next action
-    research.md                    questions, findings, hypotheses and experiments
-    design.md                      chosen behavior, rationale, invariants, open choices
-    plan.md                        current slices, responsibility and checks
-    verification.md                observed results, revisions and unresolved checks
-    review.md                      snapshot-bound review evidence and dispositions
-  sessions/<id>/                   shareable checkpoint using the same document names
-    session.json                   format, identity, authors, revision and file manifest
-    session.md                     entry point into the shared work
-    research.md / design.md / plan.md / verification.md / review.md   only when present
-    conversation.jsonl             selected readable message history when shared
-    artifacts/                     larger diagrams, images or supporting evidence
+  sessions/<id>/                   explicit portable session checkpoint
+    session.json                   session snapshot, including code comments
+    session.md                     readable session summary
+    conversation.jsonl             exported message history
+    code-comments.md               exported code comments when present
 ```
 
-Only `session.md` is created initially. The editor updates its outcome, current
-state, decisions, progress and next action as those facts emerge from normal work.
-Create `research.md`, `design.md`, `plan.md`, `verification.md` or `review.md` on
-first meaningful content, not at session start. Small work keeps those sections in
-`session.md`; its links and `session.json` artifact roles identify the canonical
-location when split. This is documentation as a byproduct of doing the work, not
-a second documentation phase or six empty forms.
+Do not precreate empty document directories or templates. A session creates a
+document when the work has lasting research, design, plan, verification or
+review content; its filename names the subject, not the session. The explicit
+checkpoint is a snapshot of session history, not the working document root.
 
 For implementation handoffs, persist the parent/child relationship so the sidebar
-can restore it after reopening. Record the child link, delegated scope and context
-revision in the parent's `session.md` (or `plan.md` when present). Include the code
-baseline and any unfinished or unsaved work in the handoff context. On return,
-record changed decisions and revision-specific verification evidence in the
-parent's existing artifacts. Handoff context remains private under the same
-publication rules; creating a child does not publish the session to Git or include
-credentials.
+can restore it after reopening. Include the code baseline and any unfinished
+work in the handoff context. On return, record lasting decisions and verified
+outcomes in the relevant topic documents. Handoff context remains private;
+creating a child does not publish documentation to Git or include credentials.
 
 Record human decisions and accepted uncertainty at the point they are made;
 record AI research with sources and clear fact/inference boundaries; record plan
 deviations while implementing; and record actual checks and observed outcomes
-without turning passed commands into deployment claims. Product-oriented work may
-add `requirements.md`. Keep diagram source in Markdown/Mermaid; generate rendered
-outputs only when useful. The current MVP export materializes `session.json`,
-`session.md` and `conversation.jsonl` under `.ahead/sessions/<session-id>/`;
-template-driven working artifacts, selected conversation export and revision-pinned
-attachments remain implementation work.
+without turning passed commands into deployment claims. Keep diagram source in
+Markdown/Mermaid; generate rendered outputs only when useful. The current MVP
+export materializes `session.json`, `session.md`, `conversation.jsonl` and, when
+present, `code-comments.md` under `.ahead/sessions/<session-id>/`. Automatic
+document creation, selected conversation export and revision-pinned attachments
+remain implementation work.
 
-For a working session, each artifact has one active file path: private or explicitly shared. Publishing creates a checkpoint, not a second live editable copy of private work. Explicitly continuing shared work creates a linked working session. If a file is edited externally, index the new revision and surface conflicts with unsaved editor content; never overwrite it from a stale database cache. Persist artifact writes atomically, then reconcile the database hash/index so a crash or external edit cannot leave two apparent authoritative versions.
+Each lasting document has one canonical file path in the documentation root. Sharing it uses ordinary Git review; a session checkpoint is separate history, not a second editable copy. If a file is edited externally, index the new revision and surface conflicts with unsaved editor content; never overwrite it from a stale database cache.
 
-Human and agent UI links should open the same canonical artifact. Session context names the artifact root and current roles/paths; agents do not guess the newest filename or inspect arbitrary database internals. FIM reads the compact versioned context assembled from these documents and the session. Save chosen decisions before a harness reset. Pin attached past-session evidence to its source revision; importing it must not revive old grants or execute old commands.
+Human and agent UI links should open the same canonical document. Session context names the configured root; agents do not guess the newest filename or inspect arbitrary database internals. FIM reads compact context from documents and the active session. Save lasting decisions before session history expires. Pin attached past-session evidence to its source revision; importing it must not revive old grants or execute old commands.
 
-Shared snapshots are plain-text readable without AHEAD. A database export/backup can remain an optional complete local archive; do not use the live Turso database file as the default Git interchange format. Large logs/audio are not duplicated on every turn or embedded in every checkpoint: preserve selected evidence and its provenance, use explicit retention/export for larger material, and do not claim history is complete after pruning it. No whole-repository compression system or new storage engine is needed for this design.
+After archive, the complete session database record is retained for 30 days and then purged on the next session-store activity. Explicitly exported checkpoints and topic documents are independent files and are not part of that purge; users decide what to retain in Git. A database backup can remain an optional complete local archive. Do not use the live Turso database file as the default Git interchange format or claim history is complete after pruning it.
 
-This refines the previous export-only artifact proposal: working design artifacts become ordinary files too, while the runtime remains database-backed. AHEAD creates `.ahead/.gitignore` when a project is set up or opened, but never overwrites an existing file. Its default-deny boundary explicitly permits only itself, shared configuration, template overrides and published sessions. Private roots, database sidecars and credentials remain excluded without modifying the project's root `.gitignore`.
+This replaces the earlier session-directory proposal for lasting documents. AHEAD creates `.ahead/.gitignore` when a project is set up or opened, but never overwrites an existing file. Its default-deny boundary explicitly permits shared configuration, template overrides and explicitly exported session checkpoints. Runtime databases and credentials remain excluded without modifying the project's root `.gitignore`.
 
 ## 10. Implementation status and review scenarios
 

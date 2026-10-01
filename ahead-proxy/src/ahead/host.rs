@@ -18,9 +18,9 @@ use std::{
 use uuid::Uuid;
 
 use ahead_rpc::ahead::{
-    AheadRequest, AssistanceMode, CodeAnchor, DisplayRange, GithubIssueRef,
-    HarnessKind, Id, LearningArc, LearningRecord, MemoryDocument, MemoryExcerpt,
-    MemoryScope, MemoryWriteResult, Participant, PredictionRequest,
+    AheadRequest, AssistanceMode, CodeAnchor, CodeComment, DisplayRange,
+    GithubIssueRef, HarnessKind, Id, LearningArc, LearningRecord, MemoryDocument,
+    MemoryExcerpt, MemoryScope, MemoryWriteResult, Participant, PredictionRequest,
     PredictionResult, RepoPath, Revision, SessionExportBundle, SessionLifecycle,
     SessionListItem, SessionParticipantRecord, SessionPolicySnapshot, SessionRole,
     SessionTask, SessionView, TaskIntent, VoiceControl, WorkKind, WorkSession,
@@ -205,6 +205,10 @@ impl AheadSessionHost {
                         parent.task.intent == TaskIntent::Assistance,
                         "Teaching tasks cannot hand off implementation"
                     );
+                    anyhow::ensure!(
+                        parent.workflow.phase.id == "implement",
+                        "Implementation handoff is available in the implementation phase"
+                    );
                     Some(parent)
                 } else {
                     None
@@ -354,6 +358,41 @@ impl AheadSessionHost {
                 quote,
                 "human",
             )?)?),
+            AheadRequest::CreateCodeComment {
+                session_id,
+                path,
+                range,
+                quote,
+                source_sha256,
+                body,
+            } => Ok(serde_json::to_value(self.create_code_comment(
+                &session_id,
+                path,
+                range,
+                quote,
+                source_sha256,
+                body,
+            )?)?),
+            AheadRequest::ListCodeComments { session_id } => {
+                self.get_session(&session_id)?
+                    .context("Session not found")?;
+                Ok(serde_json::to_value(
+                    self.store.read().list_code_comments(&session_id)?,
+                )?)
+            }
+            AheadRequest::ResolveCodeComment {
+                session_id,
+                comment_id,
+            } => {
+                let actor_id = self.comment_actor(&session_id)?;
+                Ok(serde_json::to_value(
+                    self.store.read().resolve_code_comment(
+                        &session_id,
+                        &comment_id,
+                        &actor_id,
+                    )?,
+                )?)
+            }
             AheadRequest::ListAnchorsForPaths { paths } => {
                 Ok(serde_json::to_value(self.anchors_for_paths(&paths)?)?)
             }
@@ -1494,6 +1533,70 @@ impl AheadSessionHost {
         Ok(anchor)
     }
 
+    pub fn create_code_comment(
+        &self,
+        session_id: &str,
+        path: RepoPath,
+        range: DisplayRange,
+        quote: String,
+        source_sha256: String,
+        body: String,
+    ) -> Result<CodeComment> {
+        let actor_id = self.comment_actor(session_id)?;
+        let path = self.canonical_workspace_file_path(&path)?;
+        let body = body.trim();
+        anyhow::ensure!(
+            !body.is_empty() && body.len() <= 8_000,
+            "Comment must be 1–8000 bytes"
+        );
+        anyhow::ensure!(
+            !quote.is_empty() && quote.len() <= 4_000,
+            "Select up to 4000 bytes of code"
+        );
+        anyhow::ensure!(
+            (range.start.line, range.start.col) < (range.end.line, range.end.col),
+            "Select a nonempty code range"
+        );
+        anyhow::ensure!(
+            source_sha256.len() == 64
+                && source_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Invalid source revision"
+        );
+        let comment = CodeComment {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            actor_id,
+            path,
+            range,
+            quote,
+            source_sha256,
+            body: body.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            resolved_at: None,
+            resolved_by: None,
+        };
+        self.store.read().insert_code_comment(&comment)?;
+        Ok(comment)
+    }
+
+    fn comment_actor(&self, session_id: &str) -> Result<String> {
+        let view = self.get_session(session_id)?.context("Session not found")?;
+        anyhow::ensure!(
+            self.list_sessions()?
+                .iter()
+                .any(|session| session.id == session_id),
+            "Cannot comment on an archived session"
+        );
+        let actor_id = self.auth.read().get_active_user(None).login;
+        anyhow::ensure!(
+            view.participants.iter().any(|record| matches!(
+                &record.participant, Participant::Human { id, .. } if id == &actor_id
+            )),
+            "Only a session participant can comment"
+        );
+        Ok(actor_id)
+    }
+
     /// Drops uncommitted attribution anchors on `paths` once they are committed.
     /// Git blame becomes authoritative from that point on.
     pub fn clear_committed_anchors(
@@ -1559,12 +1662,53 @@ impl AheadSessionHost {
                 issue.owner, issue.repo, issue.issue_number, issue.title
             ));
         }
+        context.push_str(&format!(
+            "Durable documentation root: {}/. When creating lasting documents, use topic-named Markdown under research/, design/, plans/, verification/, or reviews/. Session history expires 30 days after archive.\n",
+            self.documentation_root()?,
+        ));
         let durable = self.durable_prediction_context(&view.session.id)?;
         if !durable.is_empty() {
             context.push_str("Durable work state:\n");
             context.push_str(&durable);
         }
         Ok(context)
+    }
+
+    fn documentation_root(&self) -> Result<String> {
+        let Some(workspace) = self.workspace.read().clone() else {
+            return Ok("docs".to_string());
+        };
+        let config =
+            ahead_core::config::read_ahead_config(&workspace, "config.toml")?;
+        let root = if let Some(config) = config {
+            let table: toml::Table =
+                config.parse().context("Invalid .ahead/config.toml")?;
+            match table.get("documentation") {
+                Some(value) => {
+                    let table = value
+                        .as_table()
+                        .context("[documentation] must be a table")?;
+                    match table.get("root") {
+                        Some(root) => root
+                            .as_str()
+                            .context("documentation.root must be a string")?
+                            .to_string(),
+                        None => "docs".to_string(),
+                    }
+                }
+                None => "docs".to_string(),
+            }
+        } else {
+            "docs".to_string()
+        };
+        anyhow::ensure!(
+            !root.is_empty()
+                && Path::new(&root)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "documentation.root must be a workspace-relative directory"
+        );
+        Ok(root)
     }
 
     fn implementation_handoff_context(
@@ -1732,6 +1876,7 @@ impl AheadSessionHost {
         let view = self.get_session(session_id)?.context("Session not found")?;
         let store = self.store.read();
         let anchors = store.list_anchors(session_id)?;
+        let code_comments = store.list_code_comments(session_id)?;
         let work_items = store.list_work_items(session_id)?;
         let mut work_item_events = Vec::new();
         for item in &work_items {
@@ -1760,6 +1905,7 @@ impl AheadSessionHost {
             conversation_messages,
             agent_runtime_state,
             anchors,
+            code_comments,
             work_items,
             work_item_events,
             work_item_closeouts,
@@ -1795,6 +1941,9 @@ impl AheadSessionHost {
             store.insert_session(&view)?;
             for anchor in &bundle.anchors {
                 store.insert_anchor(anchor)?;
+            }
+            for comment in &bundle.code_comments {
+                store.insert_code_comment(comment)?;
             }
             for item in &bundle.work_items {
                 store.insert_work_item_row(item)?;
@@ -2463,10 +2612,39 @@ mod tests {
             "Search open and saved files".into(),
             None,
         )?;
+        let premature = host.handle_request(AheadRequest::StartWork {
+            work_kind: None,
+            title: "Too early".into(),
+            starting_point: "Prototype the search results".into(),
+            work_item: None,
+            harness: Some(HarnessKind::ExternalAcp),
+            external_agent_id: Some("not-curated".into()),
+            parent_session_id: Some(parent.session.id.clone()),
+        });
+        assert!(
+            premature
+                .unwrap_err()
+                .to_string()
+                .contains("implementation phase")
+        );
+        host.store.read().upsert_message(
+            &ahead_rpc::ahead::ConversationMessage {
+                id: "handoff-message".into(),
+                session_id: parent.session.id.clone(),
+                turn_id: "handoff-turn".into(),
+                sequence: 1,
+                role: "human".into(),
+                actor_id: "human".into(),
+                content: "Keep the public API unchanged.".into(),
+                status: "complete".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )?;
         let context = host.implementation_handoff_context(
             &parent,
             "Prototype the search results",
         )?;
+        assert!(context.contains("Keep the public API unchanged."));
         let child = host.start_work_with_binding(
             Some(parent.session.work_kind),
             "Search prototype".into(),
@@ -2918,6 +3096,23 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         host.store.read().upsert_message(&message).unwrap();
+        let comment = CodeComment {
+            id: "comment-export-1".into(),
+            session_id: view.session.id.clone(),
+            actor_id: "human".into(),
+            path: "src/a.rs".into(),
+            range: DisplayRange {
+                start: ahead_rpc::ahead::DisplayPosition { line: 1, col: 0 },
+                end: ahead_rpc::ahead::DisplayPosition { line: 1, col: 3 },
+            },
+            quote: "fn a() {}".into(),
+            source_sha256: "a".repeat(64),
+            body: "Check this branch".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            resolved_at: None,
+            resolved_by: None,
+        };
+        host.store.read().insert_code_comment(&comment).unwrap();
 
         let bundle = host.session_export(&view.session.id).unwrap();
         assert_eq!(bundle.session.id, view.session.id);
@@ -2926,6 +3121,7 @@ mod tests {
         assert_eq!(bundle.conversation_summaries.len(), 1);
         assert_eq!(bundle.conversation_messages.len(), 1);
         assert_eq!(bundle.conversation_messages[0].content, message.content);
+        assert_eq!(bundle.code_comments, vec![comment.clone()]);
 
         // Serde round-trip: clean-machine reconstruction path.
         let json = serde_json::to_string(&bundle).unwrap();
@@ -2953,10 +3149,39 @@ mod tests {
         let messages = fresh.store.read().list_messages(&view.session.id).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "Keep the retry invariant.");
+        assert_eq!(
+            fresh
+                .store
+                .read()
+                .list_code_comments(&view.session.id)
+                .unwrap(),
+            vec![comment]
+        );
 
         // Second restore of the same bundle refuses overwrite.
         let bundle3 = host.session_export(&view.session.id).unwrap();
         assert!(fresh.session_restore(bundle3).is_err());
+    }
+
+    #[test]
+    fn documentation_root_is_project_configured_and_workspace_relative() -> Result<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        std::fs::create_dir(workspace.path().join(".ahead"))?;
+        let host = AheadSessionHost::in_memory()?;
+        host.set_workspace(workspace.path().to_path_buf());
+        assert_eq!(host.documentation_root()?, "docs");
+        std::fs::write(
+            workspace.path().join(".ahead/config.toml"),
+            "[documentation]\nroot = 'engineering'\n",
+        )?;
+        assert_eq!(host.documentation_root()?, "engineering");
+        std::fs::write(
+            workspace.path().join(".ahead/config.toml"),
+            "[documentation]\nroot = '../outside'\n",
+        )?;
+        assert!(host.documentation_root().is_err());
+        Ok(())
     }
 
     #[test]

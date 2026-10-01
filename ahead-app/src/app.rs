@@ -24,6 +24,7 @@ use gpui_kit::component::{ActiveTheme, Icon, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
+use sha2::Digest;
 
 use crate::proxy_client::{DebugTerminalEvent, EditorPresentationRequest};
 use crate::workspace_panels::{
@@ -766,6 +767,7 @@ pub struct Shell {
     system_speech_active: Arc<AtomicBool>,
     _shortcut_interceptor: Option<Subscription>,
     status_message: String,
+    pending_comment: Option<(String, u32)>,
 }
 
 impl Shell {
@@ -903,6 +905,7 @@ impl Shell {
             system_speech_active,
             _shortcut_interceptor: None,
             status_message: String::new(),
+            pending_comment: None,
         }
     }
 
@@ -950,9 +953,22 @@ impl Shell {
             }
         }
         self.code = code.clone();
-        self.session.update(cx, |session, _| {
+        self.session.update(cx, |session, cx| {
             session.code = Some(code.clone());
+            code.update(cx, |code, cx| {
+                code.set_code_comments(
+                    session.session_id.clone(),
+                    session.code_comments_snapshot(),
+                    cx,
+                );
+            });
         });
+        if let Some((comment_path, line)) = self.pending_comment.as_ref()
+            && code.read(cx).file_path == *comment_path
+        {
+            code.update(cx, |code, cx| code.show_code_comment_line(*line, cx));
+            self.pending_comment = None;
+        }
         self.problems.update(cx, |problems, _| {
             problems.code = code;
         });
@@ -976,7 +992,13 @@ impl Shell {
         let shell_for_tabs = shell;
         let speech_process = self.system_speech_process.clone();
         let speech_active = self.system_speech_active.clone();
-        code.update(cx, |code, _| {
+        let session_panel = self.session.downgrade();
+        let (session_id, comments) = self.session.read_with(cx, |session, _| {
+            (session.session_id.clone(), session.code_comments_snapshot())
+        });
+        code.update(cx, |code, cx| {
+            code.set_session_panel(session_panel);
+            code.set_code_comments(session_id, comments, cx);
             code.set_close_handler(move |panel, window, cx| {
                 _ = shell_for_close.update(cx, |shell, cx| {
                     shell.close_code_tab(panel, window, cx);
@@ -1297,8 +1319,8 @@ impl Shell {
                     self.configure_code(code.clone(), cx);
                     self.code_tabs.push(code.clone());
                     let buffers = self.code_tabs.clone();
-                    self.session.update(cx, |session, _| {
-                        session.set_buffers(buffers.clone());
+                    self.session.update(cx, |session, cx| {
+                        session.set_buffers(buffers.clone(), cx);
                     });
                     self.search.update(cx, |search, cx| {
                         search.set_buffers(buffers, cx);
@@ -1447,8 +1469,8 @@ impl Shell {
             self.configure_code(code.clone(), cx);
             self.code_tabs.push(code.clone());
             let buffers = self.code_tabs.clone();
-            self.session.update(cx, |session, _| {
-                session.set_buffers(buffers.clone());
+            self.session.update(cx, |session, cx| {
+                session.set_buffers(buffers.clone(), cx);
             });
             self.search.update(cx, |search, cx| {
                 search.set_buffers(buffers, cx);
@@ -1687,6 +1709,19 @@ impl Shell {
                 }
             };
         match action {
+            crate::code_panel::CodeTabAction::CommentOnSelection => {
+                let Some(target) =
+                    self.code_tabs[index].read(cx).selected_code_comment(cx)
+                else {
+                    set_status(self, "Select code to comment on".to_string(), cx);
+                    return;
+                };
+                let session_id = self.session.read(cx).session_id.clone();
+                self.code_tabs[index].update(cx, |code, cx| {
+                    code.begin_code_comment(target, session_id, window, cx);
+                });
+                return;
+            }
             crate::code_panel::CodeTabAction::CopyRelativePath => {
                 let relative = crate::explorer_panel::relative_path(
                     std::path::Path::new(&workspace),
@@ -1801,6 +1836,77 @@ impl Shell {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn open_code_comment(
+        &mut self,
+        comment: &ahead_rpc::ahead::CodeComment,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = std::path::PathBuf::from(&self.explorer.read(cx).root);
+        let Ok(workspace) = workspace.canonicalize() else {
+            self.status_message = "Workspace unavailable".into();
+            cx.notify();
+            return;
+        };
+        let Ok(path) = workspace.join(&comment.path).canonicalize() else {
+            self.status_message = "Commented file unavailable".into();
+            cx.notify();
+            return;
+        };
+        if !path.starts_with(&workspace) || !path.is_file() {
+            self.status_message = "Commented file is outside the workspace".into();
+            cx.notify();
+            return;
+        }
+        let current_source = self
+            .code_tabs
+            .iter()
+            .find(|code| code.read(cx).file_path == path.to_string_lossy())
+            .and_then(|code| {
+                code.read(cx)
+                    .turn_context(cx)
+                    .map(|context| context.file_content)
+            })
+            .or_else(|| std::fs::read_to_string(&path).ok());
+        let source_matches = current_source.is_some_and(|source| {
+            format!("{:x}", sha2::Sha256::digest(source.as_bytes()))
+                == comment.source_sha256
+        });
+        if !source_matches {
+            self.status_message = "Commented source changed; opened its original line without selecting stale code".into();
+        }
+        let location = crate::ross::OpenLocation {
+            line: comment.range.start.line as usize,
+            column: crate::ross::OpenColumn::Utf16(comment.range.start.col as usize),
+            end_line: if source_matches {
+                comment.range.end.line
+            } else {
+                comment.range.start.line
+            } as usize,
+            end_column: crate::ross::OpenColumn::Utf16(if source_matches {
+                comment.range.end.col
+            } else {
+                comment.range.start.col
+            } as usize),
+        };
+        crate::ross::request_open_at(
+            self.explorer.read(cx).mailbox_id,
+            &path.to_string_lossy(),
+            location,
+        );
+        let path_text = path.to_string_lossy().into_owned();
+        let line = comment.range.start.line.saturating_add(1);
+        if let Some(code) = self
+            .code_tabs
+            .iter()
+            .find(|code| code.read(cx).file_path == path_text)
+        {
+            code.update(cx, |code, cx| code.show_code_comment_line(line, cx));
+        } else {
+            self.pending_comment = Some((path_text, line));
+        }
+        cx.notify();
     }
 
     fn trash_workspace_path(
@@ -1970,8 +2076,8 @@ impl Shell {
         self.code_tabs[index].update(cx, |code, _| code.release_buffer());
         self.code_tabs.remove(index);
         let buffers = self.code_tabs.clone();
-        self.session.update(cx, |session, _| {
-            session.set_buffers(buffers.clone());
+        self.session.update(cx, |session, cx| {
+            session.set_buffers(buffers.clone(), cx);
         });
         self.search.update(cx, |search, cx| {
             search.set_buffers(buffers, cx);

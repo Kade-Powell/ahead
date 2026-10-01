@@ -24,10 +24,11 @@ use ahead_rpc::{
         AgentConfigOptionValue, AgentPlanEntry, AgentPresentationAction,
         AgentRuntimeState, AgentToolCall, AgentTurnRequestDto, AgentUsage,
         AgentUserInputRequest, AheadNotification, AheadRequest, CodeAnchor,
-        ConversationMessage, ConversationMessageCursor, ConversationMessagePage,
-        ExternalAcpAdapter, HarnessKind, McpServerDeclaration, MemoryDocument,
-        MemoryExcerpt, MemoryScope, MemoryWriteResult, SessionExportBundle,
-        SessionListItem, SessionView, WorkItem, WorkItemStatus,
+        CodeComment, ConversationMessage, ConversationMessageCursor,
+        ConversationMessagePage, ExternalAcpAdapter, HarnessKind,
+        McpServerDeclaration, MemoryDocument, MemoryExcerpt, MemoryScope,
+        MemoryWriteResult, SessionExportBundle, SessionListItem, SessionView,
+        WorkItem, WorkItemStatus,
     },
     core::{CoreNotification, CoreRequest, CoreResponse},
     dap_types::{
@@ -1719,6 +1720,63 @@ impl ProxyClient {
             })
     }
 
+    pub fn create_code_comment(
+        &self,
+        session_id: &str,
+        path: String,
+        range: ahead_rpc::ahead::DisplayRange,
+        quote: String,
+        source_sha256: String,
+        body: String,
+    ) -> Result<CodeComment, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::CreateCodeComment {
+                session_id: session_id.to_string(),
+                path,
+                range,
+                quote,
+                source_sha256,
+                body,
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: error.to_string(),
+        })
+    }
+
+    pub fn code_comments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CodeComment>, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::ListCodeComments {
+                session_id: session_id.to_string(),
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: error.to_string(),
+        })
+    }
+
+    pub fn resolve_code_comment(
+        &self,
+        session_id: &str,
+        comment_id: &str,
+    ) -> Result<CodeComment, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::ResolveCodeComment {
+                session_id: session_id.to_string(),
+                comment_id: comment_id.to_string(),
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: error.to_string(),
+        })
+    }
+
     /// Fetches one durable page and merges it into the loaded chat window.
     pub fn conversation_page(
         &self,
@@ -1806,6 +1864,17 @@ impl ProxyClient {
     /// databases and harness state stay outside the shared directory.
     pub fn export_checkpoint(&self, session_id: &str) -> Result<PathBuf, RpcError> {
         let bundle = self.session_export(session_id)?;
+        if std::path::Path::new(session_id).components().count() != 1
+            || !matches!(
+                std::path::Path::new(session_id).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(RpcError {
+                code: 0,
+                message: "Invalid session checkpoint id".into(),
+            });
+        }
         let directory = self
             .workspace
             .join(".ahead")
@@ -1869,6 +1938,21 @@ impl ProxyClient {
             &directory.join("conversation.jsonl"),
             conversation_jsonl.as_bytes(),
         )?;
+        if !bundle.code_comments.is_empty() {
+            let mut review = String::from("# Code comments\n\n");
+            for comment in &bundle.code_comments {
+                review.push_str(&format!(
+                    "## {}:{} · {}\n\n{}\n\n```\n{}\n```\n\nSource revision: `{}`\n\n",
+                    comment.path,
+                    comment.range.start.line + 1,
+                    comment.actor_id,
+                    comment.body,
+                    comment.quote,
+                    comment.source_sha256,
+                ));
+            }
+            write_atomic(&directory.join("code-comments.md"), review.as_bytes())?;
+        }
         Ok(directory.join("session.json"))
     }
 

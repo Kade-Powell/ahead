@@ -439,6 +439,25 @@ pub struct CodeAnchor {
     pub surrounding_context: Option<String>,
 }
 
+/// Session discussion attached to a selected code range. The quote and source
+/// hash let readers recognize when the file has changed since the comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeComment {
+    pub id: Id,
+    pub session_id: Id,
+    pub actor_id: Id,
+    pub path: RepoPath,
+    pub range: DisplayRange,
+    pub quote: String,
+    pub source_sha256: Sha256,
+    pub body: String,
+    pub created_at: Timestamp,
+    #[serde(default)]
+    pub resolved_at: Option<Timestamp>,
+    #[serde(default)]
+    pub resolved_by: Option<Id>,
+}
+
 /// Canonical actor id for edits authored by the AHEAD agent rather than a human.
 pub const AHEAD_ACTOR_ID: &str = "ahead";
 
@@ -1097,6 +1116,8 @@ pub struct SessionExportBundle {
     /// Runtime bindings, credentials and pending input are not portable.
     pub agent_runtime_state: AgentRuntimeState,
     pub anchors: Vec<CodeAnchor>,
+    #[serde(default)]
+    pub code_comments: Vec<CodeComment>,
     pub work_items: Vec<WorkItem>,
     pub work_item_events: Vec<WorkItemEvent>,
     pub work_item_closeouts: Vec<WorkItemCloseout>,
@@ -1229,6 +1250,21 @@ pub enum AheadRequest {
         path: RepoPath,
         range: DisplayRange,
         quote: String,
+    },
+    CreateCodeComment {
+        session_id: Id,
+        path: RepoPath,
+        range: DisplayRange,
+        quote: String,
+        source_sha256: Sha256,
+        body: String,
+    },
+    ListCodeComments {
+        session_id: Id,
+    },
+    ResolveCodeComment {
+        session_id: Id,
+        comment_id: Id,
     },
     /// Uncommitted attribution anchors on the given paths, across sessions.
     ListAnchorsForPaths {

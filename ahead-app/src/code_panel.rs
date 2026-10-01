@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent, PanelId, TabGroup,
@@ -23,7 +24,8 @@ use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitl
 use gpui_kit::component::input::{
     Copy as CopyAction, Cut as CutAction, Editor, EditorState, Enter, Escape,
     IndentInline, InputEvent, MoveDown, MoveUp, Paste as PasteAction, Rope, RopeExt,
-    SelectAll, TabSize, TextDecoration, TextDecorationCollection,
+    SelectAll, TabSize, TextDecoration, TextDecorationCollection, Textarea,
+    TextareaState,
 };
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::text::TextView;
@@ -31,6 +33,7 @@ use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
+use gpui_util::ResultExt;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use sha2::Digest;
@@ -62,6 +65,7 @@ struct NavigationResults {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeTabAction {
+    CommentOnSelection,
     Promote,
     Close,
     CloseOthers,
@@ -75,6 +79,14 @@ pub enum CodeTabAction {
     DuplicateFile,
     TrashFile,
     ViewHistory,
+}
+
+#[derive(Clone)]
+pub struct SelectedCodeComment {
+    pub path: String,
+    pub range: ahead_rpc::ahead::DisplayRange,
+    pub quote: String,
+    pub source_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +134,14 @@ fn read_editor_file(path: &str) -> Result<String, FileOpenError> {
 pub struct CodePanel {
     pub focus: FocusHandle,
     pub editor: Entity<EditorState>,
+    comment_input: Entity<TextareaState>,
+    comment_session_id: Option<String>,
+    code_comments: Vec<ahead_rpc::ahead::CodeComment>,
+    comment_popover_line: Option<u32>,
+    comment_draft_target: Option<SelectedCodeComment>,
+    comment_pending: bool,
+    comment_error: Option<String>,
+    session_panel: Option<WeakEntity<crate::session_panel::SessionPanel>>,
     presentation_decorations: TextDecorationCollection,
     presentation: Option<ActivePresentation>,
     pointer_overlay_position: Option<(f32, f32)>,
@@ -203,6 +223,17 @@ impl CodePanel {
             editor.set_disabled(file_error.is_some(), cx);
             editor
         });
+        let comment_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Comment on this code…")
+                .auto_grow(2, 5)
+        });
+        cx.subscribe(&comment_input, |_: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
 
         let editor_for_observer = editor.clone();
         cx.observe(&editor_for_observer, |_, _, cx| cx.notify())
@@ -294,6 +325,14 @@ impl CodePanel {
         Self {
             focus: cx.focus_handle(),
             editor,
+            comment_input,
+            comment_session_id: None,
+            code_comments: Vec::new(),
+            comment_popover_line: None,
+            comment_draft_target: None,
+            comment_pending: false,
+            comment_error: None,
+            session_panel: None,
             presentation_decorations,
             presentation: None,
             pointer_overlay_position: None,
@@ -722,6 +761,206 @@ impl CodePanel {
         })
     }
 
+    pub fn selected_code_comment(&self, cx: &App) -> Option<SelectedCodeComment> {
+        let context = self.turn_context(cx)?;
+        let range = context.selection?;
+        let selection = self.editor.read(cx).selected_range();
+        let quote = context.file_content.get(selection)?.to_string();
+        Some(SelectedCodeComment {
+            path: context.active_path,
+            range,
+            quote,
+            source_sha256: format!(
+                "{:x}",
+                sha2::Sha256::digest(context.file_content.as_bytes())
+            ),
+        })
+    }
+
+    pub(crate) fn set_session_panel(
+        &mut self,
+        panel: WeakEntity<crate::session_panel::SessionPanel>,
+    ) {
+        self.session_panel = Some(panel);
+    }
+
+    pub(crate) fn show_code_comment_line(
+        &mut self,
+        line: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.comment_draft_target = None;
+        self.comment_popover_line = Some(line);
+        cx.notify();
+    }
+
+    pub(crate) fn set_code_comments(
+        &mut self,
+        session_id: Option<String>,
+        comments: Vec<ahead_rpc::ahead::CodeComment>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_session_id != session_id {
+            self.comment_popover_line = None;
+            self.comment_draft_target = None;
+        }
+        self.comment_session_id = session_id;
+        self.code_comments = comments;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_code_comment(
+        &mut self,
+        target: SelectedCodeComment,
+        session_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if session_id.is_none() || self.proxy.is_none() {
+            self.status = "Start an AHEAD session before commenting".into();
+            cx.notify();
+            return;
+        }
+        self.comment_session_id = session_id;
+        self.comment_popover_line = Some(target.range.start.line + 1);
+        self.comment_draft_target = Some(target);
+        self.comment_error = None;
+        self.comment_input.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn save_code_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(session_id), Some(target)) = (
+            self.proxy.clone(),
+            self.comment_session_id.clone(),
+            self.comment_draft_target.clone(),
+        ) else {
+            return;
+        };
+        let body = self.comment_input.read(cx).value().trim().to_string();
+        if body.is_empty() || self.comment_pending {
+            return;
+        }
+        self.comment_pending = true;
+        self.comment_error = None;
+        cx.spawn_in(window, async move |this, cx| {
+            let request_session_id = session_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    proxy.create_code_comment(
+                        &session_id,
+                        target.path,
+                        target.range,
+                        target.quote,
+                        target.source_sha256,
+                        body,
+                    )
+                })
+                .await;
+            this.update_in(cx, |code, window, cx| {
+                if code.comment_session_id.as_deref() != Some(&request_session_id) {
+                    return;
+                }
+                code.comment_pending = false;
+                match result {
+                    Ok(comment) => {
+                        code.code_comments.push(comment.clone());
+                        code.comment_draft_target = None;
+                        code.comment_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        if let Some(panel) = &code.session_panel {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel
+                                        .upsert_code_comment_from_editor(comment, cx)
+                                })
+                                .log_err();
+                        }
+                        code.status = "Code comment saved to session".into();
+                    }
+                    Err(error) => code.comment_error = Some(error.message),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn resolve_code_comment(
+        &mut self,
+        comment_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.comment_session_id.clone())
+        else {
+            return;
+        };
+        if self.comment_pending {
+            return;
+        }
+        self.comment_pending = true;
+        self.comment_error = None;
+        cx.spawn_in(window, async move |this, cx| {
+            let request_session_id = session_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    proxy.resolve_code_comment(&session_id, &comment_id)
+                })
+                .await;
+            this.update(cx, |code, cx| {
+                if code.comment_session_id.as_deref() != Some(&request_session_id) {
+                    return;
+                }
+                code.comment_pending = false;
+                match result {
+                    Ok(comment) => {
+                        if let Some(existing) = code
+                            .code_comments
+                            .iter_mut()
+                            .find(|existing| existing.id == comment.id)
+                        {
+                            *existing = comment.clone();
+                        }
+                        if let Some(panel) = &code.session_panel {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel
+                                        .upsert_code_comment_from_editor(comment, cx)
+                                })
+                                .log_err();
+                        }
+                        code.comment_popover_line = None;
+                    }
+                    Err(error) => code.comment_error = Some(error.message),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn reference_code_comment(
+        &mut self,
+        comment: &ahead_rpc::ahead::CodeComment,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(panel) = &self.session_panel {
+            if let Err(error) = panel.update_in(cx, |panel, window, cx| {
+                panel.reference_code_comment(comment, window, cx)
+            }) {
+                self.status =
+                    format!("Could not attach comment to chat: {error}").into();
+            }
+        }
+    }
+
     pub fn has_unsaved_changes(&self) -> bool {
         self.dirty
     }
@@ -768,6 +1007,8 @@ impl CodePanel {
             }
         };
         self.presentation = None;
+        self.comment_popover_line = None;
+        self.comment_draft_target = None;
         self.presentation_decorations.clear(cx);
         self.loading = true;
         self.editor.update(cx, |ed, cx| {
@@ -2162,6 +2403,46 @@ impl Render for CodePanel {
         let line_height = editor_state.line_height().unwrap_or(px(16.));
         let scroll_offset = editor_state.scroll_offset();
         let editor_text = editor_state.text().to_string();
+        let comment_path = std::path::Path::new(&self.file_path)
+            .strip_prefix(&self.workspace)
+            .unwrap_or_else(|_| std::path::Path::new(&self.file_path))
+            .to_string_lossy();
+        let mut comment_starts = std::collections::HashMap::<u32, usize>::new();
+        let mut comment_ranges = std::collections::HashSet::<u32>::new();
+        let mut comment_ends = std::collections::HashSet::<u32>::new();
+        for comment in self.code_comments.iter().filter(|comment| {
+            comment.resolved_at.is_none() && comment.path == comment_path
+        }) {
+            let start = comment.range.start.line.saturating_add(1);
+            *comment_starts.entry(start).or_default() += 1;
+            let end = comment.range.end.line.saturating_add(
+                if comment.range.end.col == 0
+                    && comment.range.end.line > comment.range.start.line
+                {
+                    0
+                } else {
+                    1
+                },
+            );
+            for line in start..=end.min(line_count) {
+                comment_ranges.insert(line);
+            }
+            comment_ends.insert(end);
+        }
+        let selected_comment_target = self.selected_code_comment(cx);
+        let comment_popover = self.comment_popover_line.map(|line| {
+            let comments = self
+                .code_comments
+                .iter()
+                .filter(|comment| {
+                    comment.resolved_at.is_none()
+                        && comment.path == comment_path
+                        && comment.range.start.line.saturating_add(1) == line
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (line, comments)
+        });
         let presentation_line = self
             .presentation_decorations
             .get_ranges(cx)
@@ -2366,7 +2647,7 @@ impl Render for CodePanel {
                     .min_h_0()
                     .child(
                         div()
-                            .w(px(38.))
+                            .w(px(56.))
                             .h_full()
                             .relative()
                             .overflow_hidden()
@@ -2386,6 +2667,11 @@ impl Render for CodePanel {
                                         let show_breakpoint_preview = self.hovered_breakpoint_line == Some(ln) && !is_bp;
                                         let is_agent = actor_lines.contains(&ln);
                                         let is_pointer = pointer_line == Some(ln);
+                                        let comment_count = comment_starts.get(&ln).copied().unwrap_or(0);
+                                        let has_comment_range = comment_ranges.contains(&ln);
+                                        let is_comment_end = comment_ends.contains(&ln);
+                                        let draft_target = selected_comment_target.clone().filter(|target| target.range.start.line + 1 == ln);
+                                        let comment_session_id = self.comment_session_id.clone();
                                         h_flex()
                                             .id(("gutter", ln as usize))
                                             .h(line_height)
@@ -2501,6 +2787,49 @@ impl Render for CodePanel {
                                                         gpui_kit::Hsla::transparent_black()
                                                     }),
                                             )
+                                            .child(
+                                                div()
+                                                    .w(px(18.))
+                                                    .h(line_height)
+                                                    .relative()
+                                                    .border_l_2()
+                                                    .border_color(if has_comment_range { cx.theme().primary } else { gpui_kit::Hsla::transparent_black() })
+                                                    .when(is_comment_end, |rail| rail.child(
+                                                        div()
+                                                            .absolute()
+                                                            .bottom(px(0.))
+                                                            .left(px(0.))
+                                                            .w(px(6.))
+                                                            .h(px(3.))
+                                                            .bg(cx.theme().primary)
+                                                    ))
+                                                    .when(comment_count > 0, |rail| rail.child(
+                                                        Button::new(("comment-marker", ln as usize))
+                                                            .icon(IconName::MessageSquare)
+                                                            .with_size(px(16.))
+                                                            .w(px(16.))
+                                                            .h(line_height)
+                                                            .p_0()
+                                                            .tooltip(format!("Show {comment_count} code comment(s) on line {ln}"))
+                                                            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                                this.comment_popover_line = (this.comment_popover_line != Some(ln)).then_some(ln);
+                                                                this.comment_draft_target = None;
+                                                                cx.notify();
+                                                            }))
+                                                    ))
+                                                    .when(comment_count == 0, |rail| rail.when_some(draft_target, |rail, target| rail.child(
+                                                        Button::new(("add-comment-marker", ln as usize))
+                                                            .icon(IconName::MessageSquarePlus)
+                                                            .with_size(px(16.))
+                                                            .w(px(16.))
+                                                            .h(line_height)
+                                                            .p_0()
+                                                            .tooltip("Comment on selected code")
+                                                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                                                this.begin_code_comment(target.clone(), comment_session_id.clone(), window, cx);
+                                                            }))
+                                                    )))
+                                            )
                                     }))
                             )
                     )
@@ -2566,6 +2895,11 @@ impl Render for CodePanel {
                                 ))
                                 .separator()
                                 .item(file_item(
+                                    "Comment on selection",
+                                    CodeTabAction::CommentOnSelection,
+                                ))
+                                .separator()
+                                .item(file_item(
                                     "Copy Relative Path",
                                     CodeTabAction::CopyRelativePath,
                                 ))
@@ -2610,8 +2944,118 @@ impl Render for CodePanel {
                             .child(
                                 Editor::new(&self.editor)
                                     .aria_label("AHEAD Code Editor")
+                                    // The parent GPUI popup already provides these edit actions.
+                                    .context_menu(|menu, _, _| menu)
                                     .h_full()
                             )
+                            .when_some(comment_popover, |el, (line, comments)| {
+                                let top = gutter_top + line_height * (line.saturating_sub(1)) as f32;
+                                el.child(
+                                    v_flex()
+                                        .id("inline_code_comments")
+                                        .debug_selector(|| "inline-code-comments".into())
+                                        .absolute()
+                                        .top(top)
+                                        .left(px(12.))
+                                        .w(px(380.))
+                                        .max_h(px(340.))
+                                        .overflow_y_scroll()
+                                        .p_2()
+                                        .gap_2()
+                                        .bg(popup_bg)
+                                        .border_1()
+                                        .border_color(border_color)
+                                        .rounded_md()
+                                        .shadow_md()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(h_flex().gap_1().child(IconName::MessageSquare).child(format!("Code comments · line {line}")))
+                                                .child(
+                                                    Button::new("close_inline_comments")
+                                                        .icon(IconName::X)
+                                                        .tooltip("Close code comments")
+                                                        .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                            this.comment_popover_line = None;
+                                                            this.comment_draft_target = None;
+                                                            cx.notify();
+                                                        }))
+                                                )
+                                        )
+                                        .children(comments.into_iter().map(|comment| {
+                                            let reference_comment = comment.clone();
+                                            let resolve_id = comment.id.clone();
+                                            let source_changed = format!("{:x}", sha2::Sha256::digest(editor_text.as_bytes())) != comment.source_sha256;
+                                            v_flex()
+                                                .gap_1()
+                                                .p_2()
+                                                .border_l_2()
+                                                .border_color(cx.theme().primary)
+                                                .child(div().text_size(px(11.)).text_color(text_color).child(format!("{} · lines {}–{}", comment.actor_id, comment.range.start.line + 1, comment.range.end.line + 1)))
+                                                .child(div().text_size(px(11.)).text_color(text_color).child(comment.quote.chars().take(220).collect::<String>()))
+                                                .when(source_changed, |card| card.child(div().text_size(px(10.)).text_color(cx.theme().warning).child("Source changed since this comment")))
+                                                .child(div().text_size(px(12.)).child(comment.body.clone()))
+                                                .child(h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        Button::new(SharedString::from(format!("attach-inline-{}", comment.id)))
+                                                            .ghost()
+                                                            .icon(IconName::MessageSquare)
+                                                            .label("Attach to chat")
+                                                            .tooltip("Attach this comment to the AHEAD chat composer")
+                                                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                                                this.reference_code_comment(&reference_comment, window, cx);
+                                                            }))
+                                                    )
+                                                    .child(
+                                                        Button::new(SharedString::from(format!("resolve-inline-{}", comment.id)))
+                                                            .ghost()
+                                                            .icon(IconName::MessageSquareCheck)
+                                                            .label("Resolve")
+                                                            .tooltip("Resolve this code comment")
+                                                            .disabled(self.comment_pending)
+                                                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                                                this.resolve_code_comment(resolve_id.clone(), window, cx);
+                                                            }))
+                                                    )
+                                                )
+                                        }))
+                                        .when_some(self.comment_draft_target.clone(), |card, target| card.child(
+                                            v_flex()
+                                                .gap_2()
+                                                .p_2()
+                                                .border_l_2()
+                                                .border_color(cx.theme().primary)
+                                                .child(div().text_size(px(11.)).child(format!("Selected lines {}–{}", target.range.start.line + 1, target.range.end.line + 1)))
+                                                .child(div().text_size(px(11.)).text_color(text_color).child(target.quote.chars().take(220).collect::<String>()))
+                                                .child(Textarea::new(&self.comment_input).aria_label("Code comment").w_full())
+                                                .child(h_flex().gap_1()
+                                                    .child(
+                                                        Button::new("save_inline_code_comment")
+                                                            .primary()
+                                                            .icon(IconName::Send)
+                                                            .label(if self.comment_pending { "Saving…" } else { "Save comment" })
+                                                            .tooltip("Save comment in this AHEAD session")
+                                                            .disabled(self.comment_pending || self.comment_input.read(cx).value().trim().is_empty())
+                                                            .on_click(cx.listener(|this: &mut Self, _, window, cx| this.save_code_comment(window, cx)))
+                                                    )
+                                                    .child(
+                                                        Button::new("cancel_inline_code_comment")
+                                                            .ghost()
+                                                            .label("Cancel")
+                                                            .tooltip("Discard comment draft")
+                                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                                this.comment_draft_target = None;
+                                                                this.comment_popover_line = None;
+                                                                cx.notify();
+                                                            }))
+                                                    )
+                                                )
+                                        ))
+                                        .when_some(self.comment_error.clone(), |card, error| card.child(div().text_size(px(11.)).text_color(cx.theme().danger).child(error)))
+                                )
+                            })
                             .when_some(expanded_hunk, |el, hunk| {
                                 let top = gutter_top + line_height * (hunk.start + hunk.len).saturating_sub(1) as f32;
                                 let new_lines: Vec<_> = editor_text.lines()

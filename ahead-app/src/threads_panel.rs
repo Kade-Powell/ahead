@@ -522,6 +522,13 @@ impl ThreadsPanel {
             ThreadKind::Ahead { item_id, .. }
             | ThreadKind::External { item_id, .. } => item_id,
         };
+        if self.threads.iter().any(|candidate| {
+            candidate.parent_session_id.as_deref() == Some(session_id.as_str())
+        }) {
+            self.error = Some("Archive linked implementation threads first".into());
+            cx.notify();
+            return;
+        }
         let Some(proxy) = self.proxy.clone() else {
             self.error = Some("AHEAD host is unavailable".into());
             cx.notify();
@@ -888,7 +895,6 @@ impl ThreadsPanel {
 
     fn close_new_session(&mut self, cx: &mut Context<Self>) {
         self.show_new_session = false;
-        self.handoff_parent_session_id = None;
         self.handoff_parent_session_id = None;
         self.new_session_generation = self.new_session_generation.wrapping_add(1);
         self.external_adapter_catalog_loading = false;
@@ -1405,7 +1411,7 @@ impl ThreadsPanel {
                         div()
                             .text_size(px(11.))
                             .text_color(muted)
-                            .child("The agent will receive the current AHEAD task, plan, and recent discussion. Return to the parent thread to verify and review its changes."),
+                            .child("The agent will receive the current AHEAD task, plan, and recent discussion. It shares this workspace, so avoid editing the same files at once. Return to the parent thread to verify and review its changes."),
                     ))
                     .child(
                         div().flex_1().min_w_0().max_w(px(420.)).child(

@@ -679,6 +679,14 @@ the app itself.
 
 ## Multiplayer collaboration
 
+- [ ] Finish session code comments in `ahead-app/src/code_panel.rs` and
+      `ahead-app/src/session_panel.rs`: gutter range rails, an inline reading and
+      writing popover, resolution, the session-wide navigator, and clickable
+      chat references are implemented locally. Add diff-hunk anchors,
+      stale-range relocation, explicit attachment to a linked implementation
+      child, review dispositions and live multi-client visibility/permissions.
+      Verify the rendered editor journey; transient teaching presentation notes
+      remain separate.
 - [ ] Build a host-authoritative, cloudless multiplayer session for AHEAD chat,
       code and terminal surfaces. Read and adapt the pinned Zed collaboration
       patterns from `crates/collab/src/rpc.rs`,
@@ -908,16 +916,13 @@ the app itself.
       write. The full `ahead-proxy` library suite passes (182 tests). Still
       exercise the selected managed and installed-agent paths through the
       rebuilt `just dev` app and verify session restore.
-- [ ] Add the implementation handoff described in workflow atlas W17 and §1.2:
-      keep human implementation as the default, let the human start a linked
-      external agent thread with current session context, and return to the
-      parent for verification/review. Persist the relationship through
-      `ahead-rpc/src/ahead.rs` and `ahead-proxy/src/ahead/{host,store}.rs`; show
-      the child indented beneath its parent in
-      `ahead-app/src/{workspace_panels,session_panel}.rs`. Verify context transfer,
-      sidebar nesting after reopen, return with partial changes/evidence, and
-      that child completion leaves parent review pending. Resolve unsaved-buffer
-      and concurrent-edit handling before enabling the handoff.
+- [ ] Finish live verification of the W17 implementation handoff with a
+      launched ACP agent: send a delegated turn and return to the parent with
+      partial changes and review still pending. Child nesting and return
+      navigation survive app restart in a disposable project. The handoff
+      blocks open unsaved buffers, but parent and child still share one
+      checkout; add conflict handling or isolation before supporting
+      simultaneous edits to the same files.
 - [ ] Let each session/thread optionally bind to a Git branch, created from a
       chosen base or selected from existing branches. When a user switches to a
       thread bound to another branch, activate that branch too; leave unbound
@@ -2096,14 +2101,14 @@ the app itself.
       Keep databases, sidecars and personal overrides ignored.
 - [ ] Implement the working-document convention in
       `docs/development/ahead-workflows.md` §9 using the existing session host,
-      store and editor save path: named Markdown artifacts with one canonical
-      path, private/shared separation, revision/hash indexing and external-edit
-      conflict handling. Render from `defaults/artifacts/` with optional tracked
-      `.ahead/templates/` overrides; create only `session.md` initially and split
-      other documents on first meaningful content. Update artifacts during normal
-      work, preview selected publication into `.ahead/sessions/<id>/`, and point
-      agents and UI links at the same canonical files. Retain libSQL for runtime
-      history instead of duplicating editable documents.
+      store and editor save path: topic-named Markdown under the configured
+      `[documentation].root` (default `docs/`), grouped by research, design,
+      plans, verification and reviews rather than session ID. The host now passes
+      the root and kind convention to agent/FIM context, but automatic document
+      creation, canonical document links, revision/hash indexing, external-edit
+      conflict handling, and Settings UI for this configuration remain open.
+      Keep `.ahead/sessions/<id>/` as an explicit session checkpoint, separate
+      from lasting documentation; retain libSQL only for expiring runtime history.
 
 ## Guided investigation, debugger and voice
 
@@ -2148,8 +2153,8 @@ the app itself.
       listings, presentation dispatch, editor acknowledgements and cancellation
       settlement, including a serialized stdio loop regression. They do not
       verify end-to-end ACP stdio startup/discovery for real Pi, Codex or Claude
-      agents, or a rendered frame. Add durable inline code discussion alongside
-      the current transient label/note. Compare the full journey with
+      agents, or a rendered frame. Durable inline discussion is tracked under
+      Multiplayer collaboration. Compare the full journey with
       `docs/development/ahead-workflows.md` §6.
 - [ ] Extend `ahead-app/src/{proxy_client,debug_bar}.rs` and the existing
       `ahead-proxy/src/plugin/dap.rs` route for guided breakpoint setup: retain

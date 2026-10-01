@@ -30,6 +30,7 @@ use gpui_kit::component::message::{
 };
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::progress::ProgressCircle;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
@@ -282,6 +283,10 @@ pub struct SessionPanel {
     pub focus: FocusHandle,
     workspace: std::path::PathBuf,
     pub chat_input: Entity<TextareaState>,
+    code_comments: Vec<ahead_rpc::ahead::CodeComment>,
+    comments_expanded: bool,
+    resolving_comment_id: Option<String>,
+    comment_error: Option<String>,
     pub model_select: Entity<SelectState<Vec<ModelSpec>>>,
     pub selected_model: usize,
     pub models: Vec<ModelSpec>,
@@ -795,6 +800,10 @@ impl SessionPanel {
             focus: cx.focus_handle(),
             workspace,
             chat_input,
+            code_comments: Vec::new(),
+            comments_expanded: false,
+            resolving_comment_id: None,
+            comment_error: None,
             model_select,
             selected_model: 0,
             models: Vec::new(),
@@ -907,6 +916,7 @@ impl SessionPanel {
             .as_ref()
             .and_then(|proxy| proxy.external_agent_id(&session_id));
         self.refresh_conversation(&proxy, &session_id);
+        self.load_code_comments(&proxy, &session_id);
         self.session_id = Some(session_id.clone());
         self
     }
@@ -1191,6 +1201,12 @@ impl SessionPanel {
         self.harness_context_window = None;
         self.harness_warning = state.harness_warning;
         self.session_id = Some(session_id);
+        if let Some(proxy) = self.proxy.clone() {
+            if let Some(session_id) = self.session_id.clone() {
+                self.load_code_comments(&proxy, &session_id);
+                self.sync_editor_comments(cx);
+            }
+        }
         if self.show_commands {
             self.load_skill_catalog(cx);
         }
@@ -1225,6 +1241,8 @@ impl SessionPanel {
                     self.load_skill_catalog(cx);
                 }
                 self.refresh_conversation(&proxy, &session_id);
+                self.load_code_comments(&proxy, &session_id);
+                self.sync_editor_comments(cx);
                 self.sync_conversation_scroller(false, cx);
                 self.status = "Shared session attached".into();
                 self.prepare_external_session(cx);
@@ -1250,6 +1268,9 @@ impl SessionPanel {
         self.phase_id = "plan".to_string();
         self.work_items.clear();
         self.conversation.clear();
+        self.code_comments.clear();
+        self.comment_error = None;
+        self.sync_editor_comments(cx);
         self.conversation_has_older = false;
         self.loading_older_messages = false;
         self.plan_entries.clear();
@@ -1274,11 +1295,19 @@ impl SessionPanel {
         self
     }
 
+    pub(crate) fn code_comments_snapshot(
+        &self,
+    ) -> Vec<ahead_rpc::ahead::CodeComment> {
+        self.code_comments.clone()
+    }
+
     pub fn set_buffers(
         &mut self,
         buffers: Vec<Entity<crate::code_panel::CodePanel>>,
+        cx: &mut Context<Self>,
     ) {
         self.buffers = buffers;
+        self.sync_editor_comments(cx);
     }
 
     pub fn with_harness_kind(
@@ -2270,6 +2299,147 @@ impl SessionPanel {
         }
     }
 
+    fn load_code_comments(
+        &mut self,
+        proxy: &std::sync::Arc<crate::proxy_client::ProxyClient>,
+        session_id: &str,
+    ) {
+        match proxy.code_comments(session_id) {
+            Ok(comments) => {
+                self.code_comments = comments;
+                self.comment_error = None;
+            }
+            Err(error) => {
+                self.code_comments.clear();
+                self.comment_error = Some(error.message);
+            }
+        }
+    }
+
+    fn refresh_code_comments(&mut self, cx: &mut Context<Self>) {
+        if let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        {
+            self.load_code_comments(&proxy, &session_id);
+            self.sync_editor_comments(cx);
+            cx.notify();
+        }
+    }
+
+    fn sync_editor_comments(&self, cx: &mut Context<Self>) {
+        for code in &self.buffers {
+            code.update(cx, |code, cx| {
+                code.set_code_comments(
+                    self.session_id.clone(),
+                    self.code_comments.clone(),
+                    cx,
+                );
+            });
+        }
+    }
+
+    pub(crate) fn upsert_code_comment_from_editor(
+        &mut self,
+        comment: ahead_rpc::ahead::CodeComment,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_id.as_deref() != Some(&comment.session_id) {
+            return;
+        }
+        if let Some(existing) = self
+            .code_comments
+            .iter_mut()
+            .find(|existing| existing.id == comment.id)
+        {
+            *existing = comment;
+        } else {
+            self.code_comments.push(comment);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn reference_code_comment(
+        &mut self,
+        comment: &ahead_rpc::ahead::CodeComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prior = self.chat_input.read(cx).value().to_string();
+        let separator = if prior.trim().is_empty() { "" } else { "\n\n" };
+        let reference = format!(
+            "Code comment [[comment:{}]] on {}:{}\n> {}\n{}",
+            comment.id,
+            comment.path,
+            comment.range.start.line + 1,
+            comment.quote.trim().replace('\n', "\n> "),
+            comment.body,
+        );
+        self.chat_input.update(cx, |input, cx| {
+            input.set_value(format!("{prior}{separator}{reference}"), window, cx)
+        });
+        self.chat_input.focus_handle(cx).focus(window, cx);
+        self.status = "Code comment referenced in composer".into();
+        cx.notify();
+    }
+
+    fn resolve_code_comment(
+        &mut self,
+        comment_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        if self.resolving_comment_id.is_some() {
+            return;
+        }
+        self.resolving_comment_id = Some(comment_id.clone());
+        self.comment_error = None;
+        cx.spawn_in(window, async move |this, cx| {
+            let request_session_id = session_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    proxy.resolve_code_comment(&session_id, &comment_id)
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                if panel.session_id.as_deref() != Some(&request_session_id) {
+                    return;
+                }
+                panel.resolving_comment_id = None;
+                match result {
+                    Ok(comment) => {
+                        panel.upsert_code_comment_from_editor(comment, cx);
+                        panel.sync_editor_comments(cx);
+                    }
+                    Err(error) => panel.comment_error = Some(error.message),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_code_comment(
+        &mut self,
+        comment: &ahead_rpc::ahead::CodeComment,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shell) = self.shell.clone() else {
+            return;
+        };
+        if let Err(error) = shell.update(cx, |shell, cx| {
+            shell.open_code_comment(comment, cx);
+        }) {
+            self.status = format!("Could not open code comment: {error}").into();
+        }
+    }
+
     fn quote_message(
         &mut self,
         content: &str,
@@ -2890,6 +3060,7 @@ impl Render for SessionPanel {
         let bg_color = cx.theme().background;
         let card_bg = cx.theme().group_box;
         let can_handoff = self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
+            && self.phase_id == "implement"
             && self.session.active.as_ref().is_some_and(|view| {
                 view.task.intent == ahead_rpc::ahead::TaskIntent::Assistance
             });
@@ -2965,6 +3136,7 @@ impl Render for SessionPanel {
             format!("{agent_label} side thread")
         };
         let conversation = std::rc::Rc::new(self.conversation.clone());
+        let code_comments = std::rc::Rc::new(self.code_comments.clone());
         let has_older_messages = self.conversation_has_older;
         let loading_older_messages = self.loading_older_messages;
         let pending_user_input = self.pending_user_input.clone();
@@ -3439,6 +3611,13 @@ impl Render for SessionPanel {
                         agent_label_for_messages.clone()
                     };
                     let content = message.content.clone();
+                    let linked_comments: Vec<_> = code_comments.iter()
+                        .filter(|comment| content.contains(&format!("[[comment:{}]]", comment.id)))
+                        .cloned()
+                        .collect();
+                    let display_content = linked_comments.iter().fold(content.clone(), |text, comment| {
+                        text.replace(&format!("[[comment:{}]]", comment.id), "")
+                    });
                     let quoted_content = content.clone();
                     let reviewed_memory = memory_review.clone().filter(|review| {
                         !is_human
@@ -3476,12 +3655,25 @@ impl Render for SessionPanel {
                                         .child(
                                             div()
                                                 .text_size(px(13.))
-                                                .child(content.clone()),
+                                                .child(display_content.clone()),
                                         ),
                                 ),
                             )
                             .footer(MessageFooter::new().child(
-                                Clipboard::new(clipboard_id.clone()).value(content),
+                                h_flex().gap_2()
+                                    .child(Clipboard::new(clipboard_id.clone()).value(content))
+                                    .children(linked_comments.iter().map(|comment| {
+                                        let comment = comment.clone();
+                                        let label = format!("{}:{}", comment.path, comment.range.start.line + 1);
+                                        Button::new(SharedString::from(format!("chat-comment-{}-{message_id}", comment.id)))
+                                            .ghost()
+                                            .icon(IconName::MessageSquare)
+                                            .label(label)
+                                            .tooltip("Open referenced code comment")
+                                            .on_click(window.listener_for(&session_panel, move |this, _, _, cx| {
+                                                this.open_code_comment(&comment, cx);
+                                            }))
+                                    })),
                             ))
                     } else {
                         let agent_content = if is_streaming
@@ -3519,7 +3711,7 @@ impl Render for SessionPanel {
                                         .text_size(px(13.))
                                         .line_height(px(20.))
                                         .text_color(text_color)
-                                        .child(render_agent_markdown(&message_id, &content))
+                                        .child(render_agent_markdown(&message_id, &display_content))
                                         .into_any_element()
                                 }
                             };
@@ -3545,6 +3737,18 @@ impl Render for SessionPanel {
                                     h_flex()
                                         .gap_2()
                                         .child(Clipboard::new(clipboard_id).value(content))
+                                        .children(linked_comments.iter().map(|comment| {
+                                            let comment = comment.clone();
+                                            let label = format!("{}:{}", comment.path, comment.range.start.line + 1);
+                                            Button::new(SharedString::from(format!("chat-comment-{}-{message_id}", comment.id)))
+                                                .ghost()
+                                                .icon(IconName::MessageSquare)
+                                                .label(label)
+                                                .tooltip("Open referenced code comment")
+                                                .on_click(window.listener_for(&session_panel, move |this, _, _, cx| {
+                                                    this.open_code_comment(&comment, cx);
+                                                }))
+                                        }))
                                         .when(retryable, |footer| {
                                             footer.child(
                                                 Button::new(SharedString::from(format!(
@@ -3754,6 +3958,17 @@ impl Render for SessionPanel {
                                         this.export_checkpoint(cx)
                                     })),
                             )
+                            .child(
+                                Button::new("code_comments_toggle")
+                                    .icon(IconName::MessageSquare)
+                                    .label(format!("Comments ({})", self.code_comments.iter().filter(|comment| comment.resolved_at.is_none()).count()))
+                                    .tooltip("Show or hide this session's code comments")
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.comments_expanded = !this.comments_expanded;
+                                        if this.comments_expanded { this.refresh_code_comments(cx); }
+                                        cx.notify();
+                                    })),
+                            )
                             .when(can_handoff, |actions| actions.child(
                                 Button::new("handoff_implementation")
                                     .icon(IconName::ArrowRight)
@@ -3817,6 +4032,97 @@ impl Render for SessionPanel {
                         })
                     }))
             )
+            .when(chat_available && self.comments_expanded, |panel| panel.child(
+                v_flex()
+                    .mx_3()
+                    .mt_2()
+                    .p_2()
+                    .gap_2()
+                    .min_w_0()
+                    .max_h(px(280.))
+                    .overflow_y_scrollbar()
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(border_color)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child(IconName::MessageSquare)
+                            .child("Code comments")
+                            .child(
+                                Button::new("refresh_code_comments")
+                                    .ghost()
+                                    .icon(IconName::RefreshCw)
+                                    .tooltip("Refresh comments from collaborators")
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.refresh_code_comments(cx)))
+                            )
+                    )
+                    .when_some(self.comment_error.clone(), |card, error| card.child(
+                        div().text_size(px(11.)).text_color(cx.theme().danger).child(error)
+                    ))
+                    .when(self.code_comments.iter().all(|comment| comment.resolved_at.is_some()), |card| card.child(
+                        div().text_size(px(11.)).text_color(muted)
+                            .child("No open comments. Select code in the editor and choose Comment on selection.")
+                    ))
+                    .children(self.code_comments.iter().rev().filter(|comment| comment.resolved_at.is_none()).map(|comment| {
+                        let open_comment = comment.clone();
+                        let reference_comment = comment.clone();
+                        let resolve_id = comment.id.clone();
+                        let id = comment.id.clone();
+                        v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .p_2()
+                            .border_l_2()
+                            .border_color(cx.theme().border)
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(SharedString::from(format!("open-comment-{id}")))
+                                            .ghost()
+                                            .icon(IconName::FileCode)
+                                            .label(format!("{}:{}", comment.path, comment.range.start.line + 1))
+                                            .tooltip("Open the commented code range")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_code_comment(&open_comment, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("reference-comment-{id}")))
+                                            .ghost()
+                                            .icon(IconName::MessageSquare)
+                                            .label("Reference")
+                                            .tooltip("Insert this code comment into chat")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.reference_code_comment(&reference_comment, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("resolve-comment-{id}")))
+                                            .ghost()
+                                            .icon(IconName::MessageSquareCheck)
+                                            .label("Resolve")
+                                            .tooltip("Resolve this code comment")
+                                            .disabled(self.resolving_comment_id.is_some())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.resolve_code_comment(resolve_id.clone(), window, cx);
+                                            })),
+                                    ),
+                            )
+                            .child(div().text_size(px(11.)).text_color(muted).child(format!(
+                                "{} · source {}",
+                                comment.actor_id,
+                                comment.source_sha256.chars().take(8).collect::<String>(),
+                            )))
+                            .child(div().text_size(px(12.)).child(comment.body.clone()))
+                    }))
+            ))
             // Virtualized Conversation Message Stream
             .when(chat_available, |panel| panel.child(
                 v_flex()

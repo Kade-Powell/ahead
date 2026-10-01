@@ -7,7 +7,7 @@
 
 use ahead_agent::{InstructionFileSource, LegacyNativeThreadImport};
 use ahead_rpc::ahead::{
-    AgentRuntimeState, ApprovalRecord, CodeAnchor, ConversationMessage,
+    AgentRuntimeState, ApprovalRecord, CodeAnchor, CodeComment, ConversationMessage,
     ConversationMessageCursor, ConversationMessagePage, ConversationSummary,
     DisplayPosition, DisplayRange, GithubIssueRef, Id, LearningArc, LearningRecord,
     Participant, Revision, SessionLifecycle, SessionListItem,
@@ -1138,6 +1138,7 @@ impl SessionStore {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionListItem>> {
+        self.purge_expired_archives()?;
         self.block_on(async {
             let mut rows = self
                 .conn
@@ -1208,7 +1209,152 @@ impl SessionStore {
         if changed == 0 && self.get_session(session_id)?.is_none() {
             bail!("Session not found: {session_id}");
         }
+        self.purge_expired_archives()?;
         Ok(())
+    }
+
+    fn purge_expired_archives(&self) -> Result<()> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        self.block_on(async {
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut rows = transaction.query(
+                "SELECT session_id FROM archived_sessions WHERE archived_at <= ?1",
+                params![cutoff.clone()],
+            ).await?;
+            let mut expired = Vec::new();
+            while let Some(row) = rows.next().await? {
+                expired.push(row.get::<String>(0)?);
+            }
+            drop(rows);
+            let mut rows = transaction.query(
+                "SELECT thread_id FROM agent_runtime_threads WHERE archived = 1 AND archived_at <= ?1",
+                params![cutoff],
+            ).await?;
+            let mut expired_threads = Vec::new();
+            while let Some(row) = rows.next().await? {
+                expired_threads.push(row.get::<String>(0)?);
+            }
+            drop(rows);
+            if expired.is_empty() && expired_threads.is_empty() {
+                transaction.rollback().await?;
+                return Ok(());
+            }
+            for thread_id in expired_threads {
+                for statement in [
+                    "DELETE FROM agent_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+                    "DELETE FROM agent_runtime_thread_items WHERE thread_id = ?1",
+                    "DELETE FROM agent_runtime_thread_metadata WHERE thread_id = ?1",
+                    "DELETE FROM agent_runtime_threads WHERE thread_id = ?1",
+                ] {
+                    transaction.execute(statement, params![thread_id.clone()]).await?;
+                }
+            }
+            for session_id in expired {
+                for statement in [
+                    "DELETE FROM agent_spawn_edges WHERE child_thread_id IN (SELECT thread_id FROM agent_runtime_threads WHERE session_id = ?1) OR parent_thread_id IN (SELECT thread_id FROM agent_runtime_threads WHERE session_id = ?1)",
+                    "DELETE FROM agent_runtime_thread_items WHERE thread_id IN (SELECT thread_id FROM agent_runtime_threads WHERE session_id = ?1)",
+                    "DELETE FROM agent_runtime_thread_metadata WHERE thread_id IN (SELECT thread_id FROM agent_runtime_threads WHERE session_id = ?1)",
+                    "DELETE FROM agent_runtime_threads WHERE session_id = ?1",
+                    "DELETE FROM learning_records WHERE arc_id IN (SELECT learning_arcs.id FROM learning_arcs JOIN session_tasks ON session_tasks.id = learning_arcs.task_id WHERE session_tasks.session_id = ?1)",
+                    "DELETE FROM learning_arcs WHERE task_id IN (SELECT id FROM session_tasks WHERE session_id = ?1)",
+                    "DELETE FROM work_item_events WHERE session_id = ?1",
+                    "DELETE FROM work_item_closeouts WHERE session_id = ?1",
+                    "DELETE FROM work_items WHERE session_id = ?1",
+                    "DELETE FROM session_events WHERE session_id = ?1",
+                    "DELETE FROM anchors WHERE session_id = ?1",
+                    "DELETE FROM conversation_summaries WHERE session_id = ?1",
+                    "DELETE FROM conversation_messages WHERE session_id = ?1",
+                    "DELETE FROM harness_runtime_state WHERE session_id = ?1",
+                    "DELETE FROM harness_bindings WHERE session_id = ?1",
+                    "DELETE FROM harness_turn_requests WHERE session_id = ?1",
+                    "DELETE FROM turn_instruction_sources WHERE session_id = ?1",
+                    "DELETE FROM participants WHERE session_id = ?1",
+                    "DELETE FROM workflow_state WHERE session_id = ?1",
+                    "DELETE FROM session_tasks WHERE session_id = ?1",
+                    "DELETE FROM archived_sessions WHERE session_id = ?1",
+                    "DELETE FROM sessions WHERE id = ?1",
+                ] {
+                    transaction.execute(statement, params![session_id.clone()]).await?;
+                }
+            }
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_code_comment(&self, comment: &CodeComment) -> Result<()> {
+        let payload = serde_json::to_string(comment)?;
+        self.block_on(async {
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut rows = transaction.query(
+                "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id = ?1",
+                params![comment.session_id.clone()],
+            ).await?;
+            let sequence: i64 = rows.next().await?.context("Missing event sequence")?.get(0)?;
+            drop(rows);
+            transaction.execute(
+                "INSERT INTO session_events
+                 (id, session_id, sequence, request_id, event_type, payload_json, actor_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'code_comment', ?5, ?6, ?7)",
+                params![
+                    comment.id.clone(), comment.session_id.clone(), sequence + 1,
+                    comment.id.clone(), payload, comment.actor_id.clone(),
+                    comment.created_at.clone(),
+                ],
+            ).await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    pub fn list_code_comments(&self, session_id: &str) -> Result<Vec<CodeComment>> {
+        self.purge_expired_archives()?;
+        self.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT payload_json FROM session_events
+                 WHERE session_id = ?1 AND event_type = 'code_comment'
+                 ORDER BY sequence",
+                    params![session_id],
+                )
+                .await?;
+            let mut comments = Vec::new();
+            while let Some(row) = rows.next().await? {
+                comments.push(serde_json::from_str(&row.get::<String>(0)?)?);
+            }
+            Ok(comments)
+        })
+    }
+
+    pub fn resolve_code_comment(
+        &self,
+        session_id: &str,
+        comment_id: &str,
+        actor_id: &str,
+    ) -> Result<CodeComment> {
+        let mut comment = self
+            .list_code_comments(session_id)?
+            .into_iter()
+            .find(|comment| comment.id == comment_id)
+            .context("Code comment not found in session")?;
+        if comment.resolved_at.is_some() {
+            return Ok(comment);
+        }
+        comment.resolved_at = Some(chrono::Utc::now().to_rfc3339());
+        comment.resolved_by = Some(actor_id.to_string());
+        let payload = serde_json::to_string(&comment)?;
+        let changed = self.block_on(self.conn.execute(
+            "UPDATE session_events SET payload_json = ?1
+             WHERE id = ?2 AND session_id = ?3 AND event_type = 'code_comment'",
+            params![payload, comment_id, session_id],
+        ))?;
+        anyhow::ensure!(changed == 1, "Code comment disappeared while resolving");
+        Ok(comment)
     }
 
     pub fn insert_session(&mut self, view: &SessionView) -> Result<()> {
@@ -3080,6 +3226,7 @@ impl SessionStore {
     pub fn list_native_thread_headers(
         &self,
     ) -> Result<Vec<ahead_agent::NativeThreadHeader>> {
+        self.purge_expired_archives()?;
         self.block_on(async {
             let mut rows = self
                 .conn
@@ -3152,6 +3299,7 @@ impl SessionStore {
         &self,
         request: &ahead_agent::NativeThreadHeaderPageRequest,
     ) -> Result<Option<Vec<ahead_agent::NativeThreadHeader>>> {
+        self.purge_expired_archives()?;
         anyhow::ensure!(
             request.limit > 0,
             "native thread page limit must be positive"
@@ -4711,6 +4859,15 @@ mod tests {
                 .len(),
             1
         );
+        let expired = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        store.block_on(store.conn.execute(
+            "UPDATE agent_runtime_threads SET archived_at = ?1 WHERE thread_id = 'second'",
+            params![expired],
+        ))?;
+        let headers = store.list_native_thread_headers()?;
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].thread_id, "first");
+        assert!(store.load_native_thread("second")?.is_none());
         Ok(())
     }
 
@@ -7112,10 +7269,52 @@ mod tests {
         assert_eq!(listed[0].title, "Investigate parser crash");
         assert_eq!(listed[0].updated_at, "2026-09-20T12:00:00Z");
         assert_eq!(listed[0].backend.as_deref(), Some("external-agent:pi-acp"));
+        let comment = CodeComment {
+            id: "comment-turso-newer".into(),
+            session_id: newer.session.id.clone(),
+            actor_id: "dev-42".into(),
+            path: "src/parser.rs".into(),
+            range: DisplayRange {
+                start: DisplayPosition { line: 1, col: 0 },
+                end: DisplayPosition { line: 1, col: 3 },
+            },
+            quote: "let".into(),
+            source_sha256: "a".repeat(64),
+            body: "Keep this branch readable".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            resolved_at: None,
+            resolved_by: None,
+        };
+        store.insert_code_comment(&comment)?;
+        assert_eq!(
+            store.list_code_comments(&newer.session.id)?,
+            vec![comment.clone()]
+        );
+        let resolved =
+            store.resolve_code_comment(&newer.session.id, &comment.id, "dev-42")?;
+        assert!(resolved.resolved_at.is_some());
+        assert_eq!(resolved.resolved_by.as_deref(), Some("dev-42"));
+        assert_eq!(
+            store.list_code_comments(&newer.session.id)?,
+            vec![resolved.clone()]
+        );
+        assert_eq!(
+            store.resolve_code_comment(&newer.session.id, &comment.id, "other")?,
+            resolved
+        );
         store.archive_session(&newer.session.id)?;
         store.archive_session("sess-turso-1")?;
         assert!(store.list_sessions()?.is_empty());
         assert!(store.work_item_session(&item_a.id)?.is_none());
+        assert!(store.get_session("sess-turso-1")?.is_some());
+        let expired = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        store.block_on(store.conn.execute(
+            "UPDATE archived_sessions SET archived_at = ?1 WHERE session_id = ?2",
+            params![expired, newer.session.id.clone()],
+        ))?;
+        store.list_sessions()?;
+        assert!(store.get_session(&newer.session.id)?.is_none());
+        assert!(store.list_code_comments(&newer.session.id)?.is_empty());
         assert!(store.get_session("sess-turso-1")?.is_some());
 
         Ok(())
