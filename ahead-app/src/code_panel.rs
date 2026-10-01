@@ -2506,6 +2506,9 @@ impl Render for CodePanel {
         let inline_blame_position = self
             .inline_blame_position
             .filter(|(line, _, _)| *line == self.active_line);
+        let inline_blame_top = (gutter_top
+            + line_height * self.active_line.saturating_sub(1) as f32)
+            .as_f32();
         let hover_text = self.hover_text.clone();
         v_flex()
             .size_full()
@@ -3214,11 +3217,11 @@ impl Render for CodePanel {
                                     .inset_0(),
                                 )
                             })
-                            .when_some(inline_blame_position.zip(inline_blame_text), |el, ((_, left, top), label)| {
+                            .when_some(inline_blame_position.zip(inline_blame_text), |el, ((_, left, _), label)| {
                                 el.child(
                                     h_flex()
                                         .absolute()
-                                        .top(px(top))
+                                        .top(px(inline_blame_top))
                                         .left(px(left + 28.))
                                         .items_center()
                                         .gap_1()
