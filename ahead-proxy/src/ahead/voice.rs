@@ -6,16 +6,16 @@
 //! Implements strict barge-in generation tracking and separates speech interruption
 //! from task cancellation.
 
+use ahead_rpc::ahead::{Id, VoiceControl};
+use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
-use parking_lot::Mutex;
-use ahead_rpc::ahead::{Id, VoiceControl};
 
 #[derive(Debug, Clone)]
 pub struct QueuedAudioFrame {

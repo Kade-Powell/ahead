@@ -1,8 +1,12 @@
 # AHEAD agent skills
 
-Status: accepted product/architecture direction, implementation pending. The
-skill specifications exist under `ahead-harness/skills/`; runtime discovery,
-loading and host integration remain tracked in `TODO.md`.
+Status: project `AGENTS.md` loading from root through turn cwd and Agent Skills
+discovery are implemented in source, with focused library, native-reader, RPC
+and headless composer tests passing. Built-in AHEAD skill packages live under
+`ahead-agent/skills/`; project and user skills resolve from `.agents/skills/`
+and `~/.agents/skills/`. Live managed-turn loading, persisted skill provenance,
+target-scoped instruction discovery and rendered end-to-end behavior remain
+open; see `TODO.md`.
 
 This is the canonical overview of AHEAD's built-in and workspace skill model.
 Individual `SKILL.md` files contain the detailed procedure for one skill.
@@ -62,7 +66,7 @@ the debugging policy.
 
 ## 3. Built-in AHEAD skills
 
-These are shipped under `ahead-harness/skills/` and are AHEAD-owned versions:
+These are shipped under `ahead-agent/skills/` and are AHEAD-owned versions:
 
 | Skill | Role | Activation |
 |---|---|---|
@@ -104,32 +108,64 @@ host authorization. A skill cannot weaken AHEAD rules by giving the model a
 different instruction, tool name or apparent approval.
 
 See the shared policy in
-[`ahead-harness/skills/references/human-led-policy.md`](../../ahead-harness/skills/references/human-led-policy.md).
+[`ahead-agent/skills/references/human-led-policy.md`](../../ahead-agent/skills/references/human-led-policy.md).
 
 ## 5. Workspace instructions and skill discovery
 
-Before selecting skills or taking task actions, the agent reads applicable
-`AGENTS.md` files:
-
-1. workspace/project root;
-2. each more-specific ancestor directory of files being inspected or changed;
-3. explicitly configured user instruction roots, if present.
+Managed chats load project `AGENTS.md` files from the discovered workspace root
+through the turn's working directory. Structured editor and attached-file
+targets add applicable nested `AGENTS.md` files along those target paths. No
+AHEAD-specific or user-global instruction file is required. External ACP
+agents remain responsible for their own instruction discovery.
 
 For a task spanning multiple directories, AHEAD assembles the applicable
 instruction set for each tree and surfaces conflicts. More-specific instructions
 add detail to broader instructions unless they conflict with a higher-priority
 rule.
 
-In addition to built-ins, discover workspace-local `SKILL.md` files from:
+In addition to built-ins, discover workspace-local `SKILL.md` files from
+`.agents/skills/` and user skills from `~/.agents/skills/`. The Agent Skills
+format defines package contents, not discovery roots; its client guide
+recommends these paths as cross-client conventions. AHEAD does not also scan
+`.agent/skills/` or `.skills/` by default.
 
-1. `.agents/skills/`;
-2. `.agent/skills/`;
-3. `.skills/`;
-4. explicitly configured user skill roots.
+Keep same-named skills from different sources separately discoverable; the
+composer labels their source and uses a source-qualified slash command to
+preserve the human's choice. An unqualified name is activated only when it is
+unique. This duplicate-selection and slash-command behavior belongs to AHEAD's
+UI contract; the Agent Skills format does not define activation syntax or
+collision handling.
+
+AHEAD dogfoods this contract. Runtime-maintenance procedures adapted from the
+Codex CLI live beside the other project skills under `.agents/skills/`, use an
+`ahead-agent-` prefix, and are selected by the scoped `AGENTS.md`. They are not
+part of the built-in AHEAD skill bundle.
 
 Only skill metadata is read during discovery. Bodies and resources load after
 selection or host activation. Do not recursively scan arbitrary directories,
 install skills automatically or fetch skill content from the network.
+
+The host-resource contract keeps handles opaque and source-qualified; they never
+contain absolute skill paths. A selected host skill carries a
+`<resource_access>` locator in turn context. AHEAD's native `skill_resource_read`
+tool accepts that package handle and either the main resource or a
+package-relative resource such as `<package>/references/guide.md`. The host
+snapshot boundary rejects unknown or disabled skills, and the retained filesystem
+boundary rejects absolute paths, parent traversal, Windows-separator aliases,
+and resources whose canonical target leaves the skill directory. Resource
+contents are bounded and returned in cursor-checked UTF-8 pages.
+This follows Zed's global-skill read boundary in
+`../zed/crates/agent/src/tools/read_file_tool.rs::read_global_skill_file`, while
+keeping AHEAD's source-qualified package handle opaque instead of sending an
+absolute user-home path to the model.
+
+The copied generic Codex skills catalog/provider, extension installer, and
+`skills.list`/`skills.read` adapters have been pruned. `ThreadManager::new_for_ahead`
+also uses `empty_extension_registry()`. AHEAD exposes its own direct dynamic
+reader through `HostSkillsSnapshot::read_package_resource`. Package-resource
+containment and native UTF-8 paging/stale-cursor regressions passed on
+2026-09-28; live managed-turn nested-reference verification remains open. See
+`TODO.md` for the remaining gates.
 
 `AGENTS.md` and workspace skills provide extra instructions, not capability
 grants. AHEAD's host policy and explicit human scope always win.
@@ -178,19 +214,27 @@ update a tracker. A human decides what to fix, accept as risk, defer or publish.
 
 ## 8. Implementation status
 
-Specified now:
+Implemented in source; the following focused regressions passed on 2026-09-28
+(see `TODO.md` for command-level evidence):
 
-- AHEAD-owned skill files and shared human-led policy;
-- task-local skill contracts and provenance fields;
-- workspace skill and `AGENTS.md` discovery rules;
-- teaching, diagnosis, research, design, triage, prototype and review policy;
-- end-of-session automated review behavior.
+- AHEAD-owned skill specifications under `ahead-agent/skills/`, separate from
+  repository-maintenance skills under `.agents/skills/`;
+- project-root `.agents/skills/` and user `~/.agents/skills/` resolution;
+- source-qualified selection for same-named project and user skills, including
+  duplicate-name handling in the native resolver;
+- `skill_resource_read` through the host snapshot, including resource
+  containment and bounded UTF-8 paging with cursor validation;
+- Agent Skills package validation, project-source RPC privacy, and headless
+  slash-palette filtering and selection.
 
-Not yet demonstrated as live product behavior:
+Still incomplete or not demonstrated as live product behavior:
 
-- runtime discovery and metadata registry;
-- progressive body/reference loading;
-- instruction hash capture and conflict UI;
+- a live managed-turn demonstration of selected-body and nested-reference
+  loading, plus rendered invalid-package diagnostics;
+- selected-skill revision/provenance persistence and complete skill/instruction
+  conflict handling;
+- applicable instruction path/hash capture, target-directory reload, and
+  conflict presentation;
 - skill selection events and task routing;
 - immutable end-of-session review activation;
 - rendered teaching, debugging and review journeys.

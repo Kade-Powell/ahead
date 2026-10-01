@@ -1,0 +1,32 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "ahead-agent-skills"
+version.workspace = true
+
+[lib]
+name = "ahead_agent_skills"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+codex-analytics = { workspace = true }
+codex-config = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-extension-api = { workspace = true }
+codex-protocol = { workspace = true }
+codex-skills = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dunce = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

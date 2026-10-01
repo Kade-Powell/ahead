@@ -6,10 +6,9 @@ use std::{
     process::{self, Child, Command, Stdio},
     sync::Arc,
     thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow};
-use jsonrpc_lite::{Id, Params};
 use ahead_core::meta;
 use ahead_rpc::{
     RpcError,
@@ -17,13 +16,15 @@ use ahead_rpc::{
     plugin::{PluginId, ServerId},
     style::LineStyle,
 };
-use ropey::Rope;
+use anyhow::{Result, anyhow};
+use jsonrpc_lite::{Id, Params};
 use lsp_types::{
     notification::{Initialized, Notification},
     request::{Initialize, Request},
     *,
 };
 use parking_lot::Mutex;
+use ropey::Rope;
 use serde_json::Value;
 
 use super::{
@@ -31,7 +32,7 @@ use super::{
     psp::{
         PluginHandlerNotification, PluginHostHandler, PluginServerHandler,
         PluginServerRpcHandler, ResponseSender, RpcCallback,
-        handle_plugin_server_message,
+        SERVER_SHUTDOWN_TIMEOUT, handle_plugin_server_message,
     },
 };
 use crate::{buffer::Buffer, plugin::PluginCatalogRpcHandler};
@@ -61,7 +62,7 @@ pub enum LspRpc {
 
 pub struct LspClient {
     server_rpc: PluginServerRpcHandler,
-    process: Child,
+    process: Arc<Mutex<Child>>,
     workspace: Option<PathBuf>,
     host: PluginHostHandler,
     options: Option<Value>,
@@ -90,7 +91,7 @@ impl PluginServerHandler for LspClient {
                 self.initialize();
             }
             InitializeResult(result) => {
-                self.host.server_capabilities = result.capabilities;
+                self.host.initialized(result);
             }
             Shutdown => {
                 self.shutdown();
@@ -180,7 +181,9 @@ impl LspClient {
         pwd: Option<PathBuf>,
         server_uri: Url,
         args: Vec<String>,
+        env: Vec<(String, String)>,
         options: Option<Value>,
+        workspace_configuration: Option<Value>,
     ) -> Result<Self> {
         let server = match server_uri.scheme() {
             "file" => {
@@ -199,36 +202,32 @@ impl LspClient {
             _ => return Err(anyhow!("uri not supported")),
         };
 
-        let mut process = Self::process(workspace.as_ref(), &server, &args)?;
+        let mut process = Self::process(workspace.as_ref(), &server, &args, &env)?;
         let stdin = process.stdin.take().unwrap();
         let stdout = process.stdout.take().unwrap();
         let stderr = process.stderr.take().unwrap();
 
         let mut writer = Box::new(BufWriter::new(stdin));
         let (io_tx, io_rx) = crossbeam_channel::unbounded();
-        let server_rpc = PluginServerRpcHandler::new(
-            server_id.clone(),
-            plugin_id,
-            io_tx.clone(),
-        );
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), plugin_id, io_tx.clone());
+        let writer_rpc = server_rpc.clone();
         thread::spawn(move || {
             for msg in io_rx {
-                if msg
-                    .get_method()
-                    .map(|x| x == lsp_types::request::Shutdown::METHOD)
-                    .unwrap_or_default()
-                {
+                let Some(msg) = msg else {
                     break;
-                }
+                };
                 if let Ok(msg) = serde_json::to_string(&msg) {
                     tracing::debug!("write to lsp: {}", msg);
                     let msg =
                         format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
-                    if let Err(err) = writer.write(msg.as_bytes()) {
+                    if let Err(err) = writer
+                        .write_all(msg.as_bytes())
+                        .and_then(|()| writer.flush())
+                    {
                         tracing::error!("{:?}", err);
-                    }
-                    if let Err(err) = writer.flush() {
-                        tracing::error!("{:?}", err);
+                        writer_rpc.shutdown();
+                        break;
                     }
                 }
             }
@@ -251,15 +250,16 @@ impl LspClient {
                             &message_str,
                             &name,
                         ) {
-                            if let Err(err) = io_tx.send(resp) {
+                            if let Err(err) = io_tx.send(Some(resp)) {
                                 tracing::error!("{:?}", err);
                             }
                         }
                     }
-                    Err(_err) => {
+                    Err(error) => {
+                        local_server_rpc.shutdown();
                         core_rpc.log(
                             ahead_rpc::core::LogLevel::Error,
-                            format!("lsp server {server} stopped!"),
+                            format!("lsp server {server} stopped: {error}"),
                             Some(format!(
                                 "ahead_proxy::plugin::lsp::{}::{}::stopped",
                                 server_id_closure.author, server_id_closure.name
@@ -298,6 +298,39 @@ impl LspClient {
             }
         });
 
+        let process = Arc::new(Mutex::new(process));
+        let monitored_process = process.clone();
+        let monitored_rpc = server_rpc.clone();
+        let catalog_rpc = plugin_rpc.clone();
+        thread::spawn(move || {
+            loop {
+                monitored_rpc.expire_requests(Instant::now());
+                let exit = monitored_process.lock().try_wait();
+                let message = match exit {
+                    Ok(Some(status)) => format!(
+                        "Language server exited ({status}). Restart language servers to reconnect."
+                    ),
+                    Ok(None) => {
+                        thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(error) => {
+                        format!("Could not inspect language server process: {error}")
+                    }
+                };
+                monitored_rpc.shutdown();
+                if let Err(error) = catalog_rpc.catalog_notification(
+                    super::PluginCatalogNotification::LanguageServerStopped {
+                        plugin_id: monitored_rpc.plugin_id,
+                        message,
+                    },
+                ) {
+                    tracing::error!(?error, "reporting language server exit");
+                }
+                break;
+            }
+        });
+
         let host = PluginHostHandler::new(
             workspace.clone(),
             pwd,
@@ -307,6 +340,7 @@ impl LspClient {
             plugin_rpc.core_rpc.clone(),
             server_rpc.clone(),
             plugin_rpc.clone(),
+            workspace_configuration,
         );
 
         Ok(Self {
@@ -329,7 +363,9 @@ impl LspClient {
         pwd: Option<PathBuf>,
         server_uri: Url,
         args: Vec<String>,
+        env: Vec<(String, String)>,
         options: Option<Value>,
+        workspace_configuration: Option<Value>,
     ) -> Result<(PluginId, PluginServerRpcHandler)> {
         let mut lsp = Self::new(
             plugin_rpc,
@@ -341,7 +377,9 @@ impl LspClient {
             pwd,
             server_uri,
             args,
+            env,
             options,
+            workspace_configuration,
         )?;
         let plugin_id = lsp.server_rpc.plugin_id;
 
@@ -380,17 +418,16 @@ impl LspClient {
             root_path: None,
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        match self.server_rpc.server_request(
-            Initialize::METHOD,
-            params,
-            None,
-            None,
-            false,
-        ) {
-            Ok(value) => {
-                let result: InitializeResult =
-                    serde_json::from_value(value).unwrap();
-                self.host.server_capabilities = result.capabilities;
+        let result = self
+            .server_rpc
+            .server_request(Initialize::METHOD, params, None, None, false)
+            .map_err(|error| error.message)
+            .and_then(|value| {
+                serde_json::from_value::<InitializeResult>(value)
+                    .map_err(|error| format!("Invalid initialize response: {error}"))
+            });
+        match result {
+            Ok(result) => {
                 self.server_rpc.server_notification(
                     Initialized::METHOD,
                     InitializedParams {},
@@ -398,18 +435,35 @@ impl LspClient {
                     None,
                     false,
                 );
+                self.host.initialized(result);
             }
-            Err(err) => {
-                tracing::error!("{:?}", err);
+            Err(error) => {
+                self.host.initialization_failed(error);
+                self.server_rpc.shutdown();
             }
         }
     }
 
     fn shutdown(&mut self) {
-        if let Err(err) = self.process.kill() {
-            tracing::error!("{:?}", err);
+        let deadline = Instant::now() + SERVER_SHUTDOWN_TIMEOUT;
+        if matches!(self.process.lock().try_wait(), Ok(None)) {
+            if let Err(error) = self.server_rpc.shutdown_protocol(deadline) {
+                tracing::warn!(?error, "language server graceful shutdown failed");
+            }
+            while Instant::now() < deadline
+                && matches!(self.process.lock().try_wait(), Ok(None))
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
-        if let Err(err) = self.process.wait() {
+        self.server_rpc.close_io();
+        let mut process = self.process.lock();
+        if !matches!(process.try_wait(), Ok(Some(_))) {
+            if let Err(err) = process.kill() {
+                tracing::error!("{:?}", err);
+            }
+        }
+        if let Err(err) = process.wait() {
             tracing::error!("{:?}", err);
         }
     }
@@ -418,6 +472,7 @@ impl LspClient {
         workspace: Option<&PathBuf>,
         server: &str,
         args: &[String],
+        env: &[(String, String)],
     ) -> Result<Child> {
         let mut process = Command::new(server);
         if let Some(workspace) = workspace {
@@ -425,6 +480,7 @@ impl LspClient {
         }
 
         process.args(args);
+        process.envs(env.iter().map(|(key, value)| (key, value)));
 
         #[cfg(target_os = "windows")]
         let process = process.creation_flags(0x08000000);
@@ -530,5 +586,241 @@ pub fn get_change_for_sync_kind(
         }
         TextDocumentSyncKind::INCREMENTAL => Some(vec![content_change.clone()]),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::psp::{PluginServerRpc, ResponseHandler};
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_exits_cooperative_processes_and_kills_unresponsive_ones() {
+        use crate::plugin::{PluginCatalogNotification, PluginCatalogRpc};
+        let script = r#"
+shutdown_seen=no
+while IFS= read -r header; do
+    length=$(printf '%s' "$header" | tr -cd '0-9')
+    IFS= read -r separator
+    body=$(dd bs=1 count="$length" 2>/dev/null)
+    id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$body" in
+        *'"method":"initialize"'*)
+            response='{"jsonrpc":"2.0","id":0,"result":{"capabilities":{}}}'
+            printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+            ;;
+        *'"method":"shutdown"'*)
+            [ "$1" = ignore ] && continue
+            shutdown_seen=yes
+            response=$(printf '{"jsonrpc":"2.0","id":%s,"result":null}' "$id")
+            printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+            ;;
+        *'"method":"exit"'*)
+            [ "$1" = ignore ] && continue
+            [ "$shutdown_seen" = yes ] || exit 7
+            exit 0
+            ;;
+    esac
+done
+[ "$1" = ignore ] && exec sleep 30
+exit 8
+"#;
+        for mode in ["cooperative", "ignore"] {
+            let catalog =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let notifications =
+                catalog.plugin_rx.lock().take().expect("catalog receiver");
+            let mut client = LspClient::new(
+                catalog,
+                Vec::new(),
+                None,
+                ServerId {
+                    author: "ahead".into(),
+                    name: "lsp-shutdown-test".into(),
+                },
+                "shutdown-test".into(),
+                None,
+                None,
+                Url::parse("urn:sh").expect("shell URI"),
+                vec!["-c".into(), script.into(), "test-lsp".into(), mode.into()],
+                Vec::new(),
+                None,
+                None,
+            )
+            .expect("owned fake server");
+            let process = client.process.clone();
+            let rpc = client.server_rpc.clone();
+            let handler = rpc.clone();
+            let mainloop = thread::spawn(move || handler.mainloop(&mut client));
+            let ready = matches!(notifications.recv_timeout(Duration::from_secs(5)), Ok(PluginCatalogRpc::Handler(PluginCatalogNotification::LanguageServerStatus { params, .. })) if params.is_ok());
+            let started = Instant::now();
+            rpc.shutdown();
+            let stopped = rpc.wait_for_shutdown();
+            if !stopped {
+                let mut process = process.lock();
+                process.kill().expect("clean up unresponsive test child");
+                process.wait().expect("reap test child");
+            }
+            assert!(ready, "fake server initialized ({mode})");
+            assert!(stopped, "shutdown must be bounded ({mode})");
+            mainloop.join().expect("handler exited");
+            let status = process
+                .lock()
+                .try_wait()
+                .expect("child status")
+                .expect("child exited");
+            assert_eq!(status.success(), mode == "cooperative", "{status}");
+            if mode == "ignore" {
+                assert!(started.elapsed() >= SERVER_SHUTDOWN_TIMEOUT);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_is_detected_even_when_a_descendant_keeps_stdout_open() {
+        use crate::plugin::{PluginCatalogNotification, PluginCatalogRpc};
+        let catalog_rpc =
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+        let notifications = catalog_rpc
+            .plugin_rx
+            .lock()
+            .take()
+            .expect("catalog receiver");
+        let (plugin_id, rpc) = LspClient::start(
+            catalog_rpc,
+            Vec::new(),
+            None,
+            ServerId {
+                author: "ahead".into(),
+                name: "lsp-crash-test".into(),
+            },
+            "crash-test".into(),
+            None,
+            None,
+            Url::parse("urn:sh").expect("shell URI"),
+            vec!["-c".into(), "sleep 3 & exit 7".into()],
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("owned child");
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        rpc.server_request_async(
+            "test/pending",
+            Value::Null,
+            None,
+            None,
+            true,
+            move |reply| sender.send(reply).expect("pending request reply"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let notification = notifications
+                .recv_deadline(deadline)
+                .expect("process exit before inherited stdout closes");
+            if let PluginCatalogRpc::Handler(
+                PluginCatalogNotification::LanguageServerStopped {
+                    plugin_id: stopped,
+                    message,
+                },
+            ) = notification
+            {
+                assert_eq!(stopped, plugin_id);
+                assert!(message.contains("exited"), "{message}");
+                break;
+            }
+        }
+        assert!(
+            receiver
+                .recv_deadline(deadline)
+                .expect("failed pending request")
+                .is_err()
+        );
+        assert!(rpc.wait_for_shutdown());
+    }
+
+    #[test]
+    fn completion_resolve_is_a_noop_without_the_optional_capability() {
+        let core_rpc = ahead_rpc::core::CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test".into(),
+        };
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, sender);
+        let host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc,
+            server_rpc.clone(),
+            catalog_rpc,
+            None,
+        );
+        let (reply_sender, reply_receiver) = crossbeam_channel::bounded(1);
+        let item = serde_json::json!({"label": "calculate", "additionalTextEdits": [], "data": {"opaque": 1}});
+        server_rpc.handle_rpc(PluginServerRpc::ServerRequest {
+            id: Id::Num(42),
+            method: lsp_types::request::ResolveCompletionItem::METHOD.into(),
+            params: Params::from(item.clone()),
+            language_id: None,
+            path: None,
+            rh: ResponseHandler::Chan(reply_sender),
+        });
+        server_rpc.handle_rpc(PluginServerRpc::Shutdown);
+        let mut process =
+            Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--list")
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("test child");
+        assert!(process.wait().expect("reap test child").success());
+        let mut client = LspClient {
+            server_rpc: server_rpc.clone(),
+            process: Arc::new(Mutex::new(process)),
+            workspace: None,
+            host,
+            options: None,
+        };
+        let responder = server_rpc.clone();
+        let initialize = std::thread::spawn(move || {
+            let request = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("initialize request")
+                .expect("initialize frame");
+            assert_eq!(request.get_method(), Some(Initialize::METHOD));
+            responder.handle_server_response(
+                request.get_id().expect("initialize id").clone(),
+                Ok(serde_json::json!({"capabilities": {}})),
+            );
+            let initialized = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("initialized notification")
+                .expect("initialized frame");
+            assert_eq!(initialized.get_method(), Some(Initialized::METHOD));
+            receiver
+        });
+        server_rpc.mainloop(&mut client);
+        assert_eq!(
+            reply_receiver
+                .try_recv()
+                .expect("reply")
+                .expect("no resolve needed"),
+            item
+        );
+        assert!(
+            initialize
+                .join()
+                .expect("server initialization")
+                .try_recv()
+                .is_err(),
+            "must not send an unsupported request"
+        );
     }
 }

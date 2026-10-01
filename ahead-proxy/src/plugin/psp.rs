@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use ahead_core::encoding::{offset_utf8_to_utf16, offset_utf16_to_utf8};
@@ -32,27 +33,30 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
     VersionedTextDocumentIdentifier,
     notification::{
-        Cancel, DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-        Initialized, LogMessage, Notification, Progress, PublishDiagnostics,
-        ShowMessage,
+        Cancel, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        DidSaveTextDocument, Initialized, LogMessage, Notification, Progress,
+        PublishDiagnostics, ShowMessage,
     },
     request::{
         CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
         CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
-        DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
-        GotoImplementation, GotoTypeDefinition, HoverRequest, Initialize,
-        InlayHintRequest, InlineCompletionRequest, PrepareRenameRequest, References,
-        RegisterCapability, Rename, Request, ResolveCompletionItem,
-        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
-        WorkDoneProgressCreate, WorkspaceSymbolRequest,
+        DocumentDiagnosticRequest, DocumentSymbolRequest, FoldingRangeRequest,
+        Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
+        HoverRequest, Initialize, InlayHintRequest, InlineCompletionRequest,
+        PrepareRenameRequest, References, RegisterCapability, Rename, Request,
+        ResolveCompletionItem, SelectionRangeRequest, SemanticTokensFullRequest,
+        SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use ropey::{LineType, Rope};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{PluginCatalogRpcHandler, lsp::DocumentFilter};
+
+pub(super) const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub enum ResponseHandler<Resp, Error> {
     Chan(Sender<Result<Resp, Error>>),
@@ -162,9 +166,21 @@ pub struct PluginServerRpcHandler {
     pub server_id: ServerId,
     rpc_tx: Sender<PluginServerRpc>,
     rpc_rx: Receiver<PluginServerRpc>,
-    io_tx: Sender<JsonRpc>,
+    io_tx: Sender<Option<JsonRpc>>,
     id: Arc<AtomicU64>,
-    server_pending: Arc<Mutex<HashMap<Id, ResponseHandler<Value, RpcError>>>>,
+    server_requests: Arc<Mutex<ServerRequests>>,
+    terminated: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[derive(Default)]
+struct ServerRequests {
+    stopped: bool,
+    pending: HashMap<Id, PendingRequest>,
+}
+
+struct PendingRequest {
+    deadline: Instant,
+    response: ResponseHandler<Value, RpcError>,
 }
 
 #[derive(Clone)]
@@ -259,7 +275,7 @@ impl PluginServerRpcHandler {
     pub fn new(
         server_id: ServerId,
         plugin_id: Option<PluginId>,
-        io_tx: Sender<JsonRpc>,
+        io_tx: Sender<Option<JsonRpc>>,
     ) -> Self {
         let (rpc_tx, rpc_rx) = crossbeam_channel::unbounded();
 
@@ -270,7 +286,8 @@ impl PluginServerRpcHandler {
             rpc_rx,
             io_tx,
             id: Arc::new(AtomicU64::new(0)),
-            server_pending: Arc::new(Mutex::new(HashMap::new())),
+            server_requests: Arc::new(Mutex::new(ServerRequests::default())),
+            terminated: Arc::new((Mutex::new(false), Condvar::new())),
         };
 
         rpc.initialize();
@@ -290,12 +307,25 @@ impl PluginServerRpcHandler {
         params: Params,
         rh: ResponseHandler<Value, RpcError>,
     ) {
-        {
-            let mut pending = self.server_pending.lock();
-            pending.insert(id.clone(), rh);
+        let mut state = self.server_requests.lock();
+        if state.stopped {
+            drop(state);
+            rh.invoke(Err(Self::stopped_error()));
+            return;
         }
+        state.pending.insert(
+            id.clone(),
+            PendingRequest {
+                deadline: Instant::now() + SERVER_REQUEST_TIMEOUT,
+                response: rh,
+            },
+        );
         let msg = JsonRpc::request_with_params(id, method, params);
-        self.send_server_rpc(msg);
+        let failed = self.io_tx.send(Some(msg)).is_err();
+        drop(state);
+        if failed {
+            self.shutdown();
+        }
     }
 
     fn send_server_notification(&self, method: &str, params: Params) {
@@ -304,14 +334,52 @@ impl PluginServerRpcHandler {
     }
 
     fn send_server_rpc(&self, msg: JsonRpc) {
-        if let Err(err) = self.io_tx.send(msg) {
+        if let Err(err) = self.io_tx.send(Some(msg)) {
             tracing::error!("{:?}", err);
         }
     }
 
     pub fn handle_rpc(&self, rpc: PluginServerRpc) {
-        if let Err(err) = self.rpc_tx.send(rpc) {
-            tracing::error!("{:?}", err);
+        let state = self.server_requests.lock();
+        if state.stopped
+            && !matches!(
+                rpc,
+                PluginServerRpc::Shutdown
+                    | PluginServerRpc::Handler(PluginHandlerNotification::Shutdown)
+            )
+        {
+            drop(state);
+            Self::reject_stopped(rpc);
+            return;
+        }
+        let result = self.rpc_tx.send(rpc);
+        drop(state);
+        if let Err(err) = result {
+            Self::reject_stopped(err.0);
+        }
+    }
+
+    fn stopped_error() -> RpcError {
+        RpcError {
+            code: -32097,
+            message:
+                "Language server stopped. Restart language servers and try again."
+                    .into(),
+        }
+    }
+
+    fn reject_stopped(rpc: PluginServerRpc) {
+        match rpc {
+            PluginServerRpc::ServerRequest { rh, .. } => {
+                rh.invoke(Err(Self::stopped_error()))
+            }
+            PluginServerRpc::FormatSemanticTokens { f, .. } => {
+                f.call(Err(Self::stopped_error()))
+            }
+            PluginServerRpc::HostRequest { resp, .. } => {
+                resp.send_err(-32097, Self::stopped_error().message)
+            }
+            _ => {}
         }
     }
 
@@ -404,28 +472,100 @@ impl PluginServerRpcHandler {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
         let params = Params::from(serde_json::to_value(params).unwrap());
         if check {
-            if let Err(err) = self.rpc_tx.send(PluginServerRpc::ServerRequest {
+            self.handle_rpc(PluginServerRpc::ServerRequest {
                 id: Id::Num(id as i64),
                 method,
                 params,
                 language_id,
                 path,
                 rh,
-            }) {
-                tracing::error!("{:?}", err);
-            }
+            });
         } else {
             self.send_server_request(Id::Num(id as i64), &method, params, rh);
         }
     }
 
     pub fn handle_server_response(&self, id: Id, result: Result<Value, RpcError>) {
-        if let Some(handler) = { self.server_pending.lock().remove(&id) } {
-            handler.invoke(result);
+        let handler = self.server_requests.lock().pending.remove(&id);
+        if let Some(handler) = handler {
+            handler.response.invoke(result);
+        }
+    }
+
+    pub(super) fn expire_requests(&self, now: Instant) {
+        let mut state = self.server_requests.lock();
+        if state.stopped {
+            return;
+        }
+        let expired = state
+            .pending
+            .extract_if(|_, pending| pending.deadline <= now)
+            .collect::<Vec<_>>();
+        drop(state);
+        for (id, pending) in expired {
+            self.send_server_notification(
+                Cancel::METHOD,
+                Params::from(serde_json::json!({ "id": id })),
+            );
+            pending.response.invoke(Err(RpcError { code: -32098, message: "Language server request timed out. Try again or restart language servers.".into() }));
+        }
+    }
+
+    pub(super) fn shutdown_protocol(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), RpcError> {
+        let id = Id::Num(self.id.fetch_add(1, Ordering::Relaxed) as i64);
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        self.server_requests.lock().pending.insert(
+            id.clone(),
+            PendingRequest {
+                deadline,
+                response: ResponseHandler::Chan(sender),
+            },
+        );
+        self.send_server_rpc(JsonRpc::request_with_params(
+            id.clone(),
+            lsp_types::request::Shutdown::METHOD,
+            Params::None(()),
+        ));
+        let result = receiver.recv_deadline(deadline).unwrap_or_else(|_| {
+            Err(RpcError {
+                code: -32098,
+                message: "Language server shutdown timed out".into(),
+            })
+        });
+        self.server_requests.lock().pending.remove(&id);
+        self.send_server_notification(
+            lsp_types::notification::Exit::METHOD,
+            Params::None(()),
+        );
+        self.close_io();
+        result.and_then(|value| {
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: -32603,
+                message: format!("Invalid shutdown response: {error}"),
+            })
+        })
+    }
+
+    pub(super) fn close_io(&self) {
+        if let Err(error) = self.io_tx.send(None) {
+            tracing::debug!(?error, "language server writer already closed");
         }
     }
 
     pub fn shutdown(&self) {
+        let mut state = self.server_requests.lock();
+        if state.stopped {
+            return;
+        }
+        state.stopped = true;
+        let pending = std::mem::take(&mut state.pending);
+        drop(state);
+        for handler in pending.into_values() {
+            handler.response.invoke(Err(Self::stopped_error()));
+        }
         // to kill lsp
         self.handle_rpc(PluginServerRpc::Handler(
             PluginHandlerNotification::Shutdown,
@@ -434,11 +574,40 @@ impl PluginServerRpcHandler {
         self.handle_rpc(PluginServerRpc::Shutdown);
     }
 
+    pub fn wait_for_shutdown(&self) -> bool {
+        self.wait_for_shutdown_until(
+            Instant::now() + SERVER_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        )
+    }
+
+    pub(super) fn wait_for_shutdown_until(&self, deadline: Instant) -> bool {
+        let (terminated, changed) = &*self.terminated;
+        let mut terminated = terminated.lock();
+        changed.wait_while_for(
+            &mut terminated,
+            |terminated| !*terminated,
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        *terminated
+    }
+
     pub fn mainloop<H>(&self, handler: &mut H)
     where
         H: PluginServerHandler,
     {
         for msg in &self.rpc_rx {
+            if self.server_requests.lock().stopped
+                && !matches!(
+                    msg,
+                    PluginServerRpc::Shutdown
+                        | PluginServerRpc::Handler(
+                            PluginHandlerNotification::Shutdown
+                        )
+                )
+            {
+                Self::reject_stopped(msg);
+                continue;
+            }
             match msg {
                 PluginServerRpc::ServerRequest {
                     id,
@@ -448,11 +617,18 @@ impl PluginServerRpcHandler {
                     path,
                     rh,
                 } => {
-                    if handler
-                        .document_supported(language_id.as_deref(), path.as_deref())
-                        && handler.method_registered(&method)
-                    {
+                    let supported = handler
+                        .document_supported(language_id.as_deref(), path.as_deref());
+                    if supported && handler.method_registered(&method) {
                         self.send_server_request(id, &method, params, rh);
+                    } else if supported && method == ResolveCompletionItem::METHOD {
+                        // Resolve is optional; a server without it already supplied the complete item.
+                        rh.invoke(serde_json::to_value(params).map_err(|error| {
+                            RpcError {
+                                code: 0,
+                                message: error.to_string(),
+                            }
+                        }));
                     } else {
                         rh.invoke(Err(RpcError {
                             code: 0,
@@ -525,6 +701,9 @@ impl PluginServerRpcHandler {
                     handler.handle_handler_notification(notification)
                 }
                 PluginServerRpc::Shutdown => {
+                    let (terminated, changed) = &*self.terminated;
+                    *terminated.lock() = true;
+                    changed.notify_all();
                     return;
                 }
             }
@@ -544,11 +723,16 @@ pub fn handle_plugin_server_message(
             let rpc = PluginServerRpc::HostRequest {
                 id: id.clone(),
                 method: value.get_method().unwrap().to_string(),
-                params: value.get_params().unwrap(),
+                params: value.get_params().unwrap_or(Params::None(())),
                 resp: ResponseSender::new(tx),
             };
             server_rpc.handle_rpc(rpc);
-            let result = rx.recv().unwrap();
+            let result = rx.recv().unwrap_or_else(|_| {
+                Err(RpcError {
+                    code: -32603,
+                    message: "language server request handler stopped".to_string(),
+                })
+            });
             let resp = match result {
                 Ok(v) => JsonRpc::success(id, &v),
                 Err(e) => JsonRpc::error(
@@ -565,7 +749,7 @@ pub fn handle_plugin_server_message(
         Ok(value @ JsonRpc::Notification(_)) => {
             let rpc = PluginServerRpc::HostNotification {
                 method: value.get_method().unwrap().to_string(),
-                params: value.get_params().unwrap(),
+                params: value.get_params().unwrap_or(Params::None(())),
                 from: from.to_string(),
             };
             server_rpc.handle_rpc(rpc);
@@ -594,6 +778,222 @@ pub fn handle_plugin_server_message(
     }
 }
 
+#[cfg(test)]
+mod parameterless_message_tests {
+    use super::{
+        PluginServerRpc, PluginServerRpcHandler, handle_plugin_server_message,
+    };
+    use ahead_rpc::plugin::ServerId;
+    use crossbeam_channel::unbounded;
+    use jsonrpc_lite::Params;
+    use serde_json::Value;
+
+    #[test]
+    fn timed_out_requests_cancel_once_and_do_not_close_the_server() {
+        let (io_tx, io_rx) = unbounded();
+        let rpc = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".into(),
+                name: "test".into(),
+            },
+            None,
+            io_tx,
+        );
+        let (sender, receiver) = unbounded();
+        let reentrant = rpc.clone();
+        rpc.server_request_async(
+            "test/slow",
+            Value::Null,
+            None,
+            None,
+            false,
+            move |result: Result<Value, ahead_rpc::RpcError>| {
+                assert_eq!(result.expect_err("timeout").code, -32098);
+                reentrant.server_request_async(
+                    "test/retry",
+                    Value::Null,
+                    None,
+                    None,
+                    false,
+                    move |reply| sender.send(reply).expect("retry result"),
+                );
+            },
+        );
+        let first = io_rx.recv().expect("request").expect("frame");
+        rpc.expire_requests(
+            std::time::Instant::now()
+                + super::SERVER_REQUEST_TIMEOUT
+                + std::time::Duration::from_secs(1),
+        );
+        let cancellation = io_rx.recv().expect("cancellation").expect("frame");
+        assert_eq!(cancellation.get_method(), Some("$/cancelRequest"));
+        assert_eq!(
+            serde_json::to_value(cancellation.get_params()).expect("cancel params")
+                ["id"],
+            serde_json::to_value(first.get_id()).expect("id")
+        );
+        let retry = io_rx.recv().expect("retry request").expect("frame");
+        rpc.handle_server_response(
+            first.get_id().expect("first id").clone(),
+            Ok(Value::Null),
+        );
+        assert!(receiver.try_recv().is_err());
+        rpc.handle_server_response(
+            retry.get_id().expect("retry id").clone(),
+            Ok(Value::Bool(true)),
+        );
+        assert_eq!(
+            receiver.recv().expect("retry reply").expect("success"),
+            Value::Bool(true)
+        );
+        assert!(io_rx.try_recv().is_err());
+        rpc.shutdown();
+    }
+
+    #[test]
+    fn shutdown_flushes_exit_before_closing_io_even_after_a_timeout() {
+        for respond in [true, false] {
+            let (io_tx, io_rx) = unbounded();
+            let rpc = PluginServerRpcHandler::new(
+                ServerId {
+                    author: "ahead".into(),
+                    name: "test".into(),
+                },
+                None,
+                io_tx,
+            );
+            rpc.shutdown();
+            let responder = rpc.clone();
+            let server = std::thread::spawn(move || {
+                let request =
+                    io_rx.recv().expect("shutdown").expect("shutdown frame");
+                assert_eq!(request.get_method(), Some("shutdown"));
+                if respond {
+                    responder.handle_server_response(
+                        request.get_id().expect("id").clone(),
+                        Ok(Value::Null),
+                    );
+                }
+                let exit = io_rx.recv().expect("exit").expect("exit frame");
+                assert_eq!(exit.get_method(), Some("exit"));
+                assert!(io_rx.recv().expect("close writer").is_none());
+            });
+            let deadline = std::time::Instant::now()
+                + if respond {
+                    std::time::Duration::from_secs(2)
+                } else {
+                    std::time::Duration::ZERO
+                };
+            assert_eq!(rpc.shutdown_protocol(deadline).is_ok(), respond);
+            server.join().expect("server finished");
+        }
+    }
+
+    #[test]
+    fn shutdown_rejects_pending_and_future_requests_without_calling_back_under_lock()
+    {
+        let (io_tx, _io_rx) = unbounded();
+        let rpc = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".into(),
+                name: "test".into(),
+            },
+            None,
+            io_tx,
+        );
+        let (sender, receiver) = unbounded();
+        let reentrant = rpc.clone();
+        rpc.server_request_async(
+            "test/pending",
+            Value::Null,
+            None,
+            None,
+            false,
+            move |result: Result<Value, ahead_rpc::RpcError>| {
+                assert_eq!(result.unwrap_err().code, -32097);
+                reentrant.server_request_async(
+                    "test/reentrant",
+                    Value::Null,
+                    None,
+                    None,
+                    true,
+                    move |result: Result<Value, ahead_rpc::RpcError>| {
+                        sender.send(result).unwrap()
+                    },
+                );
+            },
+        );
+        rpc.shutdown();
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            -32097
+        );
+        assert_eq!(
+            rpc.server_request("test/later", Value::Null, None, None, false)
+                .unwrap_err()
+                .code,
+            -32097
+        );
+        rpc.shutdown();
+        rpc.handle_server_response(jsonrpc_lite::Id::Num(0), Ok(Value::Null));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn accepts_server_messages_without_params() {
+        let (io_tx, _) = unbounded();
+        let handler = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".to_string(),
+                name: "test".to_string(),
+            },
+            None,
+            io_tx,
+        );
+        let receiver = handler.rpc_rx.clone();
+        let responder = std::thread::spawn(move || {
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                PluginServerRpc::Handler(_)
+            ));
+            match receiver.recv().unwrap() {
+                PluginServerRpc::HostRequest { params, resp, .. } => {
+                    assert_eq!(params, Params::None(()));
+                    resp.send_null();
+                }
+                _ => panic!("expected server request"),
+            }
+        });
+        let response = handle_plugin_server_message(
+            &handler,
+            r#"{"jsonrpc":"2.0","id":1,"method":"workspace/diagnostic/refresh"}"#,
+            "test",
+        )
+        .unwrap();
+        responder.join().unwrap();
+        assert_eq!(response.get_result(), Some(&Value::Null));
+
+        assert!(
+            handle_plugin_server_message(
+                &handler,
+                r#"{"jsonrpc":"2.0","method":"test/noParams"}"#,
+                "test",
+            )
+            .is_none()
+        );
+        match handler.rpc_rx.recv().unwrap() {
+            PluginServerRpc::HostNotification { params, .. } => {
+                assert_eq!(params, Params::None(()));
+            }
+            _ => panic!("expected server notification"),
+        }
+    }
+}
+
 struct SaveRegistration {
     include_text: bool,
     filters: Vec<DocumentFilter>,
@@ -617,6 +1017,7 @@ pub struct PluginHostHandler {
     pub server_rpc: PluginServerRpcHandler,
     pub server_capabilities: ServerCapabilities,
     server_registrations: ServerRegistrations,
+    workspace_configuration: Option<Value>,
 }
 
 impl PluginHostHandler {
@@ -630,6 +1031,7 @@ impl PluginHostHandler {
         core_rpc: CoreRpcHandler,
         server_rpc: PluginServerRpcHandler,
         catalog_rpc: PluginCatalogRpcHandler,
+        workspace_configuration: Option<Value>,
     ) -> Self {
         let document_selector = document_selector
             .iter()
@@ -646,7 +1048,24 @@ impl PluginHostHandler {
             server_rpc,
             server_capabilities: ServerCapabilities::default(),
             server_registrations: ServerRegistrations::default(),
+            workspace_configuration,
         }
+    }
+
+    pub(super) fn initialized(&mut self, result: InitializeResult) {
+        self.server_capabilities = result.capabilities;
+        self.catalog_rpc.language_server_status(
+            self.server_rpc.plugin_id,
+            ServerStatusParams::ready(self.server_display_name.clone()),
+        );
+    }
+
+    pub(super) fn initialization_failed(&self, message: String) {
+        tracing::error!(server = self.server_display_name, %message, "language server initialization failed");
+        self.catalog_rpc.language_server_status(
+            self.server_rpc.plugin_id,
+            ServerStatusParams::failed(self.server_display_name.clone(), message),
+        );
     }
 
     pub fn document_supported(
@@ -689,7 +1108,7 @@ impl PluginHostHandler {
                 .as_ref()
                 .and_then(|c| c.resolve_provider)
                 .unwrap_or(false),
-            DidOpenTextDocument::METHOD => {
+            DidOpenTextDocument::METHOD | DidCloseTextDocument::METHOD => {
                 match &self.server_capabilities.text_document_sync {
                     Some(TextDocumentSyncCapability::Kind(kind)) => {
                         kind != &TextDocumentSyncKind::NONE
@@ -801,6 +1220,9 @@ impl PluginHostHandler {
             SemanticTokensFullRequest::METHOD => {
                 self.server_capabilities.semantic_tokens_provider.is_some()
             }
+            DocumentDiagnosticRequest::METHOD => {
+                self.server_capabilities.diagnostic_provider.is_some()
+            }
             InlayHintRequest::METHOD => {
                 self.server_capabilities.inlay_hint_provider.is_some()
             }
@@ -856,14 +1278,16 @@ impl PluginHostHandler {
                 .and_then(|o| o.save.as_ref())
                 .map(|o| match o {
                     TextDocumentSyncSaveOptions::Supported(is_supported) => {
-                        (*is_supported, true)
+                        (*is_supported, false)
                     }
                     TextDocumentSyncSaveOptions::SaveOptions(options) => {
                         (true, options.include_text.unwrap_or(false))
                     }
                 })
                 .unwrap_or((false, false));
-            return (should_send, include_text);
+            if should_send {
+                return (true, include_text);
+            }
         }
 
         if let Some(options) = self.server_registrations.save.as_ref() {
@@ -948,6 +1372,19 @@ impl PluginHostHandler {
                 self.register_capabilities(params.registrations);
                 resp.send_null();
             }
+            "workspace/configuration" => {
+                let params = serde_json::to_value(params)?;
+                let result = workspace_configuration_response(
+                    self.workspace_configuration.as_ref(),
+                    &params,
+                );
+                resp.send(result);
+            }
+            "workspace/diagnostic/refresh" => {
+                resp.send_null();
+                self.catalog_rpc
+                    .refresh_diagnostics(self.server_rpc.plugin_id);
+            }
             _ => return Err(anyhow!("request not supported")),
         }
 
@@ -964,7 +1401,11 @@ impl PluginHostHandler {
             PublishDiagnostics::METHOD => {
                 let diagnostics: PublishDiagnosticsParams =
                     serde_json::from_value(serde_json::to_value(params)?)?;
-                self.catalog_rpc.core_rpc.publish_diagnostics(diagnostics);
+                self.catalog_rpc.publish_diagnostics(
+                    self.server_rpc.plugin_id,
+                    super::DiagnosticSource::Pushed,
+                    diagnostics,
+                );
             }
             Progress::METHOD => {
                 let progress: ProgressParams =
@@ -996,7 +1437,7 @@ impl PluginHostHandler {
             "experimental/serverStatus" => {
                 let mut param: ServerStatusParams =
                     serde_json::from_value(serde_json::to_value(params)?)?;
-                param.server_name = Some(self.server_id.name.clone());
+                param.server_name = Some(self.server_display_name.clone());
                 if !param.is_ok() {
                     if let Some(msg) = &param.message {
                         self.core_rpc.show_message(
@@ -1008,7 +1449,8 @@ impl PluginHostHandler {
                         );
                     }
                 }
-                self.catalog_rpc.core_rpc.server_status(param);
+                self.catalog_rpc
+                    .language_server_status(self.server_rpc.plugin_id, param);
             }
             _ => {
                 self.core_rpc.log(
@@ -1094,12 +1536,8 @@ impl PluginHostHandler {
                 if let Some(c) = existing.1.as_ref() {
                     c.clone()
                 } else {
-                    let change = get_document_content_change(&text, &delta)
-                        .unwrap_or_else(|| TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: new_text.to_string(),
-                        });
+                    let change =
+                        get_document_content_change(&text, &delta, &new_text);
                     existing.1 = Some(change.clone());
                     change
                 }
@@ -1143,6 +1581,256 @@ impl PluginHostHandler {
     }
 }
 
+fn workspace_configuration_response(
+    settings: Option<&Value>,
+    params: &Value,
+) -> Value {
+    // The Zed extension WIT callback accepts a worktree, not a scope URI, so
+    // this extension-provided configuration is intentionally scope-invariant.
+    let empty_settings = Value::Object(Default::default());
+    let settings = settings.unwrap_or(&empty_settings);
+    let items = params
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| match item.get("section").and_then(Value::as_str) {
+            Some(section) => settings.get(section).cloned().unwrap_or(Value::Null),
+            None => settings.clone(),
+        })
+        .collect();
+    Value::Array(items)
+}
+
+#[cfg(test)]
+mod save_capability_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_and_custom_status_use_the_same_server_identity() {
+        use crate::plugin::{PluginCatalogNotification, PluginCatalogRpc};
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let notifications = catalog_rpc
+            .plugin_rx
+            .lock()
+            .take()
+            .expect("catalog receiver");
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "lsp-test".into(),
+        };
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, sender);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc.clone(),
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let next_status = || {
+            let PluginCatalogRpc::Handler(
+                PluginCatalogNotification::LanguageServerStatus { params, .. },
+            ) = notifications.try_recv().expect("status notification")
+            else {
+                panic!("expected server status")
+            };
+            assert_eq!(params.server_name.as_deref(), Some("Test LSP"));
+            params
+        };
+        host.initialized(InitializeResult {
+            capabilities: ServerCapabilities::default(),
+            server_info: None,
+            offset_encoding: None,
+        });
+        assert!(next_status().is_ok());
+        host.handle_notification(
+            "experimental/serverStatus".into(),
+            Params::from(serde_json::json!({"health": "ok", "quiescent": false})),
+            "Test LSP".into(),
+        )
+        .expect("server status");
+        assert!(!next_status().is_quiescent());
+        host.initialization_failed("invalid capabilities".into());
+        let failed = next_status();
+        assert!(!failed.is_ok());
+        assert_eq!(failed.message.as_deref(), Some("invalid capabilities"));
+    }
+
+    #[test]
+    fn incremental_snapshot_changes_replace_the_old_document_range() {
+        use ahead_rpc::delta::DeltaOp;
+        let snapshots = [
+            "import { calculate } from './math.ts';\n// café 日本語\nconst result = calculate(21);\nconsole.log(result.doubled);\n",
+            "import { calculate } from './math.ts';\nconst result = calculate(21);\nresult.dou",
+            "import { calculate } from './math.ts';\nconst result = calculate(21);\nresult.doubled",
+            "α🙂target",
+            "",
+        ];
+        for pair in snapshots.windows(2) {
+            let old_text = Rope::from(pair[0]);
+            let new_text = Rope::from(pair[1]);
+            let delta = AheadDelta::new(
+                old_text.len(),
+                vec![
+                    DeltaOp::Delete(old_text.len()),
+                    DeltaOp::Insert(pair[1].to_owned()),
+                ],
+            );
+            let change = get_document_content_change(&old_text, &delta, &new_text);
+            let range = change.range.expect("incremental range");
+            assert_eq!(range.start, Position::new(0, 0));
+            let last_line = pair[0].rsplit('\n').next().expect("last line");
+            assert_eq!(
+                range.end,
+                Position::new(
+                    pair[0].bytes().filter(|byte| *byte == b'\n').count() as u32,
+                    last_line.encode_utf16().count() as u32
+                )
+            );
+            assert_eq!(change.text, pair[1]);
+        }
+    }
+
+    #[test]
+    fn dynamic_save_registration_applies_when_static_save_is_absent() {
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "rust".into(),
+        };
+        let (io_tx, _io_rx) = crossbeam_channel::unbounded();
+        let server_rpc = PluginServerRpcHandler::new(server_id.clone(), None, io_tx);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Rust Analyzer".into(),
+            vec![lsp_types::DocumentFilter {
+                language: Some("rust".into()),
+                scheme: None,
+                pattern: None,
+            }],
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let rust_path = Path::new("/workspace/src/main.rs");
+        assert_eq!(
+            host.check_save_capability("rust", rust_path),
+            (false, false)
+        );
+        host.register_capability(Registration {
+            id: "save".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"pattern": "**/*.rs"}, {"pattern": "**/Cargo.toml"}],
+                "includeText": false
+            })),
+        }).expect("valid dynamic registration");
+        assert_eq!(host.check_save_capability("rust", rust_path), (true, false));
+        assert_eq!(
+            host.check_save_capability("toml", Path::new("/workspace/Cargo.toml")),
+            (true, false)
+        );
+        assert_eq!(
+            host.check_save_capability("json", Path::new("/workspace/data.json")),
+            (false, false)
+        );
+
+        host.server_capabilities.text_document_sync =
+            Some(TextDocumentSyncCapability::Options(
+                lsp_types::TextDocumentSyncOptions {
+                    save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                    ..Default::default()
+                },
+            ));
+        assert_eq!(host.check_save_capability("rust", rust_path), (true, false));
+        for kind in [
+            TextDocumentSyncKind::NONE,
+            TextDocumentSyncKind::FULL,
+            TextDocumentSyncKind::INCREMENTAL,
+        ] {
+            host.server_capabilities.text_document_sync =
+                Some(TextDocumentSyncCapability::Kind(kind));
+            assert_eq!(
+                host.method_registered(DidCloseTextDocument::METHOD),
+                kind != TextDocumentSyncKind::NONE
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_configuration_tests {
+    use super::workspace_configuration_response;
+    use serde_json::json;
+
+    #[test]
+    fn client_advertises_workspace_configuration_support() {
+        assert_eq!(
+            super::super::client_capabilities()
+                .workspace
+                .and_then(|workspace| workspace.configuration),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn responds_with_requested_sections_and_whole_configuration() {
+        let settings = json!({
+            "rust-analyzer": { "check": { "command": "clippy" } },
+            "zed": { "channel": "stable" }
+        });
+        let params = json!({
+            "items": [
+                {
+                    "scopeUri": "file:///workspace/src/lib.rs",
+                    "section": "rust-analyzer"
+                },
+                {
+                    "scopeUri": "file:///workspace/tests/lib.rs",
+                    "section": "rust-analyzer"
+                },
+                {},
+                { "section": "missing" },
+                { "section": null }
+            ]
+        });
+
+        assert_eq!(
+            workspace_configuration_response(Some(&settings), &params),
+            json!([
+                { "check": { "command": "clippy" } },
+                { "check": { "command": "clippy" } },
+                settings,
+                null,
+                settings
+            ])
+        );
+    }
+
+    #[test]
+    fn responds_with_empty_configuration_when_no_items_or_settings_exist() {
+        assert_eq!(
+            workspace_configuration_response(None, &json!({ "items": [] })),
+            json!([])
+        );
+        assert_eq!(
+            workspace_configuration_response(None, &json!({ "items": [{}] })),
+            json!([{}])
+        );
+    }
+}
+
 /// Byte offset of a line start, clamped to the document.
 fn offset_of_line(text: &Rope, line: usize) -> usize {
     let lines = text.len_lines(LineType::LF_CR);
@@ -1167,7 +1855,8 @@ fn offset_to_position(text: &Rope, offset: usize) -> Position {
 fn get_document_content_change(
     text: &Rope,
     delta: &AheadDelta,
-) -> Option<TextDocumentContentChangeEvent> {
+    new_text: &Rope,
+) -> TextDocumentContentChangeEvent {
     let (start, end) = delta.summary();
 
     // TODO: Handle more trivial cases like typing when there's a selection or transpose
@@ -1183,7 +1872,7 @@ fn get_document_content_change(
             text,
         };
 
-        return Some(text_document_content_change_event);
+        return text_document_content_change_event;
     }
     // Or a simple delete
     else if delta.is_simple_delete() {
@@ -1200,10 +1889,19 @@ fn get_document_content_change(
             text: String::new(),
         };
 
-        return Some(text_document_content_change_event);
+        return text_document_content_change_event;
     }
 
-    None
+    // Incremental servers need the replaced range in the *old* snapshot,
+    // including when a paste or editor snapshot replaces the whole document.
+    TextDocumentContentChangeEvent {
+        range: Some(Range::new(
+            Position::new(0, 0),
+            offset_to_position(text, text.len()),
+        )),
+        range_length: None,
+        text: new_text.to_string(),
+    }
 }
 
 fn format_semantic_styles(

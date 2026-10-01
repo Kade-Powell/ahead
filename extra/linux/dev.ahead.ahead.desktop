@@ -2,7 +2,7 @@
 Version=1.0
 Type=Application
 
-Name=Ahead
+Name=AHEAD
 Comment=Lightning-fast and powerful code editor written in Rust
 Categories=Development;IDE;
 GenericName=Code Editor

@@ -3,5 +3,7 @@
 use ahead_app::app;
 
 pub fn main() {
-    app::launch();
+    if !ahead_proxy::run_if_requested() {
+        app::launch();
+    }
 }

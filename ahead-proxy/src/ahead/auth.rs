@@ -7,8 +7,8 @@
 //! - Local persistent auth store (`~/.ahead/auth.json`)
 //! - Non-blocking offline fallback to local git config
 
-use anyhow::{bail, Context, Result};
 use ahead_rpc::ahead::{GitHubDeviceCodeResponse, GitHubUser};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -67,7 +67,9 @@ impl GitHubAuthManager {
         if !token_output.status.success() {
             bail!("GitHub CLI not logged in");
         }
-        let token = String::from_utf8_lossy(&token_output.stdout).trim().to_string();
+        let token = String::from_utf8_lossy(&token_output.stdout)
+            .trim()
+            .to_string();
         if token.is_empty() {
             bail!("Empty token from gh CLI");
         }
@@ -93,9 +95,12 @@ impl GitHubAuthManager {
         let output = std::process::Command::new("curl")
             .args([
                 "-sSL",
-                "-H", "User-Agent: AHEAD",
-                "-H", &format!("Authorization: Bearer {token}"),
-                "-H", "Accept: application/vnd.github+json",
+                "-H",
+                "User-Agent: AHEAD",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                "-H",
+                "Accept: application/vnd.github+json",
                 "https://api.github.com/user",
             ])
             .output()?;
@@ -121,7 +126,10 @@ impl GitHubAuthManager {
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.current_user.as_ref().map(|u| u.is_authenticated).unwrap_or(false)
+        self.current_user
+            .as_ref()
+            .map(|u| u.is_authenticated)
+            .unwrap_or(false)
     }
 
     /// Sign out: clear token and cached user
@@ -153,7 +161,10 @@ impl GitHubAuthManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            drop(std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)));
+            drop(std::fs::set_permissions(
+                &auth_path,
+                std::fs::Permissions::from_mode(0o600),
+            ));
         }
 
         self.access_token = Some(token);
@@ -176,7 +187,10 @@ impl GitHubAuthManager {
     }
 
     /// Resolves author identity from local Git configuration when offline or unauthenticated
-    pub fn resolve_local_git_fallback(&self, workspace_path: Option<&Path>) -> GitHubUser {
+    pub fn resolve_local_git_fallback(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> GitHubUser {
         let name = Self::read_git_config("user.name", workspace_path)
             .unwrap_or_else(|| {
                 std::env::var("USER")
@@ -213,7 +227,9 @@ impl GitHubAuthManager {
     }
 
     /// Parses raw response from https://github.com/login/device/code
-    pub fn parse_device_code_response(json: &str) -> Result<GitHubDeviceCodeResponse> {
+    pub fn parse_device_code_response(
+        json: &str,
+    ) -> Result<GitHubDeviceCodeResponse> {
         #[derive(Deserialize)]
         struct RawResponse {
             device_code: String,
@@ -238,7 +254,10 @@ impl GitHubAuthManager {
     /// Parses raw response from https://github.com/login/oauth/access_token
     pub fn parse_access_token_response(json: &str) -> Result<PollTokenResult> {
         #[derive(Deserialize)]
-        #[expect(dead_code, reason = "success/error variants share the OAuth response shape; both kept for parsing")]
+        #[expect(
+            dead_code,
+            reason = "success/error variants share the OAuth response shape; both kept for parsing"
+        )]
         struct TokenSuccess {
             access_token: String,
             #[serde(default)]
@@ -264,13 +283,20 @@ impl GitHubAuthManager {
             match err.error.as_str() {
                 "authorization_pending" => return Ok(PollTokenResult::Pending),
                 "slow_down" => return Ok(PollTokenResult::SlowDown),
-                "expired_token" => bail!("Device authorization expired. Please try again."),
+                "expired_token" => {
+                    bail!("Device authorization expired. Please try again.")
+                }
                 "access_denied" => bail!("Authorization was cancelled by user."),
-                other => bail!("GitHub auth error: {} ({})", other, err.error_description),
+                other => {
+                    bail!("GitHub auth error: {} ({})", other, err.error_description)
+                }
             }
         }
 
-        bail!("Unknown response format from GitHub OAuth endpoint: {}", json)
+        bail!(
+            "Unknown response format from GitHub OAuth endpoint: {}",
+            json
+        )
     }
 
     /// Parses raw response from https://api.github.com/user
@@ -338,7 +364,8 @@ mod tests {
         );
 
         // Slow down
-        let slow_down = r#"{"error": "slow_down", "error_description": "Interval too fast"}"#;
+        let slow_down =
+            r#"{"error": "slow_down", "error_description": "Interval too fast"}"#;
         assert_eq!(
             GitHubAuthManager::parse_access_token_response(slow_down)?,
             PollTokenResult::SlowDown
@@ -352,7 +379,8 @@ mod tests {
         );
 
         // Access denied
-        let denied = r#"{"error": "access_denied", "error_description": "User cancelled"}"#;
+        let denied =
+            r#"{"error": "access_denied", "error_description": "User cancelled"}"#;
         assert!(GitHubAuthManager::parse_access_token_response(denied).is_err());
         Ok(())
     }
@@ -377,7 +405,8 @@ mod tests {
 
     #[test]
     fn test_auth_persistence_roundtrip() -> Result<()> {
-        let temp_dir = std::env::temp_dir().join(format!("ahead-test-auth-{}", uuid::Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir()
+            .join(format!("ahead-test-auth-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
         let mut mgr = GitHubAuthManager::with_custom_dir(temp_dir.clone());
 
@@ -416,7 +445,8 @@ mod tests {
 
     #[test]
     fn test_local_git_fallback_when_unauthenticated() {
-        let temp_dir = std::env::temp_dir().join(format!("ahead-test-git-{}", uuid::Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir()
+            .join(format!("ahead-test-git-{}", uuid::Uuid::new_v4()));
         drop(std::fs::create_dir_all(&temp_dir));
         let mgr = GitHubAuthManager::with_custom_dir(temp_dir.clone());
 
@@ -428,4 +458,3 @@ mod tests {
         drop(std::fs::remove_dir_all(&temp_dir));
     }
 }
-

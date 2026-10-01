@@ -68,7 +68,10 @@ mod tests {
 
     #[test]
     fn caret_passthrough() {
-        assert_eq!(caret_to_display(10, 4), DisplayPosition { line: 10, col: 4 });
+        assert_eq!(
+            caret_to_display(10, 4),
+            DisplayPosition { line: 10, col: 4 }
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use ahead_rpc::ahead::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Clone)]
 pub struct PredictionWorkContext {
@@ -50,74 +50,204 @@ pub struct PredictionProviderConfig {
 impl Default for PredictionProviderConfig {
     fn default() -> Self {
         Self {
-            provider: "ollama".to_string(),
-            base_url: "http://localhost:11434/v1".to_string(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:1234/v1".to_string(),
             api_key: None,
-            model: "qwen2.5-coder:7b".to_string(),
+            model: "openai-compatible-model".to_string(),
         }
     }
 }
 
 impl PredictionProviderConfig {
-    /// Loads non-secret provider settings with project-over-user precedence.
-    /// The API key is intentionally read from the user file only.
-    pub fn from_workspace(workspace: Option<&Path>) -> Self {
+    /// Loads the active endpoint from the AHEAD provider catalog.
+    ///
+    /// Each `[[ai.connections]]` entry is kept as a separate endpoint. Later
+    /// config layers override matching provider IDs while retaining a key from
+    /// an earlier private settings layer when the override omits it.
+    pub fn from_workspace(workspace: Option<&Path>) -> Result<Self> {
         let mut configs = Vec::new();
         if let Ok(home) = std::env::var("HOME") {
-            let path = Path::new(&home).join(".ahead").join("settings.toml");
-            if let Some(value) = read_toml(&path) {
-                configs.push((path, value));
+            if let Some(value) = read_toml(Path::new(&home), "settings.toml")
+                .context("user AHEAD provider settings")?
+            {
+                configs.push((value, true));
             }
         }
         if let Some(workspace) = workspace {
-            for path in [
-                workspace.join(".ahead/config.toml"),
-                workspace.join(".ahead/config.local.toml"),
-            ] {
-                if let Some(value) = read_toml(&path) {
-                    configs.push((path, value));
+            for filename in ["settings.toml", "config.toml", "config.local.toml"] {
+                if let Some(value) = read_toml(workspace, filename)
+                    .context("workspace AHEAD provider settings")?
+                {
+                    let private = filename != "config.toml";
+                    configs.push((value, private));
                 }
             }
         }
 
-        let defaults = Self::default();
-        let value = |key: &str| {
-            configs
-                .iter()
-                .rev()
-                .find_map(|(_, config)| {
-                    config
-                        .get("ai")
-                        .and_then(|ai| ai.get(key))
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                        .map(str::to_string)
-                })
-        };
-        let api_key = configs
-            .first()
-            .and_then(|(_, config)| config.get("ai"))
-            .and_then(|ai| ai.get("api_key"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
-
-        Self {
-            provider: value("provider").unwrap_or(defaults.provider),
-            base_url: value("base_url").unwrap_or(defaults.base_url),
-            api_key,
-            model: value("model").unwrap_or(defaults.model),
+        let mut providers =
+            BTreeMap::<String, (String, bool, PredictionProviderConfig)>::new();
+        let mut active_connection = None;
+        for (config, private) in configs {
+            let Some(ai) = config.get("ai") else {
+                continue;
+            };
+            if let Some(active) = ai
+                .get("active_connection")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|active| !active.is_empty())
+            {
+                active_connection = Some(active.to_string());
+            }
+            let fallback_provider = ai
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("openai-compatible");
+            if let Some(connections) =
+                ai.get("connections").and_then(Value::as_array)
+            {
+                for connection in connections {
+                    if let Some((id, name, provider)) =
+                        prediction_provider(connection, fallback_provider)
+                    {
+                        merge_prediction_provider(
+                            &mut providers,
+                            id,
+                            name,
+                            private,
+                            provider,
+                        );
+                    }
+                }
+            } else if let Some((id, name, provider)) =
+                prediction_provider(ai, fallback_provider)
+            {
+                merge_prediction_provider(
+                    &mut providers,
+                    id,
+                    name,
+                    private,
+                    provider,
+                );
+            }
         }
+
+        let defaults = Self::default();
+        Ok(active_connection
+            .and_then(|active| {
+                providers.iter().find(|(id, (name, _, _))| {
+                    id.as_str() == active || name == &active
+                })
+            })
+            .or_else(|| providers.iter().next())
+            .map(|(_, (_, _, provider))| provider.clone())
+            .unwrap_or(defaults))
     }
 }
 
-fn read_toml(path: &Path) -> Option<Value> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .parse::<toml::Value>()
-        .ok()
-        .map(|value| serde_json::to_value(value).ok())
-        .flatten()
+fn provider_id_for(name: &str, fallback: &str) -> String {
+    let mut id = String::from("ahead-");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id == "ahead" {
+        format!("ahead-{}", fallback.trim_matches('-'))
+    } else {
+        id
+    }
+}
+
+fn prediction_provider(
+    value: &Value,
+    fallback_provider: &str,
+) -> Option<(String, String, PredictionProviderConfig)> {
+    let table = value.as_object()?;
+    let name = table
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Configured model")
+        .trim();
+    let base_url = table.get("base_url").and_then(Value::as_str)?.trim();
+    let model = table
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            table
+                .get("models")
+                .and_then(Value::as_array)
+                .and_then(|models| models.first())
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)?;
+    if name.is_empty() || base_url.is_empty() || model.is_empty() {
+        return None;
+    }
+    let id = table
+        .get("provider_id")
+        .or_else(|| table.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| provider_id_for(name, fallback_provider));
+    let provider = table
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_provider)
+        .trim()
+        .to_string();
+    let api_key = table
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+        .map(str::to_string);
+    Some((
+        id,
+        name.to_string(),
+        PredictionProviderConfig {
+            provider,
+            base_url: base_url.to_string(),
+            api_key,
+            model: model.to_string(),
+        },
+    ))
+}
+
+fn merge_prediction_provider(
+    providers: &mut BTreeMap<String, (String, bool, PredictionProviderConfig)>,
+    id: String,
+    name: String,
+    private: bool,
+    mut provider: PredictionProviderConfig,
+) {
+    if let Some((_, previous_private, previous)) = providers.get(&id) {
+        if provider.api_key.is_none() && (*previous_private || private) {
+            provider.api_key = previous.api_key.clone();
+        }
+    }
+    providers.insert(id, (name, private, provider));
+}
+
+fn read_toml(root: &Path, filename: &str) -> Result<Option<Value>> {
+    let Some(text) = ahead_core::config::read_ahead_config(root, filename)
+        .with_context(|| {
+            format!("AHEAD provider layer `{filename}` could not be read")
+        })?
+    else {
+        return Ok(None);
+    };
+    let table: toml::Table = text.parse().map_err(|_| {
+        anyhow::anyhow!("AHEAD provider layer `{filename}` contains invalid TOML")
+    })?;
+    Ok(Some(serde_json::to_value(table)?))
 }
 
 fn completion_endpoint(base_url: &str) -> Result<String> {
@@ -129,7 +259,10 @@ fn completion_endpoint(base_url: &str) -> Result<String> {
     if url.path().ends_with("/completions") {
         Ok(url.to_string())
     } else {
-        Ok(format!("{}/completions", url.to_string().trim_end_matches('/')))
+        Ok(format!(
+            "{}/completions",
+            url.to_string().trim_end_matches('/')
+        ))
     }
 }
 
@@ -148,7 +281,11 @@ impl PredictionEngine {
 
         let mut prompt = String::new();
         prompt.push_str("# AHEAD Prediction Context\n");
-        prompt.push_str(&format!("Mode: {:?}\n", work.mode));
+        let task_intent = match work.mode {
+            AssistanceMode::Learn => "Teaching",
+            AssistanceMode::Assist => "Assistance",
+        };
+        prompt.push_str(&format!("Task intent: {task_intent}\n"));
         prompt.push_str(&format!("Work Kind: {}\n", work.work_kind.display_name()));
         prompt.push_str(&format!("Phase: {}\n", work.phase_title));
 
@@ -179,10 +316,11 @@ impl PredictionEngine {
             }
         }
 
+        let (prefix, suffix) = prediction_excerpt(request);
         prompt.push_str(&format!("\n# Active Buffer: {}\n", request.path));
-        prompt.push_str(&format!("Prefix:\n{}\n", request.prefix));
+        prompt.push_str(&format!("Prefix:\n{prefix}\n"));
         prompt.push_str("<CURSOR>\n");
-        prompt.push_str(&format!("Suffix:\n{}\n", request.suffix));
+        prompt.push_str(&format!("Suffix:\n{suffix}\n"));
 
         Ok(prompt)
     }
@@ -202,15 +340,20 @@ impl PredictionEngine {
         open_buffers: &[OpenBufferContext],
         provider: &PredictionProviderConfig,
     ) -> Result<PredictionResult> {
+        if matches!(work.mode, AssistanceMode::Learn) {
+            bail!("Predictions are disabled in Learn mode");
+        }
         if provider.provider.eq_ignore_ascii_case("anthropic") {
-            bail!("Anthropic direct does not expose the configured FIM completion route");
+            bail!(
+                "Anthropic direct does not expose the configured FIM completion route"
+            );
         }
         if provider.model.trim().is_empty() {
             bail!("prediction provider model is empty");
         }
 
         if infer_prompt_format(&provider.model).is_some() {
-            return Self::predict_fim(work, request, provider);
+            return Self::predict_fim(work, request, open_buffers, provider);
         }
 
         let prompt = Self::assemble_context(work, request, open_buffers)?;
@@ -219,9 +362,10 @@ impl PredictionEngine {
             .context("invalid prediction completion URL")?;
         let mut client_builder = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5));
-        if endpoint_url.host_str().is_some_and(|host| {
-            matches!(host, "localhost" | "127.0.0.1" | "::1")
-        }) {
+        if endpoint_url
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+        {
             client_builder = client_builder.no_proxy();
         }
         let client = client_builder
@@ -265,30 +409,29 @@ impl PredictionEngine {
     fn predict_fim(
         work: &PredictionWorkContext,
         request: &PredictionRequest,
+        open_buffers: &[OpenBufferContext],
         provider: &PredictionProviderConfig,
     ) -> Result<PredictionResult> {
         let format = infer_prompt_format(&provider.model)
             .context("no FIM prompt format for model")?;
-        let full = format!("{}{}", request.prefix, request.suffix);
-        let cursor = request.prefix.len().min(full.len());
-        let (start, end) = cursor_excerpt_bounds(&full, cursor, MAX_EXCERPT_TOKENS);
-        let prefix = full.get(start..cursor).unwrap_or_default();
-        let suffix = full.get(cursor..end).unwrap_or_default();
+        let (prefix, suffix) = prediction_excerpt(request);
 
         let mut prompt = String::new();
-        if let Some(header) =
-            session_fim_header(work, comment_prefix_for_path(&request.path))
-        {
-            prompt.push_str(&header);
-        }
-        prompt.push_str(&format_fim_prompt(format, prefix, suffix));
+        prompt.push_str(&session_fim_header(
+            work,
+            comment_prefix_for_path(&request.path),
+            &request.work_context,
+            open_buffers,
+        ));
+        prompt.push_str(&format_fim_prompt(format, &prefix, &suffix));
         let stop = fim_stop_tokens();
 
-        let (replacement, request_id) = if provider.provider.eq_ignore_ascii_case("ollama") {
-            Self::post_ollama_generate(provider, &prompt, &stop)?
-        } else {
-            Self::post_completions(provider, &prompt, &stop)?
-        };
+        let (replacement, _request_id) =
+            if provider.provider.eq_ignore_ascii_case("ollama") {
+                Self::post_ollama_generate(provider, &prompt, &stop)?
+            } else {
+                Self::post_completions(provider, &prompt, &stop)?
+            };
         let replacement = clean_fim_completion(&replacement);
         if replacement.is_empty() {
             bail!("prediction provider returned no completion text");
@@ -408,9 +551,10 @@ fn blocking_client(endpoint: &str) -> Result<reqwest::blocking::Client> {
         reqwest::Url::parse(endpoint).context("invalid prediction URL")?;
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5));
-    if endpoint_url.host_str().is_some_and(|host| {
-        matches!(host, "localhost" | "127.0.0.1" | "::1")
-    }) {
+    if endpoint_url
+        .host_str()
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+    {
         builder = builder.no_proxy();
     }
     builder.build().context("build prediction provider client")
@@ -544,6 +688,16 @@ pub fn guess_token_count(bytes: usize) -> usize {
 /// `CURSOR_EXCERPT_TOKEN_BUDGET`.
 pub const MAX_EXCERPT_TOKENS: usize = 8192;
 
+fn prediction_excerpt(request: &PredictionRequest) -> (String, String) {
+    let full = format!("{}{}", request.prefix, request.suffix);
+    let cursor = request.prefix.len().min(full.len());
+    let (start, end) = cursor_excerpt_bounds(&full, cursor, MAX_EXCERPT_TOKENS);
+    (
+        full.get(start..cursor).unwrap_or_default().to_string(),
+        full.get(cursor..end).unwrap_or_default().to_string(),
+    )
+}
+
 /// Computes a linewise excerpt window around the cursor that fits the token
 /// budget, mirroring Zed's `compute_cursor_excerpt` (symmetric expansion,
 /// down first then up). Returns byte offsets into `text`; inputs are
@@ -562,7 +716,8 @@ pub fn cursor_excerpt_bounds(
         .iter()
         .rposition(|&start| start <= cursor)
         .unwrap_or(0);
-    let mut budget = budget_tokens.saturating_sub(line_token_count(text, cursor_row));
+    let mut budget =
+        budget_tokens.saturating_sub(line_token_count(text, cursor_row));
     let mut start_row = cursor_row;
     let mut end_row = cursor_row;
     loop {
@@ -623,10 +778,8 @@ fn line_token_count(text: &str, row: usize) -> usize {
 fn comment_prefix_for_path(path: &str) -> Option<&'static str> {
     let extension = Path::new(path).extension()?.to_str()?;
     match extension {
-        "rs" | "js" | "jsx" | "ts" | "tsx" | "go" | "java" | "c" | "h"
-        | "cpp" | "hpp" | "swift" | "kt" | "kts" | "scala" | "cs" | "php" => {
-            Some("//")
-        }
+        "rs" | "js" | "jsx" | "ts" | "tsx" | "go" | "java" | "c" | "h" | "cpp"
+        | "hpp" | "swift" | "kt" | "kts" | "scala" | "cs" | "php" => Some("//"),
         "py" | "sh" | "bash" | "rb" | "toml" | "yaml" | "yml" | "r" | "pl" => {
             Some("#")
         }
@@ -641,9 +794,18 @@ fn comment_prefix_for_path(path: &str) -> Option<&'static str> {
 fn session_fim_header(
     work: &PredictionWorkContext,
     comment: Option<&str>,
-) -> Option<String> {
-    let comment = comment?;
-    let mut header = format!("{comment} AHEAD {:?} · {}\n", work.mode, work.phase_title);
+    request_context: &str,
+    open_buffers: &[OpenBufferContext],
+) -> String {
+    let mut context = format!(
+        "AHEAD {:?} · {} · {}\n",
+        work.mode,
+        work.work_kind.display_name(),
+        work.phase_title
+    );
+    if let Some(issue) = &work.primary_issue {
+        context.push_str(&format!("Issue: {issue}\n"));
+    }
     let invariants: Vec<&str> = work
         .active_invariants
         .iter()
@@ -651,9 +813,32 @@ fn session_fim_header(
         .map(String::as_str)
         .collect();
     if !invariants.is_empty() {
-        header.push_str(&format!("{comment} Invariants: {}\n", invariants.join("; ")));
+        context.push_str(&format!("Invariants: {}\n", invariants.join("; ")));
     }
-    Some(header)
+    if !request_context.trim().is_empty() {
+        context.push_str("Session and applicable instructions:\n");
+        context.push_str(request_context.trim());
+        context.push('\n');
+    }
+    for buffer in open_buffers {
+        context.push_str(&format!(
+            "Relevant open buffer: {}\n{}\n",
+            buffer.path, buffer.relevant_excerpt
+        ));
+    }
+
+    if let Some(comment) = comment {
+        let mut rendered = String::new();
+        for line in context.lines() {
+            rendered.push_str(comment);
+            rendered.push(' ');
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
+        rendered
+    } else {
+        format!("[AHEAD FIM context]\n{context}[/AHEAD FIM context]\n\n")
+    }
 }
 
 #[cfg(test)]
@@ -691,9 +876,8 @@ mod tests {
                 let read = stream.read(&mut chunk).unwrap();
                 assert!(read > 0, "provider closed before sending a request");
                 request.extend_from_slice(&chunk[..read]);
-                if let Some(header_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
                 {
                     body_start = header_end + 4;
                     let headers = String::from_utf8_lossy(&request[..header_end]);
@@ -711,8 +895,10 @@ mod tests {
                     }
                 }
             }
-            let body = String::from_utf8(request[body_start..body_start + content_length].to_vec())
-                .unwrap();
+            let body = String::from_utf8(
+                request[body_start..body_start + content_length].to_vec(),
+            )
+            .unwrap();
             let response_body = r#"{"choices":[{"text":"retry_with_backoff()"}]}"#;
             write!(
                 stream,
@@ -747,13 +933,189 @@ mod tests {
             model: "test-fim".to_string(),
         };
 
-        let result = PredictionEngine::predict(&work, &request, &[], &provider).unwrap();
+        let result =
+            PredictionEngine::predict(&work, &request, &[], &provider).unwrap();
         let body = server.join().unwrap();
         assert_eq!(result.replacement, "retry_with_backoff()");
         assert!(body.contains("Preserve idempotency"));
         assert!(body.contains("Active step: implement the retry policy"));
         assert!(body.contains("pub fn retry"));
         assert!(body.contains("\"suffix\":\" {\\n}\""));
+    }
+
+    #[test]
+    fn fim_provider_request_includes_project_instructions_session_and_open_buffers()
+    {
+        let (address, server) =
+            spawn_stub(r#"{"choices":[{"text":"retry_with_backoff()"}]}"#);
+        let work = PredictionWorkContext {
+            work_kind: WorkKind::ProductChange,
+            mode: AssistanceMode::Assist,
+            phase_title: "Implement retry policy".to_string(),
+            primary_issue: Some("#142 Improve retries".to_string()),
+            active_invariants: vec!["Preserve idempotency".to_string()],
+        };
+        let request = PredictionRequest {
+            request_id: "fim-context-1".to_string(),
+            session_id: "session-1".to_string(),
+            path: "src/retry.rs".to_string(),
+            cursor: DisplayPosition { line: 4, col: 7 },
+            prefix: "pub fn retry".to_string(),
+            suffix: " {\n}".to_string(),
+            work_context:
+                "root policy\nnested source policy\nDecision: preserve retries"
+                    .to_string(),
+        };
+        let open_buffers = vec![OpenBufferContext {
+            path: "src/client.rs".to_string(),
+            relevant_excerpt: "pub struct UnsavedRequest;".to_string(),
+        }];
+        let provider = PredictionProviderConfig {
+            provider: "openai-compatible".to_string(),
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "qwen2.5-coder:7b".to_string(),
+        };
+
+        let result =
+            PredictionEngine::predict(&work, &request, &open_buffers, &provider)
+                .expect("FIM provider request");
+        let body: Value = serde_json::from_str(&server.join().unwrap())
+            .expect("provider JSON request body");
+        let prompt = body["prompt"].as_str().expect("FIM prompt");
+
+        assert_eq!(result.replacement, "retry_with_backoff()");
+        assert!(prompt.contains("// root policy"));
+        assert!(prompt.contains("// nested source policy"));
+        assert!(prompt.contains("// Decision: preserve retries"));
+        assert!(prompt.contains("// Relevant open buffer: src/client.rs"));
+        assert!(prompt.contains("// pub struct UnsavedRequest;"));
+        assert!(prompt.contains("<|fim_prefix|>pub fn retry"));
+    }
+
+    #[test]
+    fn host_fim_request_sends_persisted_objective_and_live_context() -> Result<()> {
+        use ahead_rpc::ahead::AheadRequest;
+
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path();
+        std::fs::create_dir_all(workspace.join(".ahead"))?;
+        std::fs::create_dir_all(workspace.join("src"))?;
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "Workspace instruction: preserve public retry semantics.",
+        )?;
+        std::fs::write(
+            workspace.join("src/AGENTS.md"),
+            "Nested instruction: keep retry delays bounded.",
+        )?;
+
+        let (address, server) =
+            spawn_stub(r#"{"choices":[{"text":"retry_with_backoff()"}]}"#);
+        let connection_name = format!("ahead-fim-test-{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            format!(
+                r#"
+                [ai]
+                active_connection = "{connection_name}"
+
+                [[ai.connections]]
+                name = "{connection_name}"
+                provider_id = "{connection_name}"
+                provider = "openai-compatible"
+                base_url = "http://{address}/v1"
+                model = "qwen2.5-coder:7b"
+                "#
+            ),
+        )?;
+
+        let database_path = workspace.join(".ahead/sessions.db");
+        let host = crate::ahead::host::AheadSessionHost::new(
+            crate::ahead::store::SessionStore::open(&database_path)?,
+        );
+        host.set_workspace(workspace.to_path_buf());
+        let objective =
+            "Add bounded exponential backoff without retrying committed responses.";
+        let session = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Safe retries".to_string(),
+            objective.to_string(),
+            None,
+        )?;
+        let item = host.handle_request(AheadRequest::WorkItemCreate {
+            session_id: session.session.id.clone(),
+            title: "Add bounded exponential backoff".to_string(),
+        })?;
+        let item_id = item["id"].as_str().context("work item id")?.to_string();
+        host.handle_request(AheadRequest::WorkItemNote {
+            item_id: item_id.clone(),
+            kind: "invariant".to_string(),
+            body_markdown: "Preserve retry idempotency.".to_string(),
+        })?;
+        host.handle_request(AheadRequest::WorkItemNote {
+            item_id,
+            kind: "decision".to_string(),
+            body_markdown: "Do not retry a committed response.".to_string(),
+        })?;
+        host.handle_request(AheadRequest::ConversationSummarize {
+            session_id: session.session.id.clone(),
+            phase: "plan".to_string(),
+            summary_markdown: "Retry only when no response has been committed."
+                .to_string(),
+            message_id_range: "message-1..message-2".to_string(),
+        })?;
+
+        drop(host);
+        let host = crate::ahead::host::AheadSessionHost::new(
+            crate::ahead::store::SessionStore::open(&database_path)?,
+        );
+        host.set_workspace(workspace.to_path_buf());
+        let open_buffers = [OpenBufferContext {
+            path: "src/client.rs".to_string(),
+            relevant_excerpt: "pub struct UnsavedRequest;".to_string(),
+        }];
+        let result = host.request_prediction(
+            PredictionRequest {
+                request_id: "host-fim-1".to_string(),
+                session_id: session.session.id,
+                path: "src/retry.rs".to_string(),
+                cursor: DisplayPosition { line: 4, col: 7 },
+                prefix: "pub fn retry".to_string(),
+                suffix: " {\n}".to_string(),
+                work_context:
+                    "Caller context: preserve the existing request identity."
+                        .to_string(),
+            },
+            &open_buffers,
+        )?;
+        let body: Value =
+            serde_json::from_str(&server.join().expect("provider stub thread"))?;
+        let prompt = body["prompt"].as_str().context("provider prompt")?;
+        let objective_line = format!("Objective: {objective}");
+
+        assert_eq!(result.replacement, "retry_with_backoff()");
+        for expected in [
+            "Session: Safe retries",
+            objective_line.as_str(),
+            "Product Change · Questions & Outline",
+            "Workspace instruction: preserve public retry semantics.",
+            "Nested instruction: keep retry delays bounded.",
+            "Add bounded exponential backoff",
+            "Preserve retry idempotency.",
+            "Do not retry a committed response.",
+            "Retry only when no response has been committed.",
+            "Caller context: preserve the existing request identity.",
+            "Relevant open buffer: src/client.rs",
+            "pub struct UnsavedRequest;",
+            "pub fn retry",
+        ] {
+            assert!(
+                prompt.contains(expected),
+                "provider prompt omitted: {expected}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -847,10 +1209,7 @@ mod tests {
             infer_prompt_format("codestral:latest"),
             Some(PromptFormat::Codestral)
         );
-        assert_eq!(
-            infer_prompt_format("glm-4:9b"),
-            Some(PromptFormat::Glm)
-        );
+        assert_eq!(infer_prompt_format("glm-4:9b"), Some(PromptFormat::Glm));
         assert_eq!(infer_prompt_format("test-fim"), None);
         assert_eq!(infer_prompt_format("llama3:70b"), None);
     }
@@ -865,28 +1224,32 @@ mod tests {
             format_fim_prompt(PromptFormat::CodeLlama, "a", "b"),
             "<PRE> a <SUF>b <MID>"
         );
-        assert!(format_fim_prompt(PromptFormat::Codestral, "a", "b")
-            .starts_with("[SUFFIX]"));
+        assert!(
+            format_fim_prompt(PromptFormat::Codestral, "a", "b")
+                .starts_with("[SUFFIX]")
+        );
     }
 
     #[test]
     fn clean_fim_completion_truncates_leaked_tokens() {
-        assert_eq!(
-            clean_fim_completion("ok()<|fim_suffix|>trailing"),
-            "ok()"
-        );
+        assert_eq!(clean_fim_completion("ok()<|fim_suffix|>trailing"), "ok()");
         assert_eq!(clean_fim_completion("ok()"), "ok()");
     }
 
     #[test]
     fn cursor_excerpt_bounds_cover_small_buffers_fully() {
         let text = "fn a() {}\nfn b() {}\n";
-        assert_eq!(cursor_excerpt_bounds(text, 5, MAX_EXCERPT_TOKENS), (0, text.len()));
+        assert_eq!(
+            cursor_excerpt_bounds(text, 5, MAX_EXCERPT_TOKENS),
+            (0, text.len())
+        );
     }
 
     #[test]
     fn cursor_excerpt_bounds_window_around_cursor() {
-        let text = (0..400).map(|i| format!("line {i:03}\n")).collect::<String>();
+        let text = (0..400)
+            .map(|i| format!("line {i:03}\n"))
+            .collect::<String>();
         let cursor = text.find("line 200").unwrap();
         let (start, end) = cursor_excerpt_bounds(&text, cursor, 60);
         assert!(start <= cursor && cursor <= end);
@@ -904,21 +1267,36 @@ mod tests {
             primary_issue: None,
             active_invariants: vec!["Preserve idempotency".to_string()],
         };
-        let header =
-            session_fim_header(&work, comment_prefix_for_path("src/retry.rs")).unwrap();
+        let open_buffers = vec![OpenBufferContext {
+            path: "src/client.rs".to_string(),
+            relevant_excerpt: "pub struct Request;".to_string(),
+        }];
+        let header = session_fim_header(
+            &work,
+            comment_prefix_for_path("src/retry.rs"),
+            "root instructions\nnested instructions",
+            &open_buffers,
+        );
         assert!(header.starts_with("// AHEAD"));
         assert!(header.contains("Preserve idempotency"));
-        assert!(session_fim_header(&work, comment_prefix_for_path("notes.xyz")).is_none());
+        assert!(header.contains("// root instructions"));
+        assert!(header.contains("// nested instructions"));
+        assert!(header.contains("// Relevant open buffer: src/client.rs"));
+        let unknown_extension = session_fim_header(
+            &work,
+            comment_prefix_for_path("notes.xyz"),
+            "root instructions",
+            &[],
+        );
+        assert!(unknown_extension.contains("root instructions"));
+        assert!(unknown_extension.contains("[AHEAD FIM context]"));
     }
 
     /// Minimal HTTP stub: reads one request with Content-Length framing and
     /// answers with a fixed JSON body, returning the raw request body.
     fn spawn_stub(
         response_body: &'static str,
-    ) -> (
-        std::net::SocketAddr,
-        std::thread::JoinHandle<String>,
-    ) {
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -934,9 +1312,8 @@ mod tests {
                 let read = stream.read(&mut chunk).unwrap();
                 assert!(read > 0, "provider closed before sending a request");
                 request.extend_from_slice(&chunk[..read]);
-                if let Some(header_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
                 {
                     body_start = header_end + 4;
                     let headers = String::from_utf8_lossy(&request[..header_end]);
@@ -1038,5 +1415,79 @@ mod tests {
         assert_eq!(result.replacement, "ok()");
         assert!(body.contains("\"raw\":true"));
         assert!(body.contains("\"num_predict\""));
+    }
+
+    #[test]
+    fn prediction_provider_selects_an_active_workspace_connection() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-prediction-providers-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join(".ahead")).expect("workspace");
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            r#"
+                [ai]
+                active_connection = "Hosted"
+
+                [[ai.connections]]
+                name = "Local"
+                provider_id = "local"
+                provider = "ollama"
+                base_url = "http://127.0.0.1:11434/v1"
+                models = ["qwen"]
+
+                [[ai.connections]]
+                name = "Hosted"
+                provider_id = "hosted"
+                base_url = "https://models.example.test/v1"
+                model = "reasoning"
+                api_key = "secret"
+            "#,
+        )
+        .expect("settings");
+
+        let provider = PredictionProviderConfig::from_workspace(Some(&workspace))
+            .expect("load workspace provider");
+        assert_eq!(provider.provider, "openai-compatible");
+        assert_eq!(provider.base_url, "https://models.example.test/v1");
+        assert_eq!(provider.model, "reasoning");
+        assert_eq!(provider.api_key.as_deref(), Some("secret"));
+        std::fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prediction_provider_reports_symlinked_workspace_settings() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[ai]\nactive_connection = 'Safe'\n[[ai.connections]]\nname = 'Safe'\nprovider_id = 'ahead-symlink-regression-safe'\nbase_url = 'http://127.0.0.1:1234/v1'\nmodel = 'safe'\n",
+        )
+        .expect("shared provider");
+        let outside = workspace.path().join("outside.toml");
+        std::fs::write(
+            &outside,
+            "[ai]\nactive_connection = 'Outside'\n[[ai.connections]]\nname = 'Outside'\nbase_url = 'https://outside.example/v1'\nmodel = 'outside'\napi_key = 'secret'\n",
+        )
+        .expect("outside provider");
+        symlink(&outside, ahead.join("settings.toml"))
+            .expect("symlink provider settings");
+
+        let error = PredictionProviderConfig::from_workspace(Some(workspace.path()))
+            .expect_err("symlinked provider settings must fail closed");
+        assert!(format!("{error:#}").contains("settings.toml"));
+        std::fs::remove_file(ahead.join("settings.toml"))
+            .expect("remove provider symlink");
+        std::fs::write(ahead.join("settings.toml"), "[ai\n")
+            .expect("write invalid provider settings");
+        let error = PredictionProviderConfig::from_workspace(Some(workspace.path()))
+            .expect_err("invalid provider TOML must be reported");
+        assert!(format!("{error:#}").contains("invalid TOML"));
     }
 }

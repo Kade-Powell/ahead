@@ -49,7 +49,9 @@
   <key>NSLocationWhenInUseUsageDescription</key>
   <string>An application in AHEAD would like to access your location information while active.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>An application in AHEAD would like to access your microphone.</string>
+  <string>AHEAD uses the microphone for voice input when you turn on the microphone in the agent composer.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>AHEAD transcribes voice input on this Mac when you turn on the microphone in the agent composer.</string>
   <key>NSRemindersUsageDescription</key>
   <string>An application in AHEAD would like to access your reminders.</string>
   <key>NSSystemAdministrationUsageDescription</key>

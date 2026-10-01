@@ -1,10 +1,6 @@
-//! Voice intent + output-generation transitions.
-//!
-//! The voice lane is a state/queue probe: no mic, STT/TTS, or streaming
-//! exists yet. These functions track intent and the barge-in generation
-//! only, so both shells present identical honest state.
+//! Voice input/output state mirrored into the editor UI.
 
-/// Mic/speaker intent (no audio flows).
+/// Active microphone, listener, speaker, mute, and interruption state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VoiceIntent {
     pub active: bool,
@@ -16,7 +12,10 @@ pub struct VoiceIntent {
 
 impl VoiceIntent {
     pub fn new() -> Self {
-        Self { generation: 1, ..Default::default() }
+        Self {
+            generation: 1,
+            ..Default::default()
+        }
     }
 }
 

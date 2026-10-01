@@ -1,0 +1,5 @@
+{
+  "name": "AHEAD editor smoke project",
+  "features": ["search", "quick-open", "syntax", "git", "terminal", "agent-context"],
+  "unicode": "🦀 café"
+}

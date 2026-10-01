@@ -92,6 +92,7 @@ export interface SessionTask {
   intent: TaskIntent;
   work_kind: WorkKind;
   title: string;
+  objective: string;
   parent_task_id?: Id;
   learning_arc_id?: Id;
   created_at: Timestamp;
@@ -119,10 +120,10 @@ export interface SkillDescriptor {
   supported_task_intents: TaskIntent[];
   required_capabilities: Capability[];
   source:
-    | { kind: "builtin"; root: "ahead-harness/skills" }
+    | { kind: "builtin"; root: "ahead-agent/skills" }
     | {
         kind: "workspace";
-        root: ".agents/skills" | ".agent/skills" | ".skills";
+        root: ".agents/skills";
         content_sha256: Sha256;
       }
     | { kind: "user"; root_id: Id; content_sha256: Sha256 };
@@ -149,6 +150,15 @@ export interface SessionView {
   current_task_id?: Id;
   workflow: WorkflowState;
   participants: Array<{ participant: Participant; role: SessionRole }>;
+}
+
+// ListSessions returns metadata; GetSession resolves the full SessionView.
+export interface SessionListItem {
+  id: Id;
+  title: string;
+  lifecycle: SessionLifecycle;
+  created_at: Timestamp;
+  backend: string | null;
 }
 
 export interface WorkflowState {
@@ -181,7 +191,8 @@ export type WorkflowAction =
 
 export interface StartWorkInput {
   project_id: Id;
-  work_kind: WorkKind;
+  /** Suggested by the host/agent from the human request; editable metadata. */
+  work_kind?: WorkKind;
   title: string;
   human_starting_point: string;
   work_item?: GithubIssueRef;
@@ -365,6 +376,7 @@ export interface EditorContext {
   };
   attached_anchor_ids: Id[];
   attached_artifact_ids: Id[];
+  attached_files?: { path: string; content: string }[];
 }
 
 export type PresentationAction =
@@ -486,7 +498,7 @@ export interface AgentBackend {
   id: Id;
   title: string;
   transport:
-    | { kind: "ahead_codex_stdio"; pinned_revision: string }
+    | { kind: "ahead_stdio"; pinned_revision: string }
     | { kind: "acp_stdio"; local_installation_id: Id };
   certification: "managed" | "external";
   capabilities: {
@@ -511,7 +523,7 @@ export interface ModelRoute {
   backend_id?: Id; // Present when the coding backend owns the route; direct audio/prediction need none.
   purpose: "reasoning" | "edit_prediction" | "realtime_voice" | "speech_to_text" | "text_to_speech";
   provider:
-    | { kind: "codex_builtin"; provider_id: "openai" | "ollama" | "lmstudio" | "amazon-bedrock" }
+    | { kind: "ahead_builtin"; provider_id: "openai" | "ollama" | "lmstudio" | "amazon-bedrock" }
     | {
         kind: "custom"; base_url: string;
         protocol: "responses" | "chat_completions" | "completions" | "anthropic_messages" | "gemini_generate_content";
@@ -530,6 +542,7 @@ export interface AgentTurnRequest {
   session_id: Id;
   task_id: Id;
   thread_id: Id;
+  harness: "ahead" | "external_acp";
   message_id: Id;
   backend_id: Id;
   model_route_id: Id;

@@ -11,7 +11,7 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | ID | Status | Requirement or proposed choice |
 |---|---|---|
 | W1 | Required | Humans own business behavior and write business logic with explicitly accepted FIM in assistance tasks. FIM receives current/open-file context plus the active work, decisions, plan and relevant attached history. Teaching tasks do not receive edit predictions. |
-| W2 | Required | Preserve the selected harness's model-facing tools and loop behavior. **2026-09-18 decision:** two tiers — the AHEAD-owned managed runtime (AHEAD owns the effect boundary, default for explicit teaching and assistance tasks) and external ACP agents (compatibility only, no enforcement guarantees). Live probes showed the external ACP adapter executes shell/edit tool calls with no permission requests and does not route writes through the client, so ACP alone cannot carry teaching read-only enforcement, mechanical scope or edit attribution. See [harness decision](ahead-humanlayer-workflows.md#harness-decision-2026-09-18). |
+| W2 | Required | Preserve the selected harness's model-facing tools and loop behavior. **Updated 2026-09-22:** follow Zed's native-agent split exactly in shape—direct built-in loop through the AHEAD proxy; ACP only for external agent processes. The managed path owns the effect boundary; external ACP remains compatibility-only with no enforcement guarantee. Lifecycle policy and agent-advertised ACP modes are separate. See [native cutover](ahead-humanlayer-workflows.md#native-integration-cutover-2026-09-22). |
 | W3 | Required | Use `.ahead` as a mixed project workspace: track non-secret project configuration, project artifact-template overrides and explicitly shared session checkpoints; ignore credentials, personal settings, databases, caches and private working sessions. Let developers browse and attach shared past sessions. |
 | W4 | Required | Support voice conversation while coding, with Maieutic-style highlighting and pointing, and teaching from actual code. |
 | W5 | Required | Diagram the flows and human/AI roles across the SDLC, including investigation and bug diagnosis. Preserve one discoverable, readable home for design artifacts. |
@@ -23,8 +23,9 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W11 | Settled 2026-09-21 | A session is a durable container, not a binary Learn/Assist mode. Each session contains explicit tasks: `teaching` when the human asks to learn, and `assistance` for everything else. A teaching task may be linked to an assistance task without changing the parent task's effect policy. |
 | W12 | Settled 2026-09-21 | Integrate a graduated diagnosing-bugs workflow into corrective-debugging and investigation tasks: establish a red reproduction loop, minimize it, rank falsifiable hypotheses, instrument or test, fix with regression evidence, then clean up. Redact sensitive diagnostic evidence before persistence or sharing. |
 | W13 | Settled 2026-09-21 | Ship AHEAD-owned skills as built-in `SKILL.md` bundles with startup metadata and progressive body/reference loading. The agent may select relevant assistance skills, but the session host enforces task policy, capabilities and human authorization. End-of-session automated review is a standard review step; it never auto-applies findings or publishes externally. |
-| W14 | Settled 2026-09-21 | Read applicable `AGENTS.md` files from the workspace root through each target directory before selecting skills or taking actions. Discover workspace-local skills from `.agents/skills/`, `.agent/skills/` and `.skills/` plus explicitly configured user roots. These provide extra instructions only within AHEAD's rules; built-ins cannot be silently shadowed, discovered skills do not authorize effects, and scripts/network/credential/external-write behavior remains host-gated. |
+| W14 | Settled 2026-09-21; root convention clarified 2026-09-23 | Follow the open `AGENTS.md` convention for project instructions and the portable Agent Skills package format. Discover workspace skills from `.agents/skills/` (the client guide's widely adopted cross-client location); user skills use AHEAD's `~/.agents/skills/` convention. This repository dogfoods those paths. Zed is a non-normative implementation reference: AHEAD does not load Zed `.rules` or other editor-specific instruction formats. Instructions and skills provide context only within AHEAD's rules; built-ins cannot be silently shadowed, discovered skills do not authorize effects, and scripts/network/credential/external-write behavior remains host-gated. See [the standards boundary](ahead-agent-standards.md). |
 | W15 | Settled 2026-09-22 | Treat pull-request review as a distinct work type over an immutable base/head snapshot. A contributor may review the code and explicitly shared session artifacts, mark each artifact's review status and disposition, and record findings. AHEAD records reviewer identity, reviewer relationship to the implementers, revisions and policy context, then offers an advisory merge-readiness suggestion. The repository/team's normal PR requirements—including whether independent review is required—and the team's or solo contributor's merge timing remain authoritative; AHEAD neither requires a second person universally nor authorizes, blocks or performs the merge. |
+| W16 | Required | Presentation Core is an editor capability available to every supported AHEAD agent implementation and version, across managed models/providers and external adapters. Agent adapters expose the same inspect, highlight, label/note, pointer and speech tools by forwarding requests to the editor; availability does not depend on teaching versus assistance intent. Presentation actions do not edit source files or move the human caret. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
@@ -261,6 +262,44 @@ sequenceDiagram
   A-->>H: Adapt the explanation or propose the next observation
 ```
 
+Presentation Core is an editor tool surface, independent of the agent runtime.
+Every supported AHEAD agent implementation and version exposes the same
+`read_editor_buffer`, `present_code`, `move_code_pointer`,
+`clear_presentation`, `speak_text`, and `stop_speaking` schemas. The editor
+capability is available across supported harnesses and providers, and is not
+gated on teaching intent. Managed agent tools
+and external ACP stdio MCP sessions currently adapt that shared contract;
+future adapters must reuse its schemas and argument validation rather than
+copying a runtime-specific version; the reusable API is
+`ahead_agent::editor_tools`. `read_editor_buffer` returns the
+current unsaved contents of an open,
+non-private worktree file, so the agent can verify a quote before pointing.
+AHEAD supplies the stdio MCP server in every ACP session, and it routes through
+a local, session-scoped bridge to the same editor request path. `present_code`
+opens a worktree file, checks the exact quote against the current editor buffer, draws
+a GPUI decoration and inline note from a `PresentationCue`, and acknowledges on
+the next rendered frame. It does not call `set_cursor_position` or
+`window.focus`. `move_code_pointer` resolves a second exact quote in the same
+active cue and moves only the agent arrow; the original range highlight and
+inline note remain in place. Both editor actions preserve the human selection
+and acknowledge after the updated frame. Pointer movement, cue-specific clear,
+and cue-linked speech are limited to cues created by that session; each queued
+editor action is checked against both its session and active turn, so cancelled
+or superseded turns are rejected too. Switching sessions stops
+speech and microphone capture, drops that session's transcript drafts, and clears
+its cue. The speaker uses macOS `/usr/bin/say`; typing in the editor or
+agent composer, changing a breakpoint, or using a debugger control interrupts
+playback without cancelling the agent turn. The microphone path uses AVAudioEngine
+and Apple's Speech framework on macOS, requires the current language to support on-device
+recognition, and explicitly requires on-device requests so microphone audio is
+not sent to a speech service. Partial text is shown as the user speaks; each
+final transcript stays as a draft until the user adds it to the composer,
+reviews or corrects it, and sends it through the selected harness. These are
+source-level behaviors; the interactive native and ACP journeys still need
+validation, including OS permissions and unavailable on-device languages.
+Persistent inline discussion is not implemented; the current code note is
+attached to a transient presentation cue.
+
 Teaching tasks can use a small loop: **human prediction/explanation → verified visible example → agent hint or challenge → human experiment/explanation → evidence and next concept**. Ask a useful question when it develops understanding; answer straightforward factual questions directly. The former extension's exact word limits and mandatory quiz cadence are not automatically AHEAD requirements.
 
 Voice is an input/output channel for the same work, not a competing engineering authority. The speech frontend must not invent code observations or decisions while a different coding harness works. Keep visible, correctable transcripts; speak from verified context and acknowledge a visual change before claiming it is on screen. Preserve microphone input during speech and editing. Barge-in stops obsolete speech; it does not silently cancel a test or resume a paused program. “Stop talking,” “cancel that task” and “pause the program” are distinct intents; clarify an ambiguous “stop” when the target matters.
@@ -347,9 +386,9 @@ merge; AHEAD does not add a merge button or dictate merge timing.
 
 ## 9. Storage and artifact convention
 
-The current store already uses Turso's `libsql` and opens `.ahead/session.db`. Retain that installed database path and library unless a measured need requires changing them. This refers to the existing SQLite-compatible libSQL implementation; it does not select a migration to Turso's separate rewritten database engine or require Turso Cloud. [libSQL distinction](https://docs.turso.tech/libsql).
+The current store already uses Turso's `libsql` and opens `.ahead/session.db`. Retain that installed database path and library unless a measured need requires changing them. This selects local Turso/libSQL, not Turso Cloud or a separate database engine. [libSQL distinction](https://docs.turso.tech/libsql).
 
-SQLite is a binary, page-based database, not a plain-text document format. It gives us transactional/queryable storage; it does not guarantee fewer bytes than Markdown/JSON. Pages, indexes and journals also occupy space. Measure real histories before claiming a size benefit. [SQLite format](https://www.sqlite.org/fileformat.html).
+The session database is transactional and queryable, not a plain-text document format; it does not guarantee fewer bytes than Markdown/JSON. Measure real histories before claiming a size benefit.
 
 **Canonical split:** database for frequent runtime state; ordinary Markdown for intentional engineering documents. The database stores conversation/events, current runtime references, local UI state and rebuildable search indexes. It may cache document content by revision/hash, but that cache is not a second independently editable design document.
 
@@ -360,13 +399,22 @@ that directory:
 | Path | Git policy | Purpose |
 |---|---|---|
 | `.ahead/.gitignore` | tracked and created on project setup/open | Default-deny boundary that travels with the project without changing its root `.gitignore`. |
-| `.ahead/config.toml` | tracked | Non-secret project workflow, editor and provider defaults. |
+| `.ahead/config.toml` | tracked | Non-secret project workflow/editor/provider defaults; MCP declarations remain inert until local opt-in. |
 | `.ahead/templates/` | tracked when present | Project overrides for built-in artifact templates. |
 | `.ahead/sessions/<id>/` | tracked when explicitly published | Portable session checkpoint and selected human-readable artifacts. |
 | `~/.ahead/settings.toml` | outside the repository | Private user-level defaults and credentials. |
 | `.ahead/settings.toml` | ignored | Workspace-private AI connections, credentials and personal overrides. |
 | `.ahead/config.local.toml` | ignored | Checkout-specific non-secret overrides. |
 | `.ahead/local/`, `.ahead/session.db*`, `.ahead/auth.json` | ignored | Private working documents, runtime history, caches and credentials. |
+
+**Proposed MCP default:** use an AHEAD-owned `[mcp.servers.<id>]` settings shape
+that maps to MCP's standard transports; do not claim compatibility with a
+private editor config format. Require explicit local opt-in in
+`.ahead/settings.toml` or `~/.ahead/settings.toml`; never auto-launch a server
+from tracked config. This is a proposed config contract, not a working
+server-launch path. The native host must keep MCP unavailable in Learn until it
+can enforce read-only behavior for external server effects; MCP writes are not
+AHEAD CodeAnchors. See the [agent standards boundary](ahead-agent-standards.md#protocols).
 
 Built-in artifact templates live in `defaults/artifacts/`. A project may override
 a template by placing a file with the same name in `.ahead/templates/`; it need
@@ -434,36 +482,33 @@ attachments remain implementation work.
 
 For a working session, each artifact has one active file path: private or explicitly shared. Publishing creates a checkpoint, not a second live editable copy of private work. Explicitly continuing shared work creates a linked working session. If a file is edited externally, index the new revision and surface conflicts with unsaved editor content; never overwrite it from a stale database cache. Persist artifact writes atomically, then reconcile the database hash/index so a crash or external edit cannot leave two apparent authoritative versions.
 
-Human and agent UI links should open the same canonical artifact. Session context names the artifact root and current roles/paths; agents do not guess the newest filename or read arbitrary SQLite internals. FIM reads the compact versioned context assembled from these documents and the session. Save chosen decisions before a harness reset. Pin attached past-session evidence to its source revision; importing it must not revive old grants or execute old commands.
+Human and agent UI links should open the same canonical artifact. Session context names the artifact root and current roles/paths; agents do not guess the newest filename or inspect arbitrary database internals. FIM reads the compact versioned context assembled from these documents and the session. Save chosen decisions before a harness reset. Pin attached past-session evidence to its source revision; importing it must not revive old grants or execute old commands.
 
-Shared snapshots are plain-text readable without AHEAD. A database export/backup can remain an optional complete local archive; do not use a live SQLite file as the default Git interchange format. Large logs/audio are not duplicated on every turn or embedded in every checkpoint: preserve selected evidence and its provenance, use explicit retention/export for larger material, and do not claim history is complete after pruning it. No whole-repository compression system or new storage engine is needed for this design.
+Shared snapshots are plain-text readable without AHEAD. A database export/backup can remain an optional complete local archive; do not use the live Turso database file as the default Git interchange format. Large logs/audio are not duplicated on every turn or embedded in every checkpoint: preserve selected evidence and its provenance, use explicit retention/export for larger material, and do not claim history is complete after pruning it. No whole-repository compression system or new storage engine is needed for this design.
 
 This refines the previous export-only artifact proposal: working design artifacts become ordinary files too, while the runtime remains database-backed. AHEAD creates `.ahead/.gitignore` when a project is set up or opened, but never overwrites an existing file. Its default-deny boundary explicitly permits only itself, shared configuration, template overrides and published sessions. Private roots, database sidecars and credentials remain excluded without modifying the project's root `.gitignore`.
 
 ## 10. Implementation status and review scenarios
 
-Source inspection on 2026-09-18, not live end-to-end validation:
+Source inspection and focused validation through 2026-09-22:
 
-- **Harness (updated 2026-09-18, after live validation):** AHEAD now speaks ACP
-  v1 over stdio to the maintained `@agentclientprotocol/codex-acp` adapter,
-  which launches the AHEAD agent runtime. `ahead-agent/src/acp_client.rs`
-  performs `initialize` → `session/new|load` → `session/prompt`, streams
-  `session/update`, answers `session/request_permission` from the current task
-  intent and policy,
-  and cancels with `session/cancel`. `ahead-agent/src/session.rs` binds each durable
-  AHEAD session to a harness conversation, persists streamed messages, and
-  reopens via `session/load`. Live-verified on this machine against Codex
-  runtime `0.152.0` (adapter `1.12.0`): streamed reply, durable message rows,
-  cancellation (`stopReason: cancelled`), and reopen/continue all passed
-  (see `ahead-proxy/tests/harness_{e2e,session_e2e}.rs`). The old deterministic
-  `AheadAgentLoop` remains as a fallback/`AgentTurn` path but is no longer the
-  conversational foundation. Model/tool fidelity beyond one streamed turn
-  (multi-tool turns, compaction, unsaved-buffer reads) is still unverified.
+- **Harness (updated 2026-09-22):** following Zed commit
+  `418f89714891f9d8105a3e92e60b9a7a5084d232`, built-in AHEAD chat now calls the
+  hard-forked native `ThreadManager` through `ahead-agent/src/native_client.rs`;
+  it does not use ACP or a Codex App Server. The focused real Responses test
+  verifies a native streamed turn. Plans, usage, stable tool ids, reasoning,
+  cancellation and `request_user_input` are routed into the durable panel.
+  `ahead-agent/src/acp_client.rs` is now external-only and supports streamed
+  messages/thoughts, stable tool updates, plans, usage, titles and advertised
+  slash commands. Pi ACP reaches initialize, session creation, command discovery
+  and prompt completion; its final model delta is blocked by an expired local Pi
+  bearer token. Multi-tool native turns, compaction and unsaved-buffer reads still
+  need authenticated acceptance evidence.
 - `ahead-proxy/src/ahead/store.rs` and `ahead-proxy/src/dispatch.rs` already provide the local libSQL store and `.ahead/session.db` path. `dispatch.rs` now surfaces an open failure instead of silently presenting an in-memory store as durable, but full message/artifact sharing and canonical working-document synchronization remain incomplete.
 - `ahead-rpc/src/ahead.rs::PresentationCue` already separates agent highlighting from the human caret. The complete visible cue/voice interaction is not established by that DTO.
 - `ahead-proxy/src/plugin/dap.rs`, `ahead-rpc/src/dap_types.rs`, `ahead-app/src/debug_bar.rs` and `ahead-app/src/proxy_client.rs` contain DAP machinery. The current client reduces breakpoint responses to line numbers and flattens stopped frames; it does not yet establish the ownership, binding state and stop identity required above. The debug bar also initializes an illustrative active line rather than proving current-caret targeting.
 - `ahead-proxy/src/ahead/voice.rs` identifies itself as a runtime probe. Queue-generation tests are not evidence of working microphone capture, playback or synchronized teaching in the editor.
-- `ahead-app/src/session_panel.rs` is now bound to the real streamed harness conversation (proxy `AgentTurnStart`/`AgentTurnCancel`, 250 ms delta polling, durable reopen) instead of the previous keyword-mocked replies, but the rendered journey has only been compile-verified here, not driven in a running window.
+- `ahead-app/src/session_panel.rs` is bound to the real streamed harness conversation (proxy `AgentTurnStart`/`AgentTurnCancel`/`AgentTurnRetry`, 250 ms delta polling, durable reopen and explicit interrupted-turn retry) instead of keyword-mocked replies. A headless GPUI test verifies the interactive agent-question state; the complete rendered journey still needs a running-window pass.
 
 Review the design against these concrete journeys before implementing a generic workflow system:
 

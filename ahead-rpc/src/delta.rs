@@ -79,7 +79,10 @@ impl AheadDelta {
         for op in &self.ops {
             match op {
                 DeltaOp::Retain(n) => {
-                    let end = floor_boundary(&base_text, cursor.saturating_add(*n).min(base_len));
+                    let end = floor_boundary(
+                        &base_text,
+                        cursor.saturating_add(*n).min(base_len),
+                    );
                     let start = floor_boundary(&base_text, cursor.min(base_len));
                     if end > start {
                         out.push_str(&base_text[start..end]);
@@ -111,16 +114,22 @@ impl AheadDelta {
         for op in &self.ops {
             match op {
                 DeltaOp::Retain(n) => {
-                    let end =
-                        floor_boundary(&base_text, cursor.saturating_add(*n).min(base_len));
+                    let end = floor_boundary(
+                        &base_text,
+                        cursor.saturating_add(*n).min(base_len),
+                    );
                     ops.push(DeltaOp::Retain(end.saturating_sub(cursor)));
                     cursor = end;
                 }
                 DeltaOp::Insert(text) => ops.push(DeltaOp::Delete(text.len())),
                 DeltaOp::Delete(n) => {
-                    let end =
-                        floor_boundary(&base_text, cursor.saturating_add(*n).min(base_len));
-                    ops.push(DeltaOp::Insert(base_text[cursor.min(base_len)..end].to_string()));
+                    let end = floor_boundary(
+                        &base_text,
+                        cursor.saturating_add(*n).min(base_len),
+                    );
+                    ops.push(DeltaOp::Insert(
+                        base_text[cursor.min(base_len)..end].to_string(),
+                    ));
                     cursor = end;
                 }
             }
@@ -166,8 +175,11 @@ impl AheadDelta {
     /// Returns the inserted text when the delta is a single insertion.
     pub fn as_simple_insert(&self) -> Option<&str> {
         if self.ops.len() == 3 {
-            if let [DeltaOp::Retain(_), DeltaOp::Insert(text), DeltaOp::Retain(_)] =
-                &self.ops[..]
+            if let [
+                DeltaOp::Retain(_),
+                DeltaOp::Insert(text),
+                DeltaOp::Retain(_),
+            ] = &self.ops[..]
             {
                 return Some(text);
             }
@@ -314,10 +326,8 @@ mod tests {
         assert_eq!(insert.as_simple_insert(), Some("xy"));
         assert!(!insert.is_simple_delete());
 
-        let delete = AheadDelta::new(
-            5,
-            vec![DeltaOp::Retain(2), DeltaOp::Delete(3)],
-        );
+        let delete =
+            AheadDelta::new(5, vec![DeltaOp::Retain(2), DeltaOp::Delete(3)]);
         assert_eq!(delete.as_simple_insert(), None);
         assert!(delete.is_simple_delete());
 

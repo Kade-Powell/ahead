@@ -10,8 +10,8 @@ Source:        	{{{ git_dir_pack }}}
 BuildRequires:  cargo libxkbcommon-x11-devel libxcb-devel vulkan-loader-devel wayland-devel openssl-devel pkgconf libxkbcommon-x11-devel
 
 %description
-Ahead is an open source code editor written in Rust, forked from Lapce.
-It is designed with Rope Science from the Xi-Editor, enabling lightning-fast computation, and leverages GPU rendering.
+AHEAD is an open source code editor written in Rust, forked from Lapce.
+It uses rope-based text editing and a native GPUI and gpui-kit interface.
 
 %prep
 {{{ git_dir_setup_macro }}}

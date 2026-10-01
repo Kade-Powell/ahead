@@ -64,8 +64,12 @@ jobs:
         if: startsWith(matrix.os, 'windows')
         run: cargo clean
 
-      - name: Run doc tests
-        run: cargo test --doc --workspace
+      - name: Run workspace library tests
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo test --locked --lib
+
+      - name: Run workspace doc tests
+        run: cargo test --locked --doc
 
   fmt:
     name: Rustfmt
@@ -111,4 +115,4 @@ jobs:
         run: cargo fetch --locked
 
       - name: Run clippy
-        run: cargo clippy
+        run: cargo clippy --locked --all-targets

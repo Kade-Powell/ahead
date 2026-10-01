@@ -25,16 +25,17 @@ This repository is **AHEAD, the editor**, a maintained fork of Lapce. The editor
 ## Agent Guidance & UI Components
 
 See [AGENTS.md](../../AGENTS.md) for canonical agent instructions.
+See the [agent standards boundary](ahead-agent-standards.md) for normative `AGENTS.md`, Agent Skills, ACP and MCP contracts; Zed is an implementation reference, not an instruction-format compatibility target.
 All production UI is built using **GPUI** and **gpui-kit** (https://gpui-kit.com).
 Make sure to use **gpui-kit components whenever possible** (https://gpui-kit.com/component/); it provides pre-built dock areas, editor states, inputs, buttons, flex layouts, and dialogs.
 
 ## Upstream maintenance
 
-This repository preserves Lapce's Git ancestry, crate layout (`lapce-app`, `lapce-core`, `lapce-proxy`, `lapce-rpc`), and directory structure. AHEAD features are concentrated at explicit extension points:
-- **Session host & policy**: Governed workflow phases, explicit teaching tasks, assistance-by-default tasks, and SQLite session persistence.
+This repository preserves Lapce's Git ancestry and upstream source history. The active editor uses the renamed `ahead-app`, `ahead-core`, `ahead-proxy`, and `ahead-rpc` crates. AHEAD features are concentrated at explicit extension points:
+- **Session host & policy**: Governed workflow phases, explicit teaching tasks, assistance-by-default tasks, and Turso/libSQL session persistence.
 - **Built-in skills**: AHEAD-owned progressive-disclosure skills under `ahead-agent/skills/`; human-led teaching, diagnosis, research, design vocabulary, triage, prototyping and automated review.
-- **Workspace skills**: Discover user-provided `SKILL.md` files under `.agents/skills/`, `.agent/skills/` and `.skills/` as extra instructions, subject to AHEAD policy and host authorization.
-- **Workspace instructions**: Read applicable `AGENTS.md` files from the workspace root through each target directory before skill selection or task actions; record their hashes for resumable tasks.
+- **Workspace skills**: Discover user-provided `SKILL.md` files under project `.agents/skills/` and user `~/.agents/skills/` as extra instructions, subject to AHEAD policy and host authorization.
+- **Workspace instructions**: Managed chats load project `AGENTS.md` files from the discovered workspace root through the turn working directory. AHEAD also adds the applicable nested files for structured editor and attached-file targets; FIM receives the hierarchy for its active and relevant open-buffer targets. These are standard Markdown project instructions, not a required AHEAD-specific file. AHEAD records the loaded source paths and full-file hashes in Turso. External ACP agents retain their own instruction-discovery behavior; details and limits are in the [agent standards boundary](ahead-agent-standards.md).
 - **Agent skill architecture**: [AHEAD agent skills](ahead-agent-skills.md) is the canonical catalog, policy, discovery, provenance and implementation-status document.
 - **Voice runtime**: Full-duplex streaming audio and transcript bus with barge-in interruption.
 - **Edit prediction**: Fast context assembler incorporating active work, unsaved buffers, and diagnostics.

@@ -13,20 +13,17 @@ use std::{
     },
 };
 
-use anyhow::{Result, anyhow};
-use crossbeam_channel::{Receiver, Sender};
-use dyn_clone::DynClone;
 use ahead_rpc::{
     RequestId, RpcError,
     core::CoreRpcHandler,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
     delta::AheadDelta,
     plugin::PluginId,
-    proxy::ProxyRpcHandler,
     style::LineStyle,
-    terminal::TermId,
 };
-use ropey::Rope;
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender};
+use dyn_clone::DynClone;
 use lsp_types::{
     CallHierarchyClientCapabilities, CallHierarchyIncomingCall,
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyPrepareParams,
@@ -45,17 +42,16 @@ use lsp_types::{
     InlineCompletionResponse, InlineCompletionTriggerKind, Location, MarkupKind,
     MessageActionItemCapabilities, ParameterInformationSettings,
     PartialResultParams, Position, PrepareRenameResponse,
-    PublishDiagnosticsClientCapabilities, Range, ReferenceContext, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokens,
-    SemanticTokensClientCapabilities, SemanticTokensParams,
-    ShowMessageRequestClientCapabilities, SignatureHelp,
+    PublishDiagnosticsClientCapabilities, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
+    SelectionRangeParams, SemanticTokens, SemanticTokensClientCapabilities,
+    SemanticTokensParams, ShowMessageRequestClientCapabilities, SignatureHelp,
     SignatureHelpClientCapabilities, SignatureHelpParams,
     SignatureInformationSettings, SymbolInformation, TextDocumentClientCapabilities,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
-    TextDocumentSyncClientCapabilities, TextEdit,
-    VersionedTextDocumentIdentifier, WindowClientCapabilities,
-    WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceEdit,
-    WorkspaceSymbolClientCapabilities, WorkspaceSymbolParams,
+    TextDocumentSyncClientCapabilities, TextEdit, VersionedTextDocumentIdentifier,
+    WindowClientCapabilities, WorkDoneProgressParams, WorkspaceClientCapabilities,
+    WorkspaceEdit, WorkspaceSymbolClientCapabilities, WorkspaceSymbolParams,
     request::{
         CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
         CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
@@ -68,21 +64,35 @@ use lsp_types::{
     },
 };
 use parking_lot::Mutex;
+use ropey::Rope;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use url::Url;
 
 use self::{
     catalog::PluginCatalog,
-    dap::DapRpcHandler,
     psp::{ClonableCallback, RpcCallback},
 };
 use crate::buffer::language_id_from_path;
 
 pub type PluginName = String;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DiagnosticSource {
+    Pushed,
+    Pulled,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum PluginCatalogRpc {
+    PublishDiagnostics {
+        plugin_id: PluginId,
+        source: DiagnosticSource,
+        diagnostics: PublishDiagnosticsParams,
+    },
+    RefreshDiagnostics {
+        plugin_id: PluginId,
+    },
     ServerRequest {
         plugin_id: Option<PluginId>,
         request_sent: Option<Arc<AtomicUsize>>,
@@ -125,6 +135,9 @@ pub enum PluginCatalogRpc {
     DidOpenTextDocument {
         document: TextDocumentItem,
     },
+    DidCloseTextDocument {
+        path: PathBuf,
+    },
     DidChangeTextDocument {
         language_id: String,
         document: VersionedTextDocumentIdentifier,
@@ -144,16 +157,23 @@ pub enum PluginCatalogRpc {
 
 #[allow(clippy::large_enum_variant)]
 pub enum PluginCatalogNotification {
-    DapLoaded(DapRpcHandler),
-    DapDisconnected(DapId),
+    RestartLanguageServers {
+        documents: Vec<TextDocumentItem>,
+    },
+    LanguageServerStopped {
+        plugin_id: PluginId,
+        message: String,
+    },
+    LanguageServerStatus {
+        plugin_id: PluginId,
+        params: ahead_rpc::core::ServerStatusParams,
+    },
     DapStart {
         config: RunDebugConfig,
         breakpoints: HashMap<PathBuf, Vec<SourceBreakpoint>>,
     },
-    DapProcessId {
-        dap_id: DapId,
-        process_id: Option<u32>,
-        term_id: TermId,
+    DapTerminalResponse {
+        response: ahead_rpc::dap_types::DebugTerminalResponse,
     },
     DapContinue {
         dap_id: DapId,
@@ -196,7 +216,6 @@ pub enum PluginCatalogNotification {
 #[derive(Clone)]
 pub struct PluginCatalogRpcHandler {
     core_rpc: CoreRpcHandler,
-    proxy_rpc: ProxyRpcHandler,
     plugin_tx: Sender<PluginCatalogRpc>,
     plugin_rx: Arc<Mutex<Option<Receiver<PluginCatalogRpc>>>>,
     #[allow(dead_code)]
@@ -206,11 +225,10 @@ pub struct PluginCatalogRpcHandler {
 }
 
 impl PluginCatalogRpcHandler {
-    pub fn new(core_rpc: CoreRpcHandler, proxy_rpc: ProxyRpcHandler) -> Self {
+    pub fn new(core_rpc: CoreRpcHandler) -> Self {
         let (plugin_tx, plugin_rx) = crossbeam_channel::unbounded();
         Self {
             core_rpc,
-            proxy_rpc,
             plugin_tx,
             plugin_rx: Arc::new(Mutex::new(Some(plugin_rx))),
             id: Arc::new(AtomicU64::new(0)),
@@ -231,6 +249,14 @@ impl PluginCatalogRpcHandler {
         let plugin_rx = self.plugin_rx.lock().take().unwrap();
         for msg in plugin_rx {
             match msg {
+                PluginCatalogRpc::PublishDiagnostics {
+                    plugin_id,
+                    source,
+                    diagnostics,
+                } => plugin.publish_diagnostics(plugin_id, source, diagnostics),
+                PluginCatalogRpc::RefreshDiagnostics { plugin_id } => {
+                    plugin.refresh_diagnostics(plugin_id);
+                }
                 PluginCatalogRpc::ServerRequest {
                     plugin_id,
                     request_sent,
@@ -282,6 +308,9 @@ impl PluginCatalogRpcHandler {
                 }
                 PluginCatalogRpc::DidOpenTextDocument { document } => {
                     plugin.handle_did_open_text_document(document);
+                }
+                PluginCatalogRpc::DidCloseTextDocument { path } => {
+                    plugin.handle_did_close_text_document(path);
                 }
                 PluginCatalogRpc::DidSaveTextDocument {
                     language_id,
@@ -343,7 +372,45 @@ impl PluginCatalogRpcHandler {
         }
     }
 
-    fn catalog_notification(
+    pub fn language_server_status(
+        &self,
+        plugin_id: PluginId,
+        params: ahead_rpc::core::ServerStatusParams,
+    ) {
+        if let Err(error) = self.catalog_notification(
+            PluginCatalogNotification::LanguageServerStatus { plugin_id, params },
+        ) {
+            tracing::error!(?error, "reporting language server status");
+        }
+    }
+
+    pub fn refresh_diagnostics(&self, plugin_id: PluginId) {
+        if let Err(error) = self
+            .plugin_tx
+            .send(PluginCatalogRpc::RefreshDiagnostics { plugin_id })
+        {
+            tracing::error!(?error, "requesting document diagnostics");
+        }
+    }
+
+    pub fn publish_diagnostics(
+        &self,
+        plugin_id: PluginId,
+        source: DiagnosticSource,
+        diagnostics: PublishDiagnosticsParams,
+    ) {
+        if let Err(error) =
+            self.plugin_tx.send(PluginCatalogRpc::PublishDiagnostics {
+                plugin_id,
+                source,
+                diagnostics,
+            })
+        {
+            tracing::error!(?error, "publishing language-server diagnostics");
+        }
+    }
+
+    pub(crate) fn catalog_notification(
         &self,
         notification: PluginCatalogNotification,
     ) -> Result<()> {
@@ -479,7 +546,7 @@ impl PluginCatalogRpcHandler {
     pub fn did_save_text_document(&self, path: &Path, text: Rope) {
         let text_document =
             TextDocumentIdentifier::new(Url::from_file_path(path).unwrap());
-        let language_id = language_id_from_path(path).unwrap_or("").to_string();
+        let language_id = language_id_from_path(path).unwrap_or_default();
         if let Err(err) =
             self.plugin_tx.send(PluginCatalogRpc::DidSaveTextDocument {
                 language_id,
@@ -504,7 +571,7 @@ impl PluginCatalogRpcHandler {
             Url::from_file_path(path).unwrap(),
             rev as i32,
         );
-        let language_id = language_id_from_path(path).unwrap_or("").to_string();
+        let language_id = language_id_from_path(path).unwrap_or_default();
         if let Err(err) =
             self.plugin_tx
                 .send(PluginCatalogRpc::DidChangeTextDocument {
@@ -539,8 +606,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -570,8 +636,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -599,8 +664,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: Default::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -629,8 +693,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -663,8 +726,7 @@ impl PluginCatalogRpcHandler {
             },
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -692,8 +754,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -723,8 +784,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -760,8 +820,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -787,8 +846,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: Default::default(),
         };
 
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
         self.send_request_to_all_plugins(
             method,
@@ -806,8 +864,7 @@ impl PluginCatalogRpcHandler {
         cb: impl FnOnce(PluginId, Result<CodeLens, RpcError>) + Clone + Send + 'static,
     ) {
         let method = CodeLensResolve::METHOD;
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
         self.send_request_to_all_plugins(
             method,
@@ -834,8 +891,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             range,
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -868,8 +924,7 @@ impl PluginCatalogRpcHandler {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -894,8 +949,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -941,8 +995,7 @@ impl PluginCatalogRpcHandler {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -967,8 +1020,7 @@ impl PluginCatalogRpcHandler {
             text_document: TextDocumentIdentifier { uri },
             position,
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -998,8 +1050,7 @@ impl PluginCatalogRpcHandler {
             new_name,
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -1024,8 +1075,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -1052,8 +1102,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: Default::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request_to_all_plugins(
             method,
             params,
@@ -1078,8 +1127,7 @@ impl PluginCatalogRpcHandler {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
         self.send_request_to_all_plugins(
             method,
@@ -1110,26 +1158,31 @@ impl PluginCatalogRpcHandler {
         };
 
         let core_rpc = self.core_rpc.clone();
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
         self.send_request_to_all_plugins(
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
-            move |plugin_id, result| match result {
-                Ok(value) => {
-                    if let Ok(resp) =
-                        serde_json::from_value::<CompletionResponse>(value)
-                    {
-                        core_rpc
-                            .completion_response(request_id, input, resp, plugin_id);
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("{:?}", err);
-                }
+            move |plugin_id, result: Result<Value, RpcError>| {
+                let response = result
+                    .and_then(|value| {
+                        if value.is_null() {
+                            Ok(CompletionResponse::Array(Vec::new()))
+                        } else {
+                            serde_json::from_value::<CompletionResponse>(value)
+                                .map_err(|error| RpcError {
+                                    code: -32603,
+                                    message: error.to_string(),
+                                })
+                        }
+                    })
+                    .unwrap_or_else(|error| {
+                        tracing::debug!(?error, "completion request failed");
+                        CompletionResponse::Array(Vec::new())
+                    });
+                core_rpc.completion_response(request_id, input, response, plugin_id);
             },
         );
     }
@@ -1190,8 +1243,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let core_rpc = self.core_rpc.clone();
-        let language_id =
-            Some(language_id_from_path(path).unwrap_or("").to_string());
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
         self.send_request(
             None,
             None,
@@ -1279,12 +1331,13 @@ impl PluginCatalogRpcHandler {
         }
     }
 
-    pub fn dap_disconnected(&self, dap_id: DapId) -> Result<()> {
-        self.catalog_notification(PluginCatalogNotification::DapDisconnected(dap_id))
-    }
-
-    pub fn dap_loaded(&self, dap_rpc: DapRpcHandler) -> Result<()> {
-        self.catalog_notification(PluginCatalogNotification::DapLoaded(dap_rpc))
+    pub fn did_close_document(&self, path: PathBuf) {
+        if let Err(error) = self
+            .plugin_tx
+            .send(PluginCatalogRpc::DidCloseTextDocument { path })
+        {
+            tracing::error!(?error, "closing language-server document");
+        }
     }
 
     pub fn dap_start(
@@ -1298,16 +1351,12 @@ impl PluginCatalogRpcHandler {
         })
     }
 
-    pub fn dap_process_id(
+    pub fn dap_terminal_response(
         &self,
-        dap_id: DapId,
-        process_id: Option<u32>,
-        term_id: TermId,
+        response: ahead_rpc::dap_types::DebugTerminalResponse,
     ) -> Result<()> {
-        self.catalog_notification(PluginCatalogNotification::DapProcessId {
-            dap_id,
-            process_id,
-            term_id,
+        self.catalog_notification(PluginCatalogNotification::DapTerminalResponse {
+            response,
         })
     }
 
@@ -1435,7 +1484,7 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             completion: Some(CompletionClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
-                    snippet_support: Some(true),
+                    snippet_support: Some(false),
                     resolve_support: Some(CompletionItemCapabilityResolveSupport {
                         properties: vec!["additionalTextEdits".to_string()],
                     }),
@@ -1506,6 +1555,10 @@ fn client_capabilities() -> ClientCapabilities {
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 ..Default::default()
             }),
+            diagnostic: Some(lsp_types::DiagnosticClientCapabilities {
+                dynamic_registration: Some(false),
+                related_document_support: Some(false),
+            }),
             inline_completion: Some(InlineCompletionClientCapabilities {
                 ..Default::default()
             }),
@@ -1538,7 +1591,7 @@ fn client_capabilities() -> ClientCapabilities {
             symbol: Some(WorkspaceSymbolClientCapabilities {
                 ..Default::default()
             }),
-            configuration: Some(false),
+            configuration: Some(true),
             workspace_folders: Some(true),
             ..Default::default()
         }),

@@ -1,0 +1,10 @@
+verify: verify-rust verify-typescript verify-python
+
+verify-rust:
+    cargo test --offline
+
+verify-typescript:
+    npm test
+
+verify-python:
+    python3 -B -m unittest discover -s python -v

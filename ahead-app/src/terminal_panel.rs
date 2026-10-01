@@ -121,7 +121,16 @@ impl TerminalPanel {
     ) -> Self {
         let shell =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let tab = TerminalTab::new(id, cwd.into(), &shell);
+        Self::new_with_shell(id, cwd.into(), &shell, cx)
+    }
+
+    pub(crate) fn new_with_shell(
+        id: usize,
+        cwd: String,
+        shell: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let tab = TerminalTab::new(id, cwd, shell);
         let panel = Self {
             focus: cx.focus_handle(),
             terminal: tab,
@@ -139,6 +148,47 @@ impl TerminalPanel {
 
     pub fn terminal_id(&self) -> usize {
         self.terminal.id
+    }
+
+    pub(crate) fn process_id(&self) -> Option<u32> {
+        self.terminal.terminal.as_ref()?.process_id()
+    }
+
+    pub(crate) fn run_debug_command(
+        &mut self,
+        command: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let terminal = self
+            .terminal
+            .terminal
+            .as_ref()
+            .ok_or_else(|| self.terminal.status.to_string())?;
+        terminal.send(format!("{command}\r").into_bytes())?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crossbeam_channel::Receiver<()>> {
+        let terminal = self.terminal.terminal.as_mut()?;
+        if terminal.is_shutdown() {
+            return None;
+        }
+        let complete = terminal.shutdown();
+        self.terminal.status = "closed".into();
+        cx.notify();
+        Some(complete)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.terminal
+            .terminal
+            .as_ref()
+            .is_none_or(TerminalBackend::is_shutdown)
     }
 
     pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
@@ -166,27 +216,37 @@ impl TerminalPanel {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
-                if this
-                    .update(cx, |this, cx| {
-                        let received = this
-                            .terminal
-                            .terminal
-                            .as_ref()
-                            .into_iter()
-                            .flat_map(|terminal| {
-                                terminal.events().try_iter().collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>();
-                        let had_events = !received.is_empty();
-                        for event in received {
-                            this.handle_terminal_event(event);
-                        }
-                        if had_events {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
+                let running = this.update(cx, |this, cx| {
+                    let received = this
+                        .terminal
+                        .terminal
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|terminal| {
+                            terminal.events().try_iter().collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let had_events = !received.is_empty();
+                    for event in received {
+                        this.handle_terminal_event(event);
+                    }
+                    if had_events {
+                        cx.notify();
+                    }
+                    let running = this
+                        .terminal
+                        .terminal
+                        .as_ref()
+                        .is_some_and(TerminalBackend::is_running);
+                    if !running
+                        && let Some(terminal) = this.terminal.terminal.as_mut()
+                    {
+                        drop(terminal.shutdown());
+                        cx.notify();
+                    }
+                    running
+                });
+                if !matches!(running, Ok(true)) {
                     break;
                 }
             }

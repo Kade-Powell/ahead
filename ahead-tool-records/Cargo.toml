@@ -1,0 +1,12 @@
+[package]
+name = "ahead-tool-records"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+path = "ahead_tool_records.rs"
+
+[lints]
+workspace = true

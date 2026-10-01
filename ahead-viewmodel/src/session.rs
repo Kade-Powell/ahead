@@ -5,7 +5,7 @@
 //! working by delegating to these functions; the GPUI shell will call the
 //! same functions from entities.
 
-use ahead_rpc::ahead::{ChangeProposal, SessionView, VoiceTranscriptUpdate};
+use ahead_rpc::ahead::{SessionView, VoiceTranscriptUpdate};
 
 /// Minimal chat message (mirrors `AgentChatMessage` without timestamps-as-logic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +45,6 @@ pub struct SessionSnapshot {
     pub active: Option<SessionView>,
     pub saved: Vec<SessionView>,
     pub chat: Vec<ChatMessage>,
-    pub pending_proposals: Vec<ChangeProposal>,
     pub tracker: Vec<TrackerEntry>,
     pub transcripts: Vec<VoiceTranscriptUpdate>,
 }
@@ -55,7 +54,10 @@ fn next_id(prefix: &str, len: usize) -> String {
 }
 
 /// Validates wizard input before Begin. Returns the error text the UI shows.
-pub fn begin_validation_error(title: &str, resume_id: Option<&str>) -> Option<String> {
+pub fn begin_validation_error(
+    title: &str,
+    resume_id: Option<&str>,
+) -> Option<String> {
     if resume_id.is_some() {
         return None;
     }
@@ -66,11 +68,10 @@ pub fn begin_validation_error(title: &str, resume_id: Option<&str>) -> Option<St
 }
 
 /// Adopts a durable session: sets active, clears per-session scaffolds so a
-/// reopened session never shows another session's chat/proposals/transcripts.
+/// reopened session never shows another session's chat/transcripts.
 pub fn adopt_session(snapshot: &mut SessionSnapshot, view: SessionView) {
     snapshot.active = Some(view);
     snapshot.chat.clear();
-    snapshot.pending_proposals.clear();
     snapshot.tracker.clear();
     snapshot.transcripts.clear();
 }
@@ -81,7 +82,11 @@ pub fn apply_mode(snapshot: &mut SessionSnapshot, view: SessionView) {
 }
 
 /// Applies a host-acknowledged workflow state.
-pub fn apply_workflow(snapshot: &mut SessionSnapshot, session_id: &str, view: SessionView) {
+pub fn apply_workflow(
+    snapshot: &mut SessionSnapshot,
+    session_id: &str,
+    view: SessionView,
+) {
     debug_assert_eq!(view.session.id, session_id);
     snapshot.active = Some(view);
 }
@@ -114,17 +119,18 @@ pub fn push_agent_message(snapshot: &mut SessionSnapshot, msg: AgentMessage) {
 }
 
 /// Drops a proposal from the pending list. Returns true when one was removed.
-pub fn drop_proposal(snapshot: &mut SessionSnapshot, id: &str) -> bool {
-    let before = snapshot.pending_proposals.len();
-    snapshot.pending_proposals.retain(|p| p.id != id);
-    snapshot.pending_proposals.len() != before
+/// Retained as a no-op compatibility shim while callers migrate; the direct
+/// apply model no longer stages proposals.
+pub fn drop_proposal(_snapshot: &mut SessionSnapshot, _id: &str) -> bool {
+    false
 }
 
 /// Marks a tracker entry dispatched. Local-only until GitHub publish lands.
 pub fn queue_tracker_dispatch(snapshot: &mut SessionSnapshot, id: &str) -> bool {
     for item in &mut snapshot.tracker {
         if item.id == id {
-            item.status = "Queued locally (GitHub publish not wired yet)".to_string();
+            item.status =
+                "Queued locally (GitHub publish not wired yet)".to_string();
             return true;
         }
     }
@@ -160,7 +166,11 @@ mod tests {
         assert!(push_human_message(&mut s, "hello"));
         push_agent_message(
             &mut s,
-            AgentMessage { sender: "AHEAD Agent".into(), text: "hi".into(), is_challenge: false },
+            AgentMessage {
+                sender: "AHEAD Agent".into(),
+                text: "hi".into(),
+                is_challenge: false,
+            },
         );
         assert_eq!(s.chat[0].id, "msg-1");
         assert_eq!(s.chat[1].id, "msg-2");
@@ -170,23 +180,12 @@ mod tests {
     fn adopt_clears_scaffolds() {
         let mut s = SessionSnapshot::default();
         push_human_message(&mut s, "x");
-        s.pending_proposals.push(ChangeProposal {
-            id: "p".into(),
-            session_id: "s".into(),
-            path: "a".into(),
-            original_sha256: "h".into(),
-            patch: "p".into(),
-            is_mechanical: true,
-            description: "d".into(),
-            recommended_cursor: None,
-        });
         let view = SessionView {
             session: ahead_rpc::ahead::WorkSession {
                 id: "sess".into(),
                 project_id: "p".into(),
                 worktree_id: "w".into(),
                 work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
-                mode: ahead_rpc::ahead::AssistanceMode::Assist,
                 title: "t".into(),
                 owner_id: "o".into(),
                 lifecycle: ahead_rpc::ahead::SessionLifecycle::Active,
@@ -194,10 +193,26 @@ mod tests {
                 revision: 1,
                 created_at: "now".into(),
             },
+            task: ahead_rpc::ahead::SessionTask {
+                id: "task".into(),
+                session_id: "sess".into(),
+                intent: ahead_rpc::ahead::TaskIntent::Assistance,
+                work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
+                title: "t".into(),
+                parent_task_id: None,
+                learning_arc_id: None,
+                created_at: "now".into(),
+                completed_at: None,
+            },
+            learning_arc: None,
             workflow: ahead_rpc::ahead::WorkflowState {
                 revision: 1,
                 definition_version: "v".into(),
-                phase: ahead_rpc::ahead::WorkflowPhase { id: "plan".into(), title: "Planning".into(), visit: 1 },
+                phase: ahead_rpc::ahead::WorkflowPhase {
+                    id: "plan".into(),
+                    title: "Planning".into(),
+                    visit: 1,
+                },
                 primary_work_item: None,
                 current_artifact_ids: Vec::new(),
                 approvals: Vec::new(),
@@ -206,7 +221,6 @@ mod tests {
         };
         adopt_session(&mut s, view);
         assert!(s.chat.is_empty());
-        assert!(s.pending_proposals.is_empty());
         assert!(s.active.is_some());
     }
 
@@ -230,7 +244,12 @@ mod tests {
     fn drop_and_dispatch() {
         let mut s = SessionSnapshot::default();
         assert!(!drop_proposal(&mut s, "nope"));
-        s.tracker.push(TrackerEntry { id: "t".into(), target: "g".into(), description: "d".into(), status: "pending".into() });
+        s.tracker.push(TrackerEntry {
+            id: "t".into(),
+            target: "g".into(),
+            description: "d".into(),
+            status: "pending".into(),
+        });
         assert!(queue_tracker_dispatch(&mut s, "t"));
         assert!(s.tracker[0].status.contains("Queued locally"));
         assert!(!queue_tracker_dispatch(&mut s, "missing"));

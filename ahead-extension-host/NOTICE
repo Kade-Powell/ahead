@@ -1,0 +1,7 @@
+This crate contains the versioned Zed extension WIT contract copied from
+zed-industries/zed at commit 418f89714891f9d8105a3e92e60b9a7a5084d232.
+
+The Zed extension API is licensed under Apache-2.0. The copied WIT files are
+retained as a compatibility contract; the AHEAD host implementation is
+independent code. See the repository LICENSE for the Apache-2.0 text and
+docs/development/zed-tracking.md for provenance.

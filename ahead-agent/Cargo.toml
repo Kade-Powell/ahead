@@ -1,0 +1,50 @@
+[package]
+name         = "ahead-agent"
+description  = "AHEAD-owned agent runtime integration and durable streamed sessions"
+license      = { workspace = true }
+version      = { workspace = true }
+authors      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow            = { workspace = true }
+chrono            = { workspace = true }
+libc              = { workspace = true }
+parking_lot       = { workspace = true }
+reqwest           = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+toml              = { workspace = true }
+tempfile          = { workspace = true }
+sha2              = "0.10"
+fs4               = "0.13.1"
+tracing           = { workspace = true }
+uuid              = { version = "1.5", features = ["v4", "serde"] }
+tokio             = { version = "1.38", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+
+ahead-rpc       = { workspace = true }
+ahead-core      = { workspace = true }
+
+# Built-in agent: direct in-process hard fork. ACP is external-agent only.
+codex-core     = { path = "runtime/source/core" }
+codex-config   = { workspace = true }
+codex-agent-graph-store = { workspace = true }
+codex-protocol = { path = "runtime/source/protocol" }
+codex-features = { path = "runtime/source/features" }
+codex-exec-server = { workspace = true }
+codex-rollout = { workspace = true }
+codex-thread-store = { workspace = true }
+codex-extension-api = { path = "runtime/source/ext/extension-api" }
+ahead-agent-skills = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+dirs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[lints]
+workspace = true

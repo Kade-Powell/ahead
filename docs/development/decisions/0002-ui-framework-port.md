@@ -3,7 +3,7 @@
 - Status: Superseded by [Decision 0003](0003-ui-port-max-reuse.md)
 - Date: 2026-09-17
 - Deciders: AHEAD maintainers
-- Context: Lapce-fork UI is built on Floem (pinned git rev `e0dd862`); AHEAD must own its UI future. Related: [0001](0001-deltadb-collaboration-fallback.md) (Yrs + SQLite fallback), spec §3.2/§15 (extension scope), §14 (a11y).
+- Context: Lapce-fork UI is built on Floem (pinned git rev `e0dd862`); AHEAD must own its UI future. Related: [0001](0001-deltadb-collaboration-fallback.md) (Yrs collaboration choice and DeltaDB evaluation), spec §3.2/§15 (extension scope), §14 (a11y).
 
 ## Measured coupling (this repo, 2026-09-17)
 

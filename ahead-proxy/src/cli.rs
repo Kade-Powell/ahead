@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::{Error, Result, anyhow};
 use ahead_core::directory::Directory;
 use ahead_rpc::{
     RpcMessage,
     file::{LineCol, PathObject},
     proxy::{ProxyMessage, ProxyNotification},
 };
+use anyhow::{Error, Result, anyhow};
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PathObjectType {

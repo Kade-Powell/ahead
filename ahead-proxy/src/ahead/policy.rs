@@ -5,10 +5,8 @@
 //! Implements strict Maieutic safeguards, cursor guidance, and scaffolding allowance.
 
 use ahead_rpc::ahead::{
-    AssistanceMode, Capability, SessionPolicySnapshot, SessionRole,
-    WorkflowPhase, ChangeProposal,
+    AssistanceMode, Capability, SessionPolicySnapshot, SessionRole, WorkflowPhase,
 };
-use anyhow::{bail, Result};
 
 pub struct PolicyEvaluator;
 
@@ -48,7 +46,9 @@ impl PolicyEvaluator {
                 || phase.id == "investigation-scrutinize"
                 || phase.id == "decision-framing";
 
-            if !is_read_only_phase && (role == SessionRole::Owner || role == SessionRole::Editor) {
+            if !is_read_only_phase
+                && (role == SessionRole::Owner || role == SessionRole::Editor)
+            {
                 caps.push(Capability::ProposeEdit);
             }
 
@@ -61,35 +61,11 @@ impl PolicyEvaluator {
         caps
     }
 
-    /// Evaluates whether an edit proposal is permitted under current policy
-    pub fn authorize_proposal(
-        phase: &WorkflowPhase,
+    /// Checks if predictions are allowed under the current mode
+    pub fn predictions_allowed(
         mode: AssistanceMode,
         policy: &SessionPolicySnapshot,
-        role: SessionRole,
-        proposal: &ChangeProposal,
-    ) -> Result<()> {
-        let caps = Self::effective_capabilities(phase, mode, policy, role);
-
-        if !caps.contains(&Capability::ProposeEdit) {
-            bail!(
-                "Edit proposal denied: ProposeEdit capability not granted in mode {:?}, phase {}, role {:?}",
-                mode,
-                phase.id,
-                role
-            );
-        }
-
-        // Enforce mechanical/scaffolding boundary under strict assistance
-        if policy.assistance == "maieutic-strict" && !proposal.is_mechanical {
-            bail!("Proposal rejected: Only mechanical edits and boilerplate scaffolding are permitted under maieutic-strict policy");
-        }
-
-        Ok(())
-    }
-
-    /// Checks if predictions are allowed under the current mode
-    pub fn predictions_allowed(mode: AssistanceMode, policy: &SessionPolicySnapshot) -> bool {
+    ) -> bool {
         match mode {
             AssistanceMode::Learn => false,
             AssistanceMode::Assist => policy.predictions != "off",
@@ -121,65 +97,27 @@ mod tests {
         assert!(!caps.contains(&Capability::ProposeEdit));
         assert!(!caps.contains(&Capability::RecordDraft));
         assert!(!caps.contains(&Capability::RunApprovedCheck));
-        assert!(!PolicyEvaluator::predictions_allowed(AssistanceMode::Learn, &policy));
+        assert!(!PolicyEvaluator::predictions_allowed(
+            AssistanceMode::Learn,
+            &policy
+        ));
     }
 
     #[test]
-    fn test_assist_mode_authorizes_mechanical_proposals_in_implement_phase() {
+    fn test_assist_mode_grants_edit_capability_in_implement_phase() {
         let phase = WorkflowPhase {
             id: "implement".to_string(),
             title: "Implementation".to_string(),
             visit: 1,
         };
         let policy = SessionPolicySnapshot::default();
-        let proposal = ChangeProposal {
-            id: "prop-1".to_string(),
-            session_id: "sess-1".to_string(),
-            path: "src/lib.rs".to_string(),
-            original_sha256: "abcd".to_string(),
-            patch: "+// boilerplate".to_string(),
-            is_mechanical: true,
-            description: "Scaffold boilerplate".to_string(),
-            recommended_cursor: None,
-        };
-
-        let res = PolicyEvaluator::authorize_proposal(
+        let caps = PolicyEvaluator::effective_capabilities(
             &phase,
             AssistanceMode::Assist,
             &policy,
             SessionRole::Editor,
-            &proposal,
         );
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn test_assist_mode_denies_non_mechanical_proposals_under_strict_policy() {
-        let phase = WorkflowPhase {
-            id: "implement".to_string(),
-            title: "Implementation".to_string(),
-            visit: 1,
-        };
-        let policy = SessionPolicySnapshot::default();
-        let proposal = ChangeProposal {
-            id: "prop-2".to_string(),
-            session_id: "sess-1".to_string(),
-            path: "src/main.rs".to_string(),
-            original_sha256: "abcd".to_string(),
-            patch: "+ fn business_logic() {}".to_string(),
-            is_mechanical: false,
-            description: "Invent business logic".to_string(),
-            recommended_cursor: None,
-        };
-
-        let res = PolicyEvaluator::authorize_proposal(
-            &phase,
-            AssistanceMode::Assist,
-            &policy,
-            SessionRole::Editor,
-            &proposal,
-        );
-        assert!(res.is_err());
+        assert!(caps.contains(&Capability::ProposeEdit));
     }
 
     #[test]
@@ -190,24 +128,12 @@ mod tests {
             visit: 1,
         };
         let policy = SessionPolicySnapshot::default();
-        let proposal = ChangeProposal {
-            id: "prop-3".to_string(),
-            session_id: "sess-1".to_string(),
-            path: "src/main.rs".to_string(),
-            original_sha256: "abcd".to_string(),
-            patch: "+ fn foo() {}".to_string(),
-            is_mechanical: true,
-            description: "Fix during review".to_string(),
-            recommended_cursor: None,
-        };
-
-        let res = PolicyEvaluator::authorize_proposal(
+        let caps = PolicyEvaluator::effective_capabilities(
             &phase,
             AssistanceMode::Assist,
             &policy,
             SessionRole::Editor,
-            &proposal,
         );
-        assert!(res.is_err());
+        assert!(!caps.contains(&Capability::ProposeEdit));
     }
 }

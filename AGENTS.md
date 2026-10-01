@@ -12,7 +12,7 @@
 - **Avoid Ad-Hoc HTML/Floem Widgets**: Always prefer native `gpui-kit` components over custom styling or legacy Floem idioms. gpui-kit has most if not all components needed for AHEAD's editor, panels, and dialogs.
 - **Use gpui-kit Icons, Not Emojis**: Always use `gpui_kit::component::IconName` (Lucide catalog) or `Icon::new(IconName::...)` / `Button::icon(IconName::...)` for all status indicators, buttons, tags, chips, and chrome icons. Never use Unicode emojis in UI controls or buttons.
 - **Backend & Viewmodel Separation**: Keep views thin by delegating state transitions, policy checks, and turn serialization to `ahead-viewmodel`, `ahead-rpc`, and `ahead-proxy`.
-- **`ahead-harness` crate**: AHEAD-owned AI harnessing lives in the separate `ahead-harness` workspace crate (external ACP client, durable streamed-session controller, side tasks, `HarnessStore` boundary). The editor integrates deeply with it; do not put the agent harness back inside `ahead-proxy`. Codex is an implementation detail of the managed tier, not the crate's identity.
+- **`ahead-agent` crate**: AHEAD-owned AI harnessing lives in `ahead-agent` (native managed runtime, external ACP client, durable streamed-session controller and side tasks). The editor integrates through `ahead-proxy`; do not put the agent loop back inside the proxy. Codex is an implementation detail of the retained runtime, not the crate's identity.
 
 ## Editor Component Architecture & Implementation References
 
@@ -37,18 +37,21 @@
 - Update the relevant flow, role boundary and artifact convention together when a decision changes. Link supporting research from the atlas and keep implementation gaps in `TODO.md`.
 - Preserve Maieutic-style separate highlights/pointers and the human caret during teaching. The atlas documents proposed debugger assistance and synchronized voice behavior; do not claim those work from DTOs or scaffold tests alone.
 
-## In-Editor Agent & Codex Extraction Plan (`third-party/codex`)
+## In-Editor Agent Runtime and ACP Compatibility
 
 - **Harness Fidelity (confirmed requirement, 2026-09-18)**: When using Codex, preserve the pinned runtime's model-facing tool names, descriptions, schemas/grammars, tool results and error semantics, instruction layering, conversation/tool-call ordering, compaction, streaming and cancellation. Reusing protocol DTOs or renaming AHEAD tools to resemble Codex is not sufficient. Keep model-specific upstream tool selection rather than freezing one tool list for every model.
-- **Harness tiers (decided 2026-09-18)**: AHEAD has two explicit tiers. (1) **Managed**: run the Codex App Server directly and own the effect boundary so Learn read-only, Assist mechanical scope, per-tool human decisions and `CodeAnchor` attribution are enforceable; this is the default for managed Learn/Assist sessions. (2) **External ACP agents**: compatibility only (streaming, cancellation, resume, conversation); their shell/file effects happen in their own process and carry no AHEAD enforcement guarantee. A live probe showed the Codex ACP adapter ran shell/`edit` calls with zero permission requests and never called client `fs/write_text_file`, even in `read-only` mode, so ACP alone cannot carry the lifecycle. See [harness decision](docs/development/ahead-humanlayer-workflows.md#harness-decision-2026-09-18).
+- **Harness tiers (decided 2026-09-18)**: AHEAD has two explicit tiers. (1) **Managed**: the native `ahead-agent` runtime runs in-process and owns the effect boundary so Learn read-only, Assist scope and `CodeAnchor` attribution remain enforceable; this is the default for managed sessions. (2) **External ACP agents**: compatibility only (streaming, cancellation, resume, conversation); their shell/file effects happen in their own process and carry no AHEAD enforcement guarantee. A live probe showed the Codex ACP adapter ran shell/`edit` calls with zero permission requests and never called client `fs/write_text_file`, even in `read-only` mode, so ACP alone cannot carry the lifecycle. See [harness decision](docs/development/ahead-humanlayer-workflows.md#harness-decision-2026-09-18).
 - Prefer consuming the real harness through a maintained integration boundary before extracting or rewriting its loop. Add AHEAD session context and narrowly scoped editor capabilities without replacing native tools with proposal-only substitutes. Use supported runtime configuration for scope/sandboxing; removing product telemetry or UI must not remove core harness behavior. Harness fidelity is a requirement, not a guarantee of equal model performance.
-- The runtime choice is settled as two tiers (managed Codex App Server vs external ACP agents). The current built-in loop is a fallback, not the managed runtime. See the [harness decision](docs/development/ahead-humanlayer-workflows.md#harness-decision-2026-09-18) and live probe results; do not claim an ACP-only path enforces AHEAD's lifecycle.
-- **Core Conversation Engine to Retain**:
-  - `codex-app-server-protocol`, `codex-protocol`: JSON-RPC 2.0 wire contract (`turn/start`, `turn/steer`, `turn/interrupt`, streaming items).
-  - `codex-core::session::turn::run_turn`: Local turn loop, compaction engine, and conversation state machine.
-  - `codex-execpolicy`: Tool approval protocol and prefix-rule execution engine.
-  - `codex-app-server::in_process`, `codex-app-server-client`: In-process embedded host facade.
-  - `codex-model-provider`, `codex-ollama`, `codex-lmstudio`: Multi-provider local/cloud inference.
+- The runtime choice is settled as two tiers (managed native `ahead-agent` vs external ACP agents). The built-in path talks directly to the retained native runtime; it does not launch a Codex App Server executable or use an App Server JSON-RPC hop. See the [harness decision](docs/development/ahead-humanlayer-workflows.md#harness-decision-2026-09-18) and live probe results; do not claim an ACP-only path enforces AHEAD's lifecycle.
+- **Native runtime boundary**: `ahead-agent/src/native_client.rs` and
+  `ahead-agent/src/session.rs` own the managed turn path; the retained runtime
+  source lives under `ahead-agent/runtime/source/`. Keep model-facing tool
+  contracts, streaming, cancellation and compaction behavior faithful to that
+  pinned source. Do not reintroduce the removed App Server executable or its
+  generated schema tree without a new architecture decision.
+- **Distilled Codex maintenance guidance**: before changing files under
+  `ahead-agent/runtime/source/`, read its scoped `AGENTS.md` and use the
+  applicable workspace skills under `.agents/skills/ahead-agent-*`.
 - **Bloat to Gut**:
   - `codex-analytics`: Eliminates cloud telemetry and the 35-second shutdown flush timeout.
   - `codex-app-server-daemon`: Eliminates hourly update daemons and external curl scripts.
@@ -136,6 +139,7 @@
 ### Build & lint
 
 - Zed uses `./script/clippy`; AHEAD has no script wrapper — run `cargo clippy --workspace --all-targets` directly. `bacon` runs the fast local check loop; CI runs `cargo clippy` and `cargo fmt --all --check`.
+- For live editor work, use `just dev` from the repository root. Keep one shared Cargo build loop at a time; coordinate before starting another broad `cargo` build/check/test, and stop your watcher with Ctrl-C before a one-off check. Use the package-qualified run command in the recipe, not ambiguous `cargo run --bin ahead`. See [Building from Source](docs/building-from-source.md#agent-development-loop) for the agent workflow.
 
 ## GPUI Primitives (ported from Zed `.rules`)
 

@@ -1,0 +1,9 @@
+{
+  "name": "ahead-editor-smoke",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test typescript/math.test.ts javascript/math.test.mjs"
+  }
+}

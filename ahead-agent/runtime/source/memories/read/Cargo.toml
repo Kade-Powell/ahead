@@ -1,0 +1,13 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "ahead-memory"
+version.workspace = true
+
+[lib]
+name = "ahead_memory"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+codex-protocol = { workspace = true }

@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     RequestId, RpcError, RpcMessage,
     dap_types::{
-        self, DapId, RunDebugConfig, Scope, StackFrame, Stopped, ThreadId, Variable,
+        self, DapId, DebugTerminalRequest, Scope, StackFrame, Stopped, ThreadId,
+        Variable,
     },
     file::PathObject,
     plugin::PluginId,
@@ -69,7 +70,9 @@ pub enum CoreNotification {
     OpenPaths {
         paths: Vec<PathObject>,
     },
-    WorkspaceFileChange,
+    WorkspaceFileChange {
+        generation: u64,
+    },
     PublishDiagnostics {
         diagnostics: PublishDiagnosticsParams,
     },
@@ -113,7 +116,7 @@ pub enum CoreNotification {
         exit_code: Option<i32>,
     },
     RunInTerminal {
-        config: RunDebugConfig,
+        request: DebugTerminalRequest,
     },
     Log {
         level: LogLevel,
@@ -126,8 +129,13 @@ pub enum CoreNotification {
         stack_frames: HashMap<ThreadId, Vec<StackFrame>>,
         variables: Vec<(Scope, Vec<Variable>)>,
     },
-    DapContinued {
+    DapSessionState {
         dap_id: DapId,
+        state: dap_types::DapSessionState,
+    },
+    DapError {
+        dap_id: DapId,
+        message: String,
     },
     DapBreakpointsResp {
         dap_id: DapId,
@@ -244,8 +252,8 @@ impl CoreRpcHandler {
         }
     }
 
-    pub fn workspace_file_change(&self) {
-        self.notification(CoreNotification::WorkspaceFileChange);
+    pub fn workspace_file_change(&self, generation: u64) {
+        self.notification(CoreNotification::WorkspaceFileChange { generation });
     }
 
     pub fn diff_info(&self, diff: DiffInfo) {
@@ -284,8 +292,8 @@ impl CoreRpcHandler {
         });
     }
 
-    pub fn run_in_terminal(&self, config: RunDebugConfig) {
-        self.notification(CoreNotification::RunInTerminal { config });
+    pub fn run_in_terminal(&self, request: DebugTerminalRequest) {
+        self.notification(CoreNotification::RunInTerminal { request });
     }
 
     pub fn log(&self, level: LogLevel, message: String, target: Option<String>) {
@@ -357,8 +365,16 @@ impl CoreRpcHandler {
         });
     }
 
-    pub fn dap_continued(&self, dap_id: DapId) {
-        self.notification(CoreNotification::DapContinued { dap_id });
+    pub fn dap_session_state(
+        &self,
+        dap_id: DapId,
+        state: dap_types::DapSessionState,
+    ) {
+        self.notification(CoreNotification::DapSessionState { dap_id, state });
+    }
+
+    pub fn dap_error(&self, dap_id: DapId, message: String) {
+        self.notification(CoreNotification::DapError { dap_id, message });
     }
 
     pub fn dap_breakpoints_resp(
@@ -408,6 +424,32 @@ pub struct ServerStatusParams {
 }
 
 impl ServerStatusParams {
+    pub fn starting(server_name: String) -> Self {
+        Self {
+            server_name: Some(server_name),
+            health: "starting".into(),
+            quiescent: false,
+            message: None,
+        }
+    }
+    pub fn ready(server_name: String) -> Self {
+        Self {
+            server_name: Some(server_name),
+            health: "ok".to_string(),
+            quiescent: true,
+            message: None,
+        }
+    }
+
+    pub fn failed(server_name: String, message: String) -> Self {
+        Self {
+            server_name: Some(server_name),
+            health: "error".to_string(),
+            quiescent: true,
+            message: Some(message),
+        }
+    }
+
     pub fn is_ok(&self) -> bool {
         self.health.as_str() == "ok"
     }

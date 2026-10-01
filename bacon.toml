@@ -4,22 +4,22 @@
 default_job = "check"
 
 [jobs.check]
-command = ["cargo", "check", "--bin", "ahead", "--tests"]
+command = ["cargo", "check", "-p", "ahead", "--bin", "ahead"]
 need_stdout = false
-watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel", "ahead-agent", "ahead-tool-records"]
 
 [jobs.check-all]
 command = ["cargo", "check", "--workspace", "--all-targets"]
 need_stdout = false
-watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel", "ahead-agent", "ahead-tool-records"]
 
 [jobs.test]
-command = ["cargo", "test", "-p", "ahead-proxy", "--lib", "-p", "ahead-viewmodel"]
+command = ["cargo", "test", "-p", "ahead-agent", "-p", "ahead-proxy", "-p", "ahead-viewmodel"]
 need_stdout = true
-watch = ["ahead-proxy", "ahead-rpc", "ahead-viewmodel"]
+watch = ["ahead-agent", "ahead-proxy", "ahead-rpc", "ahead-viewmodel", "ahead-tool-records"]
 
 [jobs.run]
-command = ["cargo", "run", "--bin", "ahead"]
+command = ["cargo", "run", "-p", "ahead", "--bin", "ahead"]
 need_stdout = false
-watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel"]
-kill = ["cargo", "run", "--bin", "ahead"]
+watch = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel", "ahead-agent", "ahead-tool-records"]
+kill = ["cargo", "run", "-p", "ahead", "--bin", "ahead"]

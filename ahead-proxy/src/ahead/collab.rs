@@ -6,13 +6,11 @@
 //! - Sticky anchor index for concurrent edit adjustment without caret theft (Scenario 4)
 //! - Frozen review snapshot binding code, implementers, and attestations, invalidated upon code changes (Scenario 9)
 
-use std::collections::{HashMap, HashSet};
-use anyhow::{bail, Result};
+use ahead_rpc::ahead::{CodeAnchor, Id, Sha256, Timestamp};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use ahead_rpc::ahead::{
-    CodeAnchor, DisplayPosition, DisplayRange, Id, Sha256, Timestamp,
-};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticipantStatus {
@@ -29,8 +27,7 @@ pub struct CollabParticipant {
 }
 
 /// Sticky anchor index tracking relative anchor offsets during edits
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StickyAnchorIndex {
     anchors: HashMap<Id, CodeAnchor>,
 }
@@ -68,11 +65,14 @@ impl StickyAnchorIndex {
                 // Lines deleted
                 let delta = (-line_delta).cast_unsigned();
                 if anchor.range.start.line >= at_line + delta {
-                    anchor.range.start.line = anchor.range.start.line.saturating_sub(delta);
-                    anchor.range.end.line = anchor.range.end.line.saturating_sub(delta);
+                    anchor.range.start.line =
+                        anchor.range.start.line.saturating_sub(delta);
+                    anchor.range.end.line =
+                        anchor.range.end.line.saturating_sub(delta);
                 } else if anchor.range.start.line >= at_line {
                     anchor.range.start.line = at_line;
-                    anchor.range.end.line = anchor.range.end.line.saturating_sub(delta).max(at_line);
+                    anchor.range.end.line =
+                        anchor.range.end.line.saturating_sub(delta).max(at_line);
                 }
             }
         }
@@ -87,9 +87,14 @@ pub struct ReviewSnapshot {
     pub code_tree_sha: Sha256,
     pub implementer_ids: HashSet<Id>,
     pub findings: Vec<String>,
+    /// Compatibility name for the existing wire shape. This means that an
+    /// AHEAD review attestation exists; it is not merge approval.
     pub is_approved: bool,
     pub approved_by: Option<Id>,
     pub approved_at: Option<Timestamp>,
+    /// Whether the reviewer is one of the recorded implementers. The team or
+    /// repository policy decides whether that relationship is sufficient.
+    pub reviewer_is_implementer: Option<bool>,
 }
 
 impl ReviewSnapshot {
@@ -108,18 +113,18 @@ impl ReviewSnapshot {
             is_approved: false,
             approved_by: None,
             approved_at: None,
+            reviewer_is_implementer: None,
         }
     }
 
-    /// Scenario 9: Reviewer independence requirement
+    /// Records an AHEAD review attestation. Independence is evidence for the
+    /// repository/team policy to interpret, not a universal AHEAD gate.
     pub fn record_approval(&mut self, reviewer_id: &str) -> Result<()> {
-        if self.implementer_ids.contains(reviewer_id) {
-            bail!("Reviewer independence violation: author/implementer cannot approve their own work");
-        }
-
         self.is_approved = true;
         self.approved_by = Some(reviewer_id.to_string());
         self.approved_at = Some(Utc::now().to_rfc3339());
+        self.reviewer_is_implementer =
+            Some(self.implementer_ids.contains(reviewer_id));
         Ok(())
     }
 
@@ -132,6 +137,7 @@ impl ReviewSnapshot {
         self.is_approved = false;
         self.approved_by = None;
         self.approved_at = None;
+        self.reviewer_is_implementer = None;
         true
     }
 
@@ -146,6 +152,7 @@ impl ReviewSnapshot {
             is_approved: self.is_approved,
             approved_by: self.approved_by.clone(),
             approved_at: self.approved_at.clone(),
+            reviewer_is_implementer: self.reviewer_is_implementer,
         }
     }
 
@@ -159,6 +166,7 @@ impl ReviewSnapshot {
             is_approved: dto.is_approved,
             approved_by: dto.approved_by,
             approved_at: dto.approved_at,
+            reviewer_is_implementer: dto.reviewer_is_implementer,
         }
     }
 }
@@ -248,6 +256,7 @@ impl CollabSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahead_rpc::ahead::{DisplayPosition, DisplayRange};
 
     /// Two-client convergence: host and guest apply the same two edits
     /// in opposite orders through the sticky index; both end at the
@@ -257,6 +266,7 @@ mod tests {
         let anchor = || CodeAnchor {
             id: "comment-1".into(),
             session_id: "sess-2c".into(),
+            actor_id: "human".into(),
             path: "src/lib.rs".into(),
             range: DisplayRange {
                 start: DisplayPosition { line: 20, col: 0 },
@@ -264,7 +274,6 @@ mod tests {
             },
             quote_hash: "q".into(),
             surrounding_context: None,
-            created_at_commit: None,
         };
         // Host order: insert 3 lines at 5, then delete 2 at 30.
         let mut host = StickyAnchorIndex::new();
@@ -292,6 +301,7 @@ mod tests {
         let anchor = CodeAnchor {
             id: "anc-42".into(),
             session_id: "sess-1".into(),
+            actor_id: "human".into(),
             path: "src/engine.rs".into(),
             range: DisplayRange {
                 start: DisplayPosition { line: 50, col: 0 },
@@ -299,7 +309,6 @@ mod tests {
             },
             quote_hash: "quote_hash".into(),
             surrounding_context: None,
-            created_at_commit: None,
         };
         index.insert(anchor);
 
@@ -318,7 +327,8 @@ mod tests {
 
     #[test]
     fn test_revoked_participant_cannot_submit_edits() -> Result<()> {
-        let mut session = CollabSession::new("sess-1".into(), "host-1".into(), "Host Dev".into());
+        let mut session =
+            CollabSession::new("sess-1".into(), "host-1".into(), "Host Dev".into());
         session.join_guest("guest-1".into(), "Guest Dev".into());
 
         // Active guest can submit
@@ -329,13 +339,16 @@ mod tests {
 
         // Revoked guest must fail closed
         let err = session.can_submit_edit("guest-1");
-        assert!(err.is_err(), "Revoked participant should not be allowed to submit edits");
+        assert!(
+            err.is_err(),
+            "Revoked participant should not be allowed to submit edits"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn test_review_independence_and_stale_invalidation() {
+    fn test_review_attestation_records_relationship_and_stale_invalidation() {
         let mut snapshot = ReviewSnapshot::new(
             "snap-1".into(),
             "sess-1".into(),
@@ -343,17 +356,23 @@ mod tests {
             vec!["dev-implementer".into()],
         );
 
-        // Implementer cannot self-approve
-        let self_approval = snapshot.record_approval("dev-implementer");
-        assert!(self_approval.is_err(), "Self-approval must be rejected");
+        // AHEAD records self-review; repository/team policy decides whether it
+        // satisfies the applicable PR requirement.
+        assert!(snapshot.record_approval("dev-implementer").is_ok());
+        assert_eq!(snapshot.reviewer_is_implementer, Some(true));
 
-        // Independent reviewer can approve
+        // Another reviewer can attest as well.
         assert!(snapshot.record_approval("independent-reviewer").is_ok());
         assert!(snapshot.is_approved);
+        assert_eq!(snapshot.reviewer_is_implementer, Some(false));
 
         // Subsequent code change invalidates approval
         let is_stale = snapshot.check_stale("tree_sha_modified");
         assert!(is_stale);
-        assert!(!snapshot.is_approved, "Approval must become stale upon code changes");
+        assert!(
+            !snapshot.is_approved,
+            "Approval must become stale upon code changes"
+        );
+        assert_eq!(snapshot.reviewer_is_implementer, None);
     }
 }

@@ -63,10 +63,7 @@ impl RpcObject {
 
         match result {
             Some(r) => Ok(Ok(r)),
-            None => match self
-                .0
-                .as_object_mut()
-                .and_then(|obj| obj.remove("error"))
+            None => match self.0.as_object_mut().and_then(|obj| obj.remove("error"))
             {
                 Some(error) => Ok(Err(error)),
                 None => Err("RPC response is neither result nor error.".to_string()),

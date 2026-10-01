@@ -5,8 +5,21 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
+use crate::{
+    RequestId, RpcError, RpcMessage,
+    buffer::BufferId,
+    dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
+    delta::AheadDelta,
+    file::{FileNodeItem, PathObject},
+    file_line::FileLine,
+    plugin::PluginId,
+    source_control::{FileDiff, GitFileState},
+    style::SemanticStyles,
+    terminal::{TermId, TerminalProfile},
+};
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
 use lsp_types::{
@@ -19,20 +32,11 @@ use lsp_types::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use crate::{
-    RequestId, RpcError, RpcMessage,
-    buffer::BufferId,
-    dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
-    delta::AheadDelta,
-    file::{FileNodeItem, PathObject},
-    file_line::FileLine,
-    plugin::PluginId,
-    source_control::FileDiff,
-    style::SemanticStyles,
-    terminal::{TermId, TerminalProfile},
-};
 
-#[expect(clippy::large_enum_variant, reason = "RPC envelope dominated by small variants; boxing the large one adds indirection on every message")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "RPC envelope dominated by small variants; boxing the large one adds indirection on every message"
+)]
 pub enum ProxyRpc {
     Request(RequestId, ProxyRequest),
     Notification(ProxyNotification),
@@ -50,11 +54,15 @@ pub enum ProxyStatus {
 pub struct SearchMatch {
     pub line: usize,
     pub start: usize,
+    pub end_line: usize,
     pub end: usize,
     pub line_content: String,
 }
 
-#[expect(clippy::large_enum_variant, reason = "request envelope carries buffer/search payloads by value; consumed once per dispatch")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "request envelope carries buffer/search payloads by value; consumed once per dispatch"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -66,11 +74,18 @@ pub enum ProxyRequest {
     BufferHead {
         path: PathBuf,
     },
+    GitFileState {
+        path: PathBuf,
+        content: String,
+    },
     GlobalSearch {
         pattern: String,
         case_sensitive: bool,
         whole_word: bool,
         is_regex: bool,
+    },
+    WorkspaceFiles {
+        request_id: u64,
     },
     CompletionResolve {
         plugin_id: PluginId,
@@ -168,9 +183,6 @@ pub enum ProxyRequest {
         path: PathBuf,
     },
     GetOpenFilesContent {},
-    GetFiles {
-        path: String,
-    },
     ReadDir {
         path: PathBuf,
     },
@@ -179,6 +191,10 @@ pub enum ProxyRequest {
         path: PathBuf,
         /// Whether to create the parent directories if they do not exist.
         create_parents: bool,
+    },
+    SaveEditorBuffer {
+        path: PathBuf,
+        content: String,
     },
     SaveBufferAs {
         buffer_id: BufferId,
@@ -222,9 +238,16 @@ pub enum ProxyRequest {
     AheadRequest {
         request: crate::ahead::AheadRequest,
     },
+    InstallLanguageExtension {
+        url: String,
+        extension_id: String,
+    },
 }
 
-#[expect(clippy::large_enum_variant, reason = "notification envelope carries init/plugin payloads by value; consumed once per dispatch")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "notification envelope carries init/plugin payloads by value; consumed once per dispatch"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -241,6 +264,9 @@ pub enum ProxyNotification {
         paths: Vec<PathObject>,
     },
     Shutdown {},
+    CancelWorkspaceFiles {
+        request_id: u64,
+    },
     Completion {
         request_id: usize,
         path: PathBuf,
@@ -256,6 +282,13 @@ pub enum ProxyNotification {
         path: PathBuf,
         delta: AheadDelta,
         rev: u64,
+    },
+    EditorSnapshot {
+        path: PathBuf,
+        content: String,
+    },
+    CloseEditorBuffer {
+        path: PathBuf,
     },
     NewTerminal {
         term_id: TermId,
@@ -276,6 +309,7 @@ pub enum ProxyNotification {
     LspCancel {
         id: i32,
     },
+    RestartLanguageServers {},
     TerminalWrite {
         term_id: TermId,
         content: String,
@@ -292,10 +326,8 @@ pub enum ProxyNotification {
         config: RunDebugConfig,
         breakpoints: HashMap<PathBuf, Vec<SourceBreakpoint>>,
     },
-    DapProcessId {
-        dap_id: DapId,
-        process_id: Option<u32>,
-        term_id: TermId,
+    DapTerminalResponse {
+        response: crate::dap_types::DebugTerminalResponse,
     },
     DapContinue {
         dap_id: DapId,
@@ -341,6 +373,9 @@ pub enum ProxyNotification {
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
 pub enum ProxyResponse {
+    GitFileState {
+        state: GitFileState,
+    },
     GitGetRemoteFileUrl {
         file_url: String,
     },
@@ -402,9 +437,6 @@ pub enum ProxyResponse {
         plugin_id: PluginId,
         resp: Option<GotoImplementationResponse>,
     },
-    GetFilesResponse {
-        items: Vec<PathBuf>,
-    },
     GetDocumentFormatting {
         edits: Vec<TextEdit>,
     },
@@ -437,6 +469,10 @@ pub enum ProxyResponse {
     },
     GlobalSearchResponse {
         matches: IndexMap<PathBuf, Vec<SearchMatch>>,
+    },
+    WorkspaceFilesResponse {
+        generation: u64,
+        files: Vec<PathBuf>,
     },
     DapVariableResponse {
         varialbes: Vec<dap_types::Variable>,
@@ -473,6 +509,53 @@ enum ResponseHandler {
     Chan(Sender<Result<ProxyResponse, RpcError>>),
 }
 
+pub struct WorkspaceFilesRequest {
+    request_id: u64,
+    tx: Sender<ProxyRpc>,
+    receiver: Receiver<Result<ProxyResponse, RpcError>>,
+}
+
+impl WorkspaceFilesRequest {
+    pub fn wait(self) -> Result<(u64, Vec<PathBuf>), RpcError> {
+        let result = match self.receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result?,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                self.cancel();
+                return Err(RpcError {
+                    code: 0,
+                    message: "proxy request timed out after 30s".to_string(),
+                });
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err(RpcError {
+                    code: 0,
+                    message: "proxy connection closed".to_string(),
+                });
+            }
+        };
+        match result {
+            ProxyResponse::WorkspaceFilesResponse { generation, files } => {
+                Ok((generation, files))
+            }
+            _ => Err(RpcError {
+                code: 0,
+                message: "proxy returned the wrong workspace file response"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        if let Err(error) = self.tx.send(ProxyRpc::Notification(
+            ProxyNotification::CancelWorkspaceFiles {
+                request_id: self.request_id,
+            },
+        )) {
+            tracing::error!("{:?}", error);
+        }
+    }
+}
+
 impl ResponseHandler {
     fn invoke(self, result: Result<ProxyResponse, RpcError>) {
         match self {
@@ -496,7 +579,7 @@ pub struct ProxyRpcHandler {
     tx: Sender<ProxyRpc>,
     rx: Receiver<ProxyRpc>,
     id: Arc<AtomicU64>,
-    pending: Arc<Mutex<HashMap<u64, ResponseHandler>>>,
+    pending: Arc<Mutex<Option<HashMap<u64, ResponseHandler>>>>,
 }
 
 impl ProxyRpcHandler {
@@ -506,7 +589,7 @@ impl ProxyRpcHandler {
             tx,
             rx,
             id: Arc::new(AtomicU64::new(0)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(Some(HashMap::new()))),
         }
     }
 
@@ -537,22 +620,97 @@ impl ProxyRpcHandler {
     fn request_common(&self, request: ProxyRequest, rh: ResponseHandler) {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
 
-        self.pending.lock().insert(id, rh);
-
-        if let Err(err) = self.tx.send(ProxyRpc::Request(id, request)) {
-            tracing::error!("{:?}", err);
+        let mut pending = self.pending.lock();
+        let Some(handlers) = pending.as_mut() else {
+            drop(pending);
+            rh.invoke(Err(Self::connection_closed_error()));
+            return;
+        };
+        handlers.insert(id, rh);
+        let sent = self.tx.send(ProxyRpc::Request(id, request));
+        drop(pending);
+        if let Err(error) = sent {
+            tracing::error!("{error:?}");
+            self.disconnect();
         }
     }
 
     fn request(&self, request: ProxyRequest) -> Result<ProxyResponse, RpcError> {
+        self.request_with_timeout(request, Duration::from_secs(30))
+    }
+
+    fn request_with_timeout(
+        &self,
+        request: ProxyRequest,
+        timeout: Duration,
+    ) -> Result<ProxyResponse, RpcError> {
+        // These writes are not cancelled by a local deadline. Keep their pending
+        // slot until the real reply or disconnect, rather than invite a duplicate.
+        let wait_for_outcome = matches!(
+            &request,
+            ProxyRequest::AheadRequest {
+                request: crate::ahead::AheadRequest::StartWork { .. }
+                    | crate::ahead::AheadRequest::SetExternalAcpAdapterInstalled { .. }
+            }
+        );
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.request_common(request, ResponseHandler::Chan(tx));
-        rx.recv().unwrap_or_else(|_| {
-            Err(RpcError {
-                code: 0,
-                message: "io error".to_string(),
+        if wait_for_outcome {
+            return rx
+                .recv()
+                .unwrap_or_else(|_| Err(Self::connection_closed_error()));
+        }
+        rx.recv_timeout(timeout).unwrap_or_else(|error| {
+            Err(match error {
+                crossbeam_channel::RecvTimeoutError::Timeout => RpcError {
+                    code: 0,
+                    message: format!(
+                        "proxy request timed out after {}s",
+                        timeout.as_secs()
+                    ),
+                },
+                crossbeam_channel::RecvTimeoutError::Disconnected => {
+                    Self::connection_closed_error()
+                }
             })
         })
+    }
+
+    fn connection_closed_error() -> RpcError {
+        RpcError {
+            code: 0,
+            message: "proxy connection closed. Restart AHEAD to reconnect and restore stored sessions; an in-flight change may already have completed.".into(),
+        }
+    }
+
+    pub fn disconnect(&self) {
+        let pending = self.pending.lock().take();
+        if let Some(pending) = pending {
+            if let Err(error) = self.tx.send(ProxyRpc::Shutdown) {
+                tracing::error!("{error:?}");
+            }
+            // Callbacks can submit another request, so invoke them outside the lock.
+            for handler in pending.into_values() {
+                handler.invoke(Err(Self::connection_closed_error()));
+            }
+        }
+    }
+
+    pub fn workspace_files(&self, request_id: u64) -> WorkspaceFilesRequest {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        self.request_common(
+            ProxyRequest::WorkspaceFiles { request_id },
+            ResponseHandler::Chan(sender),
+        );
+        WorkspaceFilesRequest {
+            request_id,
+            tx: self.tx.clone(),
+            receiver,
+        }
+    }
+
+    pub fn cancel_workspace_files(&self, request_id: u64) {
+        self.notification(ProxyNotification::CancelWorkspaceFiles { request_id });
     }
 
     pub fn request_async(
@@ -568,15 +726,27 @@ impl ProxyRpcHandler {
         id: RequestId,
         result: Result<ProxyResponse, RpcError>,
     ) {
-        let handler = { self.pending.lock().remove(&id) };
+        let handler = {
+            self.pending
+                .lock()
+                .as_mut()
+                .and_then(|pending| pending.remove(&id))
+        };
         if let Some(handler) = handler {
             handler.invoke(result);
         }
     }
 
     pub fn notification(&self, notification: ProxyNotification) {
-        if let Err(err) = self.tx.send(ProxyRpc::Notification(notification)) {
-            tracing::error!("{:?}", err);
+        let pending = self.pending.lock();
+        if pending.is_none() {
+            return;
+        }
+        let sent = self.tx.send(ProxyRpc::Notification(notification));
+        drop(pending);
+        if let Err(error) = sent {
+            tracing::error!("{error:?}");
+            self.disconnect();
         }
     }
 
@@ -598,9 +768,7 @@ impl ProxyRpcHandler {
 
     pub fn shutdown(&self) {
         self.notification(ProxyNotification::Shutdown {});
-        if let Err(err) = self.tx.send(ProxyRpc::Shutdown) {
-            tracing::error!("{:?}", err);
-        }
+        self.disconnect();
     }
 
     pub fn initialize(
@@ -671,6 +839,18 @@ impl ProxyRpcHandler {
         f: impl ProxyCallback + 'static,
     ) {
         self.request_async(ProxyRequest::NewBuffer { buffer_id, path }, f);
+    }
+
+    pub fn install_language_extension(
+        &self,
+        url: String,
+        extension_id: String,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(
+            ProxyRequest::InstallLanguageExtension { url, extension_id },
+            f,
+        );
     }
 
     pub fn get_buffer_head(&self, path: PathBuf, f: impl ProxyCallback + 'static) {
@@ -773,15 +953,6 @@ impl ProxyRpcHandler {
                 rev,
                 path,
                 create_parents,
-            },
-            f,
-        );
-    }
-
-    pub fn get_files(&self, f: impl ProxyCallback + 'static) {
-        self.request_async(
-            ProxyRequest::GetFiles {
-                path: "path".into(),
             },
             f,
         );
@@ -1055,6 +1226,14 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::Update { path, delta, rev });
     }
 
+    pub fn editor_snapshot(&self, path: PathBuf, content: String) {
+        self.notification(ProxyNotification::EditorSnapshot { path, content });
+    }
+
+    pub fn close_editor_buffer(&self, path: PathBuf) {
+        self.notification(ProxyNotification::CloseEditorBuffer { path });
+    }
+
     pub fn git_discard_files_changes(&self, files: Vec<PathBuf>) {
         self.notification(ProxyNotification::GitDiscardFilesChanges { files });
     }
@@ -1083,17 +1262,11 @@ impl ProxyRpcHandler {
         });
     }
 
-    pub fn dap_process_id(
+    pub fn dap_terminal_response(
         &self,
-        dap_id: DapId,
-        process_id: Option<u32>,
-        term_id: TermId,
+        response: crate::dap_types::DebugTerminalResponse,
     ) {
-        self.notification(ProxyNotification::DapProcessId {
-            dap_id,
-            process_id,
-            term_id,
-        });
+        self.notification(ProxyNotification::DapTerminalResponse { response });
     }
 
     pub fn dap_restart(
@@ -1171,13 +1344,15 @@ impl ProxyRpcHandler {
         request: crate::ahead::AheadRequest,
         f: impl FnOnce(Result<serde_json::Value, RpcError>) + Send + 'static,
     ) {
-        self.request_async(ProxyRequest::AheadRequest { request }, move |res| match res {
-            Ok(ProxyResponse::AheadResponse { response }) => f(Ok(response)),
-            Ok(_) => f(Err(RpcError {
-                code: 0,
-                message: "Unexpected response variant for AheadRequest".into(),
-            })),
-            Err(err) => f(Err(err)),
+        self.request_async(ProxyRequest::AheadRequest { request }, move |res| {
+            match res {
+                Ok(ProxyResponse::AheadResponse { response }) => f(Ok(response)),
+                Ok(_) => f(Err(RpcError {
+                    code: 0,
+                    message: "Unexpected response variant for AheadRequest".into(),
+                })),
+                Err(err) => f(Err(err)),
+            }
         });
     }
 
@@ -1204,5 +1379,143 @@ impl ProxyRpcHandler {
 impl Default for ProxyRpcHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProxyRequest, ProxyResponse, ProxyRpc, ProxyRpcHandler};
+    use crate::ahead::{AheadRequest, HarnessKind};
+    use std::time::Duration;
+
+    fn creation_request() -> AheadRequest {
+        AheadRequest::StartWork {
+            work_kind: None,
+            title: "Delayed session".into(),
+            starting_point: "Keep one session".into(),
+            work_item: None,
+            harness: Some(HarnessKind::Ahead),
+            external_agent_id: None,
+        }
+    }
+
+    #[test]
+    fn setup_requests_wait_past_read_deadline_for_their_actual_reply() {
+        for request in [
+            creation_request(),
+            AheadRequest::SetExternalAcpAdapterInstalled {
+                adapter_id: "pi-acp".into(),
+                installed: true,
+            },
+        ] {
+            let rpc = ProxyRpcHandler::new();
+            let worker_rpc = rpc.clone();
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            let worker = std::thread::spawn(move || {
+                sender
+                    .send(worker_rpc.request_with_timeout(
+                        ProxyRequest::AheadRequest { request },
+                        Duration::ZERO,
+                    ))
+                    .expect("report result");
+            });
+            let ProxyRpc::Request(id, _) = rpc
+                .rx()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("request")
+            else {
+                panic!("expected one request");
+            };
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_millis(20)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ));
+            rpc.handle_response(
+                id,
+                Ok(ProxyResponse::AheadResponse {
+                    response: serde_json::json!({"session": {"id": "created-once"}}),
+                }),
+            );
+            let result = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reply")
+                .expect("success");
+            assert!(matches!(result, ProxyResponse::AheadResponse { .. }));
+            assert!(rpc.rx().is_empty());
+            worker.join().expect("worker");
+        }
+    }
+
+    #[test]
+    fn read_requests_keep_their_deadline() {
+        let rpc = ProxyRpcHandler::new();
+        let result = rpc.request_with_timeout(
+            ProxyRequest::AheadRequest {
+                request: AheadRequest::ListSessions,
+            },
+            Duration::ZERO,
+        );
+        assert!(result.err().expect("timeout").message.contains("timed out"));
+    }
+
+    #[test]
+    fn disconnect_releases_waiting_setup_request() {
+        let rpc = ProxyRpcHandler::new();
+        let worker_rpc = rpc.clone();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(worker_rpc.ahead_request_blocking(creation_request()))
+                .expect("report result");
+        });
+        assert!(matches!(
+            rpc.rx()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("request"),
+            ProxyRpc::Request(_, _)
+        ));
+        rpc.disconnect();
+        let error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("disconnect")
+            .expect_err("failed request");
+        assert!(error.message.contains("Restart AHEAD"));
+        worker.join().expect("worker");
+    }
+
+    #[test]
+    fn disconnect_drains_once_and_rejects_reentrant_and_future_requests() {
+        let rpc = ProxyRpcHandler::new();
+        let callback_rpc = rpc.clone();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let nested_sender = sender.clone();
+        rpc.ahead_request(creation_request(), move |result| {
+            sender.send(result).expect("first result");
+            callback_rpc.ahead_request(AheadRequest::ListSessions, move |result| {
+                nested_sender.send(result).expect("nested result");
+            });
+        });
+        let ProxyRpc::Request(id, _) = rpc.rx().try_recv().expect("request") else {
+            panic!("expected request");
+        };
+        rpc.disconnect();
+        rpc.disconnect();
+        rpc.handle_response(id, Ok(ProxyResponse::Success {}));
+        for _ in 0..2 {
+            let error = receiver
+                .try_recv()
+                .expect("one result")
+                .expect_err("closed");
+            assert!(error.message.contains("connection closed"));
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(rpc.rx().try_recv(), Ok(ProxyRpc::Shutdown)));
+        assert!(rpc.rx().is_empty());
+        let error = rpc
+            .ahead_request_blocking(creation_request())
+            .expect_err("no new writes");
+        assert!(error.message.contains("Restart AHEAD"));
+        rpc.notification(super::ProxyNotification::Shutdown {});
+        assert!(rpc.rx().is_empty());
     }
 }

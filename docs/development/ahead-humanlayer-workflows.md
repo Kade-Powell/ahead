@@ -118,14 +118,59 @@ AHEAD has two explicit tiers:
 
 1. **Managed agent.** AHEAD runs the managed runtime directly and owns the
    effect boundary. This is the default where AHEAD promises teaching-task
-   read-only behavior, assistance scope, human tool decisions, and edit
-   attribution. It preserves the pinned runtime's native harness contract rather
-   than implementing a look-alike loop. The deterministic `AheadAgentLoop` is a
-   fallback, not the managed runtime.
-2. **External ACP agents.** ACP remains the compatibility surface for streaming,
-   cancellation, resume, and conversation with other agents. Their shell and
-   file effects occur in their own process and carry no AHEAD enforcement
-   guarantee unless a future integration proves and owns such a boundary.
+   read-only behavior, workspace-bounded assistance, and edit attribution. The
+   user's instruction authorizes the requested work; the runtime allowlist and
+   sandbox bound effects without per-tool approval cards. It preserves the
+   pinned runtime's native harness contract rather than implementing a
+   look-alike loop.
+2. **External ACP agents.** AHEAD offers curated installable adapters for Pi,
+   Codex, and Claude Code. ACP provides streaming, cancellation, resume, and
+   conversation with these external agents, but their shell and file effects
+   remain outside AHEAD's control. Keep these sessions visibly external; do not
+   present them as governed Learn or Assist sessions. AHEAD's enforcement,
+   attribution, and read-only guarantees apply only to the managed/native tier.
+
+### Native integration cutover, 2026-09-22
+
+The managed implementation now follows Zed's native-agent split at commit
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. Zed's
+`crates/agent/src/native_agent_server.rs`, `crates/agent/src/agent.rs` and
+`crates/agent/src/thread.rs` directly integrate the built-in loop; only
+`crates/agent_servers/src/acp.rs` launches external ACP processes. AHEAD now does
+the same: `NativeClient` calls the retained core `ThreadManager` directly in the
+proxy process, while `HarnessClient` is external-agent ACP only. The Codex App
+Server executable and its extra JSON-RPC hop are no longer part of AHEAD.
+
+This cutover also corrected a policy bug found by the Pi probe. ACP session modes
+belong to the external agent: Pi uses them for reasoning effort. AHEAD now keeps
+its teaching/assistance policy in a separate map used for permission responses
+and only sends an ACP mode when that exact id was advertised by the agent. An
+external `current_mode_update` can no longer weaken AHEAD's policy state.
+
+The production chat route now presents the current session policy hash and
+fails closed before runtime startup if it is missing or stale. The controller
+rejects overlapping turns for one session, preserves non-cancellation aborts as
+failures, and settles an external ACP prompt immediately on cancel. Native
+input requests retain blocking and multi-select semantics; secret answers are
+declined rather than exposed in the transcript. Compaction and unsupported
+dynamic client-tool calls are handled explicitly instead of disappearing into
+the event catch-all.
+
+On editor startup, the UI restores the durable session list and newest active
+conversation from `.ahead/session.db` without blocking the GPUI foreground
+thread. Session-list reads isolate unreadable legacy rows so one incomplete
+record cannot hide healthy conversations. This path was exercised across two
+clean native-app restarts on 2026-09-23. The thread-rail close action records a
+non-destructive archive in the same database; a live create/archive/restart pass
+verified that archived sessions stay hidden while their durable state remains.
+Authenticated turn, stop, rendered failure and complete Markdown interaction
+remain separate acceptance gates.
+
+The Pi adapter is installed with the Zed-style pinned npm layout and successfully
+completes initialize, new-session, command discovery and prompt lifecycle. The
+local Pi model request currently returns `AccessDeniedException: Bearer Token has
+expired`, so a successful model delta remains an authentication gate rather than
+an AHEAD protocol failure.
 
 The architecture and current acceptance gates belong in
 [Editor MVP §§3.4–3.5](ahead-editor-mvp.md#34-own-the-policy-boundary-reuse-the-agent-machinery),
@@ -145,6 +190,8 @@ why the two-tier decision was made.
 - Agent Client Protocol: [filesystem methods](https://agentclientprotocol.com/protocol/v1/file-system),
   [plans](https://agentclientprotocol.com/protocol/v1/agent-plan), and
   [session modes](https://agentclientprotocol.com/protocol/v1/session-modes).
+- ACP Registry: [latest registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json).
+- Pi ACP: [source and protocol notes](https://github.com/svkozak/pi-acp).
 - OpenAI: [Codex prompting guide](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide),
   [harness integration rationale](https://openai.com/index/unlocking-the-codex-harness/),
   and [App Server reference](https://learn.chatgpt.com/docs/app-server).

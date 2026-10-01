@@ -1,17 +1,44 @@
 [package]
 name         = "ahead-app"
+autobins     = false
 license      = { workspace = true }
 version      = { workspace = true }
 authors      = { workspace = true }
 edition      = { workspace = true }
 rust-version = { workspace = true }
+build = "build.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+ahead-voice = { path = "../ahead-voice" }
 ahead-viewmodel = { path = "../ahead-viewmodel" }
-ahead-rpc       = { workspace = true }
+ahead-rpc = { workspace = true }
+ahead-core = { workspace = true }
 alacritty_terminal = { workspace = true }
-crossbeam-channel = { workspace = true }
-chrono          = { workspace = true }
-gpui-kit        = { workspace = true }
+chrono = { workspace = true }
+gpui-kit = { workspace = true }
+gpui-util = { workspace = true }
 gpui-kit-assets = "=0.6.6"
-uuid            = { version = "1.7", features = ["v4"] }
+toml = { workspace = true }
+tempfile = { workspace = true }
+fs4 = "0.13.1"
+uuid = { version = "1.7", features = ["v4"] }
+crossbeam-channel = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+lsp-types = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+nucleo-matcher = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }

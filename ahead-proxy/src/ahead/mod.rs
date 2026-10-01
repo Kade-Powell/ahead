@@ -1,29 +1,40 @@
 //! AHEAD Session Host & Core Systems
 //!
 //! Submodules:
-//! - `store`: SQLite transactional persistence
+//! - `store`: Turso/libSQL transactional persistence
 //! - `policy`: Capability evaluator & sandbox
 //! - `voice`: Full-duplex streaming voice runtime probe
 //! - `prediction`: Edit prediction context assembler
 //! - `host`: Session host lifecycle and RPC dispatch
+//!
+//! Agent integration lives in the separate `ahead-agent` crate so the editor
+//! can integrate deeply with it without depending on the file/LSP proxy.
 
-pub mod agent;
 pub mod auth;
 pub mod collab;
 pub mod host;
 pub mod policy;
 pub mod prediction;
+mod recovery;
+pub mod scenarios;
 pub mod store;
 pub mod tracker;
 pub mod voice;
-pub mod scenarios;
 
-pub use agent::{AheadAgentLoop, AgentTurnInput, AgentTurnOutput, AgentTurnRequest, TurnApprovalPolicy, TurnSandbox, AcpDelegator, AcpDelegatedTask, AcpTaskResult};
-pub use auth::{GitHubAuthManager, AuthRecord, PollTokenResult};
-pub use collab::{CollabSession, CollabParticipant, ParticipantStatus, StickyAnchorIndex, ReviewSnapshot};
+pub use ahead_agent::{
+    HarnessClient, HarnessClientConfig, HarnessController, HarnessEvent,
+    HarnessNotificationSink, HarnessPlanEntry, HarnessSink, HarnessStore,
+};
+pub use auth::{AuthRecord, GitHubAuthManager, PollTokenResult};
+pub use collab::{
+    CollabParticipant, CollabSession, ParticipantStatus, ReviewSnapshot,
+    StickyAnchorIndex,
+};
 pub use host::AheadSessionHost;
 pub use policy::PolicyEvaluator;
 pub use prediction::PredictionEngine;
 pub use store::SessionStore;
-pub use tracker::{TrackerAdapter, TrackerOutboxItem, TrackerUpdatePayload, OutboxStatus};
+pub use tracker::{
+    OutboxStatus, TrackerAdapter, TrackerOutboxItem, TrackerUpdatePayload,
+};
 pub use voice::VoiceSession;

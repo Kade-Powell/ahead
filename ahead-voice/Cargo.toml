@@ -1,0 +1,20 @@
+[package]
+name = "ahead-voice"
+description = "Local microphone capture and on-device transcription for AHEAD"
+license = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+build = "build.rs"
+
+[dependencies]
+ahead-rpc = { workspace = true }
+tracing = { workspace = true }
+uuid = { version = "1.7", features = ["v4"] }
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

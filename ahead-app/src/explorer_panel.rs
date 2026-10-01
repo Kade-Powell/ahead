@@ -4,8 +4,8 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
-use gpui_kit::component::tree::{tree, TreeItem, TreeState};
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme};
+use gpui_kit::component::tree::{TreeItem, TreeState, tree};
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -25,6 +25,7 @@ pub struct ExplorerPanel {
     ignored_paths: HashSet<String>,
     pub mailbox_id: usize,
     pub tree_state: Entity<TreeState>,
+    trash_handler: Option<std::rc::Rc<dyn Fn(PathBuf, &mut Window, &mut App)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,9 +161,17 @@ impl ExplorerPanel {
             ignored_paths: HashSet::new(),
             mailbox_id: cx.entity_id().as_u64() as usize,
             tree_state: cx.new(|cx| TreeState::new(cx)),
+            trash_handler: None,
         };
         panel.refresh(cx);
         panel
+    }
+
+    pub fn set_trash_handler(
+        &mut self,
+        handler: impl Fn(PathBuf, &mut Window, &mut App) + 'static,
+    ) {
+        self.trash_handler = Some(std::rc::Rc::new(handler));
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -412,14 +421,6 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn delete_path(path: &Path) -> Result<(), String> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path).map_err(|error| error.to_string())
-    } else {
-        std::fs::remove_file(path).map_err(|error| error.to_string())
-    }
 }
 
 fn colored_directory_name(
@@ -717,17 +718,13 @@ impl Render for ExplorerPanel {
                                     },
                                 ),
                             ))
-                            .item(PopupMenuItem::new("Delete").on_click(
+                            .item(PopupMenuItem::new("Move to Trash").on_click(
                                 window.listener_for(
                                     &explorer,
-                                    move |this, _, _, cx| {
-                                        let status = match delete_path(Path::new(&delete_source)) {
-                                            Ok(()) => "Deleted".to_string(),
-                                            Err(error) => format!("Could not delete: {error}"),
-                                        };
-                                        this.refresh(cx);
-                                        this.status = status.into();
-                                        cx.notify();
+                                    move |this, _, window, cx| {
+                                        if let Some(handler) = this.trash_handler.clone() {
+                                            handler(PathBuf::from(&delete_source), window, cx);
+                                        }
                                     },
                                 ),
                             ));

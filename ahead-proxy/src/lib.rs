@@ -9,15 +9,47 @@ pub mod terminal;
 pub mod watcher;
 
 use std::{
+    ffi::OsStr,
     io::{BufReader, stdin, stdout},
     process::exit,
     sync::Arc,
     thread,
 };
 
-use anyhow::{Result, anyhow};
-use clap::Parser;
-use dispatch::Dispatcher;
+fn run_helper_if_requested() {
+    let argument = std::env::args_os().nth(1);
+    #[cfg(unix)]
+    if argument.as_deref()
+        == Some(OsStr::new(codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1))
+    {
+        codex_exec_server::run_arg0_exec_helper_main();
+    }
+    if argument.as_deref()
+        == Some(OsStr::new(codex_exec_server::CODEX_FS_HELPER_ARG1))
+    {
+        codex_exec_server::run_fs_helper_main();
+    }
+}
+
+/// Runs the proxy or sandbox helper when the AHEAD executable was re-entered.
+pub fn run_if_requested() -> bool {
+    run_helper_if_requested();
+    if std::env::args_os().nth(1).as_deref()
+        == Some(OsStr::new("--ahead-editor-mcp"))
+    {
+        if let Err(error) = ahead_agent::run_editor_mcp_stdio() {
+            eprintln!("AHEAD editor MCP server failed: {error:#}");
+            exit(1);
+        }
+        return true;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--proxy")) {
+        mainloop();
+        return true;
+    }
+    false
+}
+
 use ahead_core::{directory::Directory, meta};
 use ahead_rpc::{
     RpcMessage,
@@ -26,6 +58,9 @@ use ahead_rpc::{
     proxy::{ProxyMessage, ProxyNotification, ProxyRpcHandler},
     stdio::stdio_transport,
 };
+use anyhow::{Result, anyhow};
+use clap::Parser;
+use dispatch::Dispatcher;
 use tracing::error;
 
 #[derive(Parser)]

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="windows-1252"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
-    <Product Name="Ahead" Id="*" UpgradeCode="9c09a374-1135-4782-959f-2dec376a1dfa" Language="1033" Codepage="1252" Version="0.0.1" Manufacturer="Ahead">
+    <Product Name="AHEAD" Id="*" UpgradeCode="9c09a374-1135-4782-959f-2dec376a1dfa" Language="1033" Codepage="1252" Version="0.0.1" Manufacturer="AHEAD">
         <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
         <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
         <Icon Id="ahead.exe" SourceFile=".\extra\windows\ahead.ico"/>
@@ -22,7 +22,7 @@
                 <Directory Id="AheadProgramFiles" Name="Ahead"/>
             </Directory>
             <Directory Id="ProgramMenuFolder">
-                <Directory Id="AheadProgramMenu" Name="Ahead"/>
+                <Directory Id="AheadProgramMenu" Name="AHEAD"/>
             </Directory>
         </Directory>
 
@@ -36,7 +36,7 @@
         <DirectoryRef Id="AheadProgramMenu">
             <!-- Application shortcut -->
             <Component Id="AheadShortcut" Guid="7d3d3a8e-febb-4759-8eca-873676d5066a">
-                <Shortcut Id="AheadShortcutFile" Icon="ahead.exe" Name="Ahead" Description="AI-native code editor" Target="[AheadProgramFiles]ahead.exe"/>
+                <Shortcut Id="AheadShortcutFile" Icon="ahead.exe" Name="AHEAD" Description="AI-native code editor" Target="[AheadProgramFiles]ahead.exe"/>
                 <RemoveFolder Id="AheadProgramMenu" On="uninstall"/>
                 <RegistryValue Root="HKCU" Key="Software\Microsoft\Ahead" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
             </Component>
@@ -56,6 +56,7 @@
                     <RegistryValue Type="string" Value="[AheadProgramFiles]ahead.exe &quot;%V&quot;" KeyPath="yes"/>
                 </RegistryKey>
                 <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\Open Ahead here">
+                    <RegistryValue Type="string" Value="Open AHEAD here"/>
                     <RegistryValue Type="string" Name="Icon" Value="[AheadProgramFiles]ahead.exe"/>
                 </RegistryKey>
             </Component>

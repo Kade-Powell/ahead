@@ -13,19 +13,29 @@
 //!   4. Detect conflict if remote changed; never silently overwrite
 //!   5. Handle timeouts with explicit unknown reconciliation before retrying
 
-use std::collections::HashMap;
-use anyhow::{bail, Result};
+use ahead_rpc::ahead::{GithubIssueRef, Id, Timestamp};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use ahead_rpc::ahead::{GithubIssueRef, Id, Timestamp};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutboxStatus {
     PendingAuthorization,
-    Authorized { authorized_by: Id, authorized_at: Timestamp },
-    Confirmed { remote_updated_at: Timestamp },
-    Conflict { remote_body_sha: String, observed_body_sha: String },
-    UnknownTimeout { last_attempt_at: Timestamp },
+    Authorized {
+        authorized_by: Id,
+        authorized_at: Timestamp,
+    },
+    Confirmed {
+        remote_updated_at: Timestamp,
+    },
+    Conflict {
+        remote_body_sha: String,
+        observed_body_sha: String,
+    },
+    UnknownTimeout {
+        last_attempt_at: Timestamp,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +98,11 @@ impl TrackerAdapter {
     }
 
     /// Step 2: Record explicit human authorization
-    pub fn authorize_update(&mut self, outbox_id: &str, authorizer_id: &str) -> Result<()> {
+    pub fn authorize_update(
+        &mut self,
+        outbox_id: &str,
+        authorizer_id: &str,
+    ) -> Result<()> {
         let Some(item) = self.outbox.get_mut(outbox_id) else {
             bail!("Outbox item not found: {}", outbox_id);
         };
@@ -105,7 +119,11 @@ impl TrackerAdapter {
     }
 
     /// Step 3 & 4: Dispatch update with conflict prevention
-    pub fn dispatch_update(&mut self, outbox_id: &str, simulate_timeout: bool) -> Result<OutboxStatus> {
+    pub fn dispatch_update(
+        &mut self,
+        outbox_id: &str,
+        simulate_timeout: bool,
+    ) -> Result<OutboxStatus> {
         let Some(item) = self.outbox.get_mut(outbox_id) else {
             bail!("Outbox item not found: {}", outbox_id);
         };
@@ -127,7 +145,8 @@ impl TrackerAdapter {
         }
 
         // Compare observed remote state
-        if let Some((_current_body, current_sha)) = self.remote_mock_state.get(&key) {
+        if let Some((_current_body, current_sha)) = self.remote_mock_state.get(&key)
+        {
             if *current_sha != item.observed_body_sha {
                 // Remote changed since preview! Fail closed with Conflict
                 let conflict_status = OutboxStatus::Conflict {
@@ -142,7 +161,8 @@ impl TrackerAdapter {
         // Apply mutation
         if let Some(new_body) = item.payload.body_markdown.as_ref() {
             let new_sha = format!("{:x}", sha2::Sha256::digest(new_body.as_bytes()));
-            self.remote_mock_state.insert(key, (new_body.clone(), new_sha));
+            self.remote_mock_state
+                .insert(key, (new_body.clone(), new_sha));
         }
 
         let confirmed_status = OutboxStatus::Confirmed {
@@ -162,9 +182,11 @@ impl TrackerAdapter {
             bail!("Outbox item not found: {}", outbox_id);
         };
 
-        let remote_sha = format!("{:x}", sha2::Sha256::digest(remote_body.as_bytes()));
+        let remote_sha =
+            format!("{:x}", sha2::Sha256::digest(remote_body.as_bytes()));
         if let Some(target_body) = item.payload.body_markdown.as_ref() {
-            let target_sha = format!("{:x}", sha2::Sha256::digest(target_body.as_bytes()));
+            let target_sha =
+                format!("{:x}", sha2::Sha256::digest(target_body.as_bytes()));
             if remote_sha == target_sha {
                 // The write actually went through before timeout
                 item.status = OutboxStatus::Confirmed {
@@ -226,7 +248,10 @@ impl TrackerAdapter {
                     bail!("GitHub re-fetch failed: HTTP {}", resp.status());
                 }
                 let json: serde_json::Value = resp.json()?;
-                json.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
+                json.get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string()
             }
             Err(e) if e.is_timeout() => {
                 let Some(item) = self.outbox.get_mut(outbox_id) else {
@@ -239,8 +264,13 @@ impl TrackerAdapter {
             }
             Err(e) => bail!("GitHub re-fetch failed: {e}"),
         };
-        let remote_sha = format!("{:x}", sha2::Sha256::digest(remote_body.as_bytes()));
-        let observed = self.outbox.get(outbox_id).map(|i| i.observed_body_sha.clone()).unwrap_or_default();
+        let remote_sha =
+            format!("{:x}", sha2::Sha256::digest(remote_body.as_bytes()));
+        let observed = self
+            .outbox
+            .get(outbox_id)
+            .map(|i| i.observed_body_sha.clone())
+            .unwrap_or_default();
         if remote_sha != observed {
             let Some(item) = self.outbox.get_mut(outbox_id) else {
                 bail!("Outbox item not found: {}", outbox_id);
@@ -292,7 +322,8 @@ impl TrackerAdapter {
         };
         // Refresh observed SHA from what we just wrote.
         if let Some(new_body) = item.payload.body_markdown.clone() {
-            item.observed_body_sha = format!("{:x}", sha2::Sha256::digest(new_body.as_bytes()));
+            item.observed_body_sha =
+                format!("{:x}", sha2::Sha256::digest(new_body.as_bytes()));
         }
         item.status = OutboxStatus::Confirmed {
             remote_updated_at: Utc::now().to_rfc3339(),
@@ -321,18 +352,23 @@ mod tests {
     fn stage_authorized(tracker: &mut TrackerAdapter, body: &str) -> String {
         let issue = test_issue();
         tracker.set_remote_issue(&issue, "Original issue body by Teammate");
-        let observed_sha = format!("{:x}", sha2::Sha256::digest("Original issue body by Teammate".as_bytes()));
-        let id = tracker.stage_update(
-            "sess-1".into(),
-            issue,
-            TrackerUpdatePayload {
-                title: None,
-                body_markdown: Some(body.into()),
-                labels: None,
-                state: None,
-            },
-            observed_sha,
-        ).unwrap();
+        let observed_sha = format!(
+            "{:x}",
+            sha2::Sha256::digest("Original issue body by Teammate".as_bytes())
+        );
+        let id = tracker
+            .stage_update(
+                "sess-1".into(),
+                issue,
+                TrackerUpdatePayload {
+                    title: None,
+                    body_markdown: Some(body.into()),
+                    labels: None,
+                    state: None,
+                },
+                observed_sha,
+            )
+            .unwrap();
         tracker.authorize_update(&id, "dev-kade").unwrap();
         id
     }
@@ -345,7 +381,10 @@ mod tests {
         tracker.set_remote_issue(&issue, "Original issue body by Teammate");
 
         // Engineer prepares update based on observed state
-        let observed_sha = format!("{:x}", sha2::Sha256::digest("Original issue body by Teammate".as_bytes()));
+        let observed_sha = format!(
+            "{:x}",
+            sha2::Sha256::digest("Original issue body by Teammate".as_bytes())
+        );
         let outbox_id = tracker.stage_update(
             "sess-1".into(),
             issue.clone(),
@@ -366,7 +405,10 @@ mod tests {
 
         // Dispatch must detect conflict and reject overwrite!
         let status = tracker.dispatch_update(&outbox_id, false)?;
-        assert!(matches!(status, OutboxStatus::Conflict { .. }), "Expected conflict on concurrent remote modification");
+        assert!(
+            matches!(status, OutboxStatus::Conflict { .. }),
+            "Expected conflict on concurrent remote modification"
+        );
 
         Ok(())
     }
@@ -384,7 +426,8 @@ mod tests {
         };
 
         tracker.set_remote_issue(&issue, "Body before write");
-        let observed_sha = format!("{:x}", sha2::Sha256::digest("Body before write".as_bytes()));
+        let observed_sha =
+            format!("{:x}", sha2::Sha256::digest("Body before write".as_bytes()));
 
         let outbox_id = tracker.stage_update(
             "sess-1".into(),
@@ -405,8 +448,12 @@ mod tests {
         assert!(matches!(status, OutboxStatus::UnknownTimeout { .. }));
 
         // Reconcile: simulate remote did receive the write
-        let reconciled = tracker.reconcile_timeout(&outbox_id, "Body after write")?;
-        assert!(reconciled, "Expected reconciliation to recognize applied remote state");
+        let reconciled =
+            tracker.reconcile_timeout(&outbox_id, "Body after write")?;
+        assert!(
+            reconciled,
+            "Expected reconciliation to recognize applied remote state"
+        );
 
         let item = tracker.get_item(&outbox_id).unwrap();
         assert!(matches!(item.status, OutboxStatus::Confirmed { .. }));
@@ -420,14 +467,25 @@ mod tests {
         let issue = test_issue();
         tracker.set_remote_issue(&issue, "Body");
         let observed_sha = format!("{:x}", sha2::Sha256::digest("Body".as_bytes()));
-        let id = tracker.stage_update(
-            "sess-1".into(),
-            issue,
-            TrackerUpdatePayload { title: None, body_markdown: Some("New".into()), labels: None, state: None },
-            observed_sha,
-        ).unwrap();
+        let id = tracker
+            .stage_update(
+                "sess-1".into(),
+                issue,
+                TrackerUpdatePayload {
+                    title: None,
+                    body_markdown: Some("New".into()),
+                    labels: None,
+                    state: None,
+                },
+                observed_sha,
+            )
+            .unwrap();
         // Staged but not authorized: live publish must refuse.
-        assert!(tracker.publish_to_github(&id, "token", "https://api.github.com").is_err());
+        assert!(
+            tracker
+                .publish_to_github(&id, "token", "https://api.github.com")
+                .is_err()
+        );
     }
 
     #[test]

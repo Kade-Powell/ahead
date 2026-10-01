@@ -16,20 +16,49 @@ help:
     @just --list
 
 # Run the hot-recompiling development loop.
-dev:
-    watchexec -e rs,toml -w ahead-app -w ahead-proxy -w ahead-core -w ahead-rpc -w ahead-viewmodel -r -- cargo run --bin ahead
+dev $workspace='.':
+    watchexec --debounce 1s -e rs,toml,lock,md,json,txt,svg,lark,wit,gitignore,icns -w Cargo.toml -w Cargo.lock -w build.rs -w .cargo -w .ahead/.gitignore -w defaults -w icons -w extra -w ahead-app -w ahead-voice -w ahead-proxy -w ahead-core -w ahead-extension-host -w ahead-rpc -w ahead-viewmodel -w ahead-agent -w ahead-tool-records -i '**/tests/**' -i '**/*_tests.rs' -i '**/AGENTS.md' -i '**/README.md' -r -- just _run-dev "$workspace"
+
+# Keep a stable macOS app identity across watcher rebuilds and native UI checks.
+[private]
+_run-dev $workspace:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" == Darwin ]]; then
+        cargo build -p ahead --bin ahead
+        dev_bundle="target/debug/macos/Ahead.app"
+        mkdir -p "$dev_bundle/Contents/MacOS" "$dev_bundle/Contents/Resources"
+        cp extra/macos/Ahead.app/Contents/Info.plist "$dev_bundle/Contents/Info.plist"
+        cp extra/macos/Ahead.app/Contents/Resources/ahead.icns "$dev_bundle/Contents/Resources/ahead.icns"
+        /bin/cp -c target/debug/ahead "$dev_bundle/Contents/MacOS/ahead"
+        exec "$dev_bundle/Contents/MacOS/ahead" "$workspace"
+    else
+        exec cargo run -p ahead --bin ahead -- "$workspace"
+    fi
 
 # Run bacon's default check loop.
 bacon:
     bacon
 
-# Run bacon's proxy and viewmodel test loop.
+# Run bacon's focused agent, proxy, and viewmodel test loop.
 bacon-test:
     bacon test
+
+# Run maintained workspace tests; copied core/MCP harnesses are not maintained.
+test-all:
+    cargo test --locked --workspace --all-targets --exclude codex-core --exclude codex-mcp
 
 # Rebuild and relaunch the app on change.
 bacon-run:
     bacon run
+
+# Build the in-process AHEAD agent and its retained native loop.
+ahead-build:
+    cargo build -p ahead-agent
+
+# Check the in-process AHEAD agent without building the editor shell.
+ahead-check:
+    cargo check -p ahead-agent --lib
 
 # Install Ubuntu build dependencies.
 ubuntu-deps:

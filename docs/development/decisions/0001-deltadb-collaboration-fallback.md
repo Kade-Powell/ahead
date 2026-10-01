@@ -1,9 +1,16 @@
 # Decision 0001: Collaboration Engine & DeltaDB Dependency Decision
 
-- Status: Accepted
+- Status: Partially superseded (session persistence is Turso/libSQL)
 - Date: 2026-09-17
 - Deciders: AHEAD Core Maintainers
 - Context: Section 3.5 & Milestone 0 exit requirement of [ahead-editor-mvp.md](../ahead-editor-mvp.md)
+
+2026-09-24 update: The local SQLite event-store choice below was replaced by
+Turso/libSQL at `.ahead/session.db`; the copied SQLx/SQLite state crate and
+runtime dependency path have been removed. This decision retains the Yrs
+collaboration direction and records the DeltaDB evaluation. See the [workflow
+atlas storage decision](../ahead-workflows.md#9-storage-and-artifact-convention)
+for the current persistence contract.
 
 ## Context and Problem Statement
 
@@ -18,17 +25,19 @@ Zed's Delta announcement describes synchronizing conversations and worktrees alo
 
 ## Decision
 
-We formally select the **Yrs + SQLite Event Store** fallback architecture specified in Section 3.5 and 7.1:
+We retain **Yrs** for collaborative live text and relative positions. AHEAD's
+local durable session and workflow state uses **Turso/libSQL** in
+`.ahead/session.db`; it does not use a second SQLx/SQLite store.
 
-1. **Live Text & Relative Positions**: Use **Yrs** (the Rust CRDT implementation of the Yjs ecosystem) for live buffer synchronization across connected clients and stable sticky indexes (`StickyIndex`) for code anchors through edits.
-2. **Workflow Authority & Session State**: Use a durable **SQLite** event store owned by the execution host (for solo/private sessions) and team service (for shared sessions) to sequence workflow phase transitions, role grants, proposals, checkpoints, and immutable artifacts.
-3. **No Lock-in**: If DeltaDB or a comparable system is released as an open-source embeddable library with acceptable licensing and embedding contracts in the future, the session host abstraction layer will allow evaluating it on the exact same collaboration acceptance tests.
+If DeltaDB or a comparable system becomes available as an open-source embeddable
+library with acceptable licensing and embedding contracts, AHEAD can evaluate it
+against the collaboration acceptance tests without changing the current storage
+decision.
 
 ## Consequences
 
 - **Positive**:
-  - Full control over memory footprint, storage format, and zero external binary dependencies.
   - Mature CRDT behavior for real-time text co-editing via Yrs.
-  - Transactional SQLite safety for workflow revisions, approvals, and outbox operations.
+  - One Turso/libSQL database for local managed-session and workflow state.
 - **Negative**:
   - AHEAD must manage buffer materialization and transaction barriers to the filesystem worktree.

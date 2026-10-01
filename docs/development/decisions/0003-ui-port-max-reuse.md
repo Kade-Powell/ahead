@@ -7,8 +7,14 @@
   user direction is to choose one new UI framework rather than leave the
   repository with contradictory plans. The comparison covers GPUI + gpui-kit
   and Tauri with Leptos, Dioxus, Vue, or Solid. Iced is not viable because it
-  has no Lapce-grade editor control. The primary agent is built into the
-  session host; ACP is side-tasks-only.
+  has no Lapce-grade editor control. At decision time, the primary agent was
+  planned as built into the session host, with ACP limited to side tasks.
+
+> Current architecture note (2026-09-25): the ACP side-tasks-only boundary was
+> superseded by the native integration described in
+> [ahead-editor-mvp.md §16](../ahead-editor-mvp.md#16-native-built-in-agent--external-acp-agents-2026-09-22).
+> ACP now serves curated external-agent sessions; the built-in managed runtime
+> remains in-process. The GPUI framework decision above remains accepted.
 
 ## Coupling measurement (this repo, 2026-09-17)
 
@@ -65,6 +71,31 @@ the source revision and license/attribution requirements. Do not inherit Zed's
 cloud services, telemetry, product workflows, extension assumptions, or
 unrelated features. Record the Zed path and commit used when an adaptation is
 material to the port.
+
+### 2026-09-21 source-reuse amendment
+
+For the editor surfaces where Zed is already mature, direct source reuse is
+the default implementation strategy, not merely a design reference. Bring a
+pinned Zed checkout into the development environment and port/prune the
+relevant implementation with its tests, preserving the source revision,
+Apache-2.0 notices, attribution, and a record of AHEAD modifications.
+
+The first direct-reuse targets are:
+
+1. multi-file buffers, tabs, splits, selections, undo/redo, IME and editor
+   input behavior;
+2. project search and search-result presentation;
+3. source control/review surfaces;
+4. terminal tabs, naming, resizing, task integration and terminal context;
+5. DAP debugging, including breakpoints, sessions, threads, stack frames,
+   scopes, variables, stepping and verified state.
+
+This is a high-fidelity port, not a runtime dependency on Zed's application,
+cloud services, telemetry, agent workflows or product identity. AHEAD's
+session host, agent policy/effect boundary, attribution, voice and
+collaboration state remain authoritative. Direct reuse is also subject to the
+GPUI + gpui-kit component policy and the existing accessibility, IME,
+large-file and streaming acceptance gates.
 
 ### Why GPUI wins
 
@@ -129,7 +160,7 @@ same pinned dependency set. Status as of 2026-09-17 (evidence-linked):
    no LSP round-trip, no diagnostics/completion, no overlay in the spike.
 3. Run the Start Work, agent panel, voice state, collaboration, and review
    flows through `ahead-viewmodel` and the existing session host. Status:
-   PARTIAL — chat/mode/phase/voice run through the viewmodel in
+   PARTIAL — chat/task-intent/phase/voice run through the viewmodel in
    `SessionPanel`; Start Work RPC, collaboration, review, and session-host
    wiring are Floem-only so far.
 4. Pass keyboard-only traversal and screen-reader narration on macOS for the
@@ -152,7 +183,7 @@ Floem is the temporary safety shell, not a third long-term product.
 - Negative: GPUI port is still a ~37k LOC rewrite at the view layer;
   "reuse" means logic + types + tests, not drop-in. gpui-kit youth risk
   carried; a11y must be proven in the spike.
-- Neutral: `third-party/codex` fork (rust-v0.152.0) and protocol
+- Neutral: the embedded AHEAD agent runtime (rust-v0.152.0) and protocol
   snapshot are UI-independent and unaffected.
 
 ## Post-MVP: clippy lint set (adopted from cola-v2, deferred until MVP)

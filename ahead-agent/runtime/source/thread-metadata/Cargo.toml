@@ -1,0 +1,22 @@
+[package]
+name = "codex-thread-metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_thread_metadata"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+codex-history = { workspace = true }
+codex-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }

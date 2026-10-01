@@ -41,7 +41,7 @@ Install AHEAD directly from GitHub with Cargo:
 cargo install --git https://github.com/Kade-Powell/ahead.git --bin ahead --profile release-lto --locked
 ```
 
-This installs the `ahead` executable into `$HOME/.cargo/bin`. See the [build guide](docs/building-from-source.md) for operating-system dependencies and development builds.
+This installs the `ahead` executable into `$HOME/.cargo/bin`. See the [installation notes](docs/installing-with-package-manager.md) for checkout builds and packaging commands.
 
 ## Contributing
 

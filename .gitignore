@@ -6,6 +6,7 @@ lib/
 target/
 core/languages/
 vendor/
+.ahead/
 
 .DS_Store
 *.patch

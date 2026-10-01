@@ -1,0 +1,12 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-utils-output-truncation"
+version.workspace = true
+
+[dependencies]
+codex-protocol = { workspace = true }
+codex-utils-string = { workspace = true }
+
+[lib]
+doctest = false

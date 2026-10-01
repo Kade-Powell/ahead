@@ -1,0 +1,23 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-model-provider"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_model_provider"
+path = "src/lib.rs"
+
+[dependencies]
+codex-api = { workspace = true }
+codex-http-client = { workspace = true }
+ahead-model-auth = { workspace = true }
+codex-model-provider-info = { workspace = true }
+codex-models-manager = { workspace = true }
+codex-otel = { workspace = true }
+codex-protocol = { workspace = true }
+codex-response-debug-context = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["process", "sync", "time"] }
+tracing = { workspace = true, features = ["log"] }

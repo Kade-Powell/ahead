@@ -19,25 +19,27 @@ indexmap           = { workspace = true }
 interprocess       = { workspace = true }
 notify             = { workspace = true }
 parking_lot        = { workspace = true }
-regex              = { workspace = true }
+rustix             = { workspace = true, features = ["fs", "process"] }
 reqwest            = { workspace = true }
 ropey              = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+tempfile           = { workspace = true }
 toml               = { workspace = true }
 tracing            = { workspace = true }
-tracing-log        = { workspace = true }
 url                = { workspace = true }
 
 lsp-types = { workspace = true }
 
 ahead-core        = { workspace = true }
 ahead-rpc         = { workspace = true }
-ahead-harness     = { path = "../ahead-harness" }
-ahead-viewmodel   = { path = "../ahead-viewmodel" }
+ahead-agent       = { path = "../ahead-agent" }
+codex-exec-server = { workspace = true }
+
 # proxy specific dependencies
 
 dyn-clone    = "1.0.16"
+fs4          = "0.13.1"
 jsonrpc-lite = "0.6.0"
 polling      = "3.5.0"
 libc         = "0.2"
@@ -49,17 +51,11 @@ sha2         = "0.10"
 # deleting files
 trash = "3.0.6"
 
-# search
-ignore        = "0.4"
-grep-searcher = "0.1"
-grep-matcher  = "0.1"
-grep-regex    = "0.1"
-
-# WASM extension hosting is deferred; see the TODO extension-host item.
+[dependencies.ahead-extension-host]
+path = "../ahead-extension-host"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sys-locale = "0.3"
 
-[[bin]]
-name = "ahead-proxy"
-path = "src/bin/ahead-proxy.rs"
+[dev-dependencies]
+ahead-agent = { path = "../ahead-agent", features = ["test-support"] }

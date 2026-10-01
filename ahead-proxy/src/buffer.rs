@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    ffi::OsString,
     fs,
     fs::File,
     io::{Read, Write},
@@ -9,15 +8,16 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{Result, anyhow};
+use ahead_core::directory::Directory;
 use ahead_core::encoding::offset_utf8_to_utf16;
 use ahead_rpc::{buffer::BufferId, delta::AheadDelta};
+use anyhow::{Result, anyhow};
 use lsp_types::*;
 use ropey::{LineType, Rope};
 
 #[derive(Clone)]
 pub struct Buffer {
-    pub language_id: &'static str,
+    pub language_id: String,
     pub read_only: bool,
     pub id: BufferId,
     pub rope: Rope,
@@ -47,9 +47,10 @@ impl Buffer {
                 }
             }
         };
+        let language_id =
+            language_id_from_path_with_content(&path, Some(&s)).unwrap_or_default();
         let rope = Rope::from(s);
         let rev = u64::from(rope.len() != 0);
-        let language_id = language_id_from_path(&path).unwrap_or("");
         let mod_time = get_mod_time(&path);
         Buffer {
             id,
@@ -70,46 +71,32 @@ impl Buffer {
         if self.rev != rev {
             return Err(anyhow!("not the right rev"));
         }
-        let bak_extension = self.path.extension().map_or_else(
-            || OsString::from("bak"),
-            |ext| {
-                let mut ext = ext.to_os_string();
-                ext.push(".bak");
-                ext
-            },
-        );
         let path = if self.path.is_symlink() {
             self.path.canonicalize()?
         } else {
             self.path.clone()
         };
-        let new_file = !path.exists();
-
-        let bak_file_path = &path.with_extension(bak_extension);
-        if !new_file {
-            fs::copy(&path, bak_file_path)?;
-        }
-
+        let parent = path.parent().ok_or_else(|| anyhow!("file has no parent"))?;
         if create_parents {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                if metadata.permissions().readonly() {
+                    return Err(anyhow!("can't save to read only file"));
+                }
+                file.as_file().set_permissions(metadata.permissions())?;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
         for chunk in self.rope.chunks() {
-            f.write_all(chunk.as_bytes())?;
+            file.write_all(chunk.as_bytes())?;
         }
-
+        file.as_file().sync_all()?;
+        file.persist(&path)?;
         self.mod_time = get_mod_time(&path);
-        if !new_file {
-            fs::remove_file(bak_file_path)?;
-        }
-
         Ok(())
     }
 
@@ -214,7 +201,34 @@ pub fn read_path_to_string<P: AsRef<Path>>(path: P) -> Result<String> {
     Ok(contents.to_string())
 }
 
-pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
+pub fn language_id_from_path(path: &Path) -> Option<String> {
+    language_id_from_path_with_content(path, None)
+}
+
+pub fn language_id_from_path_with_content(
+    path: &Path,
+    content: Option<&str>,
+) -> Option<String> {
+    let root = Directory::plugins_directory();
+    language_id_with_extensions(path, content, root.as_deref())
+}
+
+fn language_id_with_extensions(
+    path: &Path,
+    content: Option<&str>,
+    extensions_root: Option<&Path>,
+) -> Option<String> {
+    if let Some(root) = extensions_root {
+        match ahead_extension_host::language_id_for_path(root, path, content) {
+            Ok(Some(language)) => return Some(language),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(?error, "resolving extension language"),
+        }
+    }
+    builtin_language_id(path)
+}
+
+fn builtin_language_id(path: &Path) -> Option<String> {
     // recommended language_id values
     // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem
     Some(match path.extension() {
@@ -248,7 +262,7 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
                     "htm" | "html" | "xhtml" => "html",
                     "ini" => "ini",
                     "java" | "class" => "java",
-                    "js" => "javascript",
+                    "js" | "mjs" | "cjs" => "javascript",
                     "jsx" => "javascriptreact",
                     "json" => "json",
                     "jl" => "julia",
@@ -267,7 +281,7 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
                     "proto" => "proto",
                     "ps1" | "ps1xml" | "psc1" | "psm1" | "psd1" | "pssc"
                     | "psrc" => "powershell",
-                    "py" | "pyi" | "pyc" | "pyd" | "pyw" => "python",
+                    "py" | "pyi" | "pyw" => "python",
                     "r" => "r",
                     "rb" => "ruby",
                     "rs" => "rust",
@@ -279,7 +293,7 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
                     "svelte" => "svelte",
                     "thrift" => "thrift",
                     "toml" => "toml",
-                    "ts" => "typescript",
+                    "ts" | "mts" | "cts" => "typescript",
                     "tsx" => "typescriptreact",
                     "tex" => "tex",
                     "vb" => "vb",
@@ -303,6 +317,7 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
             },
         },
     })
+    .map(str::to_string)
 }
 
 fn get_document_content_changes(
@@ -354,7 +369,110 @@ pub fn get_mod_time<P: AsRef<Path>>(path: P) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_detection_reaches_extensions_and_keeps_builtin_languages() {
+        let root = tempfile::tempdir().expect("extension root");
+        let language = root.path().join("gleam/languages/gleam");
+        std::fs::create_dir_all(&language).expect("language directory");
+        std::fs::write(
+            root.path().join("gleam/extension.toml"),
+            "id = 'gleam'\nlanguages = ['languages/gleam']\n",
+        )
+        .expect("manifest");
+        std::fs::write(language.join("config.toml"), "name = 'Gleam'\npath_suffixes = ['gleam', 'special.ts']\nfirst_line_pattern = '^#!.*gleam'\n").expect("language config");
+        for (path, expected) in [
+            ("main.gleam", Some("Gleam")),
+            ("main.special.ts", Some("Gleam")),
+            ("main.rs", Some("rust")),
+            ("main.py", Some("python")),
+            ("main.ts", Some("typescript")),
+            ("main.mts", Some("typescript")),
+            ("main.cts", Some("typescript")),
+            ("main.tsx", Some("typescriptreact")),
+            ("main.mjs", Some("javascript")),
+            ("main.cjs", Some("javascript")),
+            ("main.jsx", Some("javascriptreact")),
+            ("main.pyc", None),
+        ] {
+            assert_eq!(
+                language_id_with_extensions(
+                    Path::new(path),
+                    None,
+                    Some(root.path())
+                )
+                .as_deref(),
+                expected,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            language_id_with_extensions(
+                Path::new("script"),
+                Some("#!/usr/bin/gleam\n"),
+                Some(root.path())
+            )
+            .as_deref(),
+            Some("Gleam")
+        );
+        assert_eq!(
+            language_id_with_extensions(
+                Path::new("script"),
+                Some("not a shebang\n#!/usr/bin/gleam\n"),
+                Some(root.path())
+            ),
+            None
+        );
+    }
     use ahead_rpc::delta::DeltaOp;
+
+    #[test]
+    fn save_preserves_existing_backup_and_rejects_stale_revisions() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("main.rs");
+        let backup = path.with_extension("rs.bak");
+        fs::write(&path, "original").expect("source");
+        fs::write(&backup, "user backup").expect("existing backup");
+        let mut buffer = Buffer::new(BufferId::next(), path.clone());
+        buffer.rope = Rope::from("new contents 🦀\n");
+        assert!(buffer.save(buffer.rev + 1, false).is_err());
+        assert_eq!(fs::read_to_string(&path).expect("source"), "original");
+        buffer.save(buffer.rev, false).expect("save buffer");
+        assert_eq!(
+            fs::read_to_string(&path).expect("saved source"),
+            "new contents 🦀\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup).expect("existing backup"),
+            "user backup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_symlink_and_executable_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().expect("test directory");
+        let target = directory.path().join("script.sh");
+        let path = directory.path().join("linked.sh");
+        fs::write(&target, "old").expect("source");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("executable source");
+        symlink(&target, &path).expect("source link");
+        let mut buffer = Buffer::new(BufferId::next(), path.clone());
+        buffer.rope = Rope::from("new");
+        buffer.save(buffer.rev, false).expect("save through link");
+        assert!(path.is_symlink());
+        assert_eq!(fs::read_to_string(&target).expect("target"), "new");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
 
     fn buffer_with(name: &str, text: &str) -> Buffer {
         let path = std::env::temp_dir().join(format!(
@@ -410,10 +528,8 @@ mod tests {
     #[test]
     fn update_rejects_wrong_rev() {
         let mut buffer = buffer_with("reject", "hello");
-        let delta = AheadDelta::new(
-            buffer.len(),
-            vec![DeltaOp::Insert("!".to_string())],
-        );
+        let delta =
+            AheadDelta::new(buffer.len(), vec![DeltaOp::Insert("!".to_string())]);
         assert!(buffer.update(&delta, 99).is_none());
         assert_eq!(buffer.get_document(), "hello");
     }

@@ -1,0 +1,24 @@
+[package]
+name = "ahead-extension-host"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+flate2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tar = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+zip = { workspace = true }

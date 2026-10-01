@@ -5,7 +5,6 @@
 //! - Living checklist with status cycling (Open, Doing, Done, Dropped)
 //! - Session workflow pipeline stepper (Plan -> Invariants -> Implement -> Verify -> Review)
 //! - AI-assisted task proposal ("AI Propose Work Items")
-//! - Mechanical code proposal authorization gate
 //! - Streaming voice controls
 
 use gpui_kit::*;
@@ -16,20 +15,29 @@ use gpui_kit::component::dock::{
 };
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::collapsible::Collapsible;
+use gpui_kit::component::stepper::{Stepper, StepperItem};
 use gpui_kit::component::{v_flex, h_flex, ActiveTheme};
 use gpui_kit_assets::IconName;
+
+const WORKFLOW_PHASES: [(&str, &str); 5] = [
+    ("plan", "Plan"),
+    ("invariants", "Invariants"),
+    ("implement", "Implement"),
+    ("verify", "Verify"),
+    ("review", "Review"),
+];
 
 pub struct WorkItemsPanel {
     pub focus: FocusHandle,
     pub work_item_input: Entity<InputState>,
     pub work_items: Vec<ahead_rpc::ahead::WorkItem>,
-    pub pending_proposals: Vec<ahead_rpc::ahead::ChangeProposal>,
     pub phase_id: &'static str,
-    pub mode_assist: bool,
     pub work_title: String,
     pub work_kind: ahead_rpc::ahead::WorkKind,
     pub voice: ahead_viewmodel::VoiceIntent,
     pub status: SharedString,
+    workflow_collapsed: bool,
 }
 
 impl WorkItemsPanel {
@@ -69,30 +77,16 @@ impl WorkItemsPanel {
             },
         ];
 
-        let initial_proposals = vec![
-            ahead_rpc::ahead::ChangeProposal {
-                id: "prop-scaffold-1".to_string(),
-                session_id: "sess-current".to_string(),
-                path: "src/service.rs".to_string(),
-                original_sha256: "00000000".to_string(),
-                patch: "@@ -1,3 +1,12 @@\n+#[derive(Debug, Clone)]\n+pub struct RetryPolicy {\n+    pub max_retries: u32,\n+    pub backoff_ms: u64,\n+}\n".to_string(),
-                is_mechanical: true,
-                description: "Scaffold mechanical RetryPolicy struct boilerplate".to_string(),
-                recommended_cursor: None,
-            },
-        ];
-
         Self {
             focus: cx.focus_handle(),
             work_item_input,
             work_items: initial_items,
-            pending_proposals: initial_proposals,
             phase_id: "plan",
-            mode_assist: true,
             work_title: "Implement resilient retry logic".to_string(),
             work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
             voice: ahead_viewmodel::VoiceIntent::new(),
             status: "Work items checklist active".into(),
+            workflow_collapsed: false,
         }
     }
 
@@ -181,16 +175,6 @@ impl WorkItemsPanel {
         cx.notify();
     }
 
-    pub fn toggle_mode(&mut self, cx: &mut Context<Self>) {
-        self.mode_assist = !self.mode_assist;
-        self.status = format!(
-            "Assistance mode: {}",
-            if self.mode_assist { "Assist (Scaffold)" } else { "Learn (Socratic)" }
-        )
-        .into();
-        cx.notify();
-    }
-
     pub fn toggle_voice(&mut self, cx: &mut Context<Self>) {
         ahead_viewmodel::voice::toggle(&mut self.voice);
         self.status = format!(
@@ -214,22 +198,6 @@ impl WorkItemsPanel {
             if self.voice.mic_muted { "MUTED" } else { "ACTIVE" }
         )
         .into();
-        cx.notify();
-    }
-
-    pub fn authorize_proposal(&mut self, proposal_id: &str, cx: &mut Context<Self>) {
-        if let Some(pos) = self.pending_proposals.iter().position(|p| p.id == proposal_id) {
-            let prop = self.pending_proposals.remove(pos);
-            self.status = format!("Authorized and applied proposal {}", prop.id).into();
-        }
-        cx.notify();
-    }
-
-    pub fn reject_proposal(&mut self, proposal_id: &str, cx: &mut Context<Self>) {
-        if let Some(pos) = self.pending_proposals.iter().position(|p| p.id == proposal_id) {
-            let prop = self.pending_proposals.remove(pos);
-            self.status = format!("Rejected proposal {}", prop.id).into();
-        }
         cx.notify();
     }
 }
@@ -274,15 +242,18 @@ impl Render for WorkItemsPanel {
             "invariants" => "Document state preconditions, postconditions, and idempotency.",
             "implement" => "Author minimal, strictly-bounded code changes adhering to invariants.",
             "verify" => "Run cargo test --workspace, inspect edge cases, zero regressions.",
-            "review" => "Peer inspection, human verification signoff, and tracker sync.",
+            "review" => "Review behavior, evidence, findings, and the team's PR policy.",
             _ => "Milestone complete.",
         };
+        let phase_index = WORKFLOW_PHASES
+            .iter()
+            .position(|(id, _)| *id == self.phase_id)
+            .unwrap_or(0);
 
         let border_color = cx.theme().border;
         let text_color = cx.theme().sidebar_foreground;
         let group_box = cx.theme().group_box;
         let panel_bg = cx.theme().sidebar;
-        let is_dark = cx.theme().mode.is_dark();
         let open_count = self.work_items.iter().filter(|i| matches!(i.status, ahead_rpc::ahead::WorkItemStatus::Open | ahead_rpc::ahead::WorkItemStatus::InProgress)).count();
 
         v_flex()
@@ -314,7 +285,7 @@ impl Render for WorkItemsPanel {
                                             .child(
                                                 div()
                                                     .font_weight(gpui_kit::FontWeight::BOLD)
-                                                    .text_color(if is_dark { gpui_kit::rgb(0xF59E0B) } else { gpui_kit::rgb(0xD97706) })
+                                                    .text_color(cx.theme().warning)
                                                     .child("ACTIVE SESSION")
                                             )
                                     )
@@ -324,13 +295,6 @@ impl Render for WorkItemsPanel {
                                             .text_color(text_color)
                                             .child(format!("{} · {}", self.work_kind.display_name(), self.work_title))
                                     )
-                            )
-                            .child(
-                                Button::new("wi_mode_toggle")
-                                    .primary()
-                                    .icon(if self.mode_assist { IconName::Code } else { IconName::Shield })
-                                    .label(if self.mode_assist { "Assist" } else { "Learn" })
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| this.toggle_mode(cx)))
                             )
                     )
             )
@@ -360,6 +324,19 @@ impl Render for WorkItemsPanel {
                                     )
                             )
                             .child(
+                                Button::new("wi_workflow_toggle")
+                                    .icon(if self.workflow_collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .tooltip("Expand or collapse workflow")
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.workflow_collapsed = !this.workflow_collapsed;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
                                 Button::new("wi_advance_btn")
                                     .icon(IconName::ArrowRight)
                                     .label("Advance Phase")
@@ -367,11 +344,34 @@ impl Render for WorkItemsPanel {
                             )
                     )
                     .child(
-                        div()
-                            .p_1()
-                            .text_size(px(11.))
-                            .text_color(text_color)
-                            .child(phase_goal)
+                        Collapsible::new()
+                            .open(!self.workflow_collapsed)
+                            .motion_id("workflow-stepper-reveal")
+                            .content(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        Stepper::new("workflow-stepper")
+                                            .selected_index(phase_index)
+                                            .items(WORKFLOW_PHASES.iter().map(|(_, label)| {
+                                                StepperItem::new().child(*label)
+                                            }))
+                                            .on_click(cx.listener(|this: &mut Self, index, _, cx| {
+                                                if let Some((phase_id, _)) = WORKFLOW_PHASES.get(*index) {
+                                                    this.phase_id = phase_id;
+                                                    this.status = format!("Workflow phase: {phase_id}").into();
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .p_1()
+                                            .text_size(px(11.))
+                                            .text_color(text_color)
+                                            .child(phase_goal),
+                                    ),
+                            ),
                     )
             )
             // Voice Bar
@@ -407,7 +407,7 @@ impl Render for WorkItemsPanel {
                 v_flex()
                     .p_3()
                     .gap_2()
-                    .bg(panel_bg)
+                .bg(panel_bg)
                     .border_1()
                     .border_color(border_color)
                     .child(
@@ -438,7 +438,11 @@ impl Render for WorkItemsPanel {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Input::new(&self.work_item_input).aria_label("Add work item...").flex_1())
+                            .child(
+                                Input::new(&self.work_item_input)
+                                    .aria_label("Add work item...")
+                                    .flex_1(),
+                            )
                             .child(
                                 Button::new("wi_add_btn")
                                     .primary()
@@ -484,7 +488,7 @@ impl Render for WorkItemsPanel {
                                                     el.child(
                                                         div()
                                                             .text_size(px(10.))
-                                                            .text_color(gpui_kit::rgb(0xF59E0B))
+                                                            .text_color(cx.theme().warning)
                                                             .child("(AI suggested)")
                                                     )
                                                 })
@@ -502,81 +506,6 @@ impl Render for WorkItemsPanel {
                     )
             )
             // Code Proposals Section
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_1()
-                    .bg(panel_bg)
-                    .border_1()
-                    .border_color(border_color)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(IconName::FileCode)
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(if is_dark { gpui_kit::rgb(0x60A5FA) } else { gpui_kit::rgb(0x2563EB) })
-                                    .child(format!("CODE PROPOSALS ({} pending)", self.pending_proposals.len()))
-                            )
-                    )
-                    .children(
-                        self.pending_proposals.iter().map(|prop| {
-                            let prop_id = prop.id.clone();
-                            let prop_id_reject = prop.id.clone();
-                            v_flex()
-                                .p_2()
-                                .gap_1()
-                                .bg(group_box)
-                                .border_1()
-                                .border_color(border_color)
-                                .child(
-                                    div()
-                                        .font_weight(gpui_kit::FontWeight::BOLD)
-                                        .text_size(px(11.))
-                                        .text_color(text_color)
-                                        .child(format!("File: {}", prop.path))
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(text_color)
-                                        .child(prop.description.clone())
-                                )
-                                .child(
-                                    div()
-                                        .p_2()
-                                        .bg(if is_dark { gpui_kit::rgb(0x020617) } else { gpui_kit::rgb(0x0F172A) })
-                                        .text_size(px(11.))
-                                        .text_color(gpui_kit::rgb(0x86EFAC))
-                                        .child(prop.patch.clone())
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new(SharedString::from(format!("wi_auth_{}", prop_id)))
-                                                .primary()
-                                                .icon(IconName::Check)
-                                                .label("Authorize & Apply")
-                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                                    this.authorize_proposal(&prop_id, cx);
-                                                }))
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!("wi_rej_{}", prop_id_reject)))
-                                                .icon(IconName::X)
-                                                .label("Reject")
-                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                                    this.reject_proposal(&prop_id_reject, cx);
-                                                }))
-                                        )
-                                )
-                        })
-                    )
-            )
             // Footer status
             .child(
                 div()

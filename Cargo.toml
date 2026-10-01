@@ -5,17 +5,42 @@ authors      = { workspace = true }
 edition      = { workspace = true }
 license      = { workspace = true }
 rust-version = { workspace = true }
+build = "build.rs"
 default-run  = "ahead"
 
 [dependencies]
 ahead-app = { path = "./ahead-app" }
+ahead-proxy = { path = "./ahead-proxy" }
 
 [[bin]]
 name = "ahead"
 path = "ahead-app/src/bin/ahead.rs"
 
 [workspace]
-members = ["ahead-app", "ahead-proxy", "ahead-rpc", "ahead-core", "ahead-viewmodel", "ahead-harness"]
+members = [
+    "ahead-app",
+    "ahead-voice",
+    "ahead-proxy",
+    "ahead-rpc",
+    "ahead-core",
+    "ahead-extension-host",
+    "ahead-viewmodel",
+    "ahead-agent",
+    "ahead-tool-records",
+    "ahead-agent/runtime/source/core",
+    "ahead-agent/runtime/source/protocol",
+]
+default-members = [
+    ".",
+    "ahead-app",
+    "ahead-voice",
+    "ahead-proxy",
+    "ahead-rpc",
+    "ahead-core",
+    "ahead-extension-host",
+    "ahead-viewmodel",
+    "ahead-agent",
+]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -112,53 +137,229 @@ authors      = ["Dongdong Zhou <dzhou121@gmail.com>"]
 [workspace.dependencies]
 anyhow            = { version = "1.0" }
 chrono            = { version = "0.4" }
-clap              = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive"] }
+clap              = { version = "4", features = ["derive"] }
 crossbeam-channel = { version = "0.5.12" }
 directories       = { version = "4.0.1" }
 git2              = { version = "0.20.0", features = ["vendored-openssl"] }
-globset           = { version = "0.4.14" }
+globset           = { version = "0.4.18" }
 include_dir       = { version = "0.7" }
 indexmap          = { version = "2.0", features = ["serde"] }
 interprocess      = { version = "1.2.1" }
-itertools         = { version = "0.12.1" }
 notify            = { version = "5.2.0", features = ["serde"] }
 once_cell         = { version = "1.19" }
 parking_lot       = { version = "0.12.3" }
 regex             = { version = "1.10.5" }
-reqwest           = { version = "0.11", features = ["blocking", "json", "socks"] }
+reqwest           = { version = "0.12", features = ["blocking", "json", "socks"] }
 ropey             = { version = "2.0.0-beta.1" }
 serde             = { version = "1.0" }
 serde_json        = { version = "1.0" }
 strum             = { version = "0.27.1" }
-strum_macros      = { version = "0.27.1" }
-thiserror         = { version = "1.0" }
-toml              = { version = "*" }
+strum_macros      = { version = "0.28" }
+thiserror         = { version = "2" }
+toml              = { version = "0.9.11" }
 url               = { version = "2.5.0" }
+wasmtime          = { version = "48", default-features = false, features = [
+    "anyhow",
+    "async",
+    "demangle",
+    "runtime",
+    "cranelift",
+    "component-model",
+    "incremental-cache",
+    "parallel-compilation",
+] }
+wasmtime-wasi     = "48"
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
 
 ahead-core = { path = "./ahead-core" }
 ahead-rpc  = { path = "./ahead-rpc" }
 
+# Hard-forked native agent closure. Paths are rooted here so AHEAD has one
+# Cargo workspace and one lockfile. This list is the retained compiled closure.
+codex-analytics = { path = "ahead-agent/runtime/source/analytics" }
+codex-agent-graph-store = { path = "ahead-agent/runtime/source/agent-graph-store" }
+codex-agent-roles = { path = "ahead-agent/runtime/source/agent-roles" }
+codex-api = { path = "ahead-agent/runtime/source/codex-api" }
+codex-apply-patch = { path = "ahead-agent/runtime/source/apply-patch" }
+codex-async-utils = { path = "ahead-agent/runtime/source/async-utils" }
+codex-client = { path = "ahead-agent/runtime/source/codex-client" }
+codex-collaboration-mode-templates = { path = "ahead-agent/runtime/source/collaboration-mode-templates" }
+codex-code-mode = { path = "ahead-agent/runtime/source/code-mode" }
+codex-code-mode-protocol = { path = "ahead-agent/runtime/source/code-mode-protocol" }
+codex-config = { path = "ahead-agent/runtime/source/config" }
+codex-context-fragments = { path = "ahead-agent/runtime/source/context-fragments" }
+codex-core = { path = "ahead-agent/runtime/source/core" }
+ahead-tool-records = { path = "ahead-tool-records" }
+codex-diagnostics = { path = "ahead-agent/runtime/source/diagnostics" }
+codex-exec-server = { path = "ahead-agent/runtime/source/exec-server" }
+codex-exec-server-protocol = { path = "ahead-agent/runtime/source/exec-server-protocol" }
+codex-execpolicy = { path = "ahead-agent/runtime/source/execpolicy" }
+codex-extension-api = { path = "ahead-agent/runtime/source/ext/extension-api" }
+codex-extension-items = { path = "ahead-agent/runtime/source/ext/items" }
+codex-features = { path = "ahead-agent/runtime/source/features" }
+codex-file-system = { path = "ahead-agent/runtime/source/file-system" }
+codex-git-utils = { path = "ahead-agent/runtime/source/git-utils" }
+codex-history = { path = "ahead-agent/runtime/source/history" }
+codex-hooks = { path = "ahead-agent/runtime/source/hooks" }
+codex-http-client = { path = "ahead-agent/runtime/source/http-client" }
+codex-install-context = { path = "ahead-agent/runtime/source/install-context" }
+codex-keyring-store = { path = "ahead-agent/runtime/source/keyring-store" }
+ahead-model-auth = { path = "ahead-agent/runtime/source/login" }
+codex-mcp = { path = "ahead-agent/runtime/source/codex-mcp" }
+ahead-memory = { path = "ahead-agent/runtime/source/memories/read" }
+codex-model-provider = { path = "ahead-agent/runtime/source/model-provider" }
+codex-model-provider-info = { path = "ahead-agent/runtime/source/model-provider-info" }
+codex-models-manager = { path = "ahead-agent/runtime/source/models-manager" }
+codex-network-proxy = { path = "ahead-agent/runtime/source/network-proxy" }
+codex-otel = { path = "ahead-agent/runtime/source/otel" }
+codex-prompts = { path = "ahead-agent/runtime/source/prompts" }
+codex-protocol = { path = "ahead-agent/runtime/source/protocol" }
+codex-response-debug-context = { path = "ahead-agent/runtime/source/response-debug-context" }
+codex-rmcp-client = { path = "ahead-agent/runtime/source/rmcp-client" }
+codex-rollout = { path = "ahead-agent/runtime/source/rollout" }
+codex-rollout-trace = { path = "ahead-agent/runtime/source/rollout-trace" }
+codex-sandboxing = { path = "ahead-agent/runtime/source/sandboxing" }
+codex-secrets = { path = "ahead-agent/runtime/source/secrets" }
+codex-shell-command = { path = "ahead-agent/runtime/source/shell-command" }
+codex-shell-escalation = { path = "ahead-agent/runtime/source/shell-escalation" }
+codex-skills = { path = "ahead-agent/runtime/source/skills" }
+ahead-agent-skills = { path = "ahead-agent/runtime/source/ext/skills" }
+codex-thread-metadata = { path = "ahead-agent/runtime/source/thread-metadata" }
+codex-thread-store = { path = "ahead-agent/runtime/source/thread-store" }
+codex-tools = { path = "ahead-agent/runtime/source/tools" }
+codex-utils-absolute-path = { path = "ahead-agent/runtime/source/utils/absolute-path" }
+codex-utils-audio = { path = "ahead-agent/runtime/source/utils/audio" }
+codex-utils-cache = { path = "ahead-agent/runtime/source/utils/cache" }
+codex-utils-home-dir = { path = "ahead-agent/runtime/source/utils/home-dir" }
+codex-utils-image = { path = "ahead-agent/runtime/source/utils/image" }
+codex-utils-output-truncation = { path = "ahead-agent/runtime/source/utils/output-truncation" }
+codex-utils-path = { path = "ahead-agent/runtime/source/utils/path-utils" }
+codex-utils-path-uri = { path = "ahead-agent/runtime/source/utils/path-uri" }
+codex-utils-pty = { path = "ahead-agent/runtime/source/utils/pty" }
+codex-utils-redacted-string = { path = "ahead-agent/runtime/source/utils/redacted-string" }
+codex-utils-rustls-provider = { path = "ahead-agent/runtime/source/utils/rustls-provider" }
+codex-utils-stream-parser = { path = "ahead-agent/runtime/source/utils/stream-parser" }
+codex-utils-string = { path = "ahead-agent/runtime/source/utils/string" }
+codex-utils-template = { path = "ahead-agent/runtime/source/utils/template" }
+codex-websocket-client = { path = "ahead-agent/runtime/source/websocket-client" }
+codex-windows-sandbox = { path = "ahead-agent/runtime/source/windows-sandbox-rs" }
+
+# Shared third-party dependencies used by the retained native agent closure.
+arc-swap = "1.9"
+age = "0.11"
+async-channel = "2.3"
+axum = { version = "0.8", default-features = false }
+base64 = "0.22"
+bitflags = "2.13"
+bm25 = "2.3"
+bytes = "1.10"
+chardetng = "0.1"
+clatter = { version = "2.2", default-features = false, features = ["alloc", "getrandom", "use-25519", "use-aes-gcm", "use-rust-crypto-ml-kem", "use-sha"] }
+dirs = "6"
+dns-lookup = "3"
+dunce = "1"
+encoding_rs = "0.8"
+eventsource-stream = "0.2"
+flate2 = "1.1"
+futures = { version = "0.3", default-features = false }
+gethostname = "1.1"
+gix = { version = "0.81", default-features = false, features = ["sha1"] }
+gix-url = "0.35"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+glob = "0.3"
+http = "1.3"
+iana-time-zone = "0.1"
+icu_decimal = "2.1"
+icu_locale_core = "2.1"
+icu_provider = { version = "2.1", features = ["sync"] }
+ignore = "0.4"
+image = { version = "0.25.9", default-features = false }
+jsonptr = { version = "0.7", default-features = false }
+keyring = { version = "3.6", default-features = false }
+landlock = "0.4"
+lazy_static = "1"
+libc = "0.2"
+log = "0.4"
+lru = "0.18"
+memchr = "2.7"
+mime_guess = "2"
+multimap = "0.10"
+nucleo-matcher = { package = "nucleo-matcher", git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
+openssl-sys = "*"
+opentelemetry = "0.31"
+opentelemetry-appender-tracing = "0.31"
+opentelemetry-otlp = "0.31"
+opentelemetry-semantic-conventions = "0.31"
+opentelemetry_sdk = "0.31"
+os_info = "3.12"
+portable-pty = "0.9"
+pretty_assertions = "1.4"
+quick-xml = "0.41"
+rand = "0.9"
+regex-lite = "0.1"
+rmcp = { version = "=3.1.3", default-features = false }
+rustix = { version = "1.1", features = ["net"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.14"
+schemars = "0.8"
+seccompiler = "0.5"
+semver = "1"
+serde_ignored = "0.1"
+serde_path_to_error = "0.1"
+serde_with = "3.17"
+serde_yaml = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+shlex = "1.3"
+similar = "2.7"
+socket2 = "0.6"
+starlark = { version = "0.14", default-features = false }
+symphonia = { version = "0.6", default-features = false, features = ["isomp4", "mkv", "mp3", "ogg", "wav"] }
+sys-locale = "0.3"
+system-configuration = "0.7"
+tar = { version = "=0.4.45", default-features = false }
+tempfile = "3.23"
+time = "0.3"
+tiny_http = "0.12"
+tokio = "1"
+tokio-rustls = "0.26"
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.28", features = ["proxy", "rustls-tls-native-roots"] }
+tokio-util = "0.7"
+toml_edit = "0.24"
+tracing-appender = "0.2"
+tracing = "0.1"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = "0.3"
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = "0.14"
+tree-sitter = "0.26.13"
+tree-sitter-bash = "0.25"
+tree-sitter-powershell = "=0.26.4"
+ts-rs = "11"
+tungstenite = { version = "0.27", features = ["deflate", "proxy"] }
+urlencoding = "2"
+uuid = "1"
+walkdir = "2.5"
+webbrowser = "1.2"
+which = "8"
+whoami = "1.6"
+wildmatch = "2.6"
+winapi-util = "0.1"
+zip = "2.4"
+zstd = "0.13"
+
 gpui-kit = { version = "=0.6.6", features = ["tree-sitter-rust"] }
+gpui-util = { package = "gpui-pre-util", version = "=0.3.6" }
 
 [patch.crates-io]
-regalloc2 = { rev = "5d79e12d0a93b10fc181f4da409b4671dd365228", git = "https://github.com/bytecodealliance/regalloc2" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
-# cargo vendor issue: https://github.com/rust-lang/cargo/issues/10310
-# dpi comes from winit (source) and muda (crate)
-dpi = { git = "https://github.com/rust-windowing/winit", rev = "ee245c569d65fdeacf705ee5eedb564508d10ebe" }
-
-
-[workspace.dependencies.tracing]
-git     = "https://github.com/tokio-rs/tracing"
-rev     = "908cc432a5994f6e17c8f36e13c217dc40085704"
-package = "tracing"
-
-[workspace.dependencies.tracing-log]
-git     = "https://github.com/tokio-rs/tracing"
-rev     = "908cc432a5994f6e17c8f36e13c217dc40085704"
-package = "tracing-log"
 
 [workspace.dependencies.alacritty_terminal]
 git = "https://github.com/alacritty/alacritty"
@@ -176,12 +377,18 @@ codegen-units = 1
 # See https://doc.rust-lang.org/cargo/reference/profiles.html
 # To use this profile:
 #   cargo build --profile fastdev
-#   cargo run --profile fastdev --bin ahead
+#   cargo run --profile fastdev -p ahead --bin ahead
 [profile.fastdev.package."*"]
 opt-level = 3
 
 [profile.dev]
 debug = 1
+
+# The imported native loop makes test binaries large. Limited debug info keeps
+# backtraces useful while avoiding slow links and oversized unwind sections.
+[profile.test]
+debug = "limited"
+incremental = false
 
 [profile.fastdev]
 inherits = "dev"

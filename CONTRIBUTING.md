@@ -1,5 +1,5 @@
 # How to contribute
-Thank you for your interest in contributing to Ahead! No contribution is too small and we consider _all_ contributions to the project. There are many ways to contribute (a few are listed here) but if you think of something else, let us know via an [issue](https://github.com/Kade-Powell/ahead/issues).
+Thank you for your interest in contributing to AHEAD! No contribution is too small and we consider _all_ contributions to the project. There are many ways to contribute (a few are listed here) but if you think of something else, let us know via an [issue](https://github.com/Kade-Powell/ahead/issues).
 
 Agent-specific guidance (skills, UI policy, workflows, `TODO.md` tracking) lives in [`AGENTS.md`](AGENTS.md) — read it before writing code with an agent.
 
@@ -9,7 +9,7 @@ If you're only participating on GitHub, you can open a [Discussion](https://gith
 
 ## Feature Requests
 
-A feature request is _editor behaviour that you want to have included in Ahead_. We track feature requests on GitHub via [issues](https://github.com/Kade-Powell/ahead/issues). There are generally few kinds of features:
+A feature request is _editor behaviour that you want to have included in AHEAD_. We track feature requests on GitHub via [issues](https://github.com/Kade-Powell/ahead/issues). There are generally few kinds of features:
 
 ### Core features
 
@@ -18,7 +18,7 @@ A feature more suited to the core development of Ahead. If this is the case plea
 ### Programming language support (autocompletion/intellisense/formatting)
 
 A feature that relates to specific programming language or development tool that provides intellisense, or various editor commands.
-We do not track plugins development here, each plugin should have own issue tracker with eventual issues linked/referenced to the main Ahead issue tracker.
+We do not track plugins development here, each plugin should have own issue tracker with eventual issues linked/referenced to the main AHEAD issue tracker.
 
 ### Syntax highlighting
 
@@ -32,7 +32,7 @@ To reduce the number of duplicate requests, please search through the issues to 
 
 Bugs should also be reported on GitHub via [issues](https://github.com/Kade-Powell/ahead/issues). This allows us to track them and see how prevalent they are.
 
-If you encounter a bug when using Ahead, check the issues to see if anyone else has encountered it. If it already exists, you can use emoji reactions so we can see community interest in specific issues and how important they are.
+If you encounter a bug when using AHEAD, check the issues to see if anyone else has encountered it. If it already exists, you can use emoji reactions so we can see community interest in specific issues and how important they are.
 
 Please follow the rule of [NoPlusOne](https://github.com/golang/go/wiki/NoPlusOne)
 
@@ -40,7 +40,15 @@ Please follow the rule of [NoPlusOne](https://github.com/golang/go/wiki/NoPlusOn
 
 If you want to write some code, develop the documentation, or otherwise work on a certain feature or bug, let us know by replying to or creating an [issue](https://github.com/Kade-Powell/ahead/issues).
 
-Run `cargo fmt --all` and `cargo clippy` on your code before submitting pull requests and fix any issues; this makes sure that the CI runs only fail on genuine build errors and not formatting/Clippy lints. Keep `TODO.md` accurate per `AGENTS.md` work tracking, and follow the PR hygiene section there (`Release Notes:` footer, imperative title).
+Before submitting a pull request, run `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets`, and `cargo test --locked --lib`. These
+commands use the AHEAD default workspace members; `--workspace` also compiles
+the retained runtime's pruned upstream test harness and is not the normal
+development gate. Test builds disable Cargo incremental artifacts because
+concurrent agent runs otherwise duplicate tens of gigabytes of cache; normal
+`just dev` and `bacon` checks keep incremental compilation. CI also runs
+documentation tests. Keep `TODO.md` accurate per `AGENTS.md` work tracking, and
+follow the PR hygiene section there (`Release Notes:` footer, imperative title).
 
 We are currently in the process of improving the documentation for new developers/code contributors. Feel free to get started, or open an [issue](https://github.com/Kade-Powell/ahead/issues) to see what can be done.
 

@@ -1,15 +1,15 @@
 ## Installation With Package Manager
 
-Ahead is not yet published to upstream package repositories (the existing `lapce` listings there carry Lapce, the project Ahead is forked from).
+AHEAD is not yet published to upstream package repositories (the existing `lapce` listings there carry Lapce, the project AHEAD is forked from).
 
-For now, install Ahead from:
+For now, install AHEAD from:
 
 - **GitHub releases** (https://github.com/Kade-Powell/ahead/releases):
   - macOS: `Ahead-macos.dmg`
   - Windows: `Ahead-windows.msi` or `Ahead-windows-portable.zip`
   - Debian/Ubuntu: `.deb` packages built per distribution version
   - Linux (other): `ahead-linux-*.tar.gz`
-- **Cargo**, from a checkout (see [Building from source](building-from-source.md)):
+- **Cargo**, from a checkout:
   ```sh
   cargo install --path . --bin ahead --profile release-lto --locked
   ```

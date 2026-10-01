@@ -16,6 +16,31 @@ use crate::counter::Counter;
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DapId(pub u64);
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DapSessionState {
+    #[default]
+    Idle,
+    Starting,
+    Running,
+    Stopped,
+    Stopping,
+    Terminated,
+    Failed(String),
+}
+
+impl DapSessionState {
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Stopped | Self::Stopping
+        )
+    }
+
+    pub fn can_stop(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopped)
+    }
+}
+
 impl Default for DapId {
     fn default() -> Self {
         Self::next()
@@ -57,9 +82,8 @@ pub struct RunDebugConfig {
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub prelaunch: Option<RunDebugProgram>,
-    #[serde(skip)]
-    pub debug_command: Option<Vec<String>>,
-    #[serde(skip)]
+    // User-authored configs get an ID; RPC round trips must retain it.
+    #[serde(default)]
     pub dap_id: DapId,
     #[serde(default)]
     pub tracing_output: bool,
@@ -137,7 +161,10 @@ pub enum DapEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-#[expect(clippy::large_enum_variant, reason = "DAP union dominated by small variants; review if a large payload variant is added")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "DAP union dominated by small variants; review if a large payload variant is added"
+)]
 pub enum DapPayload {
     Request(DapRequest),
     Response(DapResponse),
@@ -528,6 +555,23 @@ pub struct RunInTerminalArguments {
     pub env: Option<HashMap<String, Option<String>>>,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+pub struct DebugTerminalRequest {
+    pub dap_id: DapId,
+    pub generation: u64,
+    pub request_seq: u64,
+    pub arguments: RunInTerminalArguments,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+pub struct DebugTerminalResponse {
+    pub dap_id: DapId,
+    pub generation: u64,
+    pub request_seq: u64,
+    pub shell_process_id: Option<u32>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum RunInTerminal {}
 
@@ -684,8 +728,16 @@ impl Request for StackTrace {
 #[derive(Debug)]
 pub enum Disconnect {}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectArguments {
+    pub restart: bool,
+    pub terminate_debuggee: bool,
+    pub suspend_debuggee: bool,
+}
+
 impl Request for Disconnect {
-    type Arguments = ();
+    type Arguments = DisconnectArguments;
     type Result = ();
     const COMMAND: &'static str = "disconnect";
 }

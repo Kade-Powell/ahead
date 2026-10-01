@@ -6,6 +6,25 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub const MAX_EDITOR_RECOVERY_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorRecoverySnapshot {
+    pub buffer_id: String,
+    pub revision: u64,
+    pub path: PathBuf,
+    /// None marks a saved or explicitly discarded revision. It fences older writes.
+    pub contents: Option<String>,
+    pub saved_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorRecoverySummary {
+    pub buffer_id: String,
+    pub path: PathBuf,
+    pub revision: u64,
+}
+
 /// UTF8 line and column-offset
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
@@ -352,7 +371,8 @@ impl FileNodeItem {
             return None;
         };
 
-        #[expect(clippy::needless_collect, reason = "Ancestors is not reversible")] // Ancestors is not reversible
+        #[expect(clippy::needless_collect, reason = "Ancestors is not reversible")]
+        // Ancestors is not reversible
         let ancestors = path.ancestors().take(take).collect::<Vec<&Path>>();
         Some(ancestors.into_iter().rev())
     }

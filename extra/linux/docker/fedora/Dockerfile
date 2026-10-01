@@ -124,14 +124,14 @@ cat > ahead.spec <<EOL
 Name:     ${PACKAGE_NAME}
 Version:  ${RELEASE_TAG_NAME}
 Release:  1.${DISTRO_ID}${DISTRO_VERSION}
-Summary:  Lightning-fast and Powerful Code Editor written in Rust
+Summary:  AHEAD native code editor for human-led development
 License:  Apache-2.0
 URL:      https://github.com/Kade-Powell/ahead
 Packager: Jakub Panek
 
 %description
-Ahead is written in pure Rust with a UI in Floem (which is also written in Rust).
-It is designed with Rope Science from the Xi-Editor which makes for lightning-fast computation, and leverages OpenGL for rendering.
+AHEAD is written in Rust with a native GPUI and gpui-kit interface.
+It uses rope-based text editing and GPU rendering.
 
 %build
 xx-clang --setup-target-triple
