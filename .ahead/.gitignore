@@ -2,6 +2,7 @@
 *
 !.gitignore
 !config.toml
+!team.toml
 !templates/
 !templates/**
 !sessions/

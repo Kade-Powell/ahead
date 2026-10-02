@@ -6,7 +6,9 @@ lib/
 target/
 core/languages/
 vendor/
-.ahead/
+.ahead/*
+!.ahead/.gitignore
+!.ahead/team.toml
 
 .DS_Store
 *.patch

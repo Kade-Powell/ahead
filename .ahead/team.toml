@@ -1,0 +1,6 @@
+# Add one [[members]] entry per GitHub account allowed to join shared sessions.
+# Example:
+# [[members]]
+# github = "octocat"
+# display_name = "Octocat"
+# role = "editor"
