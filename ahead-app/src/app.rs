@@ -727,6 +727,13 @@ fn closes_code_tab(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CenterPanel {
+    Settings,
+    Search,
+    Problems,
+}
+
 pub struct Shell {
     pub area: Entity<DockArea>,
     pub focus: FocusHandle,
@@ -759,10 +766,8 @@ pub struct Shell {
     debug_visible: bool,
     active_terminal: usize,
     next_terminal_id: usize,
-    settings_active: bool,
-    search_active: bool,
-    search_pinned: bool,
-    problems_active: bool,
+    open_center_panels: Vec<CenterPanel>,
+    active_center_panel: Option<CenterPanel>,
     system_speech_process: SystemSpeechProcess,
     system_speech_active: Arc<AtomicBool>,
     _shortcut_interceptor: Option<Subscription>,
@@ -897,10 +902,8 @@ impl Shell {
             debug_visible: false,
             active_terminal: 0,
             next_terminal_id: 2,
-            settings_active: false,
-            search_active: false,
-            search_pinned: false,
-            problems_active: false,
+            open_center_panels: Vec::new(),
+            active_center_panel: None,
             system_speech_process,
             system_speech_active,
             _shortcut_interceptor: None,
@@ -1022,21 +1025,33 @@ impl Shell {
         });
     }
 
-    fn set_center_layout(
+    fn open_center_panel(
         &mut self,
-        settings_active: bool,
-        search_active: bool,
-        problems_active: bool,
+        panel: CenterPanel,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_active = settings_active;
-        self.search_active = search_active;
-        self.search_pinned |= search_active;
-        self.problems_active = problems_active;
+        if !self.open_center_panels.contains(&panel) {
+            self.open_center_panels.push(panel);
+        }
+        self.active_center_panel = Some(panel);
+        self.refresh_center_layout(window, cx);
+    }
+
+    fn show_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_center_panel = None;
+        self.refresh_center_layout(window, cx);
+    }
+
+    fn refresh_center_layout(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open_center_panels = self.open_center_panels.clone();
+        let active_center_panel = self.active_center_panel;
         let settings = self.settings.clone();
         let search = self.search.clone();
-        let search_pinned = self.search_pinned;
         let problems = self.problems.clone();
         let code_tabs = self.code_tabs.clone();
         let code_count = code_tabs.len();
@@ -1051,25 +1066,25 @@ impl Shell {
             for code in code_tabs {
                 editor_tabs = editor_tabs.panel_view(panel_handle(code), cx);
             }
-            let editor_tabs = if settings_active {
-                editor_tabs.panel_view(panel_handle(settings), cx)
-            } else if search_active {
-                editor_tabs.panel_view(panel_handle(search), cx)
-            } else if problems_active {
-                editor_tabs.panel_view(panel_handle(problems), cx)
-            } else if search_pinned {
-                editor_tabs.panel_view(panel_handle(search), cx)
-            } else {
-                editor_tabs
-            };
-            let active_index = if settings_active || search_active || problems_active
-            {
-                code_count
-            } else {
-                active_code_index
-            };
-            let editor_tabs = editor_tabs.active_index(active_index);
-            area.set_center(editor_tabs, window, cx);
+            for panel in &open_center_panels {
+                editor_tabs =
+                    match panel {
+                        CenterPanel::Settings => editor_tabs
+                            .panel_view(panel_handle(settings.clone()), cx),
+                        CenterPanel::Search => {
+                            editor_tabs.panel_view(panel_handle(search.clone()), cx)
+                        }
+                        CenterPanel::Problems => editor_tabs
+                            .panel_view(panel_handle(problems.clone()), cx),
+                    };
+            }
+            let active_index = active_center_panel
+                .and_then(|panel| {
+                    open_center_panels.iter().position(|open| *open == panel)
+                })
+                .map(|index| code_count + index)
+                .unwrap_or(active_code_index);
+            area.set_center(editor_tabs.active_index(active_index), window, cx);
         });
         cx.notify();
     }
@@ -1086,23 +1101,20 @@ impl Shell {
             gpui_kit::component::dock::PanelId::from(self.settings.entity_id());
         let problems_panel =
             gpui_kit::component::dock::PanelId::from(self.problems.entity_id());
-        if panel == search_panel {
-            self.search_pinned = false;
-            self.search_active = false;
+        let closed = if panel == search_panel {
+            CenterPanel::Search
         } else if panel == settings_panel {
-            self.settings_active = false;
+            CenterPanel::Settings
         } else if panel == problems_panel {
-            self.problems_active = false;
+            CenterPanel::Problems
         } else {
             return;
+        };
+        self.open_center_panels.retain(|open| *open != closed);
+        if self.active_center_panel == Some(closed) {
+            self.active_center_panel = self.open_center_panels.last().copied();
         }
-        self.set_center_layout(
-            self.settings_active,
-            self.search_active,
-            self.problems_active,
-            window,
-            cx,
-        );
+        self.refresh_center_layout(window, cx);
     }
 
     fn poll_explorer_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1327,7 +1339,7 @@ impl Shell {
                     });
                 }
                 self.set_active_code(code, cx);
-                self.set_center_layout(false, false, false, window, cx);
+                self.show_code(window, cx);
                 (
                     true,
                     format!(
@@ -1363,7 +1375,7 @@ impl Shell {
                     return (false, message);
                 }
                 self.set_active_code(code, cx);
-                self.set_center_layout(false, false, false, window, cx);
+                self.show_code(window, cx);
                 (
                     true,
                     format!(
@@ -1427,7 +1439,7 @@ impl Shell {
                 code.update(cx, |code, cx| code.promote_preview(cx));
             }
             self.set_active_code(code.clone(), cx);
-            self.set_center_layout(false, false, false, window, cx);
+            self.show_code(window, cx);
             if let Some(location) = request.location {
                 code.update(cx, |code, cx| {
                     code.reveal_location(location, window, cx);
@@ -1479,7 +1491,7 @@ impl Shell {
         };
 
         self.set_active_code(code.clone(), cx);
-        self.set_center_layout(false, false, false, window, cx);
+        self.show_code(window, cx);
         if let Some(location) = request.location {
             code.update(cx, |code, cx| {
                 code.reveal_location(location, window, cx);
@@ -1795,7 +1807,7 @@ impl Shell {
             let code = self.code_tabs[index].clone();
             code.update(cx, |code, cx| code.promote_preview(cx));
             self.set_active_code(code, cx);
-            self.set_center_layout(false, false, false, window, cx);
+            self.show_code(window, cx);
             return;
         }
 
@@ -2428,7 +2440,7 @@ impl Shell {
             self.chat_zoomed = false;
             self.agent_workspace
                 .update(cx, |panel, cx| panel.set_chat_zoomed(false, cx));
-            self.set_center_layout(false, false, false, window, cx);
+            self.show_code(window, cx);
             self.restore_side_docks(window, cx);
         } else {
             self.left_dock_was_open =
@@ -2438,9 +2450,7 @@ impl Shell {
             self.bottom_dock_was_open =
                 self.area.read(cx).is_dock_open(DockPlacement::Bottom);
             self.chat_zoomed = true;
-            self.settings_active = false;
-            self.search_active = false;
-            self.problems_active = false;
+            self.active_center_panel = None;
             self.agent_workspace
                 .update(cx, |panel, cx| panel.set_chat_zoomed(true, cx));
 
@@ -2555,15 +2565,15 @@ impl Shell {
             ToggleRight => self.area.update(cx, |area, cx| {
                 area.toggle_dock(DockPlacement::Right, window, cx)
             }),
-            Settings => self.set_center_layout(true, false, false, window, cx),
+            Settings => self.open_center_panel(CenterPanel::Settings, window, cx),
             Explorer => self.show_left_panel(WorkspaceView::Explorer, window, cx),
-            Search => self.set_center_layout(false, true, false, window, cx),
+            Search => self.open_center_panel(CenterPanel::Search, window, cx),
             SourceControl => self.show_left_panel(WorkspaceView::Git, window, cx),
             Tasks => self.show_left_panel(WorkspaceView::Tasks, window, cx),
             LanguageServers => {
                 self.show_left_panel(WorkspaceView::LanguageServers, window, cx)
             }
-            Problems => self.set_center_layout(false, false, true, window, cx),
+            Problems => self.open_center_panel(CenterPanel::Problems, window, cx),
             QuickOpen => self.open_quick_open(window, cx),
             CommandPalette => self.open_command_palette(window, cx),
             NewTerminal => self.new_terminal(window, cx),
@@ -2894,10 +2904,10 @@ impl Render for Shell {
                                     Button::new("search_btn")
                                         .icon(IconName::Search)
                                         .tooltip(format!("Search Workspace ({})", shortcut_hint("⌘⇧F", "Ctrl+Shift+F"))),
-                                    self.search_active,
+                                    self.open_center_panels.contains(&CenterPanel::Search),
                                 )
                                     .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                        this.set_center_layout(false, true, false, window, cx);
+                                        this.open_center_panel(CenterPanel::Search, window, cx);
                                     })),
                             )
                             .child(
@@ -2908,10 +2918,10 @@ impl Render for Shell {
                                         let n = self.code.read_with(cx, |code, _| code.diagnostics.len());
                                         format!("Problems: {n} problem{} ({})", if n == 1 { "" } else { "s" }, shortcut_hint("⌘⇧M", "Ctrl+Shift+M"))
                                     }),
-                                    self.problems_active,
+                                    self.open_center_panels.contains(&CenterPanel::Problems),
                                 )
                                     .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                        this.set_center_layout(false, false, true, window, cx);
+                                        this.open_center_panel(CenterPanel::Problems, window, cx);
                                         let first = this.code.read_with(cx, |code, _| code.diagnostics.first().cloned());
                                         let code_focus = this.code.read_with(cx, |code, _| code.focus.clone());
                                         if let Some(d) = first {
@@ -2929,10 +2939,10 @@ impl Render for Shell {
                                     Button::new("settings_btn")
                                         .icon(IconName::Settings)
                                         .tooltip(format!("Open Settings ({})", shortcut_hint("⌘,", "Ctrl+,"))),
-                                    self.settings_active,
+                                    self.open_center_panels.contains(&CenterPanel::Settings),
                                 )
                                     .on_click(cx.listener(|this: &mut Self, _, window, cx| {
-                                        this.set_center_layout(true, false, false, window, cx);
+                                        this.open_center_panel(CenterPanel::Settings, window, cx);
                                     }))
                             )
                     )
@@ -3729,8 +3739,10 @@ pub fn launch() {
                                 _ = shell_for_session_settings.update(
                                     cx,
                                     |shell, cx| {
-                                        shell.set_center_layout(
-                                            true, false, false, window, cx,
+                                        shell.open_center_panel(
+                                            CenterPanel::Settings,
+                                            window,
+                                            cx,
                                         );
                                     },
                                 );
@@ -3779,7 +3791,7 @@ pub fn launch() {
                         });
                         // Center: editor tabs. Bottom utility dock: Terminal and Debug tabs.
                         shell.update(cx, |shell, cx| {
-                            shell.set_center_layout(false, false, false, window, cx);
+                            shell.show_code(window, cx);
                             shell.set_bottom_layout(false, window, cx);
                         });
 
