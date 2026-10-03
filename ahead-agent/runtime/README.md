@@ -8,8 +8,8 @@ boundaries.
 `source/` was extracted from AHEAD's former `third-party/codex/codex-rs` at
 AHEAD fork commit `7c07b2f88aceedb4ed187a5fafa145044660d07a`, whose parent is
 the upstream `rust-v0.152.0` commit `316795b3cf2a45e90d121d9f46499d4658b2645c`.
-The fork commit is not an upstream revision. Exact source and patch provenance
-is recorded in [`SOURCE_BASELINE.toml`](SOURCE_BASELINE.toml). The extracted
+The fork commit is not an upstream revision. The historical import revisions
+and paths are recorded in [`SOURCE_BASELINE.toml`](SOURCE_BASELINE.toml). The extracted
 tree is selectively trimmed and AHEAD-modified; it is not an upstream sync
 checkout. `ahead-agent` is a library;
 `ahead-proxy` hosts it in-process. The `ahead` executable re-enters itself with
@@ -27,7 +27,8 @@ because changing them would break protocol compatibility. They are private
 implementation details; new AHEAD code should depend on `ahead-agent` and its
 public types instead of those identifiers.
 
-The upstream license and notice files are retained beside the embedded source.
+The pinned upstream [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) are retained
+beside the embedded source.
 
 When maintaining the embedded source, read [`source/AGENTS.md`](source/AGENTS.md)
 and the scoped workspace skills under

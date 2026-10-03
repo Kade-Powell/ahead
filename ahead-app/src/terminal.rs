@@ -6,6 +6,7 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event as TerminalEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
@@ -17,6 +18,37 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 const TERMINAL_COLUMNS: usize = 120;
 const TERMINAL_ROWS: usize = 28;
 const MAX_SCROLLBACK: usize = 10_000;
+const SHARED_HISTORY_LINES: i32 = 500;
+
+fn terminal_history_text<T: EventListener>(terminal: &Term<T>) -> String {
+    let grid = terminal.grid();
+    let first_line = grid
+        .topmost_line()
+        .0
+        .max(grid.bottommost_line().0 - SHARED_HISTORY_LINES + 1);
+    let mut text = String::new();
+    let mut row = String::new();
+    let mut current_line = None;
+    for indexed in
+        grid.iter_from(Point::new(Line(first_line - 1), Column(grid.columns() - 1)))
+    {
+        if current_line != Some(indexed.point.line) {
+            if current_line.is_some() {
+                text.push_str(row.trim_end());
+                text.push('\n');
+                row.clear();
+            }
+            current_line = Some(indexed.point.line);
+        }
+        if !indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+            && !indexed.cell.c.is_control()
+        {
+            row.push(indexed.cell.c);
+        }
+    }
+    text.push_str(row.trim_end());
+    text
+}
 
 #[derive(Clone)]
 struct TerminalEventProxy {
@@ -122,7 +154,7 @@ impl TerminalBackend {
             TerminalEventProxy { events: events_tx },
             pty,
             false,
-            true,
+            false, // Alacritty's reference-test mode records PTY output in the process CWD.
         )
         .map_err(|error| format!("failed to create terminal event loop: {error}"))?;
         let pty_sender = event_loop.channel();
@@ -207,6 +239,10 @@ impl TerminalBackend {
             colors: *content.colors,
             cursor,
         }
+    }
+
+    pub(crate) fn shared_history_text(&self) -> String {
+        terminal_history_text(&self.terminal.lock())
     }
 
     pub(crate) fn mode(&self) -> TermMode {
@@ -334,27 +370,40 @@ pub(crate) struct TerminalCell {
     pub(crate) column: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct TerminalSnapshot {
     pub(crate) rows: Vec<Vec<TerminalCell>>,
     pub(crate) colors: Colors,
     pub(crate) cursor: Option<(i32, usize, CursorShape)>,
 }
 
-impl Default for TerminalSnapshot {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            colors: Colors::default(),
-            cursor: None,
-        }
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::vte::ansi::Processor;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn shared_history_includes_scrollback_without_terminal_controls() {
+        let mut terminal = Term::new(
+            Config {
+                scrolling_history: 10,
+                ..Config::default()
+            },
+            &TermSize::new(10, 3),
+            VoidListener,
+        );
+        let mut parser =
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        for byte in b"one\r\ntwo\r\nthree\r\nfour\r\nfive" {
+            parser.advance(&mut terminal, *byte);
+        }
+        let text = terminal_history_text(&terminal);
+        assert!(text.contains("one\ntwo\nthree\nfour\nfive"), "{text:?}");
+        assert!(!text.contains('\u{1b}'));
+    }
 
     fn read_pid(path: &std::path::Path) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(5);

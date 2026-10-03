@@ -661,7 +661,7 @@ pub enum Op {
 
     /// Resolve a request_user_input tool call.
     UserInputAnswer {
-        /// Turn id for the in-flight request.
+        /// Call id for the in-flight request.
         id: String,
         /// User-provided answers.
         response: RequestUserInputResponse,
@@ -2532,22 +2532,7 @@ pub struct McpToolCallBeginEvent {
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub connector_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub mcp_app_resource_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub link_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub app_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub action_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub plugin_id: Option<String>,
     /// Whether the selected tool is annotated as read-only, not its execution outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2561,22 +2546,7 @@ pub struct McpToolCallEndEvent {
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub connector_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub mcp_app_resource_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub link_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub app_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub action_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub read_only_hint: Option<bool>,
@@ -2735,7 +2705,6 @@ impl FromStr for ThreadSource {
         match value {
             "user" => Ok(ThreadSource::User),
             "subagent" => Ok(ThreadSource::Subagent),
-            "guardian_review" => Err("guardian_review is not an AHEAD thread source".to_string()),
             "memory_consolidation" => Ok(ThreadSource::MemoryConsolidation),
             other => Ok(ThreadSource::Feature(other.to_string())),
         }
@@ -4284,12 +4253,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_guardian_session_sources_are_rejected() {
-        assert!("guardian_review".parse::<ThreadSource>().is_err());
-        assert!(serde_json::from_value::<InternalSessionSource>(json!("guardian")).is_err());
-    }
-
-    #[test]
     fn session_meta_normalizes_legacy_dynamic_tools() -> Result<()> {
         let mut value = serde_json::to_value(SessionMeta::default())?;
         value["dynamic_tools"] = json!([
@@ -5014,12 +4977,7 @@ mod tests {
                 server: "server".into(),
                 tool: "tool".into(),
                 arguments: json!({"arg": "value"}),
-                connector_id: Some("connector".into()),
-                mcp_app_resource_uri: Some("app://connector".into()),
-                link_id: Some("link_123".into()),
-                app_name: Some("Calendar".into()),
-                action_name: Some("create_event".into()),
-                plugin_id: Some("sample@test".into()),
+                mcp_app_resource_uri: Some("ui://calendar/event".into()),
                 read_only_hint: Some(false),
                 status: McpToolCallStatus::InProgress,
                 result: None,
@@ -5035,15 +4993,10 @@ mod tests {
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
-                assert_eq!(event.connector_id.as_deref(), Some("connector"));
                 assert_eq!(
                     event.mcp_app_resource_uri.as_deref(),
-                    Some("app://connector")
+                    Some("ui://calendar/event")
                 );
-                assert_eq!(event.link_id.as_deref(), Some("link_123"));
-                assert_eq!(event.app_name.as_deref(), Some("Calendar"));
-                assert_eq!(event.action_name.as_deref(), Some("create_event"));
-                assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
                 assert_eq!(event.read_only_hint, Some(false));
             }
             _ => panic!("expected McpToolCallBegin event"),
@@ -5134,12 +5087,7 @@ mod tests {
                 server: "server".into(),
                 tool: "tool".into(),
                 arguments: json!({"arg": "value"}),
-                connector_id: Some("connector".into()),
-                mcp_app_resource_uri: Some("app://connector".into()),
-                link_id: Some("link_123".into()),
-                app_name: Some("Calendar".into()),
-                action_name: Some("create_event".into()),
-                plugin_id: Some("sample@test".into()),
+                mcp_app_resource_uri: Some("ui://calendar/event".into()),
                 read_only_hint: None,
                 status: McpToolCallStatus::Completed,
                 result: Some(CallToolResult {
@@ -5160,15 +5108,10 @@ mod tests {
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
-                assert_eq!(event.connector_id.as_deref(), Some("connector"));
                 assert_eq!(
                     event.mcp_app_resource_uri.as_deref(),
-                    Some("app://connector")
+                    Some("ui://calendar/event")
                 );
-                assert_eq!(event.link_id.as_deref(), Some("link_123"));
-                assert_eq!(event.app_name.as_deref(), Some("Calendar"));
-                assert_eq!(event.action_name.as_deref(), Some("create_event"));
-                assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
                 assert_eq!(event.duration, Duration::from_millis(42));
                 assert!(event.is_success());
             }

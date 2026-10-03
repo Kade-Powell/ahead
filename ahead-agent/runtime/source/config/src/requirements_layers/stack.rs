@@ -206,15 +206,9 @@ fn populate_merged_regular_fields_with_sources(
     // Destructure without `..` so every new requirements field must choose
     // whether it belongs in the regular TOML merge path or in a special merger.
     let ConfigRequirementsToml {
-        allowed_login_methods,
-        allowed_chatgpt_workspaces,
-        cli_auth_credentials_store,
-        chatgpt_base_url,
         log_dir,
         model_catalog_json,
-        check_for_update_on_startup,
         allow_login_shell,
-        feedback,
         allowed_approval_policies,
         allowed_sandbox_modes,
         allowed_permission_profiles,
@@ -232,7 +226,6 @@ fn populate_merged_regular_fields_with_sources(
         feature_requirements,
         hooks: _,
         mcp_servers,
-        apps,
         rules: _,
         enforce_residency,
         network,
@@ -242,18 +235,9 @@ fn populate_merged_regular_fields_with_sources(
         additional_developer_instructions,
     } = requirements;
 
-    set_sourced!(allowed_login_methods, &["allowed_login_methods"]);
-    set_sourced!(allowed_chatgpt_workspaces, &["allowed_chatgpt_workspaces"]);
-    set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
-    set_sourced!(chatgpt_base_url, &["chatgpt_base_url"]);
     set_sourced!(log_dir, &["log_dir"]);
     set_sourced!(model_catalog_json, &["model_catalog_json"]);
-    set_sourced!(
-        check_for_update_on_startup,
-        &["check_for_update_on_startup"]
-    );
     set_sourced!(allow_login_shell, &["allow_login_shell"]);
-    set_sourced!(feedback, &["feedback"]);
     set_sourced!(allowed_approval_policies, &["allowed_approval_policies"]);
     set_sourced!(allowed_sandbox_modes, &["allowed_sandbox_modes"]);
     set_sourced!(
@@ -276,7 +260,6 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(windows, &["windows"]);
     set_sourced!(feature_requirements, &["features", "feature_requirements"]);
     set_sourced!(mcp_servers, &["mcp_servers"]);
-    set_sourced!(apps, &["apps"]);
     set_sourced!(enforce_residency, &["enforce_residency"]);
     set_sourced!(network, &["experimental_network"]);
     set_sourced!(permissions, &["permissions"]);

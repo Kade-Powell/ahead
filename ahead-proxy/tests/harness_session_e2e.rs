@@ -115,7 +115,7 @@ fn durable_streamed_turn_persists_cancels_and_reopens() {
 
     // 1. Real streamed turn.
     controller
-        .start_turn(turn_dto(&session_id, "Reply with exactly: PONG"))
+        .start_turn(turn_dto(&session_id, "Reply with exactly: PONG"), "human")
         .expect("start turn");
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
@@ -150,10 +150,13 @@ fn durable_streamed_turn_persists_cancels_and_reopens() {
 
     // 2. Cancel a long turn.
     controller
-        .start_turn(turn_dto(
-            &session_id,
-            "Count from 1 to 200 slowly, one number per line.",
-        ))
+        .start_turn(
+            turn_dto(
+                &session_id,
+                "Count from 1 to 200 slowly, one number per line.",
+            ),
+            "human",
+        )
         .expect("start long turn");
     std::thread::sleep(Duration::from_millis(2500));
     let cancelled = controller.cancel_turn(&session_id).expect("cancel");
@@ -191,7 +194,7 @@ fn durable_streamed_turn_persists_cancels_and_reopens() {
     let history = all_messages(&reopened, &session_id).expect("reopened messages");
     assert_eq!(history.len(), messages.len());
     reopened
-        .start_turn(turn_dto(&session_id, "Reply with exactly: AGAIN"))
+        .start_turn(turn_dto(&session_id, "Reply with exactly: AGAIN"), "human")
         .expect("continue after reopen");
     let deadline = Instant::now() + Duration::from_secs(180);
     while reopened.has_active_turn(&session_id) {
@@ -270,7 +273,7 @@ fn managed_file_change_records_ahead_anchor() {
             expected_policy_sha256: String::new(),
             read_only: false,
             scope: None,
-        })
+        }, "human")
         .expect("start managed turn");
 
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -295,4 +298,216 @@ fn managed_file_change_records_ahead_anchor() {
 
     controller.shutdown_harness();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_connection_change_resumes_history_on_new_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn mock_model(
+        reply: &'static str,
+        key: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let endpoint = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("model address")
+        );
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream: TcpStream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "model request did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept model request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut buffer).expect("read model request");
+                assert_ne!(read, 0, "model request ended before body");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .expect("request content length");
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("authorization: bearer {key}")),
+                    "model request used the wrong connection credential"
+                );
+                if request.len() >= header_end + content_length {
+                    break (header_end, content_length);
+                }
+            };
+            let item = serde_json::json!({
+                "id": format!("message-{reply}"),
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": reply}],
+            });
+            let events = [
+                (
+                    "response.output_item.added",
+                    serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"id": format!("message-{reply}"), "type": "message", "role": "assistant", "content": []},
+                    }),
+                ),
+                (
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": item,
+                    }),
+                ),
+                (
+                    "response.completed",
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {"id": format!("response-{reply}"), "end_turn": true},
+                    }),
+                ),
+            ];
+            let body = events
+                .iter()
+                .map(|(event, payload)| {
+                    format!("event: {event}\ndata: {payload}\n\n")
+                })
+                .collect::<String>();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write model response");
+            String::from_utf8(
+                request[header_end..header_end + content_length].to_vec(),
+            )
+            .expect("request JSON")
+        });
+        (endpoint, server)
+    }
+
+    fn wait_for_turn(controller: &HarnessController, session_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while controller.has_active_turn(session_id) {
+            assert!(Instant::now() < deadline, "managed turn did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn save_connection(workspace: &std::path::Path, endpoint: &str, key: &str) {
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"{endpoint}\"\napi_key = \"{key}\"\nmodel = \"gpt-5.6-sol\"\n"
+            ),
+        )
+        .expect("save private connection");
+    }
+
+    let workspace = tempfile::tempdir().expect("disposable workspace");
+    std::fs::create_dir(workspace.path().join(".ahead"))
+        .expect("create private settings directory");
+    let (first_endpoint, first_server) = mock_model("FIRST_RESPONSE", "old-key");
+    save_connection(workspace.path(), &first_endpoint, "old-key");
+
+    let host = ahead_proxy::ahead::host::AheadSessionHost::new(
+        SessionStore::in_memory().expect("host store"),
+    );
+    let view = host
+        .start_work(
+            Some(ahead_rpc::ahead::WorkKind::ProductChange),
+            "Connection switch".to_string(),
+            "Preserve agent history".to_string(),
+            None,
+        )
+        .expect("start work");
+    let session_id = view.session.id.clone();
+    let store = Arc::new(parking_lot::RwLock::new(
+        SessionStore::in_memory().expect("session store"),
+    ));
+    store
+        .write()
+        .insert_session(&view)
+        .expect("persist session");
+    let controller = HarnessController::new(Arc::new(
+        ahead_proxy::ahead::store::SharedSessionStore(store),
+    ));
+    controller.set_workspace(workspace.path().to_path_buf());
+    let managed_turn = |message: &str| {
+        let mut dto = turn_dto(&session_id, message);
+        dto.harness = ahead_rpc::ahead::HarnessKind::Ahead;
+        dto.external_agent_id = None;
+        dto.model = Some("gpt-5.6-sol".to_string());
+        dto.model_provider = Some("mock".to_string());
+        dto.cwd = Some(workspace.path().to_string_lossy().into_owned());
+        dto.context.active_path.clear();
+        dto
+    };
+
+    controller
+        .start_turn(managed_turn("Reply with FIRST_RESPONSE"), "human")
+        .expect("start first turn");
+    wait_for_turn(&controller, &session_id);
+    let first_request = first_server.join().expect("first model response");
+    assert!(first_request.contains("Reply with FIRST_RESPONSE"));
+    assert!(
+        all_messages(&controller, &session_id)
+            .expect("first conversation")
+            .iter()
+            .any(|message| message.role == "agent"
+                && message.content.contains("FIRST_RESPONSE"))
+    );
+
+    let (second_endpoint, second_server) = mock_model("SECOND_RESPONSE", "new-key");
+    save_connection(workspace.path(), &second_endpoint, "new-key");
+    controller
+        .start_turn(managed_turn("Reply with SECOND_RESPONSE"), "human")
+        .expect("continue after connection change");
+    wait_for_turn(&controller, &session_id);
+    let second_request = second_server.join().expect("new model response");
+    assert!(
+        second_request.contains("FIRST_RESPONSE"),
+        "model history was lost"
+    );
+    assert!(second_request.contains("Reply with SECOND_RESPONSE"));
+    assert!(
+        all_messages(&controller, &session_id)
+            .expect("second conversation")
+            .iter()
+            .any(|message| message.role == "agent"
+                && message.content.contains("SECOND_RESPONSE"))
+    );
+    controller.shutdown_harness();
 }

@@ -20,7 +20,7 @@ pub use local::LocalSecretsBackend;
 pub use local::LocalSecretsNamespace;
 pub use sanitizer::redact_secrets;
 
-const KEYRING_SERVICE: &str = "codex";
+const KEYRING_SERVICE: &str = "ahead";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SecretName(String);
@@ -224,6 +224,7 @@ mod tests {
 
     #[test]
     fn manager_round_trips_local_backend() -> Result<()> {
+        assert_eq!(keyring_service(), "ahead");
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
         let manager = SecretsManager::new_with_keyring_store(

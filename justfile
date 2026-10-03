@@ -19,7 +19,7 @@ help:
 dev $workspace='.':
     watchexec --debounce 1s -e rs,toml,lock,md,json,txt,svg,lark,wit,gitignore,icns -w Cargo.toml -w Cargo.lock -w build.rs -w .cargo -w .ahead/.gitignore -w defaults -w icons -w extra -w ahead-app -w ahead-voice -w ahead-proxy -w ahead-core -w ahead-extension-host -w ahead-rpc -w ahead-viewmodel -w ahead-agent -w ahead-tool-records -i '**/tests/**' -i '**/*_tests.rs' -i '**/AGENTS.md' -i '**/README.md' -r -- just _run-dev "$workspace"
 
-# Keep a stable macOS app identity across watcher rebuilds and native UI checks.
+# Keep a distinct, stable macOS dev identity across watcher rebuilds.
 [private]
 _run-dev $workspace:
     #!/usr/bin/env bash
@@ -29,6 +29,9 @@ _run-dev $workspace:
         dev_bundle="target/debug/macos/Ahead.app"
         mkdir -p "$dev_bundle/Contents/MacOS" "$dev_bundle/Contents/Resources"
         cp extra/macos/Ahead.app/Contents/Info.plist "$dev_bundle/Contents/Info.plist"
+        /usr/bin/plutil -replace CFBundleIdentifier -string io.ahead.dev "$dev_bundle/Contents/Info.plist"
+        /usr/bin/plutil -replace CFBundleDisplayName -string 'AHEAD Dev' "$dev_bundle/Contents/Info.plist"
+        /usr/bin/plutil -replace CFBundleName -string 'AHEAD Dev' "$dev_bundle/Contents/Info.plist"
         cp extra/macos/Ahead.app/Contents/Resources/ahead.icns "$dev_bundle/Contents/Resources/ahead.icns"
         /bin/cp -c target/debug/ahead "$dev_bundle/Contents/MacOS/ahead"
         exec "$dev_bundle/Contents/MacOS/ahead" "$workspace"
@@ -44,9 +47,9 @@ bacon:
 bacon-test:
     bacon test
 
-# Run maintained workspace tests; copied core/MCP harnesses are not maintained.
+# Run maintained AHEAD tests; copied runtime unit-test harnesses are not product gates.
 test-all:
-    cargo test --locked --workspace --all-targets --exclude codex-core --exclude codex-mcp
+    RUST_TEST_THREADS=1 cargo test --locked --all-targets -p ahead -p ahead-app -p ahead-voice -p ahead-proxy -p ahead-rpc -p ahead-core -p ahead-extension-host -p ahead-viewmodel -p ahead-agent -p ahead-tool-records -p codex-apply-patch
 
 # Rebuild and relaunch the app on change.
 bacon-run:

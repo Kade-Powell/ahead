@@ -26,11 +26,13 @@ use ahead_rpc::{
         AgentUserInputRequest, AheadNotification, AheadRequest, CodeAnchor,
         CodeComment, ConversationMessage, ConversationMessageCursor,
         ConversationMessagePage, ExternalAcpAdapter, HarnessKind,
-        McpServerDeclaration, MemoryDocument, MemoryExcerpt, MemoryScope,
-        MemoryWriteResult, SessionExportBundle, SessionListItem, SessionView,
-        WorkItem, WorkItemStatus,
+        McpServerApprovalAction, McpServerDeclaration, MemoryDocument,
+        MemoryExcerpt, MemoryScope, MemoryWriteResult, SessionExportBundle,
+        SessionListItem, SessionParticipantRecord, SessionView,
+        SharedBufferEditResult, SharedBufferSnapshot, SharedSessionOffer,
+        SharedSessionUpdate, WorkItem, WorkItemStatus,
     },
-    core::{CoreNotification, CoreRequest, CoreResponse},
+    core::{CoreNotification, CoreRequest, CoreResponse, LanguageExtensionIssue},
     dap_types::{
         DapId, DapSessionState, DebugTerminalRequest, DebugTerminalResponse,
         RunDebugConfig, SourceBreakpoint, StackFrame, Stopped, ThreadId,
@@ -93,6 +95,10 @@ pub struct LspServerStatus {
 impl LspServerStatus {
     pub fn is_ready(&self) -> bool {
         self.ready
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.quiescent && !self.ready
     }
 }
 
@@ -211,6 +217,7 @@ pub struct ProxyClient {
     diff: Arc<Mutex<ProxyDiffState>>,
     git_generation: AtomicU64,
     lsp_servers: Arc<Mutex<HashMap<String, LspServerStatus>>>,
+    language_extension_issues: Mutex<Vec<LanguageExtensionIssue>>,
     /// Uncommitted attribution anchors per file, refreshed from the ahead host.
     anchors: Arc<Mutex<HashMap<PathBuf, Vec<CodeAnchor>>>>,
     anchor_requests: Mutex<HashMap<PathBuf, usize>>,
@@ -220,13 +227,17 @@ pub struct ProxyClient {
     debug_terminal_rx: async_channel::Receiver<DebugTerminalEvent>,
     /// Durable conversation messages for the active session, keyed by session.
     conversations: Arc<Mutex<HashMap<String, CachedConversation>>>,
+    shared_buffers: Arc<Mutex<HashMap<(String, String), SharedBufferSnapshot>>>,
+    shared_buffer_changes:
+        Mutex<HashMap<(String, String), (String, SharedBufferSnapshot)>>,
+    shared_buffer_subscribers: Mutex<Vec<async_channel::Sender<()>>>,
     plans: Arc<Mutex<HashMap<String, Vec<AgentPlanEntry>>>>,
     tool_calls: Arc<Mutex<HashMap<String, Vec<AgentToolCall>>>>,
     thoughts: Arc<Mutex<HashMap<String, String>>>,
     available_commands: Arc<Mutex<HashMap<String, Vec<AgentCommand>>>>,
     config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
     usage: Arc<Mutex<HashMap<String, AgentUsage>>>,
-    pending_user_inputs: Arc<Mutex<HashMap<String, AgentUserInputRequest>>>,
+    pending_user_inputs: Arc<Mutex<HashMap<String, Vec<AgentUserInputRequest>>>>,
     pending_buffer_snapshot_requests: Arc<Mutex<Vec<BufferSnapshotRequest>>>,
     pending_editor_presentation_requests: Arc<Mutex<Vec<EditorPresentationRequest>>>,
     /// In-flight streamed turns, keyed by session id.
@@ -302,6 +313,7 @@ impl ProxyClient {
             diff: Arc::new(Mutex::new(ProxyDiffState::default())),
             git_generation: AtomicU64::new(0),
             lsp_servers: Arc::new(Mutex::new(HashMap::new())),
+            language_extension_issues: Mutex::new(Vec::new()),
             anchors: Arc::new(Mutex::new(HashMap::new())),
             anchor_requests: Mutex::new(HashMap::new()),
             debug: Arc::new(Mutex::new(DebugState::default())),
@@ -309,6 +321,9 @@ impl ProxyClient {
             debug_terminal_tx,
             debug_terminal_rx,
             conversations: Arc::new(Mutex::new(HashMap::new())),
+            shared_buffers: Arc::new(Mutex::new(HashMap::new())),
+            shared_buffer_changes: Mutex::new(HashMap::new()),
+            shared_buffer_subscribers: Mutex::new(Vec::new()),
             plans: Arc::new(Mutex::new(HashMap::new())),
             tool_calls: Arc::new(Mutex::new(HashMap::new())),
             thoughts: Arc::new(Mutex::new(HashMap::new())),
@@ -490,6 +505,33 @@ impl ProxyClient {
         receiver
     }
 
+    pub(crate) fn subscribe_shared_buffers(&self) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.shared_buffer_subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(sender);
+        receiver
+    }
+
+    pub(crate) fn shared_buffer_change_for_path(
+        &self,
+        workspace: &str,
+        path: &str,
+    ) -> Option<(String, String, SharedBufferSnapshot)> {
+        self.shared_buffer_changes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find(|((_, relative), _)| {
+                std::path::Path::new(workspace).join(relative)
+                    == std::path::Path::new(path)
+            })
+            .map(|((session_id, _), (previous, snapshot))| {
+                (session_id.clone(), previous.clone(), snapshot.clone())
+            })
+    }
+
     pub fn all_diagnostics(&self) -> Vec<(PathBuf, Vec<Diagnostic>)> {
         self.diagnostics
             .lock()
@@ -512,26 +554,45 @@ impl ProxyClient {
         servers
     }
 
+    pub fn language_extension_issues(&self) -> Vec<LanguageExtensionIssue> {
+        self.language_extension_issues
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     pub fn restart_language_servers(&self) {
         self.proxy_rpc.notification(
             ahead_rpc::proxy::ProxyNotification::RestartLanguageServers {},
         );
     }
 
-    pub fn install_language_extension(
+    pub fn install_extension(
         &self,
         url: String,
         extension_id: String,
+        version: String,
+        expected_sha256: Option<String>,
+        restart_language_servers: bool,
         callback: impl FnOnce(Result<(), String>) + Send + 'static,
     ) {
+        let proxy_rpc = self.proxy_rpc.clone();
         self.proxy_rpc.install_language_extension(
             url,
             extension_id,
+            version,
+            expected_sha256,
             move |result| {
+                if restart_language_servers
+                    && matches!(&result, Ok(ahead_rpc::proxy::ProxyResponse::Success {})) {
+                    proxy_rpc.notification(
+                        ahead_rpc::proxy::ProxyNotification::RestartLanguageServers {},
+                    );
+                }
                 callback(match result {
                     Ok(ahead_rpc::proxy::ProxyResponse::Success {}) => Ok(()),
                     Ok(response) => Err(format!(
-                        "unexpected language-extension response: {response:?}"
+                        "unexpected extension install response: {response:?}"
                     )),
                     Err(error) => Err(error.message),
                 });
@@ -589,6 +650,40 @@ impl ProxyClient {
                 }
             },
         );
+        receiver
+    }
+
+    pub fn git_commit(
+        &self,
+        message: String,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        self.git_operation(ProxyRequest::GitCommit {
+            message,
+            diffs: Vec::new(),
+        })
+    }
+
+    pub fn git_stage_all(&self) -> async_channel::Receiver<Result<(), String>> {
+        self.git_operation(ProxyRequest::GitStageAll {})
+    }
+
+    fn git_operation(
+        &self,
+        request: ProxyRequest,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.proxy_rpc.request_async(request, move |response| {
+            let result = match response {
+                Ok(ProxyResponse::Success {}) => Ok(()),
+                Ok(other) => Err(format!("Unexpected Git response: {other:?}")),
+                Err(error) => Err(error.message),
+            };
+            if let Err(async_channel::TrySendError::Full(_)) =
+                sender.try_send(result)
+            {
+                eprintln!("Duplicate Git operation response");
+            }
+        });
         receiver
     }
 
@@ -865,6 +960,20 @@ impl ProxyClient {
                     );
                 self.notify_editor_metadata();
             }
+            CoreNotification::LanguageExtensionIssues { issues } => {
+                *self
+                    .language_extension_issues
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = issues;
+                self.notify_editor_metadata();
+            }
+            CoreNotification::LanguageServerStatusesCleared => {
+                self.lsp_servers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
+                self.notify_editor_metadata();
+            }
             CoreNotification::DapStopped {
                 dap_id,
                 stopped,
@@ -970,6 +1079,30 @@ impl ProxyClient {
     /// state. Deltas append to the in-flight message; turn state finalizes it.
     pub fn route_ahead(&self, notification: AheadNotification) {
         match notification {
+            AheadNotification::SharedBufferChanged {
+                session_id,
+                snapshot,
+                previous_content,
+            } => {
+                self.shared_buffer_changes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(
+                        (session_id.clone(), snapshot.path.clone()),
+                        (previous_content, snapshot.clone()),
+                    );
+                self.shared_buffers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert((session_id, snapshot.path.clone()), snapshot);
+                self.shared_buffer_subscribers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|sender| match sender.try_send(()) {
+                        Ok(()) | Err(async_channel::TrySendError::Full(())) => true,
+                        Err(async_channel::TrySendError::Closed(())) => false,
+                    });
+            }
             AheadNotification::ConversationMessageAdded { message } => {
                 let mut conversations =
                     self.conversations.lock().unwrap_or_else(|e| e.into_inner());
@@ -1091,6 +1224,10 @@ impl ProxyClient {
                     .is_some_and(|active| active == &turn_id)
                 {
                     streaming.remove(&session_id);
+                    self.thoughts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&session_id);
                     self.pending_user_inputs
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1169,10 +1306,31 @@ impl ProxyClient {
                 {
                     return;
                 }
-                self.pending_user_inputs
+                let mut pending = self
+                    .pending_user_inputs
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(session_id, request);
+                    .unwrap_or_else(|e| e.into_inner());
+                let requests = pending.entry(session_id).or_default();
+                if let Some(existing) = requests
+                    .iter_mut()
+                    .find(|existing| existing.request_id == request.request_id)
+                {
+                    *existing = request;
+                } else {
+                    requests.push(request);
+                }
+            }
+            AheadNotification::AgentUserInputCancelled {
+                session_id,
+                turn_id,
+                request_id,
+            } => {
+                if self.active_turn_id(&session_id).as_deref()
+                    != Some(turn_id.as_str())
+                {
+                    return;
+                }
+                self.forget_answered_user_input(&session_id, &request_id);
             }
             AheadNotification::AgentBufferSnapshotsRequested {
                 session_id,
@@ -1297,7 +1455,28 @@ impl ProxyClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(session_id)
-            .cloned()
+            .and_then(|requests| requests.first().cloned())
+    }
+
+    pub fn pending_user_input_count(&self, session_id: &str) -> usize {
+        self.pending_user_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map_or(0, Vec::len)
+    }
+
+    fn forget_answered_user_input(&self, session_id: &str, request_id: &str) {
+        let mut pending = self
+            .pending_user_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(requests) = pending.get_mut(session_id) {
+            requests.retain(|request| request.request_id != request_id);
+            if requests.is_empty() {
+                pending.remove(session_id);
+            }
+        }
     }
 
     pub fn take_buffer_snapshot_requests(&self) -> Vec<BufferSnapshotRequest> {
@@ -1648,14 +1827,14 @@ impl ProxyClient {
         workspace: &Path,
         server_id: &str,
         expected_fingerprint: &str,
-        enabled: bool,
+        action: McpServerApprovalAction,
     ) -> Result<(), RpcError> {
         self.proxy_rpc
             .ahead_request_blocking(AheadRequest::SetMcpServerApproval {
                 workspace: workspace.to_path_buf(),
                 server_id: server_id.to_string(),
                 expected_fingerprint: expected_fingerprint.to_string(),
-                enabled,
+                action,
             })
             .map(|_| ())
     }
@@ -1824,6 +2003,17 @@ impl ProxyClient {
             messages: conversation.messages.clone(),
             has_older: conversation.has_older,
         })
+    }
+
+    pub fn cached_conversation(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<ConversationMessage>> {
+        self.conversations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .map(|conversation| conversation.messages.clone())
     }
 
     pub fn agent_runtime_state(
@@ -2170,6 +2360,307 @@ impl ProxyClient {
             })
     }
 
+    pub fn post_human_message(
+        &self,
+        session_id: String,
+        content: String,
+    ) -> Result<ConversationMessage, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::PostHumanMessage {
+                session_id,
+                content,
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid human message response: {error}"),
+        })
+    }
+
+    pub fn share_session(
+        &self,
+        session_id: String,
+        bind_address: String,
+    ) -> Result<SharedSessionOffer, RpcError> {
+        let value =
+            self.proxy_rpc
+                .ahead_request_blocking(AheadRequest::ShareSession {
+                    session_id,
+                    bind_address,
+                })?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid share offer: {error}"),
+        })
+    }
+
+    pub fn workspace_participants(
+        &self,
+    ) -> Result<Vec<SessionParticipantRecord>, RpcError> {
+        let value = self
+            .proxy_rpc
+            .ahead_request_blocking(AheadRequest::GetWorkspaceParticipants)?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid team members: {error}"),
+        })
+    }
+
+    pub fn stop_sharing_session(&self, session_id: String) -> Result<(), RpcError> {
+        self.proxy_rpc
+            .ahead_request_blocking(AheadRequest::StopSharingSession {
+                session_id: session_id.clone(),
+            })?;
+        self.shared_buffer_changes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _), _| id != &session_id);
+        self.shared_buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _), _| id != &session_id);
+        Ok(())
+    }
+
+    pub fn publish_shared_terminal(
+        &self,
+        session_id: String,
+        content: String,
+    ) -> Result<(), RpcError> {
+        self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::PublishSharedTerminal {
+                session_id,
+                content,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn publish_shared_presence(
+        &self,
+        session_id: String,
+        path: Option<String>,
+        line: Option<u32>,
+    ) -> Result<(), RpcError> {
+        self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::PublishSharedPresence {
+                session_id,
+                path,
+                line,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn shared_presence(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<ahead_rpc::ahead::SharedPresence>, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::GetSharedPresence { session_id },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid shared presence: {error}"),
+        })
+    }
+
+    pub fn read_shared_buffer(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> Result<SharedBufferSnapshot, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::ReadSharedBuffer {
+                session_id: session_id.clone(),
+                path,
+            },
+        )?;
+        let snapshot: SharedBufferSnapshot =
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Invalid shared buffer: {error}"),
+            })?;
+        self.shared_buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((session_id, snapshot.path.clone()), snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn replace_shared_buffer(
+        &self,
+        session_id: String,
+        path: String,
+        expected_revision: u64,
+        content: String,
+    ) -> Result<SharedBufferEditResult, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::ReplaceSharedBuffer {
+                session_id: session_id.clone(),
+                path,
+                expected_revision,
+                content,
+            },
+        )?;
+        let edit: SharedBufferEditResult =
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Invalid shared edit: {error}"),
+            })?;
+        self.shared_buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                (session_id, edit.snapshot.path.clone()),
+                edit.snapshot.clone(),
+            );
+        Ok(edit)
+    }
+
+    pub fn cached_shared_buffer(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Option<SharedBufferSnapshot> {
+        self.shared_buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(session_id.to_string(), path.to_string()))
+            .cloned()
+    }
+
+    pub fn add_session_participant(
+        &self,
+        session_id: String,
+        user_handle: String,
+        role: ahead_rpc::ahead::SessionRole,
+    ) -> Result<SessionView, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::AddSessionParticipant {
+                session_id,
+                user_handle,
+                role,
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid updated session: {error}"),
+        })
+    }
+
+    pub fn revoke_session_participant(
+        &self,
+        session_id: String,
+        user_handle: String,
+    ) -> Result<SessionView, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::RevokeSessionParticipant {
+                session_id,
+                user_handle,
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid updated session: {error}"),
+        })
+    }
+
+    pub fn join_shared_session(
+        &self,
+        offer: SharedSessionOffer,
+    ) -> Result<SharedSessionUpdate, RpcError> {
+        let value = self
+            .proxy_rpc
+            .ahead_request_blocking(AheadRequest::JoinSharedSession { offer })?;
+        let update: SharedSessionUpdate =
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Invalid joined session: {error}"),
+            })?;
+        for message in &update.messages {
+            self.route_ahead(AheadNotification::ConversationMessageAdded {
+                message: message.clone(),
+            });
+        }
+        Ok(update)
+    }
+
+    pub fn poll_shared_session(
+        &self,
+        session_id: String,
+        after_sequence: i64,
+        active_path: Option<String>,
+        active_line: Option<u32>,
+    ) -> Result<SharedSessionUpdate, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::PollSharedSession {
+                session_id,
+                after_sequence,
+                active_path,
+                active_line,
+            },
+        )?;
+        let update: SharedSessionUpdate =
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Invalid shared session update: {error}"),
+            })?;
+        for message in &update.messages {
+            self.route_ahead(AheadNotification::ConversationMessageAdded {
+                message: message.clone(),
+            });
+        }
+        Ok(update)
+    }
+
+    pub fn post_shared_human_message(
+        &self,
+        session_id: String,
+        content: String,
+    ) -> Result<ConversationMessage, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::PostSharedHumanMessage {
+                session_id,
+                content,
+            },
+        )?;
+        let message: ConversationMessage =
+            serde_json::from_value(value).map_err(|error| RpcError {
+                code: 0,
+                message: format!("Invalid shared message: {error}"),
+            })?;
+        self.route_ahead(AheadNotification::ConversationMessageAdded {
+            message: message.clone(),
+        });
+        Ok(message)
+    }
+
+    pub fn start_shared_agent_turn(
+        &self,
+        session_id: String,
+        content: String,
+    ) -> Result<String, RpcError> {
+        let value = self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::StartSharedAgentTurn {
+                session_id,
+                content,
+            },
+        )?;
+        serde_json::from_value(value).map_err(|error| RpcError {
+            code: 0,
+            message: format!("Invalid shared turn response: {error}"),
+        })
+    }
+
+    pub fn leave_shared_session(&self, session_id: String) -> Result<(), RpcError> {
+        self.proxy_rpc
+            .ahead_request_blocking(AheadRequest::LeaveSharedSession {
+                session_id,
+            })?;
+        Ok(())
+    }
+
     /// Cancels the in-flight harness turn for a session.
     pub fn agent_cancel(&self, session_id: &str) -> Result<bool, RpcError> {
         self.proxy_rpc
@@ -2243,12 +2734,7 @@ impl ProxyClient {
                 request_id: request_id.to_string(),
                 answers,
             })
-            .map(|_| {
-                self.pending_user_inputs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(session_id);
-            })
+            .map(|_| self.forget_answered_user_input(session_id, request_id))
     }
 
     pub fn is_streaming(&self, session_id: &str) -> bool {
@@ -2391,6 +2877,29 @@ impl ProxyClient {
         self.proxy_rpc.editor_snapshot(path, content);
     }
 
+    pub(crate) fn acknowledge_shared_buffer(
+        &self,
+        session_id: &str,
+        snapshot: &SharedBufferSnapshot,
+    ) {
+        let key = (session_id.to_string(), snapshot.path.clone());
+        let mut changes = self
+            .shared_buffer_changes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if changes
+            .get(&key)
+            .is_some_and(|(_, latest)| latest == snapshot)
+        {
+            changes.remove(&key);
+        }
+        drop(changes);
+        self.sync_editor_snapshot(
+            self.workspace.join(&snapshot.path),
+            snapshot.content.clone(),
+        );
+    }
+
     pub(crate) fn editor_recovery_available(&self) -> bool {
         self.recovery_available.load(Ordering::Acquire)
     }
@@ -2451,6 +2960,16 @@ impl ProxyClient {
         snapshot: ahead_rpc::file::EditorRecoverySnapshot,
     ) -> async_channel::Receiver<Result<bool, String>> {
         self.editor_recovery_request(AheadRequest::WriteEditorRecovery { snapshot })
+    }
+
+    pub(crate) fn discard_shared_remote_recovery(
+        &self,
+        path: PathBuf,
+    ) -> Result<(), RpcError> {
+        self.proxy_rpc.ahead_request_blocking(
+            AheadRequest::DiscardSharedRemoteRecovery { path },
+        )?;
+        Ok(())
     }
 
     pub fn close_editor_buffer(&self, path: PathBuf) {
@@ -2901,7 +3420,7 @@ mod tests {
     use ahead_rpc::ahead::{
         AgentConfigChoice, AgentConfigOption, AgentConfigOptionValue,
         AgentPlanEntry, AgentToolCall, AgentUsage, AgentUserInputRequest,
-        AheadNotification, HarnessKind,
+        AheadNotification, ConversationMessage, HarnessKind,
     };
     use ahead_rpc::core::CoreNotification;
     use ahead_rpc::dap_types::{DapSessionState, DebugTerminalRequest};
@@ -2914,6 +3433,54 @@ mod tests {
 
     fn test_client() -> std::sync::Arc<ProxyClient> {
         ProxyClient::new_for_test(PathBuf::new())
+    }
+
+    #[test]
+    fn git_commit_requests_staged_changes_and_reports_result() {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+
+        let client = test_client();
+        let response = client.git_commit("Commit staged changes".into());
+        let ProxyRpc::Request(id, ProxyRequest::GitCommit { message, diffs }) =
+            client.proxy_rpc.rx().try_recv().expect("commit request")
+        else {
+            panic!("expected Git commit request");
+        };
+        assert_eq!(message, "Commit staged changes");
+        assert!(diffs.is_empty());
+        client
+            .proxy_rpc
+            .handle_response(id, Ok(ProxyResponse::Success {}));
+        assert_eq!(response.try_recv().expect("commit result"), Ok(()));
+
+        let response = client.git_commit("Retry".into());
+        let ProxyRpc::Request(id, _) =
+            client.proxy_rpc.rx().try_recv().expect("retry request")
+        else {
+            panic!("expected retry request");
+        };
+        client.proxy_rpc.handle_response(
+            id,
+            Err(ahead_rpc::RpcError {
+                code: 0,
+                message: "Stage changes before committing".into(),
+            }),
+        );
+        assert_eq!(
+            response.try_recv().expect("commit error"),
+            Err("Stage changes before committing".to_string())
+        );
+
+        let response = client.git_stage_all();
+        let ProxyRpc::Request(id, ProxyRequest::GitStageAll {}) =
+            client.proxy_rpc.rx().try_recv().expect("stage request")
+        else {
+            panic!("expected Git stage request");
+        };
+        client
+            .proxy_rpc
+            .handle_response(id, Ok(ProxyResponse::Success {}));
+        assert_eq!(response.try_recv().expect("stage result"), Ok(()));
     }
 
     #[test]
@@ -3098,6 +3665,7 @@ mod tests {
             .with_proxy(
                 client.clone(),
                 directory.path().to_str().expect("workspace"),
+                window,
                 cx,
             )
         });
@@ -3563,11 +4131,79 @@ mod tests {
     }
 
     #[test]
+    fn successful_extension_install_reloads_without_a_settings_view() {
+        use ahead_rpc::proxy::{ProxyNotification, ProxyRequest, ProxyRpc};
+
+        let client = test_client();
+        client.install_extension(
+            "https://example.invalid/html.tar.gz".into(),
+            "html".into(),
+            "0.3.2".into(),
+            Some("a".repeat(64)),
+            true,
+            |_| {},
+        );
+        let ProxyRpc::Request(
+            request_id,
+            ProxyRequest::InstallLanguageExtension {
+                extension_id,
+                version,
+                expected_sha256,
+                ..
+            },
+        ) = client.proxy_rpc.rx().try_recv().expect("install request")
+        else {
+            panic!("expected language-extension install request");
+        };
+        assert_eq!(extension_id, "html");
+        assert_eq!(version, "0.3.2");
+        assert_eq!(expected_sha256.as_deref(), Some("a".repeat(64).as_str()));
+        client
+            .proxy_rpc
+            .handle_response(request_id, Ok(ProxyResponse::Success {}));
+        assert!(matches!(
+            client.proxy_rpc.rx().try_recv(),
+            Ok(ProxyRpc::Notification(
+                ProxyNotification::RestartLanguageServers {}
+            ))
+        ));
+        client.install_extension(
+            "https://example.invalid/icons.tar.gz".into(),
+            "material-icon-theme".into(),
+            "1.3.1".into(),
+            None,
+            false,
+            |_| {},
+        );
+        let ProxyRpc::Request(
+            request_id,
+            ProxyRequest::InstallLanguageExtension { .. },
+        ) = client
+            .proxy_rpc
+            .rx()
+            .try_recv()
+            .expect("icon theme install request")
+        else {
+            panic!("expected icon theme install request");
+        };
+        client
+            .proxy_rpc
+            .handle_response(request_id, Ok(ProxyResponse::Success {}));
+        assert!(
+            client.proxy_rpc.rx().try_recv().is_err(),
+            "icon theme install must not restart language servers"
+        );
+    }
+
+    #[test]
     fn language_server_status_wakes_views_and_restart_uses_the_shared_proxy() {
         let client = test_client();
         let updates = client.subscribe_diagnostics();
+        let mut installing =
+            ahead_rpc::core::ServerStatusParams::starting("vtsls".into());
+        installing.message = Some("Installing from npm".into());
         for params in [
-            ahead_rpc::core::ServerStatusParams::starting("vtsls".into()),
+            installing,
             ahead_rpc::core::ServerStatusParams::ready("vtsls".into()),
             ahead_rpc::core::ServerStatusParams::failed(
                 "vtsls".into(),
@@ -3575,10 +4211,12 @@ mod tests {
             ),
         ] {
             let ready = params.is_ok();
+            let error = !ready && params.is_quiescent();
             client.route_core(CoreNotification::ServerStatus { params });
             assert_eq!(updates.try_recv(), Ok(()));
             assert_eq!(client.lsp_servers().len(), 1);
             assert_eq!(client.lsp_servers()[0].is_ready(), ready);
+            assert_eq!(client.lsp_servers()[0].is_error(), error);
         }
         client.restart_language_servers();
         assert!(matches!(
@@ -3591,6 +4229,9 @@ mod tests {
                 ahead_rpc::proxy::ProxyNotification::RestartLanguageServers {}
             )
         ));
+        client.route_core(CoreNotification::LanguageServerStatusesCleared);
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert!(client.lsp_servers().is_empty());
         client.route_core(CoreNotification::ServerStatus {
             params: ahead_rpc::core::ServerStatusParams::ready("vtsls".into()),
         });
@@ -3606,6 +4247,30 @@ mod tests {
                 .expect("failure reason")
                 .contains("proxy connection closed")
         );
+    }
+
+    #[test]
+    fn extension_discovery_issues_do_not_appear_as_language_servers() {
+        use ahead_rpc::core::LanguageExtensionIssue;
+
+        let client = test_client();
+        let updates = client.subscribe_diagnostics();
+        let issue = LanguageExtensionIssue {
+            name: "broken-extension".into(),
+            message: "bad manifest".into(),
+        };
+        client.route_core(CoreNotification::LanguageExtensionIssues {
+            issues: vec![issue.clone()],
+        });
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert_eq!(client.language_extension_issues(), vec![issue]);
+        assert!(client.lsp_servers().is_empty());
+
+        client.route_core(CoreNotification::LanguageExtensionIssues {
+            issues: Vec::new(),
+        });
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert!(client.language_extension_issues().is_empty());
     }
 
     #[test]
@@ -3639,6 +4304,33 @@ mod tests {
             state: "completed".into(),
         });
         assert!(!client.is_streaming("session"));
+    }
+
+    #[test]
+    fn terminal_turn_clears_transient_thinking() {
+        let client = test_client();
+        for state in ["completed", "cancelled", "failed"] {
+            let turn_id = format!("turn-{state}");
+            client.route_ahead(AheadNotification::AgentTurnState {
+                session_id: "session".into(),
+                turn_id: turn_id.clone(),
+                message_id: "message".into(),
+                state: "streaming".into(),
+            });
+            client.route_ahead(AheadNotification::AgentThoughtDelta {
+                session_id: "session".into(),
+                turn_id: turn_id.clone(),
+                delta: "Stream retry: Reconnecting".into(),
+            });
+            assert!(!client.thought("session").is_empty());
+            client.route_ahead(AheadNotification::AgentTurnState {
+                session_id: "session".into(),
+                turn_id,
+                message_id: "message".into(),
+                state: state.into(),
+            });
+            assert!(client.thought("session").is_empty(), "{state}");
+        }
     }
 
     #[test]
@@ -3734,6 +4426,46 @@ mod tests {
     }
 
     #[test]
+    fn failed_turn_keeps_its_harness_error_visible_in_chat() {
+        let client = test_client();
+        client.route_ahead(AheadNotification::ConversationMessageAdded {
+            message: ConversationMessage {
+                id: "agent-message".into(),
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                sequence: 1,
+                role: "agent".into(),
+                actor_id: "ahead".into(),
+                content: String::new(),
+                status: "streaming".into(),
+                created_at: "2026-10-01T00:00:00Z".into(),
+            },
+        });
+        client.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "agent-message".into(),
+            state: "streaming".into(),
+        });
+        client.route_ahead(AheadNotification::AgentMessageDelta {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            delta: "\n\nHarness error: AHEAD agent history was not saved".into(),
+        });
+        client.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "agent-message".into(),
+            state: "failed".into(),
+        });
+
+        let conversations = client.conversations.lock().expect("chat state");
+        let message = &conversations["session"].messages[0];
+        assert_eq!(message.status, "failed");
+        assert!(message.content.contains("history was not saved"));
+    }
+
+    #[test]
     fn ignores_stale_turn_events_after_a_new_turn_starts() {
         let client = test_client();
         client
@@ -3805,6 +4537,87 @@ mod tests {
         assert!(client.plan("session").is_empty());
         assert!(client.tool_calls("session").is_empty());
         assert!(client.usage("session").is_none());
+        assert!(client.pending_user_input("session").is_none());
+    }
+
+    #[test]
+    fn parallel_agent_input_requests_remain_queued_until_each_is_answered() {
+        use ahead_rpc::{
+            ahead::AheadRequest,
+            proxy::{ProxyRequest, ProxyResponse, ProxyRpc},
+        };
+
+        let client = test_client();
+        client
+            .streaming_turns
+            .lock()
+            .unwrap()
+            .insert("session".into(), "turn".into());
+        for request_id in ["first", "second", "second"] {
+            client.route_ahead(AheadNotification::AgentUserInputRequested {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                request: AgentUserInputRequest {
+                    request_id: request_id.into(),
+                    is_blocking: true,
+                    questions: Vec::new(),
+                },
+            });
+        }
+        assert_eq!(client.pending_user_input_count("session"), 2);
+        assert_eq!(
+            client.pending_user_input("session").unwrap().request_id,
+            "first"
+        );
+        let outgoing = client.proxy_rpc.rx().clone();
+        let responding_client = client.clone();
+        let responder = std::thread::spawn(move || {
+            let ProxyRpc::Request(
+                id,
+                ProxyRequest::AheadRequest {
+                    request:
+                        AheadRequest::AgentUserInputAnswer {
+                            session_id,
+                            request_id,
+                            ..
+                        },
+                },
+            ) = outgoing
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("answer request")
+            else {
+                panic!("expected an agent input answer request");
+            };
+            assert_eq!(session_id, "session");
+            assert_eq!(request_id, "first");
+            responding_client.proxy_rpc.handle_response(
+                id,
+                Ok(ProxyResponse::AheadResponse {
+                    response: serde_json::json!({}),
+                }),
+            );
+        });
+        client
+            .answer_agent_user_input("session", "first", HashMap::new())
+            .expect("answer first request");
+        responder.join().expect("answer responder");
+        assert_eq!(client.pending_user_input_count("session"), 1);
+        assert_eq!(
+            client.pending_user_input("session").unwrap().request_id,
+            "second"
+        );
+        client.route_ahead(AheadNotification::AgentUserInputCancelled {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            request_id: "second".into(),
+        });
+        assert!(client.pending_user_input("session").is_none());
+        client.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "agent-message".into(),
+            state: "completed".into(),
+        });
         assert!(client.pending_user_input("session").is_none());
     }
 }

@@ -41,29 +41,17 @@ use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::WorkspaceRootsToml;
 use codex_config::types::AppToolApproval;
 use codex_config::types::BundledSkillsConfig;
-use codex_config::types::FeedbackConfigToml;
-use codex_config::types::HistoryPersistence;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerOAuthConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::MemoriesConfig;
 use codex_config::types::MemoriesToml;
-use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
-use codex_config::types::NotificationCondition;
-use codex_config::types::NotificationMethod;
-use codex_config::types::Notifications;
 use codex_config::types::OtelConfigToml;
 use codex_config::types::OtelExporterKind;
-use codex_config::types::ResumeCwdMode;
 use codex_config::types::SandboxWorkspaceWrite;
-use codex_config::types::SessionPickerViewMode;
 use codex_config::types::SkillsConfig;
-use codex_config::types::Tui;
-use codex_config::types::TuiKeymap;
-use codex_config::types::TuiNotificationSettings;
-use codex_config::types::TuiPetAnchor;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_config::types::WindowsToml;
 use codex_exec_server::LOCAL_FS;
@@ -97,7 +85,6 @@ use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_path_uri::LegacyAppPathString;
-use serde::Deserialize;
 use tempfile::tempdir;
 
 use super::*;
@@ -238,35 +225,6 @@ async fn load_config_applies_optional_mcp_startup_grace() -> std::io::Result<()>
 
 #[tokio::test]
 async fn test_toml_parsing() {
-    let history_with_persistence = r#"
-[history]
-persistence = "save-all"
-"#;
-    let history_with_persistence_cfg = toml::from_str::<ConfigToml>(history_with_persistence)
-        .expect("TOML deserialization should succeed");
-    assert_eq!(
-        Some(History {
-            persistence: HistoryPersistence::SaveAll,
-            max_bytes: None,
-        }),
-        history_with_persistence_cfg.history
-    );
-
-    let history_no_persistence = r#"
-[history]
-persistence = "none"
-"#;
-
-    let history_no_persistence_cfg = toml::from_str::<ConfigToml>(history_no_persistence)
-        .expect("TOML deserialization should succeed");
-    assert_eq!(
-        Some(History {
-            persistence: HistoryPersistence::None,
-            max_bytes: None,
-        }),
-        history_no_persistence_cfg.history
-    );
-
     let memories = r#"
 [memories]
 disable_on_external_context = true
@@ -1179,185 +1137,6 @@ supports_websockets = true
     assert!(err.to_string().contains(
         "model_providers.amazon-bedrock only supports changing `base_url`, `auth`, `http_headers`, `aws.profile`, `aws.region`, and `aws.auth_refresh`; other non-default provider fields are not supported"
     ));
-}
-
-#[test]
-fn config_toml_deserializes_model_availability_nux() {
-    let toml = r#"
-[tui.model_availability_nux]
-"gpt-foo" = 2
-"gpt-bar" = 4
-"#;
-    let cfg: ConfigToml =
-        toml::from_str(toml).expect("TOML deserialization should succeed for TUI NUX");
-
-    assert_eq!(
-        cfg.tui.expect("tui config should deserialize"),
-        Tui {
-            notification_settings: TuiNotificationSettings::default(),
-            animations: true,
-            show_tooltips: true,
-            vim_mode_default: false,
-            raw_output_mode: false,
-            alternate_screen: AltScreenMode::default(),
-            status_line: None,
-            status_line_use_colors: true,
-            terminal_title: None,
-            theme: None,
-            pet: None,
-            pet_anchor: TuiPetAnchor::Composer,
-            session_picker_view: None,
-            resume_cwd: None,
-            keymap: TuiKeymap::default(),
-            model_availability_nux: ModelAvailabilityNuxConfig {
-                shown_count: HashMap::from([
-                    ("gpt-bar".to_string(), 4),
-                    ("gpt-foo".to_string(), 2),
-                ]),
-            },
-            terminal_resize_reflow_max_rows: None,
-        }
-    );
-}
-
-#[test]
-fn config_toml_status_line_use_colors_defaults_to_enabled() {
-    let toml = r#"
-[tui]
-"#;
-    let cfg: ConfigToml =
-        toml::from_str(toml).expect("TOML deserialization should succeed for TUI config");
-
-    assert!(
-        cfg.tui
-            .expect("tui config should deserialize")
-            .status_line_use_colors
-    );
-}
-
-#[test]
-fn config_toml_deserializes_status_line_use_colors_disabled() {
-    let toml = r#"
-[tui]
-status_line_use_colors = false
-"#;
-    let cfg: ConfigToml =
-        toml::from_str(toml).expect("TOML deserialization should succeed for TUI config");
-
-    assert!(
-        !cfg.tui
-            .expect("tui config should deserialize")
-            .status_line_use_colors
-    );
-}
-
-#[test]
-fn config_toml_deserializes_terminal_resize_reflow_config() {
-    let toml = r#"
-[tui]
-terminal_resize_reflow_max_rows = 9000
-"#;
-    let cfg: ConfigToml =
-        toml::from_str(toml).expect("TOML deserialization should succeed for resize reflow config");
-
-    assert_eq!(
-        cfg.tui
-            .expect("tui config should deserialize")
-            .terminal_resize_reflow_max_rows,
-        Some(9000)
-    );
-}
-
-#[tokio::test]
-async fn runtime_config_defaults_model_availability_nux() {
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load config");
-
-    assert_eq!(
-        cfg.model_availability_nux,
-        ModelAvailabilityNuxConfig::default()
-    );
-}
-
-#[test]
-fn test_tui_vim_mode_default_defaults_to_false() {
-    let toml = r#"
-        [tui]
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize empty [tui] table");
-    assert!(
-        !parsed
-            .tui
-            .expect("config should include tui section")
-            .vim_mode_default
-    );
-}
-
-#[test]
-fn test_tui_vim_mode_default_true() {
-    let toml = r#"
-        [tui]
-        vim_mode_default = true
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize vim_mode_default=true");
-    assert!(
-        parsed
-            .tui
-            .expect("config should include tui section")
-            .vim_mode_default
-    );
-}
-
-#[test]
-fn test_tui_raw_output_mode_defaults_to_false() {
-    let toml = r#"
-        [tui]
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize empty [tui] table");
-    assert!(
-        !parsed
-            .tui
-            .expect("config should include tui section")
-            .raw_output_mode
-    );
-}
-
-#[test]
-fn test_tui_raw_output_mode_true() {
-    let toml = r#"
-        [tui]
-        raw_output_mode = true
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize raw_output_mode=true");
-    assert!(
-        parsed
-            .tui
-            .expect("config should include tui section")
-            .raw_output_mode
-    );
-}
-
-#[tokio::test]
-async fn runtime_config_uses_tui_raw_output_mode() {
-    let toml = r#"
-        [tui]
-        raw_output_mode = true
-    "#;
-    let cfg_toml: ConfigToml = toml::from_str(toml).expect("deserialize raw_output_mode=true");
-    let cfg = Config::load_from_base_config_with_overrides(
-        cfg_toml,
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load config");
-
-    assert!(cfg.tui_raw_output_mode);
 }
 
 #[test]
@@ -4128,270 +3907,6 @@ async fn permissions_profiles_allow_network_enablement() -> std::io::Result<()> 
     Ok(())
 }
 
-#[test]
-fn tui_theme_deserializes_from_toml() {
-    let cfg = r#"
-[tui]
-theme = "dracula"
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.theme.as_deref()),
-        Some("dracula"),
-    );
-}
-
-#[test]
-fn tui_theme_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(parsed.tui.as_ref().and_then(|t| t.theme.as_deref()), None);
-}
-
-#[test]
-fn tui_session_picker_view_deserializes_from_toml() {
-    let cfg = r#"
-[tui]
-session_picker_view = "dense"
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.session_picker_view),
-        Some(SessionPickerViewMode::Dense),
-    );
-}
-
-#[test]
-fn tui_resume_cwd_deserializes_from_toml() {
-    let cfg = r#"
-[tui]
-resume_cwd = "current"
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.resume_cwd),
-        Some(ResumeCwdMode::Current),
-    );
-}
-
-#[test]
-fn tui_pet_deserializes_from_toml() {
-    let cfg = r#"
-[tui]
-pet = "chefito"
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.pet.as_deref()),
-        Some("chefito"),
-    );
-}
-
-#[test]
-fn tui_session_picker_view_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.session_picker_view),
-        None,
-    );
-}
-
-#[test]
-fn tui_pet_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(parsed.tui.as_ref().and_then(|t| t.pet.as_deref()), None);
-}
-
-#[test]
-fn tui_pet_anchor_deserializes_from_toml() {
-    let cfg = r#"
-[tui]
-pet_anchor = "screen-bottom"
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().map(|t| t.pet_anchor),
-        Some(TuiPetAnchor::ScreenBottom),
-    );
-}
-
-#[test]
-fn tui_pet_anchor_defaults_to_composer() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().map(|t| t.pet_anchor),
-        Some(TuiPetAnchor::Composer),
-    );
-}
-
-#[test]
-fn tui_pet_anchor_rejects_unknown_value() {
-    let cfg = r#"
-[tui]
-pet_anchor = "bottom"
-"#;
-    let err = toml::from_str::<ConfigToml>(cfg).expect_err("reject unknown pet anchor");
-    let err = err.to_string();
-    assert!(
-        err.contains("unknown variant `bottom`")
-            && err.contains("composer")
-            && err.contains("screen-bottom"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn tui_config_missing_notifications_field_defaults_to_enabled() {
-    let cfg = r#"
-[tui]
-"#;
-
-    let parsed =
-        toml::from_str::<ConfigToml>(cfg).expect("TUI config without notifications should succeed");
-    let tui = parsed.tui.expect("config should include tui section");
-
-    assert_eq!(
-        tui,
-        Tui {
-            notification_settings: TuiNotificationSettings::default(),
-            animations: true,
-            show_tooltips: true,
-            vim_mode_default: false,
-            raw_output_mode: false,
-            alternate_screen: AltScreenMode::Auto,
-            status_line: None,
-            status_line_use_colors: true,
-            terminal_title: None,
-            theme: None,
-            pet: None,
-            pet_anchor: TuiPetAnchor::Composer,
-            session_picker_view: None,
-            resume_cwd: None,
-            keymap: TuiKeymap::default(),
-            model_availability_nux: ModelAvailabilityNuxConfig::default(),
-            terminal_resize_reflow_max_rows: None,
-        }
-    );
-}
-
-#[tokio::test]
-async fn runtime_config_resolves_terminal_resize_reflow_defaults_and_overrides() {
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load default config");
-
-    assert_eq!(
-        cfg.terminal_resize_reflow,
-        TerminalResizeReflowConfig::default()
-    );
-    assert_eq!(
-        cfg.terminal_resize_reflow.max_rows,
-        TerminalResizeReflowMaxRows::Auto
-    );
-
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            tui: Some(Tui {
-                terminal_resize_reflow_max_rows: Some(9000),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load overridden config");
-
-    assert_eq!(
-        cfg.terminal_resize_reflow.max_rows,
-        TerminalResizeReflowMaxRows::Limit(9000)
-    );
-
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            tui: Some(Tui {
-                terminal_resize_reflow_max_rows: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load config with disabled resize reflow limits");
-
-    assert_eq!(
-        cfg.terminal_resize_reflow.max_rows,
-        TerminalResizeReflowMaxRows::Disabled
-    );
-}
-
-#[tokio::test]
-async fn forced_chatgpt_workspace_id_empty_values_disable_runtime_restriction()
--> std::io::Result<()> {
-    let cases: Vec<(&str, &str, Option<Vec<&str>>)> = vec![
-        ("unset", "", None),
-        ("empty string", r#"forced_chatgpt_workspace_id = """#, None),
-        (
-            "whitespace string",
-            r#"forced_chatgpt_workspace_id = "   ""#,
-            None,
-        ),
-        ("empty list", r#"forced_chatgpt_workspace_id = []"#, None),
-        (
-            "blank list entries",
-            r#"forced_chatgpt_workspace_id = ["", "  "]"#,
-            None,
-        ),
-        (
-            "mixed list entries",
-            r#"forced_chatgpt_workspace_id = ["", " 123e4567-e89b-42d3-a456-426614174000 ", "123e4567-e89b-42d3-a456-426614174001"]"#,
-            Some(vec![
-                "123e4567-e89b-42d3-a456-426614174000",
-                "123e4567-e89b-42d3-a456-426614174001",
-            ]),
-        ),
-    ];
-
-    for (name, toml, expected) in cases {
-        let cfg_toml: ConfigToml = toml::from_str(toml)
-            .unwrap_or_else(|err| panic!("{name} should parse forced_chatgpt_workspace_id: {err}"));
-        let config = Config::load_from_base_config_with_overrides(
-            cfg_toml,
-            ConfigOverrides::default(),
-            tempdir().expect("tempdir").abs(),
-        )
-        .await?;
-
-        let expected = expected.map(|values| {
-            values
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(config.forced_chatgpt_workspace_id, expected, "{name}");
-    }
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn legacy_remote_thread_store_endpoint_is_rejected() {
     let cfg: ConfigToml =
@@ -4428,82 +3943,6 @@ async fn removed_thread_store_selector_is_rejected() {
 
     assert!(err.to_string().contains("experimental_thread_store"));
     assert!(err.to_string().contains("managed sessions use Turso"));
-}
-
-#[test]
-fn profile_tui_rejects_unsupported_settings() {
-    let err = toml::from_str::<ConfigToml>(
-        r#"profile = "work"
-
-[profiles.work.tui]
-theme = "dark"
-"#,
-    )
-    .expect_err("profile TUI config should only accept supported fields");
-
-    assert!(err.to_string().contains("unknown field"));
-    assert!(err.to_string().contains("theme"));
-}
-
-#[tokio::test]
-async fn runtime_config_resolves_session_picker_view_default_and_override() {
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load default config");
-
-    assert_eq!(cfg.tui_session_picker_view, SessionPickerViewMode::Dense);
-
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            tui: Some(Tui {
-                session_picker_view: Some(SessionPickerViewMode::Comfortable),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load root override config");
-
-    assert_eq!(
-        cfg.tui_session_picker_view,
-        SessionPickerViewMode::Comfortable
-    );
-}
-
-#[tokio::test]
-async fn runtime_config_resolves_resume_cwd_default_and_override() {
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml::default(),
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load default config");
-
-    assert_eq!(cfg.tui_resume_cwd, None);
-
-    let cfg = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            tui: Some(Tui {
-                resume_cwd: Some(ResumeCwdMode::Session),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides::default(),
-        tempdir().expect("tempdir").abs(),
-    )
-    .await
-    .expect("load root override config");
-
-    assert_eq!(cfg.tui_resume_cwd, Some(ResumeCwdMode::Session));
 }
 
 #[tokio::test]
@@ -5351,99 +4790,6 @@ async fn workspace_write_includes_configured_writable_root_once_without_memories
 }
 
 #[tokio::test]
-async fn config_defaults_to_file_cli_auth_store_mode() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml::default();
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.cli_auth_credentials_store_mode,
-        AuthCredentialsStoreMode::File,
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn config_resolves_explicit_keyring_auth_store_mode() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Keyring),
-        ..Default::default()
-    };
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.cli_auth_credentials_store_mode,
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Keyring,
-            env!("CARGO_PKG_VERSION"),
-        ),
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn config_applies_managed_auth_store_and_chatgpt_base_url() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let managed_store = AuthCredentialsStoreMode::Keyring;
-    let managed_url = "https://managed.example/backend-api/";
-    let requirements = codex_config::ConfigRequirements {
-        cli_auth_credentials_store: Some(Sourced::new(managed_store, RequirementSource::Unknown)),
-        chatgpt_base_url: Some(Sourced::new(
-            managed_url.to_string(),
-            RequirementSource::Unknown,
-        )),
-        ..Default::default()
-    };
-    let config_layer_stack = ConfigLayerStack::new(
-        Vec::new(),
-        requirements,
-        codex_config::ConfigRequirementsToml::default(),
-    )?;
-
-    let config = Config::load_config_with_layer_stack(
-        LOCAL_FS.as_ref(),
-        ConfigToml {
-            cli_auth_credentials_store: Some(AuthCredentialsStoreMode::File),
-            chatgpt_base_url: Some("https://user.example/backend-api/".to_string()),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(codex_home.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-        config_layer_stack,
-    )
-    .await?;
-
-    assert_eq!(config.cli_auth_credentials_store_mode, managed_store);
-    assert_eq!(config.chatgpt_base_url, managed_url);
-    assert!(config.startup_warnings.iter().any(|warning| {
-        warning.contains("Configured value for `cli_auth_credentials_store` is overridden")
-    }));
-    assert!(config.startup_warnings.iter().any(|warning| {
-        warning.contains("Configured value for `chatgpt_base_url` is overridden")
-    }));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn config_resolves_default_oauth_store_mode() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml::default();
@@ -5467,35 +4813,6 @@ async fn config_resolves_default_oauth_store_mode() -> std::io::Result<()> {
 }
 
 #[test]
-fn local_dev_builds_force_file_cli_auth_store_modes() {
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Keyring,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Auto,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::File,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(
-            AuthCredentialsStoreMode::Ephemeral,
-            LOCAL_DEV_BUILD_VERSION,
-        ),
-        AuthCredentialsStoreMode::Ephemeral,
-    );
-    assert_eq!(
-        resolve_cli_auth_credentials_store_mode(AuthCredentialsStoreMode::Keyring, "1.2.3"),
-        AuthCredentialsStoreMode::Keyring,
-    );
-}
-
-#[test]
 fn local_dev_builds_force_file_mcp_oauth_store_modes() {
     assert_eq!(
         resolve_mcp_oauth_credentials_store_mode(
@@ -5515,26 +4832,6 @@ fn local_dev_builds_force_file_mcp_oauth_store_modes() {
         resolve_mcp_oauth_credentials_store_mode(OAuthCredentialsStoreMode::Keyring, "1.2.3"),
         OAuthCredentialsStoreMode::Keyring,
     );
-}
-
-#[tokio::test]
-async fn feedback_enabled_defaults_to_true() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        feedback: Some(FeedbackConfigToml::default()),
-        ..Default::default()
-    };
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(config.feedback_enabled, true);
-
-    Ok(())
 }
 
 #[test]
@@ -5777,28 +5074,6 @@ model = "gpt-project-local"
         "expected warning for ignored project-local profile keys: {:?}",
         config.startup_warnings
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut entries = BTreeMap::new();
-    entries.insert("apply_patch_freeform".to_string(), false);
-    let cfg = ConfigToml {
-        features: Some(FeaturesToml::from(entries)),
-        ..Default::default()
-    };
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert!(!config.features.enabled(Feature::ApplyPatchFreeform));
 
     Ok(())
 }
@@ -8650,7 +7925,7 @@ async fn legacy_profile_selection_is_rejected() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<()> {
+async fn metrics_exporter_defaults_to_none_when_missing() -> std::io::Result<()> {
     let fixture = create_test_fixture()?;
 
     let config = Config::load_from_base_config_with_overrides(
@@ -8663,7 +7938,7 @@ async fn metrics_exporter_defaults_to_statsig_when_missing() -> std::io::Result<
     )
     .await?;
 
-    assert_eq!(config.otel.metrics_exporter, OtelExporterKind::Statsig);
+    assert_eq!(config.otel.metrics_exporter, OtelExporterKind::None);
     Ok(())
 }
 
@@ -8984,15 +8259,9 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
     let fixture = create_test_fixture()?;
 
     let requirements_toml = codex_config::ConfigRequirementsToml {
-        allowed_login_methods: None,
-        allowed_chatgpt_workspaces: None,
-        cli_auth_credentials_store: None,
-        chatgpt_base_url: None,
         log_dir: None,
         model_catalog_json: None,
-        check_for_update_on_startup: None,
         allow_login_shell: None,
-        feedback: None,
         allowed_approval_policies: None,
         allowed_sandbox_modes: None,
         allowed_permission_profiles: None,
@@ -9010,7 +8279,6 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         feature_requirements: None,
         hooks: None,
         mcp_servers: None,
-        apps: None,
         rules: None,
         enforce_residency: None,
         network: None,
@@ -9521,8 +8789,6 @@ model = "gpt-5.4"
 [orchestrator.skills]
 enabled = false
 
-[orchestrator.mcp]
-enabled = false
 "#,
     )
     .expect("TOML deserialization should succeed for orchestrator settings");
@@ -9534,13 +8800,7 @@ enabled = false
     )
     .await?;
 
-    assert_eq!(
-        (
-            config.orchestrator_skills_enabled,
-            config.orchestrator_mcp_enabled
-        ),
-        (false, false)
-    );
+    assert!(!config.orchestrator_skills_enabled);
     Ok(())
 }
 
@@ -10576,12 +9836,7 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
         let model_override_guidance = hint
             .strip_prefix(hint_without_model_overrides.as_str())
             .expect("model-override guidance should extend the base usage hint");
-        for required_fragment in [
-            "Full-history forks",
-            "`fork_turns`",
-            "`model`",
-            "`reasoning_effort`",
-        ] {
+        for required_fragment in ["`model`", "`reasoning_effort`"] {
             assert!(
                 model_override_guidance.contains(required_fragment),
                 "model-override guidance should contain {required_fragment}"
@@ -11365,97 +10620,6 @@ speaker = "Desk Speakers"
     Ok(())
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
-struct TuiTomlTest {
-    #[serde(default, flatten)]
-    notifications: TuiNotificationSettings,
-}
-
-#[derive(Deserialize, Debug, PartialEq)]
-struct RootTomlTest {
-    tui: TuiTomlTest,
-}
-
-#[test]
-fn test_tui_notifications_true() {
-    let toml = r#"
-            [tui]
-            notifications = true
-        "#;
-    let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=true");
-    assert_matches!(
-        parsed.tui.notifications.notifications,
-        Notifications::Enabled(true)
-    );
-}
-
-#[test]
-fn test_tui_notifications_custom_array() {
-    let toml = r#"
-            [tui]
-            notifications = ["foo"]
-        "#;
-    let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=[\"foo\"]");
-    assert_matches!(
-        parsed.tui.notifications.notifications,
-        Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
-    );
-}
-
-#[test]
-fn test_tui_notification_method() {
-    let toml = r#"
-            [tui]
-            notification_method = "bel"
-        "#;
-    let parsed: RootTomlTest =
-        toml::from_str(toml).expect("deserialize notification_method=\"bel\"");
-    assert_eq!(parsed.tui.notifications.method, NotificationMethod::Bel);
-}
-
-#[test]
-fn test_tui_notification_condition_defaults_to_unfocused() {
-    let toml = r#"
-            [tui]
-        "#;
-    let parsed: RootTomlTest =
-        toml::from_str(toml).expect("deserialize default notification condition");
-    assert_eq!(
-        parsed.tui.notifications.condition,
-        NotificationCondition::Unfocused
-    );
-}
-
-#[test]
-fn test_tui_notification_condition_always() {
-    let toml = r#"
-            [tui]
-            notification_condition = "always"
-        "#;
-    let parsed: RootTomlTest =
-        toml::from_str(toml).expect("deserialize notification_condition=\"always\"");
-    assert_eq!(
-        parsed.tui.notifications.condition,
-        NotificationCondition::Always
-    );
-}
-
-#[test]
-fn test_tui_notification_condition_rejects_unknown_value() {
-    let toml = r#"
-            [tui]
-            notification_condition = "background"
-        "#;
-    let err = toml::from_str::<RootTomlTest>(toml).expect_err("reject unknown condition");
-    let err = err.to_string();
-    assert!(
-        err.contains("unknown variant `background`")
-            && err.contains("unfocused")
-            && err.contains("always"),
-        "unexpected error: {err}"
-    );
-}
-
 async fn load_with_enterprise_requirement(
     codex_home: &TempDir,
     requirements: impl Into<String>,
@@ -11484,11 +10648,7 @@ async fn exact_requirements_apply_to_runtime_config() -> std::io::Result<()> {
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"
-check_for_update_on_startup = true
 allow_login_shell = true
-
-[feedback]
-enabled = true
 
 [windows]
 sandbox_private_desktop = true
@@ -11500,11 +10660,7 @@ sandbox_private_desktop = true
         r#"
 log_dir = {:?}
 model_catalog_json = {:?}
-check_for_update_on_startup = false
 allow_login_shell = false
-
-[feedback]
-enabled = false
 
 [windows]
 sandbox_private_desktop = false
@@ -11516,13 +10672,8 @@ sandbox_private_desktop = false
 
     assert_eq!(config.log_dir, required_log_dir);
     assert_eq!(config.model_catalog, Some(catalog));
-    assert!(!config.check_for_update_on_startup);
     assert!(!config.permissions.allow_login_shell);
-    assert!(!config.feedback_enabled);
     assert!(!config.permissions.windows_sandbox_private_desktop);
-    assert!(config.startup_warnings.iter().any(|warning| {
-        warning.contains("Configured value for `check_for_update_on_startup` is overridden")
-    }));
     Ok(())
 }
 

@@ -5,17 +5,13 @@ use crate::cache::ModelsCache;
 use crate::cache::ModelsCacheEntry;
 use crate::cache::ModelsCacheError;
 use crate::cache::ModelsCacheFuture;
-use ahead_model_auth::AuthCredentialsStoreMode;
-use ahead_model_auth::AuthKeyringBackendKind;
 use ahead_model_auth::AuthManager;
 use ahead_model_auth::CodexAuth;
 use ahead_model_auth::ExternalAuth;
 use ahead_model_auth::ExternalAuthRefreshContext;
-use ahead_model_auth::TokenData;
 use chrono::Utc;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
-use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelsResponse;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -555,46 +551,6 @@ async fn injected_cache_ttl_refresh_preserves_cached_payload() {
         Some(crate::client_version_to_whole())
     );
     assert_eq!(stored_entries[0].models, cached_models);
-}
-
-async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
-    let auth_dot_json = ahead_model_auth::AuthDotJson {
-        auth_mode: Some(AuthMode::ChatgptAuthTokens),
-        openai_api_key: None,
-        tokens: Some(TokenData {
-            id_token: ahead_model_auth::token_data::parse_chatgpt_jwt_claims(
-                "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.\
-eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8iLCJjaGF0Z3B0X3VzZXJfaWQiOiJ1c2VyLWlkIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1pZCJ9fQ.\
-c2ln",
-            )
-            .expect("fake id token should parse"),
-            access_token: "Access Token".to_string(),
-            refresh_token: "test".to_string(),
-            account_id: Some("account_id".to_string()),
-        }),
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-        bedrock_access_keys: None,
-    };
-    std::fs::create_dir_all(codex_home).expect("codex home should be created");
-    std::fs::write(
-        codex_home.join("auth.json"),
-        serde_json::to_string(&auth_dot_json).expect("auth should serialize"),
-    )
-    .expect("auth.json should be written");
-
-    CodexAuth::from_auth_storage(
-        codex_home,
-        AuthCredentialsStoreMode::File,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        &ahead_model_auth::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .expect("auth should load")
-    .expect("auth should be present")
 }
 
 #[tokio::test]
@@ -1382,42 +1338,6 @@ async fn refresh_available_models_uses_cached_chatgpt_when_external_api_key_is_u
         endpoint.fetch_count(),
         1,
         "endpoint should fetch models when unresolved external API key falls back to ChatGPT auth"
-    );
-}
-
-#[tokio::test]
-async fn refresh_available_models_fetches_with_chatgpt_auth_tokens() {
-    let dynamic_slug = "dynamic-model-only-for-test-chatgpt-auth-tokens";
-    let codex_home = tempdir().expect("temp dir");
-    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
-        dynamic_slug,
-        "ChatGPT Auth Tokens",
-        /*priority*/ 1,
-    )]]);
-    let auth = chatgpt_auth_tokens_for_tests(codex_home.path()).await;
-    let manager = openai_manager_for_tests_with_auth(
-        codex_home.path().to_path_buf(),
-        endpoint.clone(),
-        Some(AuthManager::from_auth_for_testing(auth)),
-    );
-
-    manager
-        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
-        .await
-        .expect("refresh should fetch with ChatGPT auth tokens");
-
-    assert!(
-        manager
-            .get_remote_models()
-            .await
-            .iter()
-            .any(|candidate| candidate.slug == dynamic_slug),
-        "remote refresh should include models fetched with ChatGPT auth tokens"
-    );
-    assert_eq!(
-        endpoint.fetch_count(),
-        1,
-        "endpoint should fetch models with ChatGPT auth tokens"
     );
 }
 

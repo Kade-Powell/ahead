@@ -217,7 +217,7 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 }
 
 #[tokio::test]
-async fn unsupported_guardian_delegates_are_rejected_and_review_delegates_inherit_extensions() {
+async fn review_delegates_inherit_extensions() {
     let (mut parent_session, parent_ctx, _rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let thread_starts = Arc::new(AtomicUsize::new(0));
@@ -228,28 +228,6 @@ async fn unsupported_guardian_delegates_are_rejected_and_review_delegates_inheri
         .expect("parent session should be uniquely owned")
         .services
         .extensions = Arc::new(extensions.build());
-
-    let mut config = parent_ctx.config.as_ref().clone();
-    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    let result = run_codex_thread_interactive(
-        config,
-        Arc::clone(&parent_session.services.auth_manager),
-        Arc::clone(&parent_session.services.models_manager),
-        Arc::clone(&parent_session),
-        Arc::clone(&parent_ctx),
-        parent_ctx.environments.clone(),
-        CancellationToken::new(),
-        SubAgentSource::Other("guardian".to_string()),
-        /*initial_history*/ None,
-        crate::session::GitEnrichmentPolicy::Fresh,
-        codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(error) if error.to_string().contains("not supported by AHEAD")
-    ));
-    assert_eq!(thread_starts.load(Ordering::SeqCst), 0);
 
     let mut config = parent_ctx.config.as_ref().clone();
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);

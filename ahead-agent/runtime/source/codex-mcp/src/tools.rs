@@ -38,18 +38,10 @@ pub struct ToolInfo {
     #[serde(rename = "tool_namespace", alias = "callable_namespace")]
     pub callable_namespace: String,
     /// Model-visible namespace description.
-    // Keep the old serialized field name readable for cached ToolInfo values.
-    #[serde(default, alias = "connector_description")]
+    #[serde(default)]
     pub namespace_description: Option<String>,
     /// Raw MCP tool definition; `tool.name` is sent back to the MCP server.
     pub tool: Tool,
-    /// Optional provided-file fields accepted by each declared `openai/fileParams`
-    /// argument. This is derived from the raw MCP schema before file arguments are
-    /// masked as local paths for the model.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub openai_file_input_optional_fields: HashMap<String, Vec<String>>,
-    pub connector_id: Option<String>,
-    pub connector_name: Option<String>,
 }
 
 impl ToolInfo {
@@ -119,12 +111,7 @@ where
     let mut seen_raw_names = HashSet::new();
     let mut candidates = Vec::new();
     for tool in tools {
-        let raw_namespace_identity = format!(
-            "{}\0{}\0{}",
-            tool.server_name,
-            tool.callable_namespace,
-            tool.connector_id.as_deref().unwrap_or_default()
-        );
+        let raw_namespace_identity = format!("{}\0{}", tool.server_name, tool.callable_namespace);
         let raw_tool_identity = format!(
             "{}\0{}\0{}",
             raw_namespace_identity, tool.callable_name, tool.tool.name

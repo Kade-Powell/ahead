@@ -11,9 +11,7 @@ use super::McpServerMetadata;
 use crate::binding::McpBinding;
 use crate::binding::PreparedMcpCall;
 use crate::binding_clients::McpBindingClients;
-use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::rmcp_client::ManagedClient;
-use crate::rmcp_client::prepare_codex_apps_tools_for_model;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
 use crate::tools::normalize_tools_for_model_with_prefix;
@@ -227,11 +225,6 @@ impl McpConnectionSet {
                 (Some(Arc::new(client)), server_tools)
             };
             let server_tools = filter_tools(server_tools, &view.tool_filter);
-            let server_tools = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                prepare_codex_apps_tools_for_model(server_tools)
-            } else {
-                server_tools
-            };
             let server_tools = server_tools
                 .into_iter()
                 .map(|mut tool| {

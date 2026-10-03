@@ -16,8 +16,6 @@ fn make_mcp_tool(
     tool_name: &str,
     callable_namespace: &str,
     callable_name: &str,
-    connector_id: Option<&str>,
-    connector_name: Option<&str>,
 ) -> ToolInfo {
     ToolInfo {
         server_name: server_name.to_string(),
@@ -31,9 +29,6 @@ fn make_mcp_tool(
             format!("Test tool: {tool_name}"),
             Arc::new(JsonObject::default()),
         ),
-        openai_file_input_optional_fields: Default::default(),
-        connector_id: connector_id.map(str::to_string),
-        connector_name: connector_name.map(str::to_string),
     }
 }
 
@@ -41,14 +36,7 @@ fn numbered_mcp_tools(count: usize) -> Vec<ToolInfo> {
     (0..count)
         .map(|index| {
             let tool_name = format!("tool_{index}");
-            make_mcp_tool(
-                "rmcp",
-                &tool_name,
-                "mcp__rmcp",
-                &tool_name,
-                /*connector_id*/ None,
-                /*connector_name*/ None,
-            )
+            make_mcp_tool("rmcp", &tool_name, "mcp__rmcp", &tool_name)
         })
         .collect()
 }
@@ -100,23 +88,9 @@ fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
 
 #[test]
 fn excludes_tools_hidden_from_model_exposure() {
-    let visible_tool = make_mcp_tool(
-        "rmcp",
-        "visible_tool",
-        "mcp__rmcp",
-        "visible_tool",
-        /*connector_id*/ None,
-        /*connector_name*/ None,
-    );
+    let visible_tool = make_mcp_tool("rmcp", "visible_tool", "mcp__rmcp", "visible_tool");
     let hidden_tool = with_visibility(
-        make_mcp_tool(
-            "rmcp",
-            "hidden_tool",
-            "mcp__rmcp",
-            "hidden_tool",
-            /*connector_id*/ None,
-            /*connector_name*/ None,
-        ),
+        make_mcp_tool("rmcp", "hidden_tool", "mcp__rmcp", "hidden_tool"),
         &["app"],
     );
     let empty_visibility_tool = with_visibility(
@@ -125,31 +99,15 @@ fn excludes_tools_hidden_from_model_exposure() {
             "empty_visibility_tool",
             "mcp__rmcp",
             "empty_visibility_tool",
-            /*connector_id*/ None,
-            /*connector_name*/ None,
         ),
         &[],
     );
     let visible_calendar_tool = with_visibility(
-        make_mcp_tool(
-            "calendar",
-            "calendar_read",
-            "mcp__calendar",
-            "read",
-            Some("calendar"),
-            Some("Calendar"),
-        ),
+        make_mcp_tool("calendar", "calendar_read", "mcp__calendar", "read"),
         &["app", "model"],
     );
     let hidden_calendar_tool = with_visibility(
-        make_mcp_tool(
-            "calendar",
-            "calendar_open",
-            "mcp__calendar",
-            "open",
-            Some("calendar"),
-            Some("Calendar"),
-        ),
+        make_mcp_tool("calendar", "calendar_open", "mcp__calendar", "open"),
         &["app"],
     );
     let mcp_tools = vec![

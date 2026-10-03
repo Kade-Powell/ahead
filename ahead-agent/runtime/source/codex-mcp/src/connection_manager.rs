@@ -30,15 +30,12 @@ use std::time::Duration;
 use crate::binding::call_tool_result_from_rmcp;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
-use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
-use crate::pagination::MAX_CODEX_APPS_TOOL_CATALOG_ITEMS;
 use crate::pagination::MAX_MCP_CATALOG_ITEMS;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::DEFAULT_TOOL_TIMEOUT;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
-use crate::rmcp_client::prepare_codex_apps_tools_for_model;
 use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeInput;
 use crate::runtime::McpStartupPolicy;
@@ -162,11 +159,7 @@ impl McpServerView {
     async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
         let tools = self.connection.client.listed_tools().await?;
         let tools = filter_tools(tools, &self.tool_filter);
-        Some(if self.connection.client.is_codex_apps_mcp_server {
-            prepare_codex_apps_tools_for_model(tools)
-        } else {
-            tools
-        })
+        Some(tools)
     }
 }
 
@@ -248,17 +241,7 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            let registration = config.mcp_server_catalog.server(&server_name);
-            let is_host_owned_codex_apps = registration.is_some_and(|server| {
-                server
-                    .source()
-                    .is_host_owned_apps(&server_name, server.config())
-            });
-            let catalog_item_limit = if is_host_owned_codex_apps {
-                MAX_CODEX_APPS_TOOL_CATALOG_ITEMS
-            } else {
-                MAX_MCP_CATALOG_ITEMS
-            };
+            let catalog_item_limit = MAX_MCP_CATALOG_ITEMS;
             let metadata = McpServerMetadata::from(&server);
             let configured_config = server.config().clone();
             let configured_tool_filter = ToolFilter::from_config(&configured_config);
@@ -410,9 +393,8 @@ impl McpConnectionSet {
                 }
             }
             let cancel_token = startup_cancellation_token.child_token();
-            let tool_catalog_cache_context = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                None
-            } else if let Ok(environment) = resolved_environment.as_ref() {
+            let tool_catalog_cache_context = if let Ok(environment) = resolved_environment.as_ref()
+            {
                 tool_catalog_cache.context(
                     &server_name,
                     &configured_config,
@@ -655,10 +637,6 @@ impl McpConnectionSet {
 
     pub fn has_servers(&self) -> bool {
         !self.servers.is_empty()
-    }
-
-    pub(crate) fn contains_server(&self, server_name: &str) -> bool {
-        self.servers.contains_key(server_name)
     }
 
     pub(crate) async fn authentication_failed_servers(&self) -> Vec<String> {

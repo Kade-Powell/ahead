@@ -1,27 +1,26 @@
 use anyhow::Context;
-use codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR;
-use codex_utils_cargo_bin::find_resource;
-use pretty_assertions::assert_eq;
+use codex_apply_patch::ApplyPatchFileUpdateMode;
+use codex_apply_patch::ApplyPatchOptions;
+use codex_apply_patch::apply_patch_with_options;
+use codex_exec_server::LOCAL_FS;
+use codex_utils_path_uri::PathUri;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::tempdir;
 
-#[test]
-fn test_apply_patch_scenarios() -> anyhow::Result<()> {
-    let scenarios_marker = find_resource!("tests/fixtures/scenarios/.gitattributes")?;
-    let scenarios_dir = scenarios_marker
-        .parent()
-        .context("scenario marker should have a parent directory")?;
-    for scenario in fs::read_dir(scenarios_dir)
+#[tokio::test]
+async fn test_apply_patch_scenarios() -> anyhow::Result<()> {
+    let scenarios_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scenarios");
+    for scenario in fs::read_dir(&scenarios_dir)
         .with_context(|| format!("failed to read {}", scenarios_dir.display()))?
     {
         let scenario = scenario?;
         let path = scenario.path();
         if path.is_dir() {
             run_apply_patch_scenario(&path)
+                .await
                 .with_context(|| format!("failed to run scenario {}", path.display()))?;
         }
     }
@@ -30,7 +29,7 @@ fn test_apply_patch_scenarios() -> anyhow::Result<()> {
 
 /// Reads a scenario directory, copies the input files to a temporary directory, runs apply-patch,
 /// and asserts that the final state matches the expected state exactly.
-fn run_apply_patch_scenario(dir: &Path) -> anyhow::Result<()> {
+async fn run_apply_patch_scenario(dir: &Path) -> anyhow::Result<()> {
     let tmp = tempdir()?;
 
     // Copy the input files to the temporary directory
@@ -44,15 +43,23 @@ fn run_apply_patch_scenario(dir: &Path) -> anyhow::Result<()> {
     let patch = fs::read_to_string(&patch_path)
         .with_context(|| format!("failed to read {}", patch_path.display()))?;
 
-    // Run apply_patch in the temporary directory. We intentionally do not assert
-    // on the exit status here; the scenarios are specified purely in terms of
-    // final filesystem state, which we compare below.
-    Command::new(codex_utils_cargo_bin::cargo_bin("apply_patch")?)
-        .arg(patch)
-        .env(CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR, "1")
-        .current_dir(tmp.path())
-        .output()
-        .with_context(|| format!("failed to run scenario {}", dir.display()))?;
+    // Invalid patches may return an error after partial effects; the fixture's
+    // expected filesystem snapshot is the contract for both outcomes.
+    drop(
+        apply_patch_with_options(
+            &patch,
+            ApplyPatchOptions {
+                update_file_mode: ApplyPatchFileUpdateMode::PreserveLineEndings,
+                ..Default::default()
+            },
+            &PathUri::from_host_native_path(tmp.path())?,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await,
+    );
 
     // Assert that the final state matches the expected state exactly
     let expected_dir = dir.join("expected");
@@ -96,9 +103,6 @@ fn snapshot_dir_recursive(
         };
         let rel = stripped.to_path_buf();
 
-        // Under Buck2, files in `__srcs` are often materialized as symlinks.
-        // Use `metadata()` (follows symlinks) so our fixture snapshots work
-        // under both Cargo and Buck2.
         let metadata = fs::metadata(&path)?;
         if metadata.is_dir() {
             entries.insert(rel.clone(), Entry::Dir);
@@ -117,7 +121,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         let path = entry.path();
         let dest_path = dst.join(entry.file_name());
 
-        // See note in `snapshot_dir_recursive` about Buck2 symlink trees.
         let metadata = fs::metadata(&path)?;
         if metadata.is_dir() {
             fs::create_dir_all(&dest_path)?;

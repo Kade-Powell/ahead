@@ -328,10 +328,7 @@ impl TurnMetadataState {
         match &self.thread_source {
             // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
             Some(ThreadSource::Subagent | ThreadSource::MemoryConsolidation) => false,
-            Some(ThreadSource::Feature(feature)) => {
-                !matches!(feature.as_str(), "system" | "title" | "guardian_review")
-                    && !feature.starts_with("ambient")
-            }
+            Some(ThreadSource::Feature(_)) => false,
             Some(ThreadSource::User) | None => true,
         }
     }

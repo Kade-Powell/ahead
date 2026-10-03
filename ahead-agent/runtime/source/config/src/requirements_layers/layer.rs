@@ -8,14 +8,6 @@ use toml::Value as TomlValue;
 
 use super::stack::RequirementsCompositionError;
 
-// Authentication requirements that cloud-managed layers cannot set.
-const LOCAL_ONLY_AUTH_REQUIREMENTS: &[&str] = &[
-    "allowed_login_methods",
-    "allowed_chatgpt_workspaces",
-    "cli_auth_credentials_store",
-    "chatgpt_base_url",
-];
-
 #[derive(Clone, Debug)]
 pub struct RequirementsLayerEntry {
     pub(super) source: RequirementSource,
@@ -86,19 +78,9 @@ impl ComposableRequirementsLayer {
             let _guard = base_dir
                 .as_ref()
                 .map(|base_dir| AbsolutePathBufGuard::new(base_dir.as_path()));
-            let mut regular_toml = parse_layer_toml(&toml, &source)?;
+            let regular_toml = parse_layer_toml(&toml, &source)?;
 
-            // These fields can only be set locally; ignore them before validating cloud policy.
-            if matches!(source, RequirementSource::EnterpriseManaged { .. }) {
-                for field in LOCAL_ONLY_AUTH_REQUIREMENTS {
-                    remove_top_level_field(&mut regular_toml, field);
-                }
-            }
-
-            let requirements = parse_layer_requirements(
-                &RequirementsLayerToml::Value(regular_toml.clone()),
-                &source,
-            )?;
+            let requirements = parse_layer_requirements(&regular_toml, &source)?;
             (regular_toml, requirements)
         };
 
@@ -150,27 +132,34 @@ fn parse_layer_toml(
 }
 
 fn parse_layer_requirements(
-    toml: &RequirementsLayerToml,
+    value: &TomlValue,
     source: &RequirementSource,
 ) -> Result<ConfigRequirementsToml, RequirementsCompositionError> {
-    match toml {
-        RequirementsLayerToml::String(contents) => {
-            toml::from_str(contents).map_err(|err: toml::de::Error| {
-                RequirementsCompositionError::Parse {
-                    layer_source: source.clone(),
-                    message: err.to_string(),
-                }
-            })
-        }
-        RequirementsLayerToml::Value(value) => {
-            value.clone().try_into().map_err(|err: toml::de::Error| {
-                RequirementsCompositionError::Parse {
-                    layer_source: source.clone(),
-                    message: err.to_string(),
-                }
-            })
+    for key in [
+        "allowed_login_methods",
+        "allowed_chatgpt_workspaces",
+        "cli_auth_credentials_store",
+        "chatgpt_base_url",
+        "feedback",
+        "check_for_update_on_startup",
+    ] {
+        if value
+            .as_table()
+            .is_some_and(|table| table.contains_key(key))
+        {
+            return Err(RequirementsCompositionError::Parse {
+                layer_source: source.clone(),
+                message: format!("unsupported runtime requirement `{key}`"),
+            });
         }
     }
+    value
+        .clone()
+        .try_into()
+        .map_err(|err: toml::de::Error| RequirementsCompositionError::Parse {
+            layer_source: source.clone(),
+            message: err.to_string(),
+        })
 }
 
 fn materialize_resolved_path_requirements(

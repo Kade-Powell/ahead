@@ -1,4 +1,4 @@
-This crate contains the versioned Zed extension WIT contract copied from
+This crate contains the since_v0.6.0 and since_v0.8.0 Zed extension WIT contracts copied from
 zed-industries/zed at commit 418f89714891f9d8105a3e92e60b9a7a5084d232.
 
 The Zed extension API is licensed under Apache-2.0. The copied WIT files are

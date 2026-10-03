@@ -243,8 +243,8 @@ dependencies = [
  "codex-utils-absolute-path",
  "dirs 6.0.0",
  "fs4",
- "libc",
  "parking_lot",
+ "regex",
  "reqwest 0.12.28",
  "rustix 1.1.5",
  "serde",
@@ -254,6 +254,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -286,6 +287,8 @@ name = "ahead-app"
 version = "0.0.1"
 dependencies = [
  "ahead-core",
+ "ahead-extension-host",
+ "ahead-proxy",
  "ahead-rpc",
  "ahead-viewmodel",
  "ahead-voice",
@@ -305,6 +308,8 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "reqwest 0.12.28",
+ "ropey",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -321,6 +326,7 @@ dependencies = [
  "chardetng",
  "directories",
  "encoding_rs",
+ "fs4",
  "git2",
  "globset",
  "grep-matcher",
@@ -331,25 +337,32 @@ dependencies = [
  "rustix 1.1.5",
  "strum_macros",
  "tempfile",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "ahead-extension-host"
 version = "0.0.1"
 dependencies = [
+ "ahead-core",
  "anyhow",
  "flate2",
+ "fs4",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
  "url",
  "wasmtime",
  "wasmtime-wasi",
+ "which 8.0.6",
  "zip",
 ]
 
@@ -385,6 +398,7 @@ dependencies = [
  "ahead-rpc",
  "alacritty_terminal",
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "codex-exec-server",
@@ -403,9 +417,11 @@ dependencies = [
  "notify 5.2.0",
  "parking_lot",
  "polling",
+ "rcgen",
  "reqwest 0.12.28",
  "ropey",
  "rustix 1.1.5",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -417,6 +433,7 @@ dependencies = [
  "trash",
  "url",
  "uuid",
+ "which 8.0.6",
  "zstd",
 ]
 
@@ -724,6 +741,45 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "zbus 5.19.0",
+]
+
+[[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom 7.1.1",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.20",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1214,6 +1270,9 @@ name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bit_field"
@@ -1921,7 +1980,6 @@ dependencies = [
  "tracing",
  "tungstenite 0.27.0",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -1932,7 +1990,9 @@ dependencies = [
  "codex-exec-server",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "pretty_assertions",
  "similar",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tree-sitter",
@@ -2450,8 +2510,10 @@ dependencies = [
  "codex-protocol",
  "codex-utils-output-truncation",
  "codex-utils-template",
+ "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2677,12 +2739,15 @@ dependencies = [
  "base64 0.22.1",
  "codex-git-utils",
  "codex-keyring-store",
+ "keyring",
+ "pretty_assertions",
  "rand 0.9.1",
  "regex",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tracing",
 ]
 
@@ -2832,6 +2897,8 @@ version = "0.0.1"
 dependencies = [
  "codex-utils-absolute-path",
  "dirs 6.0.0",
+ "pretty_assertions",
+ "tempfile",
 ]
 
 [[package]]
@@ -3752,6 +3819,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom 7.1.1",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -5984,8 +6065,11 @@ dependencies = [
  "smol",
  "tracing",
  "tree-sitter",
+ "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-python",
  "tree-sitter-rust",
+ "tree-sitter-typescript",
  "uuid",
  "windows 0.58.0",
 ]
@@ -9405,6 +9489,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9794,6 +9887,16 @@ name = "peeking_take_while"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
+ "serde_core",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -10731,6 +10834,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.14.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser",
+ "yasna",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11194,6 +11311,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom 7.1.1",
 ]
 
 [[package]]
@@ -13559,6 +13685,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-javascript"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf40bf599e0416c16c125c3cec10ee5ddc7d1bb8b0c60fa5c4de249ad34dc1b1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-json"
 version = "0.24.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13585,10 +13721,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -15741,6 +15897,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom 7.1.1",
+ "oid-registry",
+ "ring",
+ "rusticata-macros",
+ "thiserror 2.0.20",
+ "time",
+]
+
+[[package]]
 name = "xcb"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15847,6 +16021,16 @@ name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "bit-vec 0.9.1",
+ "time",
+]
 
 [[package]]
 name = "yazi"

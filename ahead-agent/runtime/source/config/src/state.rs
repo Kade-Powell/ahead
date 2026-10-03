@@ -50,8 +50,8 @@ pub struct LoaderOverrides {
     pub system_config_path: Option<PathBuf>,
     pub system_requirements_path: Option<PathBuf>,
     pub ignore_managed_requirements: bool,
-    /// Remote app servers own their authentication policy independently.
-    pub ignore_login_requirements: bool,
+    /// Skip legacy managed file and macOS managed-preferences config layers.
+    pub ignore_managed_config_layers: bool,
     /// Skip an explicitly supplied system config file.
     pub ignore_system_config: bool,
     pub ignore_user_config: bool,
@@ -78,7 +78,7 @@ impl LoaderOverrides {
             system_config_path: Some(base.join("config.toml")),
             system_requirements_path: Some(base.join("requirements.toml")),
             ignore_managed_requirements: false,
-            ignore_login_requirements: false,
+            ignore_managed_config_layers: false,
             ignore_system_config: false,
             ignore_user_config: false,
             ignore_project_config: false,

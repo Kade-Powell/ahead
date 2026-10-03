@@ -591,7 +591,6 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                     super::super::TerminalSandboxSource::Native,
                     crate::sandboxing::SandboxPermissions::UseDefault,
                     /*additional_permissions*/ None,
-                    /*internal_permissions*/ None,
                 ),
                 network_approval: None,
                 session: std::sync::Weak::new(),

@@ -13,9 +13,9 @@ test-support = []
 [dependencies]
 anyhow            = { workspace = true }
 chrono            = { workspace = true }
-libc              = { workspace = true }
 parking_lot       = { workspace = true }
 reqwest           = { workspace = true }
+regex             = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 toml              = { workspace = true }
@@ -23,6 +23,7 @@ tempfile          = { workspace = true }
 sha2              = "0.10"
 fs4               = "0.13.1"
 tracing           = { workspace = true }
+url               = { workspace = true }
 uuid              = { version = "1.5", features = ["v4", "serde"] }
 tokio             = { version = "1.38", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 

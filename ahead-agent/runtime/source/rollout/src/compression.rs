@@ -65,6 +65,30 @@ pub async fn open_rollout_line_reader(path: &Path) -> io::Result<RolloutLineRead
     reader::open_once(path).await
 }
 
+/// Reads an exact, already-opened rollout file without resolving its path again.
+pub async fn open_rollout_line_reader_from_file(
+    file: File,
+    path: &Path,
+) -> io::Result<RolloutLineReader> {
+    if path::is_compressed_rollout_path(path) {
+        let reader = tokio::task::spawn_blocking(move || {
+            let decoder = zstd::stream::read::Decoder::new(file)?;
+            Ok::<_, io::Error>(io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(RolloutLineReader {
+            inner: RolloutLineReaderInner::Blocking(Some(reader)),
+        })
+    } else {
+        Ok(RolloutLineReader {
+            inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(
+                tokio::fs::File::from_std(file),
+            )),
+        })
+    }
+}
+
 /// Returns the compressed `.jsonl.zst` path for a rollout path.
 #[cfg(test)]
 pub(crate) fn compressed_rollout_path(path: &Path) -> PathBuf {

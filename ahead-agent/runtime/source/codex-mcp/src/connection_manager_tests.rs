@@ -29,7 +29,6 @@ use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server_test_support::environment_manager_without_environments;
 use codex_protocol::ToolName;
-use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
@@ -164,9 +163,6 @@ fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
             format!("Test tool: {tool_name}"),
             Arc::new(JsonObject::default()),
         ),
-        openai_file_input_optional_fields: Default::default(),
-        connector_id: None,
-        connector_name: None,
     }
 }
 
@@ -380,8 +376,6 @@ async fn legacy_tool_catalog_does_not_follow_pagination_cursor() -> anyhow::Resu
 
     let tools = list_tools_for_client_uncached(
         "legacy",
-        /*is_codex_apps_mcp_server*/ false,
-        "test",
         &client,
         Some(Duration::from_secs(5)),
         crate::pagination::MAX_MCP_CATALOG_ITEMS,
@@ -417,7 +411,6 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
         ))
         .boxed()
         .shared(),
-        is_codex_apps_mcp_server: false,
         tool_catalog_cache_context: None,
         startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         cancel_token: CancellationToken::new(),
@@ -514,7 +507,6 @@ fn create_gated_async_managed_client(
     (
         AsyncManagedClient {
             client,
-            is_codex_apps_mcp_server: false,
             tool_catalog_cache_context: None,
             startup_complete,
             cancel_token: CancellationToken::new(),
@@ -653,12 +645,6 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
     );
 }
 
-fn full_access_form_input_enabled_router() -> ElicitationRequestRouter {
-    let router = ElicitationRequestRouter::default();
-    router.enable_full_access_form_input();
-    router
-}
-
 fn elicitation_meta(value: serde_json::Value) -> Option<rmcp::model::RequestMetaObject> {
     let serde_json::Value::Object(map) = value else {
         panic!("elicitation metadata must be an object");
@@ -684,7 +670,7 @@ async fn assert_elicitation_declined(
     let manager = ElicitationRequestManager::new(
         test_elicitation_config(server_name, approval_policy, PermissionProfile::Disabled),
         /*lifecycle*/ None,
-        full_access_form_input_enabled_router(),
+        ElicitationRequestRouter::default(),
     );
     let (tx_event, rx_event) = async_channel::bounded(1);
     let sender = manager.make_sender(server_name.to_string(), Some(tx_event));
@@ -754,7 +740,7 @@ async fn assert_requested_user_input_is_declined(
 
 #[tokio::test]
 async fn disabled_permissions_do_not_surface_user_input_when_auto_denied() {
-    let router = full_access_form_input_enabled_router();
+    let router = ElicitationRequestRouter::default();
     router.set_auto_deny(/*auto_deny*/ true);
     assert_requested_user_input_is_declined(
         AskForApproval::Never,
@@ -783,88 +769,13 @@ async fn plugin_tool_suggestion_elicitations_are_declined() {
 }
 
 #[tokio::test]
-async fn disabled_permissions_surface_requested_user_input_without_metadata() {
-    assert_disabled_permissions_surface_requested_user_input(/*meta*/ None).await;
-}
-
-#[tokio::test]
-async fn disabled_permissions_surface_requested_user_input_with_non_codex_approval_metadata() {
-    assert_disabled_permissions_surface_requested_user_input(elicitation_meta(serde_json::json!({
-        "origin": "https://example.com",
-        "persist": "always",
-    })))
+async fn disabled_permissions_decline_requested_user_input() {
+    assert_requested_user_input_is_declined(
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+        ElicitationRequestRouter::default(),
+    )
     .await;
-}
-
-async fn assert_disabled_permissions_surface_requested_user_input(
-    meta: Option<rmcp::model::RequestMetaObject>,
-) {
-    let router = full_access_form_input_enabled_router();
-    let manager = ElicitationRequestManager::new(
-        test_elicitation_config("server", AskForApproval::Never, PermissionProfile::Disabled),
-        /*lifecycle*/ None,
-        router.clone(),
-    );
-    let (tx_event, rx_event) = async_channel::bounded(1);
-    let sender = manager.make_sender("server".to_string(), Some(tx_event));
-    let requested_schema = requested_user_input_schema();
-    let mut pending = tokio::spawn(sender(
-        NumberOrString::Number(1),
-        codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
-            meta: meta.clone(),
-            message: "What should I say?".to_string(),
-            requested_schema: requested_schema.clone(),
-        }),
-    ));
-    let request = tokio::select! {
-        event = rx_event.recv() => {
-            let EventMsg::ElicitationRequest(request) = event.expect("user-input event").msg else {
-                panic!("expected MCP user-input elicitation");
-            };
-            request
-        }
-        response = &mut pending => {
-            panic!("user input resolved without reaching the user: {response:?}");
-        }
-    };
-
-    assert_eq!(
-        request.request,
-        ElicitationRequest::Form {
-            meta: meta
-                .map(serde_json::to_value)
-                .transpose()
-                .expect("user-input metadata should serialize"),
-            message: "What should I say?".to_string(),
-            requested_schema: serde_json::to_value(requested_schema)
-                .expect("schema should serialize"),
-        },
-    );
-    assert_eq!(request.server_name, "server");
-
-    let codex_protocol::mcp::RequestId::String(request_id) = request.id else {
-        panic!("expected Codex-owned string request ID");
-    };
-    let user_response = ElicitationResponse {
-        action: ElicitationAction::Accept,
-        content: Some(serde_json::json!({ "message": "The actual user response." })),
-        meta: None,
-    };
-    router
-        .resolve(
-            "server".to_string(),
-            NumberOrString::String(request_id.into()),
-            user_response.clone(),
-        )
-        .await
-        .expect("actual user response should resolve the elicitation");
-    assert_eq!(
-        pending
-            .await
-            .expect("user-input task should complete")
-            .expect("user input should resolve"),
-        user_response,
-    );
 }
 
 #[tokio::test]
@@ -899,7 +810,7 @@ async fn restricted_never_policy_does_not_surface_requested_user_input() {
     assert_requested_user_input_is_declined(
         AskForApproval::Never,
         PermissionProfile::default(),
-        full_access_form_input_enabled_router(),
+        ElicitationRequestRouter::default(),
     )
     .await;
 }
@@ -915,7 +826,7 @@ async fn granular_policy_does_not_surface_requested_user_input() {
             mcp_elicitations: false,
         }),
         PermissionProfile::Disabled,
-        full_access_form_input_enabled_router(),
+        ElicitationRequestRouter::default(),
     )
     .await;
 }
@@ -984,7 +895,7 @@ async fn disabled_permissions_decline_user_input_without_an_event_channel() {
     let manager = ElicitationRequestManager::new(
         test_elicitation_config("server", AskForApproval::Never, PermissionProfile::Disabled),
         /*lifecycle*/ None,
-        full_access_form_input_enabled_router(),
+        ElicitationRequestRouter::default(),
     );
     let sender = manager.make_sender("server".to_string(), /*tx_event*/ None);
 
@@ -1635,7 +1546,6 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
         "docs".to_string(),
         AsyncManagedClient {
             client: futures::future::ready(Ok(ready_client)).boxed().shared(),
-            is_codex_apps_mcp_server: false,
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cancel_token: CancellationToken::new(),
@@ -1892,7 +1802,6 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
         "docs".to_string(),
         AsyncManagedClient {
             client: pending_client,
-            is_codex_apps_mcp_server: false,
             tool_catalog_cache_context: Some(cache_context),
             startup_complete,
             cancel_token: CancellationToken::new(),
@@ -1968,7 +1877,6 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
                     .shared(),
-                is_codex_apps_mcp_server: false,
                 tool_catalog_cache_context: None,
                 startup_complete: Arc::new(AtomicBool::new(false)),
                 cancel_token: CancellationToken::new(),
@@ -2132,7 +2040,6 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
                     .shared(),
-                is_codex_apps_mcp_server: false,
                 tool_catalog_cache_context: Some(cache_context.clone()),
                 startup_complete: Arc::new(AtomicBool::new(false)),
                 cancel_token: CancellationToken::new(),
@@ -2732,10 +2639,9 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
         /*prefix_mcp_tool_names*/ true,
     );
     manager.insert_test_client(
-        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        "docs".to_string(),
         AsyncManagedClient {
             client: pending_client,
-            is_codex_apps_mcp_server: true,
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
@@ -2783,10 +2689,9 @@ async fn shutdown_cancels_pending_tool_listing() {
         /*prefix_mcp_tool_names*/ true,
     );
     manager.insert_test_client(
-        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        "docs".to_string(),
         AsyncManagedClient {
             client: pending_client,
-            is_codex_apps_mcp_server: true,
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token,
@@ -2826,10 +2731,9 @@ async fn shutdown_continues_after_caller_is_aborted() {
         /*prefix_mcp_tool_names*/ true,
     );
     manager.insert_test_client(
-        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        "docs".to_string(),
         AsyncManagedClient {
             client: blocking_client,
-            is_codex_apps_mcp_server: true,
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token: CancellationToken::new(),
@@ -3450,8 +3354,6 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
         .await?;
     let initial_tools = list_tools_for_client_uncached(
         "docs",
-        /*is_codex_apps_mcp_server*/ false,
-        /*codex_apps_refresh_trigger*/ "test",
         &client,
         /*timeout*/ None,
         crate::pagination::MAX_MCP_CATALOG_ITEMS,
@@ -3482,7 +3384,6 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
                 identity: Some(reusable_server_identity(&config, &runtime_context)),
                 client: AsyncManagedClient {
                     client: futures::future::ready(Ok(managed_client)).boxed().shared(),
-                    is_codex_apps_mcp_server: false,
                     tool_catalog_cache_context: None,
                     startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     cancel_token: CancellationToken::new(),
@@ -3947,7 +3848,6 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
             client: futures::future::ready(Ok(connected_client))
                 .boxed()
                 .shared(),
-            is_codex_apps_mcp_server: false,
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             cancel_token: CancellationToken::new(),

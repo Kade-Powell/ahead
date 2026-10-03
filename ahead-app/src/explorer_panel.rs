@@ -14,6 +14,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 pub struct ExplorerPanel {
@@ -25,6 +26,7 @@ pub struct ExplorerPanel {
     ignored_paths: HashSet<String>,
     pub mailbox_id: usize,
     pub tree_state: Entity<TreeState>,
+    icon_theme: Option<Arc<ahead_extension_host::IconTheme>>,
     trash_handler: Option<std::rc::Rc<dyn Fn(PathBuf, &mut Window, &mut App)>>,
 }
 
@@ -161,10 +163,31 @@ impl ExplorerPanel {
             ignored_paths: HashSet::new(),
             mailbox_id: cx.entity_id().as_u64() as usize,
             tree_state: cx.new(|cx| TreeState::new(cx)),
+            icon_theme: None,
             trash_handler: None,
         };
+        panel.reload_icon_theme(cx);
         panel.refresh(cx);
         panel
+    }
+
+    pub fn reload_icon_theme(&mut self, cx: &mut Context<Self>) {
+        if let Some(theme) = &self.icon_theme {
+            let mut invalidated = HashSet::new();
+            for path in theme.image_paths() {
+                if invalidated.insert(path) {
+                    ImageSource::from(path).remove_asset(cx);
+                }
+            }
+        }
+        self.icon_theme = match crate::icon_theme::active_icon_theme() {
+            Ok(theme) => theme.map(Arc::new),
+            Err(error) => {
+                eprintln!("Failed to load file icon theme: {error}");
+                None
+            }
+        };
+        cx.notify();
     }
 
     pub fn set_trash_handler(
@@ -289,6 +312,7 @@ fn git_ignored_paths(
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
     else {
         return HashSet::new();
@@ -522,6 +546,7 @@ impl Render for ExplorerPanel {
                 let tree_explorer = explorer.clone();
                 let badges = self.git_badges.clone();
                 let ignored_paths = self.ignored_paths.clone();
+                let icon_theme = self.icon_theme.clone();
                 let text = text;
                 tree(
                     &self.tree_state,
@@ -580,14 +605,21 @@ impl Render for ExplorerPanel {
                                 h_flex()
                                     .gap_1()
                                     .items_center()
-                                    .child(if is_dir {
-                                        if entry.is_expanded() {
-                                            IconName::FolderOpen
+                                    .child({
+                                        let icon_path = icon_theme.as_ref().and_then(|theme| {
+                                            if is_dir {
+                                                theme.icon_for_directory(Path::new(&path), entry.is_expanded())
+                                            } else {
+                                                theme.icon_for_file(Path::new(&path))
+                                            }
+                                        });
+                                        if let Some(icon_path) = icon_path {
+                                            img(icon_path.to_path_buf()).size(px(16.)).into_any_element()
+                                        } else if is_dir {
+                                            (if entry.is_expanded() { IconName::FolderOpen } else { IconName::Folder }).into_any_element()
                                         } else {
-                                            IconName::Folder
+                                            IconName::File.into_any_element()
                                         }
-                                    } else {
-                                        IconName::File
                                     })
                                     .child(label)
                                     .when(badge.is_some(), |row| {

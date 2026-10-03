@@ -160,6 +160,12 @@ pub enum PluginCatalogNotification {
     RestartLanguageServers {
         documents: Vec<TextDocumentItem>,
     },
+    RefreshWorkspaceConfigurations,
+    WorkspaceConfigurationResolved {
+        plugin_id: PluginId,
+        generation: u64,
+        result: Result<Option<Value>, String>,
+    },
     LanguageServerStopped {
         plugin_id: PluginId,
         message: String,
@@ -418,6 +424,15 @@ impl PluginCatalogRpcHandler {
             .send(PluginCatalogRpc::Handler(notification))
             .map_err(|e| anyhow!(e.to_string()))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_receiver(&self) -> Receiver<PluginCatalogRpc> {
+        self.plugin_rx
+            .lock()
+            .as_ref()
+            .expect("catalog receiver")
+            .clone()
     }
 
     fn send_request_to_all_plugins<P, Resp>(

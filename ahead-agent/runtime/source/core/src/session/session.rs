@@ -14,10 +14,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
-use ahead_model_auth::auth::AgentIdentityAuthPolicy;
 use codex_extension_api::ExtensionDataInit;
-use codex_http_client::ClientRouteClass;
-use codex_http_client::RouteAwareClientPool;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -69,7 +66,6 @@ pub(crate) struct Session {
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
-    pub(super) fork_persistence: ForkPersistence,
     pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -612,7 +608,6 @@ impl Session {
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         mut initial_history: InitialHistory,
-        fork_persistence: ForkPersistence,
         session_source: SessionSource,
         skills_service: Arc<HostSkillsService>,
         mcp_manager: Arc<McpManager>,
@@ -627,7 +622,6 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
         parent_rollout_thread_trace: ThreadTraceContext,
-        attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
@@ -666,29 +660,21 @@ impl Session {
             .forked_from_thread_id
             .or_else(|| initial_history.forked_from_id());
         session_configuration.forked_from_thread_id = forked_from_id;
-        let forked_from_ordinal_exclusive = match &fork_persistence {
-            ForkPersistence::Referenced { history_base, .. } => {
-                history_base.map(|position| position.end_ordinal_exclusive)
+        let forked_from_ordinal_exclusive = match &initial_history {
+            InitialHistory::Resumed(resumed) => {
+                // A resumed thread's canonical SessionMeta comes first. An ancestor's
+                // history_base describes a different fork boundary.
+                resumed.history.first().and_then(|item| match item {
+                    RolloutItem::SessionMeta(meta) if meta.meta.id == resumed.conversation_id => {
+                        codex_rollout::forked_from_ordinal_exclusive(
+                            &meta.meta,
+                            resumed.rollout_path.as_deref(),
+                        )
+                    }
+                    _ => None,
+                })
             }
-            ForkPersistence::Copied => match &initial_history {
-                InitialHistory::Resumed(resumed) => {
-                    // Both local and CCA thread stores place the resumed thread's
-                    // canonical SessionMeta first. Never inspect inherited metadata:
-                    // an ancestor's history_base describes a different fork boundary.
-                    resumed.history.first().and_then(|item| match item {
-                        RolloutItem::SessionMeta(meta)
-                            if meta.meta.id == resumed.conversation_id =>
-                        {
-                            codex_rollout::forked_from_ordinal_exclusive(
-                                &meta.meta,
-                                resumed.rollout_path.as_deref(),
-                            )
-                        }
-                        _ => None,
-                    })
-                }
-                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
-            },
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         }
         .filter(|_| forked_from_id.is_some());
         let parent_thread_id = session_configuration
@@ -824,10 +810,7 @@ impl Session {
                             selected_capability_roots: selected_capability_roots.clone(),
                             multi_agent_version: initial_multi_agent_version,
                             history_mode: session_configuration.history_mode,
-                            history_base: match &fork_persistence {
-                                ForkPersistence::Copied => None,
-                                ForkPersistence::Referenced { history_base, .. } => *history_base,
-                            },
+                            history_base: None,
                             subagent_history_start_ordinal: None,
                             initial_window_id: initial_auto_compact_window_ids
                                 .window_id
@@ -843,7 +826,6 @@ impl Session {
                             },
                         };
                         if is_paginated_subagent
-                            && matches!(&fork_persistence, ForkPersistence::Copied)
                             && let InitialHistory::Forked(items) = &initial_history
                         {
                             LiveThread::create_with_inherited_model_context(
@@ -1003,10 +985,6 @@ impl Session {
             // The managed loop is hosted by AHEAD's editor, not a detected terminal.
             let terminal_type = "ahead".to_string();
             let session_model = session_configuration.step_settings.collaboration_mode.model().to_string();
-            let auth_env_telemetry = collect_auth_env_telemetry(
-                session_configuration.provider.info(),
-                auth_manager.codex_api_key_env_enabled(),
-            );
             let mut session_telemetry = SessionTelemetry::new(
                 thread_id,
                 session_model.as_str(),
@@ -1019,7 +997,6 @@ impl Session {
                 terminal_type.clone(),
                 session_configuration.session_source.clone(),
             )
-            .with_auth_env(auth_env_telemetry.to_otel_metadata())
             .with_tool_result_log_config(config.otel.tool_result);
             if let Some(service_name) = session_configuration.metrics_service_name.as_deref() {
                 session_telemetry = session_telemetry.with_metrics_service_name(service_name);
@@ -1260,7 +1237,6 @@ impl Session {
             let session_extension_data =
                 codex_extension_api::ExtensionData::new(session_id.to_string());
             session_extension_data.insert(analytics_events_client.clone());
-            let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
             let extension_metrics =
                 extension_metrics::from_session_telemetry(session_telemetry.clone());
             for contributor in extensions.thread_lifecycle_contributors() {
@@ -1269,7 +1245,6 @@ impl Session {
                     session_source: &session_configuration.session_source,
                     persistent_thread_state_available: live_thread_init.as_ref().is_some(),
                     environments: environment_selections,
-                    mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
                     extension_metrics: Some(Arc::clone(&extension_metrics)),
                     session_store: &session_extension_data,
                     thread_store: &thread_extension_data,
@@ -1298,11 +1273,6 @@ impl Session {
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
                 exec_policy,
                 auth_manager: Arc::clone(&auth_manager),
-                openai_file_upload_client_pool: RouteAwareClientPool::new_without_request_logging(
-                    config.http_client_factory(),
-                    ClientRouteClass::Api,
-                )
-                .with_legacy_custom_ca_fallback(),
                 session_telemetry,
                 models_manager: Arc::clone(&models_manager),
                 tool_approvals: Mutex::new(ApprovalStore::default()),
@@ -1323,15 +1293,9 @@ impl Session {
                 network_approval: Arc::clone(&network_approval),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
-                attestation_provider: attestation_provider.clone(),
                 time_provider,
                 model_client: ModelClient::new(
                     Some(Arc::clone(&auth_manager)),
-                    if config.features.enabled(Feature::UseAgentIdentity) {
-                        AgentIdentityAuthPolicy::ChatGptAuth
-                    } else {
-                        AgentIdentityAuthPolicy::JwtOnly
-                    },
                     thread_id,
                     session_configuration.provider.info().clone(),
                     session_configuration.session_source.clone(),
@@ -1344,7 +1308,6 @@ impl Session {
                     /*concurrent_reasoning_summaries_enabled*/ config
                         .features
                         .enabled(Feature::ConcurrentReasoningSummaries),
-                    attestation_provider,
                     config.http_client_factory(),
                 )
                 .with_session_context(None, tx_event.clone()),
@@ -1380,7 +1343,6 @@ impl Session {
                 input_queue: InputQueue::new(),
                 services,
                 git_enrichment_policy,
-                fork_persistence,
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
             });
@@ -1450,11 +1412,6 @@ impl Session {
                     /*window_number*/ 0,
                     initial_auto_compact_window_ids,
                 );
-            }
-            if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
-                // Keep the source reserved until the child's history reference is durable.
-                sess.try_ensure_rollout_materialized(PersistContext::Standard)
-                    .await?;
             }
             {
                 let mut state = sess.state.lock().await;

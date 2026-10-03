@@ -231,7 +231,7 @@ fn language_id_with_extensions(
 fn builtin_language_id(path: &Path) -> Option<String> {
     // recommended language_id values
     // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem
-    Some(match path.extension() {
+    let language = match path.extension() {
         Some(ext) => {
             match ext.to_str()? {
                 "C" | "H" => "cpp",
@@ -316,8 +316,8 @@ fn builtin_language_id(path: &Path) -> Option<String> {
                 _ => return None,
             },
         },
-    })
-    .map(str::to_string)
+    };
+    Some(language.to_string())
 }
 
 fn get_document_content_changes(

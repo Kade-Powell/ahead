@@ -423,9 +423,6 @@ fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
                 "additionalProperties": false,
             }))),
         ),
-        openai_file_input_optional_fields: Default::default(),
-        connector_id: None,
-        connector_name: None,
     }
 }
 
@@ -2435,9 +2432,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     }
     let spawn_agent_description = spawn_agent.description.as_str();
     assert!(!spawn_agent_description.contains("max_concurrent_threads_per_session"));
-    assert!(spawn_agent_description.contains(
-        "Note that passing `fork_turns=\"none\"` will not pass any surrounding context to the spawned subagent"
-    ));
+    assert!(spawn_agent_description.contains("Include all necessary context in that message"));
 
     let direct_model_only = probe(|turn| {
         set_features(

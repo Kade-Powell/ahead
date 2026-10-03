@@ -3,14 +3,16 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, SystemTime},
 };
 
 use ahead_rpc::ahead::{AgentConfigOptionValue, ExternalAcpAdapter};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,7 +59,6 @@ const SUPPORTED_AGENTS: [SupportedAgent; 3] = [
 
 #[derive(Debug, Clone, Deserialize)]
 struct RegistryIndex {
-    #[serde(default)]
     agents: Vec<RegistryAgentEntry>,
 }
 
@@ -89,6 +90,16 @@ struct InstallProvenance {
     package_lock_sha256: String,
 }
 
+struct InstalledNpx {
+    script: PathBuf,
+    generation: PathBuf,
+}
+
+struct ResolvedNpx {
+    script: PathBuf,
+    lease: Option<Arc<File>>,
+}
+
 #[derive(Debug, Clone)]
 struct ConfiguredAdapter {
     adapter: ExternalAcpAdapter,
@@ -105,6 +116,12 @@ fn supported_agent(id: &str) -> Option<SupportedAgent> {
 const REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const REGISTRY_CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+static CACHE_INSTANCE_ID: OnceLock<uuid::Uuid> = OnceLock::new();
+
+fn cache_instance_id() -> uuid::Uuid {
+    *CACHE_INSTANCE_ID.get_or_init(uuid::Uuid::new_v4)
+}
 
 fn configured_adapters(
     storage: &Path,
@@ -149,18 +166,24 @@ fn curated_adapters(
 
 fn load_registry(storage: &Path) -> Result<Vec<RegistryAgent>> {
     let registry_path = storage.join("registry/registry.json");
-    let cache_is_fresh = registry_path
-        .metadata()
-        .and_then(|metadata| metadata.modified())
+    let cached_file = open_registry_cache(&registry_path);
+    let cache_is_fresh = cached_file
+        .as_ref()
         .ok()
+        .and_then(|file| file.metadata().ok())
+        .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < REGISTRY_CACHE_MAX_AGE);
 
     if !cache_is_fresh {
         refresh_registry_in_background(registry_path.clone());
     }
-    let Ok(body) = fs::read(&registry_path) else {
-        return Ok(Vec::new());
+    let body = match cached_file {
+        Ok(file) => read_registry_bytes(file)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
     };
 
     let index: RegistryIndex =
@@ -177,6 +200,65 @@ fn load_registry(storage: &Path) -> Result<Vec<RegistryAgent>> {
             }),
         })
         .collect())
+}
+
+fn open_registry_cache(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing registry cache directory",
+            )
+        })?;
+        let directory = File::open(parent)?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing registry cache filename",
+            )
+        })?;
+        ahead_core::secure_fs::open_relative_regular_file(
+            &directory,
+            Path::new(name),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry cache is not a regular file",
+            ));
+        }
+        File::open(path)
+    }
+}
+
+fn read_registry_bytes(reader: impl Read) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader.take(MAX_REGISTRY_BYTES + 1).read_to_end(&mut body)?;
+    ensure!(
+        body.len() as u64 <= MAX_REGISTRY_BYTES,
+        "ACP registry exceeds the 4 MiB limit"
+    );
+    Ok(body)
+}
+
+fn publish_registry_cache(path: &Path, body: &[u8]) -> Result<()> {
+    ensure!(
+        body.len() as u64 <= MAX_REGISTRY_BYTES,
+        "ACP registry exceeds the 4 MiB limit"
+    );
+    serde_json::from_slice::<RegistryIndex>(body)
+        .context("validating ACP registry before cache publication")?;
+    let parent = path.parent().context("missing registry cache directory")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(body)?;
+    temporary.persist(path)?;
+    Ok(())
 }
 
 /// Zed refreshes its registry asynchronously from `AgentRegistryStore`. AHEAD's
@@ -198,7 +280,7 @@ fn refresh_registry_in_background(registry_path: PathBuf) {
         .name("ahead-acp-registry-refresh".to_string())
         .spawn(move || {
             let result = (|| -> Result<()> {
-                let body = reqwest::blocking::Client::builder()
+                let response = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
                     .context("creating ACP registry HTTP client")?
@@ -206,25 +288,17 @@ fn refresh_registry_in_background(registry_path: PathBuf) {
                     .send()
                     .context("fetching ACP registry")?
                     .error_for_status()
-                    .context("ACP registry returned an error status")?
-                    .bytes()
-                    .context("reading ACP registry")?;
-                fs::create_dir_all(&parent).with_context(|| {
-                    format!("creating ACP registry cache {}", parent.display())
-                })?;
-                let temporary_path = registry_path.with_extension("tmp");
-                fs::write(&temporary_path, &body).with_context(|| {
-                    format!(
-                        "writing ACP registry cache {}",
-                        temporary_path.display()
-                    )
-                })?;
-                fs::rename(&temporary_path, &registry_path).with_context(|| {
-                    format!(
-                        "publishing ACP registry cache {}",
-                        registry_path.display()
-                    )
-                })?;
+                    .context("ACP registry returned an error status")?;
+                let body =
+                    read_registry_bytes(response).context("reading ACP registry")?;
+                publish_registry_cache(&registry_path, &body).with_context(
+                    || {
+                        format!(
+                            "publishing ACP registry cache {}",
+                            registry_path.display()
+                        )
+                    },
+                )?;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -543,7 +617,7 @@ fn npx_package_executable(
 fn installed_npx_executable(
     install_dir: &Path,
     package_spec: &str,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<InstalledNpx>> {
     let marker = install_dir.join("installed.json");
     let contents = match fs::read(&marker) {
         Ok(contents) => contents,
@@ -579,23 +653,121 @@ fn installed_npx_executable(
     {
         return Ok(None);
     }
-    Ok(Some(script))
+    Ok(Some(InstalledNpx { script, generation }))
+}
+
+fn recover_abandoned_staging(install_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(install_dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(".install-")
+            && entry.file_type()?.is_dir()
+        {
+            fs::remove_dir_all(entry.path()).with_context(|| {
+                format!("removing abandoned ACP install {}", entry.path().display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn lease_generation(generation: &Path) -> Result<Option<Arc<File>>> {
+    let path = generation.join(".ahead-lease");
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Older installations have no lease contract, so never prune them.
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "ACP generation lease is not a file"
+    );
+    FileExt::lock_shared(&file).with_context(|| {
+        format!("leasing ACP generation {}", generation.display())
+    })?;
+    Ok(Some(Arc::new(file)))
+}
+
+fn prune_unleased_generations(install_dir: &Path, current: &Path) -> Result<()> {
+    let instance_id = cache_instance_id().to_string();
+    for entry in fs::read_dir(install_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name() == current.file_name()
+            || !entry.file_type()?.is_dir()
+            || uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
+        {
+            continue;
+        }
+        let lease_path = path.join(".ahead-lease");
+        let owner = match fs::read_to_string(&lease_path) {
+            Ok(owner) => owner,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading {}", lease_path.display()));
+            }
+        };
+        if owner != instance_id {
+            // A prior app process may have left a live ACP child behind.
+            continue;
+        }
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening {}", lease_path.display()));
+            }
+        };
+        if !file.metadata()?.is_file() || !FileExt::try_lock_exclusive(&file)? {
+            continue;
+        }
+        FileExt::unlock(&file)?;
+        drop(file);
+        fs::remove_dir_all(&path).with_context(|| {
+            format!("removing unused ACP generation {}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn resolved_npx(install_dir: &Path, installed: InstalledNpx) -> Result<ResolvedNpx> {
+    let lease = lease_generation(&installed.generation)?;
+    if let Err(error) =
+        prune_unleased_generations(install_dir, &installed.generation)
+    {
+        tracing::warn!(%error, "could not prune unused ACP adapter generations");
+    }
+    Ok(ResolvedNpx {
+        script: installed.script,
+        lease,
+    })
 }
 
 fn ensure_npx_package(
     install_dir: &Path,
     package_spec: &str,
     install: impl FnOnce(&Path) -> Result<()>,
-) -> Result<PathBuf> {
-    if let Some(script) = installed_npx_executable(install_dir, package_spec)? {
-        return Ok(script);
-    }
+) -> Result<ResolvedNpx> {
     fs::create_dir_all(install_dir).with_context(|| {
         format!("creating ACP adapter directory {}", install_dir.display())
     })?;
     let _lock = InstallLock::acquire(install_dir.join(".install.lock"))?;
-    if let Some(script) = installed_npx_executable(install_dir, package_spec)? {
-        return Ok(script);
+    if let Err(error) = recover_abandoned_staging(install_dir) {
+        tracing::warn!(%error, "could not clear abandoned ACP adapter staging");
+    }
+    if let Some(installed) = installed_npx_executable(install_dir, package_spec)? {
+        return resolved_npx(install_dir, installed);
     }
 
     let staging = tempfile::Builder::new()
@@ -604,6 +776,10 @@ fn ensure_npx_package(
         .context("creating ACP adapter staging directory")?;
     install(staging.path())?;
     npx_package_executable(staging.path(), package_spec)?;
+    fs::write(
+        staging.path().join(".ahead-lease"),
+        cache_instance_id().to_string(),
+    )?;
     let provenance = InstallProvenance {
         generation: uuid::Uuid::new_v4(),
         package_spec: package_spec.to_string(),
@@ -628,9 +804,7 @@ fn ensure_npx_package(
         .persist(install_dir.join("installed.json"))
         .map_err(|error| error.error)
         .context("publishing ACP adapter manifest")?;
-    // ponytail: retain old generations while launch lifetimes are untracked;
-    // lease-aware cleanup must not remove files still used by Node processes.
-    Ok(script)
+    resolved_npx(install_dir, InstalledNpx { script, generation })
 }
 
 fn install_npx_adapter(
@@ -642,7 +816,7 @@ fn install_npx_adapter(
     let install_dir = storage
         .join("registry/npx")
         .join(sanitize_path_component(adapter_id));
-    let script = ensure_npx_package(&install_dir, &registry.package, |staging| {
+    let resolved = ensure_npx_package(&install_dir, &registry.package, |staging| {
         let output = Command::new("npm")
             .args(["install", "--prefix"])
             .arg(staging)
@@ -674,7 +848,10 @@ fn install_npx_adapter(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    config.args.push(script.to_string_lossy().into_owned());
+    config
+        .args
+        .push(resolved.script.to_string_lossy().into_owned());
+    config.generation_lease = resolved.lease;
     config.args.extend(registry.args.iter().cloned());
     Ok(config)
 }
@@ -684,7 +861,40 @@ mod tests {
     use super::*;
     use crate::acp_client::{HarnessClient, HarnessEvent};
     use parking_lot::Mutex;
-    use std::sync::Arc;
+
+    #[test]
+    fn registry_cache_bounds_and_publication_preserve_last_good_index() {
+        let storage = tempfile::tempdir().expect("temporary ACP registry");
+        let cache = storage.path().join("registry/registry.json");
+        let original = br#"{"agents":[]}"#;
+        publish_registry_cache(&cache, original).expect("publish initial registry");
+        assert_eq!(
+            load_registry(storage.path()).expect("load registry").len(),
+            0
+        );
+        assert!(
+            read_registry_bytes(std::io::Cursor::new(vec![0; 4 * 1024 * 1024 + 1]))
+                .is_err()
+        );
+        assert!(publish_registry_cache(&cache, b"not json").is_err());
+        assert!(publish_registry_cache(&cache, br#"{}"#).is_err());
+        assert_eq!(fs::read(&cache).expect("retain valid registry"), original);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = storage.path().join("outside");
+            fs::write(&outside, b"untouched").expect("outside sentinel");
+            symlink(&outside, cache.with_extension("tmp"))
+                .expect("old predictable staging pathname");
+            publish_registry_cache(&cache, br#"{"agents":[]}"#)
+                .expect("replace registry without following staging symlink");
+            assert_eq!(fs::read(outside).expect("outside sentinel"), b"untouched");
+            let linked = storage.path().join("registry/linked.json");
+            symlink(&cache, &linked).expect("linked cache");
+            assert!(open_registry_cache(&linked).is_err());
+        }
+    }
 
     #[test]
     fn catalog_is_curated_and_install_state_is_user_local() {
@@ -908,11 +1118,15 @@ mod tests {
                     bail!("cached launch must not run npm")
                 }))
             });
-            let launched = launch.recv_timeout(Duration::from_secs(5));
+            assert!(matches!(
+                launch.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
             release.send(())?;
             let update = updater.join().expect("installer thread");
+            let launched = launch.recv_timeout(Duration::from_secs(5));
             reader.join().expect("launch thread")?;
-            assert_eq!(launched??, old_script);
+            assert_eq!(launched??.script, old_script.script);
             assert!(update.is_err_and(|error| {
                 error.to_string().contains("injected npm failure")
             }));
@@ -920,7 +1134,7 @@ mod tests {
         })?;
 
         assert_eq!(fs::read(cache.join("installed.json"))?, old_manifest);
-        assert_eq!(fs::read_to_string(&old_script)?, "old");
+        assert_eq!(fs::read_to_string(&old_script.script)?, "old");
         assert!(fs::read_dir(&cache)?.all(|entry| {
             entry.is_ok_and(|entry| {
                 !entry.file_name().to_string_lossy().starts_with(".install-")
@@ -930,9 +1144,9 @@ mod tests {
         let new_script = ensure_npx_package(&cache, "pi-acp@2.0.0", |staging| {
             write_npx_fixture(staging, "pi-acp@2.0.0", "new")
         })?;
-        assert_ne!(new_script, old_script);
-        assert_eq!(fs::read_to_string(&new_script)?, "new");
-        assert_eq!(fs::read_to_string(&old_script)?, "old");
+        assert_ne!(new_script.script, old_script.script);
+        assert_eq!(fs::read_to_string(&new_script.script)?, "new");
+        assert_eq!(fs::read_to_string(&old_script.script)?, "old");
         let registry = RegistryNpxAdapter {
             package: "pi-acp@2.0.0".to_string(),
             args: vec!["--acp".to_string()],
@@ -985,12 +1199,72 @@ mod tests {
             let first = scope.spawn(install);
             let second = scope.spawn(install);
             assert_eq!(
-                first.join().expect("first install")?,
-                second.join().expect("second install")?
+                first.join().expect("first install")?.script,
+                second.join().expect("second install")?.script
             );
             Ok(())
         })?;
         assert_eq!(installs.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_cleanup_waits_for_resolved_commands_and_live_children() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cache = temporary.path().join("pi-acp");
+        let old = ensure_npx_package(&cache, "pi-acp@1.0.0", |staging| {
+            write_npx_fixture(staging, "pi-acp@1.0.0", "old")
+        })?;
+        let old_script = old.script.clone();
+        let abandoned = cache.join(".install-abandoned");
+        fs::create_dir(&abandoned)?;
+        fs::write(abandoned.join("partial"), "unfinished")?;
+
+        let mut config =
+            HarnessClientConfig::new("sh", temporary.path().to_path_buf());
+        config.args = vec!["-c".into(), "exec sleep 10".into()];
+        config.generation_lease = old.lease.clone();
+        let child =
+            HarnessClient::spawn_without_editor_mcp(&config, Arc::new(|_| {}))?;
+        drop(config);
+        drop(old);
+
+        let new = ensure_npx_package(&cache, "pi-acp@2.0.0", |staging| {
+            write_npx_fixture(staging, "pi-acp@2.0.0", "new")
+        })?;
+        assert!(!abandoned.exists());
+        assert!(
+            old_script.is_file(),
+            "live child must retain old generation"
+        );
+
+        child.shutdown();
+        drop(child);
+        let cached = ensure_npx_package(&cache, "pi-acp@2.0.0", |_| {
+            bail!("cached adapter must not reinstall")
+        })?;
+        assert_eq!(cached.script, new.script);
+        assert!(!old_script.exists(), "unused generation should be pruned");
+
+        let prior_process_script = cached.script.clone();
+        let canonical_cache = fs::canonicalize(&cache)?;
+        let prior_process_generation = prior_process_script
+            .ancestors()
+            .find(|path| path.parent() == Some(canonical_cache.as_path()))
+            .context("find ACP generation")?;
+        fs::write(
+            prior_process_generation.join(".ahead-lease"),
+            uuid::Uuid::new_v4().to_string(),
+        )?;
+        drop(cached);
+        drop(new);
+        ensure_npx_package(&cache, "pi-acp@3.0.0", |staging| {
+            write_npx_fixture(staging, "pi-acp@3.0.0", "newer")
+        })?;
+        assert!(
+            prior_process_script.is_file(),
+            "generations from a prior app process must be retained"
+        );
         Ok(())
     }
 
@@ -1014,7 +1288,7 @@ mod tests {
             });
             assert!(result.is_err(), "invalid executable: {invalid_bin}");
             assert_eq!(fs::read(cache.join("installed.json"))?, old_manifest);
-            assert_eq!(fs::read_to_string(&old_script)?, "old");
+            assert_eq!(fs::read_to_string(&old_script.script)?, "old");
         }
         Ok(())
     }
@@ -1099,7 +1373,7 @@ mod tests {
             scripts.push((script, version));
         }
         for (script, version) in scripts {
-            let output = Command::new("node").arg(script).output()?;
+            let output = Command::new("node").arg(script.script).output()?;
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout)?, version);
         }
@@ -1122,6 +1396,133 @@ mod tests {
         fs::write(package_dir.join("agent.js"), script)?;
         fs::write(installation.join("package-lock.json"), package_spec)?;
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires public npm and an installed Pi CLI; no provider access"]
+    fn pi_registry_adapter_round_trips_offline_session() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cwd = temporary.path().join("project");
+        fs::create_dir(&cwd)?;
+        let storage = temporary.path().join("external-agents");
+        let user_agents_dir =
+            temporary.path().join("user/.ahead/agents/external-acp");
+        set_external_acp_adapter_installed_at("pi-acp", true, &user_agents_dir)?;
+        let mut config = external_agent_config_at(
+            Some("pi-acp"),
+            cwd.clone(),
+            &storage,
+            &user_agents_dir,
+        )?;
+        let pi_home = temporary
+            .path()
+            .join("pi-home")
+            .to_string_lossy()
+            .into_owned();
+        config
+            .env
+            .insert("PI_CODING_AGENT_DIR".to_string(), pi_home.clone());
+        config.env.insert("PI_OFFLINE".to_string(), "1".to_string());
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let client = HarnessClient::spawn_without_editor_mcp(
+            &config,
+            Arc::new(move |event| captured.lock().push(event)),
+        )?;
+        let result: Result<(String, String)> = (|| {
+            let initialized = client.initialize()?;
+            ensure!(
+                initialized.is_object(),
+                "Pi ACP initialize returned no object"
+            );
+            let session_id = client.new_session(&cwd, "agent", None, None)?;
+            ensure!(
+                !session_id.is_empty(),
+                "Pi ACP returned an empty session ID"
+            );
+            let model = events
+                .lock()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    HarnessEvent::ConfigOptions {
+                        acp_session_id,
+                        options,
+                    } if acp_session_id == &session_id => options
+                        .iter()
+                        .find(|option| option.category.as_deref() == Some("model"))
+                        .cloned(),
+                    _ => None,
+                })
+                .context("Pi ACP did not publish a model config option")?;
+            let ahead_rpc::ahead::AgentConfigOptionValue::Select(current) =
+                &model.current_value
+            else {
+                bail!("Pi ACP model option is not a selection");
+            };
+            let next = model
+                .choices
+                .iter()
+                .find(|choice| choice.value != *current)
+                .context("Pi ACP advertised no alternate model")?
+                .value
+                .clone();
+            client.set_config_option(
+                &session_id,
+                &model.id,
+                &ahead_rpc::ahead::AgentConfigOptionValue::Select(next.clone()),
+            )?;
+            ensure!(
+                events.lock().iter().rev().any(|event| matches!(
+                    event,
+                    HarnessEvent::ConfigOptions { acp_session_id, options }
+                        if acp_session_id == &session_id
+                            && options.iter().any(|option| option.id == model.id
+                                && option.current_value == ahead_rpc::ahead::AgentConfigOptionValue::Select(next.clone()))
+                )),
+                "Pi ACP did not publish the selected model"
+            );
+            Ok((session_id, next))
+        })();
+        client.shutdown();
+        let (session_id, selected_model) = result?;
+        let mut restored_config = external_agent_config_at(
+            Some("pi-acp"),
+            cwd.clone(),
+            &storage,
+            &user_agents_dir,
+        )?;
+        restored_config
+            .env
+            .insert("PI_CODING_AGENT_DIR".to_string(), pi_home);
+        restored_config
+            .env
+            .insert("PI_OFFLINE".to_string(), "1".to_string());
+        let restored_events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&restored_events);
+        let restored = HarnessClient::spawn_without_editor_mcp(
+            &restored_config,
+            Arc::new(move |event| captured.lock().push(event)),
+        )?;
+        let result = (|| {
+            restored.initialize()?;
+            restored.load_session(&session_id, &cwd, "agent", None, None)?;
+            ensure!(
+                restored_events.lock().iter().rev().any(|event| matches!(
+                    event,
+                    HarnessEvent::ConfigOptions { acp_session_id, options }
+                        if acp_session_id == &session_id
+                            && options.iter().any(|option|
+                                option.category.as_deref() == Some("model")
+                                    && option.current_value == ahead_rpc::ahead::AgentConfigOptionValue::Select(selected_model.clone()))
+                )),
+                "Pi ACP did not restore the saved model selection"
+            );
+            Ok(())
+        })();
+        restored.shutdown();
+        result
     }
 
     #[test]

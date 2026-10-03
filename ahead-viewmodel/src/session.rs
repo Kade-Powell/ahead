@@ -199,6 +199,7 @@ mod tests {
                 intent: ahead_rpc::ahead::TaskIntent::Assistance,
                 work_kind: ahead_rpc::ahead::WorkKind::ProductChange,
                 title: "t".into(),
+                objective: "Test objective".into(),
                 parent_task_id: None,
                 learning_arc_id: None,
                 created_at: "now".into(),

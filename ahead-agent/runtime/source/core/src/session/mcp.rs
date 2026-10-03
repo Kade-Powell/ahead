@@ -31,10 +31,7 @@ impl Session {
                 McpEnvironmentScope::Live(&self.services.turn_environments),
             )
             .await;
-        let mcp_config = self
-            .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
-            .await
-            .config;
+        let mcp_config = mcp_projection.config;
         let local_process_cwd = environments
             .local_environment_cwd()
             .map(|cwd| cwd.to_path_buf())

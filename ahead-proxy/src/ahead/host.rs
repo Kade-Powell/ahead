@@ -8,9 +8,10 @@
 use anyhow::{Context, Result, bail};
 use parking_lot::{Mutex, RwLock};
 use sha2::Digest;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -18,13 +19,14 @@ use std::{
 use uuid::Uuid;
 
 use ahead_rpc::ahead::{
-    AheadRequest, AssistanceMode, CodeAnchor, CodeComment, DisplayRange,
-    GithubIssueRef, HarnessKind, Id, LearningArc, LearningRecord, MemoryDocument,
-    MemoryExcerpt, MemoryScope, MemoryWriteResult, Participant, PredictionRequest,
-    PredictionResult, RepoPath, Revision, SessionExportBundle, SessionLifecycle,
-    SessionListItem, SessionParticipantRecord, SessionPolicySnapshot, SessionRole,
-    SessionTask, SessionView, TaskIntent, VoiceControl, WorkKind, WorkSession,
-    WorkflowPhase, WorkflowState,
+    AheadRequest, AssistanceMode, CodeAnchor, CodeComment, ConversationMessage,
+    DisplayRange, GithubIssueRef, HarnessKind, Id, LearningArc, LearningRecord,
+    MemoryDocument, MemoryExcerpt, MemoryScope, MemoryWriteResult, Participant,
+    PredictionRequest, PredictionResult, RepoPath, Revision, SessionExportBundle,
+    SessionLifecycle, SessionListItem, SessionParticipantRecord,
+    SessionPolicySnapshot, SessionRole, SessionTask, SessionView, TaskIntent,
+    VoiceControl, WorkKind, WorkSession, WorkflowPhase, WorkflowState,
+    mentioned_participants,
 };
 
 use super::{
@@ -39,6 +41,21 @@ use super::{
 use ahead_agent::{HarnessController, path_is_allowed};
 use ahead_core::search::WorkspaceFileIndex;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamManifest {
+    #[serde(default)]
+    members: Vec<TeamMember>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamMember {
+    github: String,
+    display_name: String,
+    role: SessionRole,
+}
+
 pub struct AheadSessionHost {
     store: Arc<RwLock<SessionStore>>,
     auth: Arc<RwLock<GitHubAuthManager>>,
@@ -46,11 +63,13 @@ pub struct AheadSessionHost {
     active_session_id: Arc<RwLock<Option<Id>>>,
     active_voice_sessions: Arc<RwLock<HashMap<Id, Arc<VoiceSession>>>>,
     workspace_participants: Arc<RwLock<Vec<SessionParticipantRecord>>>,
+    shared_terminal: Arc<RwLock<HashMap<Id, String>>>,
     tracker: Arc<RwLock<super::tracker::TrackerAdapter>>,
     review_snapshots: Arc<RwLock<HashMap<Id, super::collab::ReviewSnapshot>>>,
     workspace: Arc<RwLock<Option<std::path::PathBuf>>>,
     memory_write_lock: Mutex<()>,
     recovery_owner: Mutex<Option<super::recovery::RecoveryOwner>>,
+    notification_sink: RwLock<Option<ahead_agent::HarnessNotificationSink>>,
     /// Streams conversations through the built-in runtime or an external ACP agent.
     harness: HarnessController,
 }
@@ -81,11 +100,13 @@ impl AheadSessionHost {
             active_session_id: Arc::new(RwLock::new(None)),
             active_voice_sessions: Arc::new(RwLock::new(HashMap::new())),
             workspace_participants: Arc::new(RwLock::new(vec![host_record])),
+            shared_terminal: Arc::new(RwLock::new(HashMap::new())),
             tracker: Arc::new(RwLock::new(super::tracker::TrackerAdapter::new())),
             review_snapshots: Arc::new(RwLock::new(HashMap::new())),
             workspace: Arc::new(RwLock::new(None)),
             memory_write_lock: Mutex::new(()),
             recovery_owner: Mutex::new(None),
+            notification_sink: RwLock::new(None),
             harness,
         }
     }
@@ -152,12 +173,18 @@ impl AheadSessionHost {
 
     /// Installs the UI notification sink used for streamed agent output.
     pub fn set_notification_sink(&self, sink: ahead_agent::HarnessNotificationSink) {
+        *self.notification_sink.write() = Some(sink.clone());
         self.harness.set_notification_sink(sink);
     }
 
     /// Shared streamed-harness controller (tests and status reporting).
     pub fn harness(&self) -> &HarnessController {
         &self.harness
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_auth_for_test(&self, auth: GitHubAuthManager) {
+        *self.auth.write() = auth;
     }
 
     /// Handles an incoming AheadRequest
@@ -261,14 +288,14 @@ impl AheadSessionHost {
                 workspace,
                 server_id,
                 expected_fingerprint,
-                enabled,
+                action,
             } => {
                 let workspace = self.checked_mcp_workspace(&workspace)?;
                 ahead_agent::set_mcp_server_approval(
                     &workspace,
                     &server_id,
                     &expected_fingerprint,
-                    enabled,
+                    action,
                 )?;
                 Ok(serde_json::Value::Null)
             }
@@ -401,6 +428,40 @@ impl AheadSessionHost {
                 request.session_context.clear();
                 let turn_id = self.start_streamed_agent_turn(request)?;
                 Ok(serde_json::json!({ "turn_id": turn_id }))
+            }
+            AheadRequest::PostHumanMessage {
+                session_id,
+                content,
+            } => Ok(serde_json::to_value(self.post_human_message_as(
+                &session_id,
+                &content,
+                &self.auth.read().get_active_user(None).login,
+                None,
+            )?)?),
+            AheadRequest::PublishSharedTerminal {
+                session_id,
+                content,
+            } => {
+                self.publish_shared_terminal(&session_id, content)?;
+                Ok(serde_json::json!({ "published": true }))
+            }
+            AheadRequest::ShareSession { .. }
+            | AheadRequest::StopSharingSession { .. }
+            | AheadRequest::PublishSharedPresence { .. }
+            | AheadRequest::GetSharedPresence { .. }
+            | AheadRequest::ReadSharedBuffer { .. }
+            | AheadRequest::ReplaceSharedBuffer { .. }
+            | AheadRequest::JoinSharedSession { .. }
+            | AheadRequest::PollSharedSession { .. }
+            | AheadRequest::PostSharedHumanMessage { .. }
+            | AheadRequest::StartSharedAgentTurn { .. }
+            | AheadRequest::AddSessionParticipant { .. }
+            | AheadRequest::RevokeSessionParticipant { .. }
+            | AheadRequest::LeaveSharedSession { .. } => {
+                bail!("Sharing is handled by the proxy connection")
+            }
+            AheadRequest::DiscardSharedRemoteRecovery { .. } => {
+                bail!("Shared edit recovery is handled by the proxy connection")
             }
             AheadRequest::AgentTurnCancel { session_id } => {
                 let cancelled = self.harness.cancel_turn(&session_id)?;
@@ -710,7 +771,7 @@ impl AheadSessionHost {
                 Ok(serde_json::to_value(user)?)
             }
             AheadRequest::GetWorkspaceParticipants => {
-                let parts = self.get_workspace_participants();
+                let parts = self.get_workspace_participants()?;
                 Ok(serde_json::to_value(parts)?)
             }
             AheadRequest::AddWorkspaceParticipant { user_handle, role } => {
@@ -724,21 +785,98 @@ impl AheadSessionHost {
         }
     }
 
-    pub fn get_workspace_participants(&self) -> Vec<SessionParticipantRecord> {
+    fn team_members(&self) -> Result<Option<Vec<TeamMember>>> {
+        let Some(workspace) = self.workspace.read().clone() else {
+            return Ok(None);
+        };
+        let Some(content) =
+            ahead_core::config::read_ahead_config(&workspace, "team.toml")?
+        else {
+            return Ok(None);
+        };
+        let manifest: TeamManifest =
+            toml::from_str(&content).context("Invalid .ahead/team.toml")?;
+        anyhow::ensure!(manifest.members.len() <= 128, "Too many team members");
+        let mut handles = std::collections::HashSet::new();
+        for member in &manifest.members {
+            let handle = member.github.as_str();
+            anyhow::ensure!(
+                !handle.is_empty()
+                    && handle.len() <= 64
+                    && handle
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && handle
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && handle
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && handles.insert(handle.to_ascii_lowercase()),
+                "Invalid or duplicate GitHub username in .ahead/team.toml"
+            );
+            anyhow::ensure!(
+                !member.display_name.trim().is_empty()
+                    && member.display_name.len() <= 128
+                    && member.role != SessionRole::Owner,
+                "Invalid team member name or role in .ahead/team.toml"
+            );
+        }
+        Ok(Some(manifest.members))
+    }
+
+    pub(crate) fn ensure_team_member(&self, login: &str) -> Result<()> {
+        if self.workspace.read().is_none() {
+            return Ok(());
+        }
+        let members = self
+            .team_members()?
+            .context("Add .ahead/team.toml before sharing")?;
+        anyhow::ensure!(
+            members
+                .iter()
+                .any(|member| member.github.eq_ignore_ascii_case(login)),
+            "This GitHub user is not in .ahead/team.toml"
+        );
+        Ok(())
+    }
+
+    pub fn get_workspace_participants(
+        &self,
+    ) -> Result<Vec<SessionParticipantRecord>> {
         let mut parts = self.workspace_participants.read().clone();
         let user = self.auth.read().get_active_user(None);
         if let Some(owner) = parts.iter_mut().find(|p| p.role == SessionRole::Owner)
         {
             owner.participant = Participant::Human {
                 id: user.login.clone(),
-                subject: user.email.clone().unwrap_or_default(),
+                subject: if user.id != 0 {
+                    format!("github:{}", user.id)
+                } else {
+                    user.email.clone().unwrap_or_default()
+                },
                 display_name: user
                     .name
                     .clone()
                     .unwrap_or_else(|| user.login.clone()),
             };
         }
-        parts
+        if let Some(members) = self.team_members()? {
+            parts.retain(|record| record.role == SessionRole::Owner);
+            parts.extend(members.into_iter().map(|member| {
+                SessionParticipantRecord {
+                    participant: Participant::Human {
+                        id: member.github.clone(),
+                        subject: member.github,
+                        display_name: member.display_name,
+                    },
+                    role: member.role,
+                }
+            }));
+        }
+        Ok(parts)
     }
 
     pub fn add_workspace_participant(
@@ -746,19 +884,33 @@ impl AheadSessionHost {
         user_handle: String,
         role: SessionRole,
     ) -> Result<Vec<SessionParticipantRecord>> {
-        let handle = user_handle.trim().trim_start_matches('@').to_string();
+        let handle = user_handle
+            .trim()
+            .strip_prefix('@')
+            .unwrap_or(user_handle.trim())
+            .to_string();
         if handle.is_empty()
-            || handle.contains('@')
-            || handle.contains(' ')
-            || handle.contains('/')
+            || handle.len() > 64
+            || !handle
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !handle
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !handle
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         {
             anyhow::bail!(
                 "Enter a GitHub username (e.g. octocat), not an email address"
             );
         }
         let mut parts = self.workspace_participants.write();
-        if let Some(existing) =
-            parts.iter_mut().find(|p| p.participant.id() == handle)
+        if let Some(existing) = parts
+            .iter_mut()
+            .find(|p| p.participant.id().eq_ignore_ascii_case(&handle))
         {
             existing.role = role;
         } else {
@@ -781,7 +933,8 @@ impl AheadSessionHost {
         let mut parts = self.workspace_participants.write();
         let handle = user_handle.trim().trim_start_matches('@');
         parts.retain(|p| {
-            p.participant.id() != handle || p.role == SessionRole::Owner
+            !p.participant.id().eq_ignore_ascii_case(handle)
+                || p.role == SessionRole::Owner
         });
         Ok(parts.clone())
     }
@@ -883,7 +1036,10 @@ impl AheadSessionHost {
             approvals: Vec::new(),
         };
 
-        let mut participants = self.get_workspace_participants();
+        let mut participants = self.get_workspace_participants()?;
+        if self.team_members()?.is_some() {
+            participants.retain(|record| record.role == SessionRole::Owner);
+        }
         participants.push(SessionParticipantRecord {
             participant: Participant::Ai {
                 id: "ai-assistant".to_string(),
@@ -1068,6 +1224,19 @@ impl AheadSessionHost {
 
     fn sync_memory_source(&self, scope: MemoryScope) -> Result<Option<String>> {
         let path = self.memory_source_path(scope, false)?;
+        #[cfg(unix)]
+        {
+            let content = match Self::open_memory_directory(&path, false)? {
+                Some(directory) => Self::read_memory_content_at(&directory, &path)?,
+                None => None,
+            };
+            return self.store.read().sync_memory_content(
+                scope.as_str(),
+                &path,
+                content.as_deref(),
+            );
+        }
+        #[cfg(not(unix))]
         self.store.read().sync_memory_file(scope.as_str(), &path)
     }
 
@@ -1183,6 +1352,19 @@ impl AheadSessionHost {
             }
         }
         if create_parent {
+            #[cfg(unix)]
+            {
+                if scope == MemoryScope::User {
+                    let home = ahead_directory
+                        .parent()
+                        .context("AHEAD user memory has no home directory")?;
+                    std::fs::create_dir_all(home)
+                        .context("Failed to create AHEAD user home")?;
+                }
+                Self::open_memory_directory(&source.path, true)?
+                    .context("AHEAD memory directory was not created")?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create memory directory {}", parent.display())
             })?;
@@ -1229,25 +1411,120 @@ impl AheadSessionHost {
         Ok(source.path)
     }
 
-    fn read_memory_content(path: &std::path::Path) -> Result<String> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(String::new());
+    #[cfg(unix)]
+    fn open_memory_directory(
+        path: &Path,
+        create: bool,
+    ) -> Result<Option<std::fs::File>> {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+        let root = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("AHEAD memory file has no workspace or user root")?;
+        let root = match std::fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(error)
+                if !create && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to read AHEAD memory file {}", path.display())
-                });
+                return Err(error).context("AHEAD memory root is unavailable");
             }
         };
+        let mut directory = ahead_core::secure_fs::open_canonical_directory(&root)
+            .context("Failed to open AHEAD memory root")?;
+        for name in [".ahead", "memories"] {
+            if create {
+                match mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(error)
+                            .context("Failed to create AHEAD memory directory");
+                    }
+                }
+            }
+            directory = match openat(
+                &directory,
+                name,
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(directory) => directory.into(),
+                Err(rustix::io::Errno::NOENT) if !create => return Ok(None),
+                Err(error) => {
+                    return Err(error).context(
+                        "AHEAD memory directory must not resolve through a symlink",
+                    );
+                }
+            };
+        }
+        Ok(Some(directory))
+    }
+
+    fn read_memory_content(path: &std::path::Path) -> Result<String> {
+        #[cfg(unix)]
+        {
+            let Some(directory) = Self::open_memory_directory(path, false)? else {
+                return Ok(String::new());
+            };
+            return Ok(
+                Self::read_memory_content_at(&directory, path)?.unwrap_or_default()
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let mut file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(String::new());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to read AHEAD memory file {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            Self::read_open_memory_content(&mut file, path)
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_memory_content_at(
+        directory: &std::fs::File,
+        path: &Path,
+    ) -> Result<Option<String>> {
+        use rustix::fs::{Mode, OFlags, openat};
+
+        let mut file: std::fs::File = match openat(
+            directory,
+            "MEMORY.md",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(file) => file.into(),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => {
+                return Err(error).context("Failed to read AHEAD memory file");
+            }
+        };
+        Self::read_open_memory_content(&mut file, path).map(Some)
+    }
+
+    fn read_open_memory_content(
+        file: &mut std::fs::File,
+        path: &std::path::Path,
+    ) -> Result<String> {
         if !file.metadata()?.file_type().is_file() {
             bail!("AHEAD memory source must be a regular file");
         }
@@ -1256,9 +1533,11 @@ impl AheadSessionHost {
         if file.metadata()?.len() > MEMORY_DOCUMENT_LIMIT {
             bail!("AHEAD memory document exceeds the 32 KiB limit");
         }
+        file.seek(SeekFrom::Start(0)).with_context(|| {
+            format!("Failed to read AHEAD memory file {}", path.display())
+        })?;
         let mut content = String::new();
-        (&mut file)
-            .take(MEMORY_DOCUMENT_LIMIT + 1)
+        file.take(MEMORY_DOCUMENT_LIMIT + 1)
             .read_to_string(&mut content)
             .with_context(|| {
                 format!("Failed to read AHEAD memory file {}", path.display())
@@ -1308,6 +1587,13 @@ impl AheadSessionHost {
 
         let _write_guard = self.memory_write_lock.lock();
         let path = self.memory_source_path(scope, true)?;
+        #[cfg(unix)]
+        let directory = Self::open_memory_directory(&path, true)?
+            .context("AHEAD memory directory is unavailable")?;
+        #[cfg(unix)]
+        let current =
+            Self::read_memory_content_at(&directory, &path)?.unwrap_or_default();
+        #[cfg(not(unix))]
         let current = Self::read_memory_content(&path)?;
         let current_sha256 =
             format!("{:x}", sha2::Sha256::digest(current.as_bytes()));
@@ -1317,61 +1603,105 @@ impl AheadSessionHost {
             );
         }
 
-        let parent = path
-            .parent()
-            .context("AHEAD memory file has no parent directory")?;
-        let temporary_path =
-            parent.join(format!(".MEMORY.md.{}.tmp", Uuid::new_v4()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
+        Self::replace_memory_content_at(&directory, content)?;
+        #[cfg(not(unix))]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&temporary_path).with_context(|| {
-            format!(
-                "Failed to create replacement memory file {}",
-                temporary_path.display()
-            )
-        })?;
-        let write_result = file
-            .write_all(content.as_bytes())
-            .and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(error) = write_result {
-            match std::fs::remove_file(&temporary_path) {
-                Ok(()) => {}
-                Err(cleanup_error)
-                    if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cleanup_error) => {
-                    bail!(
-                        "Failed to write memory replacement: {error}; failed to remove temporary file: {cleanup_error}"
-                    );
+            let parent = path
+                .parent()
+                .context("AHEAD memory file has no parent directory")?;
+            let temporary_path =
+                parent.join(format!(".MEMORY.md.{}.tmp", Uuid::new_v4()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options.open(&temporary_path).with_context(|| {
+                format!(
+                    "Failed to create replacement memory file {}",
+                    temporary_path.display()
+                )
+            })?;
+            let write_result = file
+                .write_all(content.as_bytes())
+                .and_then(|()| file.sync_all());
+            drop(file);
+            if let Err(error) = write_result {
+                match std::fs::remove_file(&temporary_path) {
+                    Ok(()) => {}
+                    Err(cleanup_error)
+                        if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(cleanup_error) => {
+                        bail!(
+                            "Failed to write memory replacement: {error}; failed to remove temporary file: {cleanup_error}"
+                        );
+                    }
                 }
+                return Err(error).context("Failed to write memory replacement");
             }
-            return Err(error).context("Failed to write memory replacement");
-        }
-        if let Err(error) = std::fs::rename(&temporary_path, &path) {
-            match std::fs::remove_file(&temporary_path) {
-                Ok(()) => {}
-                Err(cleanup_error)
-                    if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cleanup_error) => {
-                    bail!(
-                        "Failed to replace AHEAD memory file: {error}; failed to remove temporary file: {cleanup_error}"
-                    );
+            if let Err(error) = std::fs::rename(&temporary_path, &path) {
+                match std::fs::remove_file(&temporary_path) {
+                    Ok(()) => {}
+                    Err(cleanup_error)
+                        if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(cleanup_error) => {
+                        bail!(
+                            "Failed to replace AHEAD memory file: {error}; failed to remove temporary file: {cleanup_error}"
+                        );
+                    }
                 }
+                return Err(error).context("Failed to replace AHEAD memory file");
             }
-            return Err(error).context("Failed to replace AHEAD memory file");
         }
 
+        #[cfg(unix)]
+        let index = self.store.read().sync_memory_content(
+            scope.as_str(),
+            &path,
+            Some(content),
+        );
+        #[cfg(not(unix))]
         let index = self.store.read().sync_memory_file(scope.as_str(), &path);
         let (indexed, warning) = match index {
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
         Ok(MemoryWriteResult { indexed, warning })
+    }
+
+    #[cfg(unix)]
+    fn replace_memory_content_at(
+        directory: &std::fs::File,
+        content: &str,
+    ) -> Result<()> {
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+        let temporary_name = format!(".MEMORY.md.{}.tmp", Uuid::new_v4());
+        let result = (|| -> Result<()> {
+            let mut temporary: std::fs::File = openat(
+                directory,
+                temporary_name.as_str(),
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )?
+            .into();
+            temporary.write_all(content.as_bytes())?;
+            temporary.sync_all()?;
+            renameat(directory, temporary_name.as_str(), directory, "MEMORY.md")?;
+            directory.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            match unlinkat(directory, temporary_name.as_str(), AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to remove temporary AHEAD memory file")
+                }
+            }
+        }
+        result.context("Failed to replace AHEAD memory file")
     }
 
     fn write_memory(
@@ -1405,29 +1735,31 @@ impl AheadSessionHost {
             scope.as_str(),
             message_id
         );
-        let mut options = OpenOptions::new();
-        options.read(true).create(true).append(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = options.open(&path).with_context(|| {
-            format!("Failed to open AHEAD memory file {}", path.display())
-        })?;
+        let directory = Self::open_memory_directory(&path, true)?
+            .context("AHEAD memory directory is unavailable")?;
+        #[cfg(unix)]
+        let mut file = Self::open_memory_append_at(&directory)?;
+        #[cfg(not(unix))]
+        let mut file = {
+            let mut options = OpenOptions::new();
+            options.read(true).create(true).append(true);
+            options.open(&path).with_context(|| {
+                format!("Failed to open AHEAD memory file {}", path.display())
+            })?
+        };
         if !file.metadata()?.file_type().is_file() {
             bail!("AHEAD memory source must be a regular file");
         }
-        file.seek(SeekFrom::Start(0)).with_context(|| {
-            format!("Failed to read AHEAD memory file {}", path.display())
-        })?;
-        let mut existing = String::new();
-        file.read_to_string(&mut existing).with_context(|| {
-            format!("Failed to read AHEAD memory file {}", path.display())
-        })?;
+        let existing = Self::read_open_memory_content(&mut file, &path)?;
         if existing.lines().any(|line| line.trim() == marker) {
+            #[cfg(unix)]
+            let index = self.store.read().sync_memory_content(
+                scope.as_str(),
+                &path,
+                Some(&existing),
+            );
+            #[cfg(not(unix))]
             let index = self.store.read().sync_memory_file(scope.as_str(), &path);
             let (indexed, warning) = match index {
                 Ok(_) => (true, None),
@@ -1457,6 +1789,13 @@ impl AheadSessionHost {
             format!("Failed to sync AHEAD memory file {}", path.display())
         })?;
 
+        #[cfg(unix)]
+        let index = self.store.read().sync_memory_content(
+            scope.as_str(),
+            &path,
+            Some(&format!("{existing}{entry}")),
+        );
+        #[cfg(not(unix))]
         let index = self.store.read().sync_memory_file(scope.as_str(), &path);
         let (indexed, warning) = match index {
             Ok(_) => (true, None),
@@ -1465,9 +1804,35 @@ impl AheadSessionHost {
         Ok(MemoryWriteResult { indexed, warning })
     }
 
+    #[cfg(unix)]
+    fn open_memory_append_at(directory: &std::fs::File) -> Result<std::fs::File> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use std::os::unix::fs::MetadataExt;
+
+        let file: std::fs::File = openat(
+            directory,
+            "MEMORY.md",
+            OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::APPEND
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .context("Failed to open AHEAD memory file")?
+        .into();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            bail!("AHEAD memory source must be a regular, singly-linked file");
+        }
+        Ok(file)
+    }
+
     pub fn archive_session(&self, session_id: &str) -> Result<()> {
         self.store.read().archive_session(session_id)?;
         self.active_sessions.write().remove(session_id);
+        self.shared_terminal.write().remove(session_id);
         Ok(())
     }
 
@@ -1543,6 +1908,50 @@ impl AheadSessionHost {
         body: String,
     ) -> Result<CodeComment> {
         let actor_id = self.comment_actor(session_id)?;
+        self.insert_code_comment(
+            session_id,
+            path,
+            range,
+            quote,
+            source_sha256,
+            body,
+            actor_id,
+        )
+    }
+
+    pub(crate) fn create_code_comment_as(
+        &self,
+        session_id: &str,
+        path: RepoPath,
+        range: DisplayRange,
+        quote: String,
+        source_sha256: String,
+        body: String,
+        actor_id: &str,
+        github_id: u64,
+    ) -> Result<CodeComment> {
+        self.shared_comment_actor(session_id, actor_id, github_id)?;
+        self.insert_code_comment(
+            session_id,
+            path,
+            range,
+            quote,
+            source_sha256,
+            body,
+            actor_id.to_string(),
+        )
+    }
+
+    fn insert_code_comment(
+        &self,
+        session_id: &str,
+        path: RepoPath,
+        range: DisplayRange,
+        quote: String,
+        source_sha256: String,
+        body: String,
+        actor_id: String,
+    ) -> Result<CodeComment> {
         let path = self.canonical_workspace_file_path(&path)?;
         let body = body.trim();
         anyhow::ensure!(
@@ -1579,6 +1988,81 @@ impl AheadSessionHost {
         Ok(comment)
     }
 
+    pub(crate) fn shared_code_comments(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CodeComment>> {
+        self.shareable_session(session_id)?;
+        self.store.read().list_code_comments(session_id)
+    }
+
+    pub(crate) fn publish_shared_terminal(
+        &self,
+        session_id: &str,
+        content: String,
+    ) -> Result<()> {
+        self.can_host_share(session_id)?;
+        anyhow::ensure!(
+            content.len() <= 128 * 1024,
+            "Terminal snapshot is too large"
+        );
+        self.shared_terminal
+            .write()
+            .insert(session_id.to_string(), content);
+        Ok(())
+    }
+
+    pub(crate) fn shared_terminal_output(&self, session_id: &str) -> Result<String> {
+        self.shareable_session(session_id)?;
+        Ok(self
+            .shared_terminal
+            .read()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn clear_shared_terminal(&self, session_id: &str) {
+        self.shared_terminal.write().remove(session_id);
+    }
+
+    pub(crate) fn resolve_code_comment_as(
+        &self,
+        session_id: &str,
+        comment_id: &str,
+        actor_id: &str,
+        github_id: u64,
+    ) -> Result<CodeComment> {
+        self.shared_comment_actor(session_id, actor_id, github_id)?;
+        self.store
+            .read()
+            .resolve_code_comment(session_id, comment_id, actor_id)
+    }
+
+    fn shared_comment_actor(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        github_id: u64,
+    ) -> Result<()> {
+        let view = self.shareable_session(session_id)?;
+        anyhow::ensure!(
+            view.participants.iter().any(|record| {
+                matches!(&record.participant, Participant::Human { id, subject, .. }
+                if id.eq_ignore_ascii_case(actor_id)
+                    && subject == &format!("github:{github_id}"))
+                    && matches!(
+                        record.role,
+                        SessionRole::Owner
+                            | SessionRole::Editor
+                            | SessionRole::Reviewer
+                    )
+            }),
+            "This participant cannot comment in the session"
+        );
+        Ok(())
+    }
+
     fn comment_actor(&self, session_id: &str) -> Result<String> {
         let view = self.get_session(session_id)?.context("Session not found")?;
         anyhow::ensure!(
@@ -1590,11 +2074,273 @@ impl AheadSessionHost {
         let actor_id = self.auth.read().get_active_user(None).login;
         anyhow::ensure!(
             view.participants.iter().any(|record| matches!(
-                &record.participant, Participant::Human { id, .. } if id == &actor_id
+                &record.participant, Participant::Human { id, .. } if id.eq_ignore_ascii_case(&actor_id)
             )),
             "Only a session participant can comment"
         );
         Ok(actor_id)
+    }
+
+    pub(crate) fn shareable_session(&self, session_id: &str) -> Result<SessionView> {
+        let mut view = self.get_session(session_id)?.context("Session not found")?;
+        // The durable membership row is authoritative during invitation and revocation.
+        view.participants = self
+            .store
+            .read()
+            .get_session(session_id)?
+            .context("Session not found")?
+            .participants;
+        anyhow::ensure!(
+            matches!(view.session.lifecycle, SessionLifecycle::Active),
+            "Only an active session can be shared"
+        );
+        anyhow::ensure!(
+            !self
+                .store
+                .read()
+                .get_harness_binding(session_id)?
+                .is_some_and(|(_, backend)| backend.starts_with("external-agent")),
+            "Only a managed AHEAD session can be shared"
+        );
+        Ok(view)
+    }
+
+    pub(crate) fn can_host_share(&self, session_id: &str) -> Result<SessionView> {
+        let view = self.shareable_session(session_id)?;
+        let auth = self.auth.read();
+        anyhow::ensure!(
+            auth.is_authenticated()
+                && auth
+                    .get_active_user(None)
+                    .login
+                    .eq_ignore_ascii_case(&view.session.owner_id),
+            "Sign in as the session owner to share it"
+        );
+        if let Some(Participant::Human { subject, .. }) = view
+            .participants
+            .iter()
+            .find(|record| record.role == SessionRole::Owner)
+            .map(|record| &record.participant)
+        {
+            if subject.starts_with("github:") {
+                anyhow::ensure!(
+                    subject == &format!("github:{}", auth.get_active_user(None).id),
+                    "This GitHub account is not the session owner"
+                );
+            }
+        }
+        Ok(view)
+    }
+
+    fn refresh_session_participants(&self, session_id: &str) -> Result<SessionView> {
+        let updated = self
+            .store
+            .read()
+            .get_session(session_id)?
+            .context("Session not found")?;
+        if let Some(active) = self.active_sessions.write().get_mut(session_id) {
+            active.participants = updated.participants.clone();
+            active.session.revision = updated.session.revision;
+        }
+        self.get_session(session_id)?.context("Session not found")
+    }
+
+    pub(crate) fn bind_owner_identity(&self, session_id: &str) -> Result<()> {
+        let view = self.can_host_share(session_id)?;
+        let user = self.auth.read().get_active_user(None);
+        anyhow::ensure!(
+            user.id != 0,
+            "Session owner needs a verified GitHub identity"
+        );
+        let record = SessionParticipantRecord {
+            participant: Participant::Human {
+                id: view.session.owner_id,
+                subject: format!("github:{}", user.id),
+                display_name: user.name.unwrap_or(user.login),
+            },
+            role: SessionRole::Owner,
+        };
+        self.store
+            .write()
+            .upsert_session_participant(session_id, &record)?;
+        self.refresh_session_participants(session_id)?;
+        Ok(())
+    }
+
+    pub fn add_session_participant_verified(
+        &self,
+        session_id: &str,
+        user: ahead_rpc::ahead::GitHubUser,
+        role: SessionRole,
+    ) -> Result<SessionView> {
+        let view = self.can_host_share(session_id)?;
+        anyhow::ensure!(user.id != 0, "GitHub identity is invalid");
+        anyhow::ensure!(
+            !user.login.eq_ignore_ascii_case(&view.session.owner_id),
+            "Cannot change the session owner"
+        );
+        anyhow::ensure!(role != SessionRole::Owner, "Cannot invite another owner");
+        let display_name = if self.workspace.read().is_some() {
+            let members = self.team_members()?.context(
+                "Add .ahead/team.toml before inviting session participants",
+            )?;
+            members
+                .into_iter()
+                .find(|member| member.github.eq_ignore_ascii_case(&user.login))
+                .map(|member| member.display_name)
+                .context("This GitHub user is not in .ahead/team.toml")?
+        } else {
+            user.name.unwrap_or_else(|| format!("@{}", user.login))
+        };
+        let record = SessionParticipantRecord {
+            participant: Participant::Human {
+                id: user.login.clone(),
+                subject: format!("github:{}", user.id),
+                display_name,
+            },
+            role,
+        };
+        self.store
+            .write()
+            .upsert_session_participant(session_id, &record)?;
+        self.refresh_session_participants(session_id)
+    }
+
+    pub(crate) fn revoke_session_participant(
+        &self,
+        session_id: &str,
+        user_handle: &str,
+    ) -> Result<SessionView> {
+        let view = self.can_host_share(session_id)?;
+        let handle = user_handle.trim().trim_start_matches('@');
+        anyhow::ensure!(
+            !handle.eq_ignore_ascii_case(&view.session.owner_id),
+            "Cannot remove the session owner"
+        );
+        anyhow::ensure!(view.participants.iter().any(|record| {
+            matches!(&record.participant, Participant::Human { id, .. } if id.eq_ignore_ascii_case(handle))
+        }), "This user is not a session participant");
+        self.store
+            .write()
+            .delete_session_participant(session_id, handle)?;
+        self.refresh_session_participants(session_id)
+    }
+
+    pub(crate) fn share_join_token(&self) -> Result<String> {
+        let auth = self.auth.read();
+        anyhow::ensure!(auth.is_authenticated(), "Sign in to GitHub before joining");
+        auth.get_access_token()
+            .map(str::to_string)
+            .context("GitHub sign-in has no access token")
+    }
+
+    pub(crate) fn shared_messages_after(
+        &self,
+        session_id: &str,
+        sequence: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        self.shareable_session(session_id)?;
+        let store = self.store.read();
+        let mut messages = store.list_messages_after(session_id, sequence, 10)?;
+        if messages.is_empty() {
+            if let Some(agent) = store.latest_agent_message(session_id)? {
+                messages.push(agent);
+            }
+        }
+        Ok(messages)
+    }
+
+    pub(crate) fn post_human_message_as(
+        &self,
+        session_id: &str,
+        content: &str,
+        actor_id: &str,
+        github_id: Option<u64>,
+    ) -> Result<ConversationMessage> {
+        anyhow::ensure!(!content.trim().is_empty(), "Message is empty");
+        anyhow::ensure!(content.len() <= 64 * 1024, "Message is too long");
+        let view = self.shareable_session(session_id)?;
+        let sender = view.participants.iter().find(|record| {
+            matches!(&record.participant, Participant::Human { id, subject, .. }
+                if id.eq_ignore_ascii_case(actor_id)
+                    && github_id.is_none_or(|github_id| subject == &format!("github:{github_id}")))
+        });
+        anyhow::ensure!(
+            sender.is_some_and(|record| matches!(
+                record.role,
+                SessionRole::Owner | SessionRole::Editor | SessionRole::Reviewer
+            )),
+            "This participant cannot send session messages"
+        );
+        let recipients =
+            mentioned_participants(content, &view.participants, actor_id);
+        anyhow::ensure!(
+            !recipients.is_empty(),
+            "Address another session participant with @ to send a human-only message"
+        );
+        let store = self.store.write();
+        let message = ConversationMessage {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            turn_id: Uuid::new_v4().to_string(),
+            sequence: store.next_message_sequence(session_id)?,
+            role: format!("human_to:{}", recipients.join(",")),
+            actor_id: actor_id.to_string(),
+            content: content.to_string(),
+            status: "complete".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.upsert_message(&message)?;
+        drop(store);
+        if let Some(sink) = self.notification_sink.read().clone() {
+            sink(
+                ahead_rpc::ahead::AheadNotification::ConversationMessageAdded {
+                    message: message.clone(),
+                },
+            );
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn start_shared_agent_turn(
+        &self,
+        session_id: &str,
+        content: String,
+        actor_id: &str,
+        github_id: u64,
+    ) -> Result<Id> {
+        let view = self.shareable_session(session_id)?;
+        anyhow::ensure!(!content.trim().is_empty(), "Message is empty");
+        anyhow::ensure!(content.len() <= 64 * 1024, "Message is too long");
+        self.start_streamed_agent_turn_as(
+            ahead_rpc::ahead::AgentTurnRequestDto {
+                session_id: session_id.to_string(),
+                thread_id: format!("thread-{session_id}"),
+                harness: HarnessKind::Ahead,
+                external_agent_id: None,
+                model: None,
+                model_provider: None,
+                user_message: content,
+                session_context: String::new(),
+                context: ahead_rpc::ahead::TurnEditorContext {
+                    active_path: String::new(),
+                    caret: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+                    selection: None,
+                    file_content: String::new(),
+                    visible_end: None,
+                    attached_anchor_ids: Vec::new(),
+                    attached_files: Vec::new(),
+                    attached_memories: Vec::new(),
+                },
+                invariants: Vec::new(),
+                cwd: None,
+                expected_policy_sha256: view.session.policy.sha256,
+                read_only: false,
+                scope: None,
+            },
+            actor_id,
+            Some(github_id),
+        )
     }
 
     /// Drops uncommitted attribution anchors on `paths` once they are committed.
@@ -1617,7 +2363,13 @@ impl AheadSessionHost {
     fn durable_prediction_context(&self, session_id: &str) -> Result<String> {
         let store = self.store.read();
         let items = store.list_work_items(session_id)?;
-        let summaries = store.list_conversation_summaries(session_id)?;
+        // Summaries have no audience metadata yet; after a human-only message,
+        // do not trust them as model-facing context.
+        let summaries = if store.has_human_only_messages(session_id)? {
+            Vec::new()
+        } else {
+            store.list_conversation_summaries(session_id)?
+        };
         let mut context = String::new();
         if !items.is_empty() {
             context.push_str("Work items:\n");
@@ -1741,7 +2493,11 @@ impl AheadSessionHost {
         let page = store.list_messages_page(&parent.session.id, None, 20)?;
         if !page.messages.is_empty() {
             context.push_str("\nRecent parent conversation:\n");
-            for message in page.messages {
+            for message in page
+                .messages
+                .into_iter()
+                .filter(|message| message.human_recipient_ids().is_none())
+            {
                 let excerpt: String = message.content.chars().take(1200).collect();
                 context.push_str(&format!("{}: {}\n", message.role, excerpt));
             }
@@ -1827,11 +2583,44 @@ impl AheadSessionHost {
 
     fn start_streamed_agent_turn(
         &self,
-        mut dto: ahead_rpc::ahead::AgentTurnRequestDto,
+        dto: ahead_rpc::ahead::AgentTurnRequestDto,
     ) -> Result<Id> {
-        let view = self
-            .get_session(&dto.session_id)?
-            .context("Session not found")?;
+        let actor_id = self.auth.read().get_active_user(None).login;
+        self.start_streamed_agent_turn_as(dto, &actor_id, None)
+    }
+
+    fn start_streamed_agent_turn_as(
+        &self,
+        mut dto: ahead_rpc::ahead::AgentTurnRequestDto,
+        actor_id: &str,
+        github_id: Option<u64>,
+    ) -> Result<Id> {
+        let view = if github_id.is_some() {
+            self.shareable_session(&dto.session_id)?
+        } else {
+            self.get_session(&dto.session_id)?
+                .context("Session not found")?
+        };
+        anyhow::ensure!(
+            matches!(view.session.lifecycle, SessionLifecycle::Active),
+            "Only an active session can start an agent turn"
+        );
+        anyhow::ensure!(
+            view.participants.iter().any(|record| {
+                matches!(&record.participant, Participant::Human { id, subject, .. }
+                    if id.eq_ignore_ascii_case(actor_id)
+                        && github_id.is_none_or(|github_id| subject == &format!("github:{github_id}")))
+                    && matches!(record.role, SessionRole::Owner | SessionRole::Editor)
+            }),
+            "This participant cannot start agent turns"
+        );
+        anyhow::ensure!(
+            mentioned_participants(&dto.user_message, &view.participants, actor_id)
+                .is_empty(),
+            "Messages mentioning session participants are for people, not the agent"
+        );
+        dto.read_only |= dto.harness == HarnessKind::Ahead
+            && view.task.intent == TaskIntent::Teaching;
         if dto.expected_policy_sha256.is_empty() {
             anyhow::bail!("Agent turn is missing its expected policy hash");
         }
@@ -1866,7 +2655,9 @@ impl AheadSessionHost {
         if dto.session_context.trim().is_empty() {
             dto.session_context = self.durable_session_context(&view)?;
         }
-        self.harness.start_turn(dto)
+        dto.session_context
+            .push_str(&format!("\nCurrent message author: @{actor_id}"));
+        self.harness.start_turn(dto, actor_id)
     }
 
     /// Builds a full export bundle: session + workflow + participants +
@@ -2081,6 +2872,163 @@ mod tests {
                 .expect("session exists"),
             view
         );
+    }
+
+    #[test]
+    fn addressed_message_is_durable_and_does_not_start_an_agent_turn() -> Result<()>
+    {
+        let host = AheadSessionHost::in_memory()?;
+        assert!(
+            host.add_workspace_participant("bob,alice".into(), SessionRole::Editor)
+                .is_err()
+        );
+        host.add_workspace_participant("bob".into(), SessionRole::Editor)?;
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Shared work".into(),
+            "Discuss the change".into(),
+            None,
+        )?;
+        let message: ConversationMessage = serde_json::from_value(
+            host.handle_request(AheadRequest::PostHumanMessage {
+                session_id: view.session.id.clone(),
+                content: "@bob please review this".into(),
+            })?,
+        )?;
+        assert_eq!(message.human_recipient_ids(), Some(vec!["bob"]));
+        assert_eq!(
+            host.store.read().list_messages(&view.session.id)?,
+            vec![message]
+        );
+        assert!(
+            host.store
+                .read()
+                .has_human_only_messages(&view.session.id)?
+        );
+        host.store.read().save_conversation_summary(
+            &view.session.id,
+            "plan",
+            "private review detail",
+            "message range",
+        )?;
+        assert!(
+            !host
+                .durable_session_context(&view)?
+                .contains("private review detail")
+        );
+        assert!(!host.harness().has_active_turn(&view.session.id));
+        assert!(
+            host.handle_request(AheadRequest::PostHumanMessage {
+                session_id: view.session.id.clone(),
+                content: "@currentFile @unknown".into(),
+            })
+            .is_err()
+        );
+        host.active_sessions
+            .write()
+            .get_mut(&view.session.id)
+            .expect("active session")
+            .participants
+            .iter_mut()
+            .find(|record| record.participant.id() == view.session.owner_id)
+            .expect("owner participant")
+            .role = SessionRole::Reviewer;
+        let error = host
+            .start_streamed_agent_turn(turn_dto(
+                &view.session.id,
+                "run a turn",
+                &view.session.policy.sha256,
+            ))
+            .expect_err("reviewer cannot use the host's agent account");
+        assert!(error.to_string().contains("cannot start agent turns"));
+        Ok(())
+    }
+
+    #[test]
+    fn team_manifest_only_invites_selected_verified_members() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir(temp.path().join(".ahead"))?;
+        std::fs::write(
+            temp.path().join(".ahead/team.toml"),
+            "[[members]]\ngithub = 'bob'\ndisplay_name = 'Bob'\nrole = 'reviewer'\n",
+        )?;
+        let host = AheadSessionHost::in_memory()?;
+        let mut auth = GitHubAuthManager::with_custom_dir(temp.path().join("auth"));
+        auth.save_auth(
+            "host-token".into(),
+            ahead_rpc::ahead::GitHubUser {
+                login: "host".into(),
+                id: 1,
+                name: None,
+                avatar_url: None,
+                email: None,
+                is_authenticated: true,
+            },
+        )?;
+        host.set_auth_for_test(auth);
+        host.set_workspace(temp.path().to_path_buf());
+        let team = host.get_workspace_participants()?;
+        assert!(team.iter().any(|record| {
+            record.participant.id() == "bob" && record.role == SessionRole::Reviewer
+        }));
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Shared work".into(),
+            "Discuss".into(),
+            None,
+        )?;
+        assert!(
+            !view
+                .participants
+                .iter()
+                .any(|record| record.participant.id() == "bob")
+        );
+        let member = |login: &str, id| ahead_rpc::ahead::GitHubUser {
+            login: login.into(),
+            id,
+            name: None,
+            avatar_url: None,
+            email: None,
+            is_authenticated: true,
+        };
+        assert!(
+            host.add_session_participant_verified(
+                &view.session.id,
+                member("mallory", 99),
+                SessionRole::Editor,
+            )
+            .is_err()
+        );
+        let joined = host.add_session_participant_verified(
+            &view.session.id,
+            member("bob", 42),
+            SessionRole::Reviewer,
+        )?;
+        assert!(joined.participants.iter().any(|record| {
+            record.participant.id() == "bob" && record.role == SessionRole::Reviewer
+        }));
+        host.add_session_participant_verified(
+            &view.session.id,
+            member("bob", 42),
+            SessionRole::Viewer,
+        )?;
+        assert!(
+            host.create_code_comment_as(
+                &view.session.id,
+                "src.rs".into(),
+                DisplayRange {
+                    start: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+                    end: ahead_rpc::ahead::DisplayPosition { line: 0, col: 2 },
+                },
+                "fn".into(),
+                "0".repeat(64),
+                "Review".into(),
+                "bob",
+                42,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -2406,21 +3354,26 @@ mod tests {
         let workspace = temp.path().to_path_buf();
         let memory_path = workspace.join(".ahead/memories/MEMORY.md");
         std::fs::create_dir_all(memory_path.parent().context("memory parent")?)?;
-        let existing = "x".repeat(ahead_rpc::ahead::MEMORY_DOCUMENT_MAX_BYTES);
-        std::fs::write(&memory_path, &existing)?;
         let host = AheadSessionHost::in_memory()?;
         host.set_workspace(workspace);
 
-        let error = host
-            .handle_request(AheadRequest::WriteMemory {
-                scope: MemoryScope::Project,
-                message_id: "document-limit-message".into(),
-                content: "this append must not exceed the document limit".into(),
-            })
-            .expect_err("memory append must preserve the document limit");
+        for document_len in [
+            ahead_rpc::ahead::MEMORY_DOCUMENT_MAX_BYTES,
+            ahead_rpc::ahead::MEMORY_DOCUMENT_MAX_BYTES * 16,
+        ] {
+            let existing = "x".repeat(document_len);
+            std::fs::write(&memory_path, &existing)?;
+            let error = host
+                .handle_request(AheadRequest::WriteMemory {
+                    scope: MemoryScope::Project,
+                    message_id: "document-limit-message".into(),
+                    content: "this append must not exceed the document limit".into(),
+                })
+                .expect_err("memory append must preserve the document limit");
 
-        assert!(error.to_string().contains("32 KiB limit"));
-        assert_eq!(std::fs::read_to_string(memory_path)?, existing);
+            assert!(error.to_string().contains("32 KiB limit"));
+            assert_eq!(std::fs::read_to_string(&memory_path)?, existing);
+        }
         Ok(())
     }
 
@@ -2478,6 +3431,41 @@ mod tests {
                 .contains("must not resolve through a symlink")
         );
         assert!(!external_directory.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_directory_handle_survives_parent_symlink_swap() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        let memory_directory = workspace.join(".ahead/memories");
+        let original_directory = workspace.join(".ahead/original-memories");
+        let outside_directory = temporary.path().join("outside");
+        std::fs::create_dir_all(&memory_directory)?;
+        std::fs::create_dir_all(&outside_directory)?;
+        let path = memory_directory.join("MEMORY.md");
+        let outside_path = outside_directory.join("MEMORY.md");
+        std::fs::write(&path, "original memory")?;
+        std::fs::write(&outside_path, "outside memory")?;
+
+        let directory = AheadSessionHost::open_memory_directory(&path, false)?
+            .context("memory directory is missing")?;
+        std::fs::rename(&memory_directory, &original_directory)?;
+        std::os::unix::fs::symlink(&outside_directory, &memory_directory)?;
+
+        assert_eq!(
+            AheadSessionHost::read_memory_content_at(&directory, &path)?,
+            Some("original memory".into())
+        );
+        AheadSessionHost::replace_memory_content_at(&directory, "replacement")?;
+        let mut file = AheadSessionHost::open_memory_append_at(&directory)?;
+        file.write_all(b" appended")?;
+        assert_eq!(
+            std::fs::read_to_string(original_directory.join("MEMORY.md"))?,
+            "replacement appended"
+        );
+        assert_eq!(std::fs::read_to_string(outside_path)?, "outside memory");
         Ok(())
     }
 
@@ -2971,8 +3959,9 @@ mod tests {
 
     #[test]
     fn test_streamed_agent_turn_stale_policy_and_scope_reject() {
+        let workspace = tempfile::tempdir().unwrap();
         let host = AheadSessionHost::in_memory().unwrap();
-        host.set_workspace(PathBuf::from("/workspace"));
+        host.set_workspace(workspace.path().to_path_buf());
         let view = host
             .start_work(
                 Some(WorkKind::ProductChange),

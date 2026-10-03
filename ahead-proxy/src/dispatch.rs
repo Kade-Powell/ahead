@@ -13,16 +13,22 @@ use std::{
 
 use ahead_core::{
     encoding::offset_utf16_to_utf8_str,
-    search::{WorkspaceFileIndex, resolve_open_buffer_path},
+    search::{
+        WorkspaceFileIndex, is_binary_content, is_private_file,
+        resolve_open_buffer_path,
+    },
 };
 use ahead_extension_host::install_extension_from_url;
 use ahead_rpc::{
     RequestId, RpcError,
-    ahead::AheadRequest as AgentHostRequest,
+    ahead::{
+        AheadRequest as AgentHostRequest, SharedBufferEditResult,
+        SharedBufferSnapshot,
+    },
     buffer::BufferId,
     core::{CoreNotification, CoreRpcHandler, FileChanged},
     delta::{AheadDelta, DeltaOp},
-    file::FileNodeItem,
+    file::{EditorRecoverySnapshot, FileNodeItem},
     file_line::FileLine,
     proxy::{
         ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse,
@@ -48,6 +54,7 @@ use lsp_types::{
 };
 use parking_lot::Mutex;
 use ropey::Rope;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
@@ -63,6 +70,7 @@ const WORKSPACE_EVENT_TOKEN: WatchToken = WatchToken(2);
 const AHEAD_GITIGNORE: &str = include_str!("../../.ahead/.gitignore");
 const MAX_FIM_OPEN_BUFFERS: usize = 4;
 const MAX_FIM_OPEN_BUFFER_BYTES: usize = 4096;
+const MAX_SHARED_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn is_provider_settings_path(workspace: &Path, path: &Path) -> bool {
     path.strip_prefix(workspace).is_ok_and(|relative| {
@@ -95,6 +103,8 @@ pub struct Dispatcher {
     catalog_rpc: PluginCatalogRpcHandler,
     catalog_stopped: Option<crossbeam_channel::Receiver<()>>,
     buffers: HashMap<PathBuf, Buffer>,
+    shared_remote_pending: HashMap<PathBuf, (String, SharedBufferSnapshot)>,
+    shared_remote_recovery: HashMap<PathBuf, SharedRemoteRecovery>,
     terminals: HashMap<TermId, TerminalSender>,
     file_watcher: FileWatcher,
     file_index: Option<Arc<WorkspaceFileIndex>>,
@@ -105,6 +115,17 @@ pub struct Dispatcher {
     ahead_storage_error: Option<String>,
     pub ahead_host:
         Option<Arc<parking_lot::RwLock<crate::ahead::host::AheadSessionHost>>>,
+    shared_session_server: Option<crate::ahead::share::SharedSessionServer>,
+    shared_session_client:
+        Arc<Mutex<Option<crate::ahead::share::SharedSessionClient>>>,
+    #[cfg(feature = "test-support")]
+    share_test_api_base: Option<String>,
+}
+
+struct SharedRemoteRecovery {
+    buffer_id: String,
+    revision: u64,
+    relative_path: PathBuf,
 }
 
 impl ProxyHandler for Dispatcher {
@@ -131,6 +152,7 @@ impl ProxyHandler for Dispatcher {
                     self.workspace.clone(),
                     self.core_rpc.clone(),
                     self.proxy_rpc.clone(),
+                    self.catalog_rpc.clone(),
                     self.file_index.clone(),
                 );
                 let git_metadata_paths = notifier.git_metadata_paths.clone();
@@ -152,12 +174,14 @@ impl ProxyHandler for Dispatcher {
                 }
 
                 let plugin_rpc = self.catalog_rpc.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
                 let workspace = self.workspace.clone();
                 let (stopped, catalog_stopped) = crossbeam_channel::bounded(1);
                 self.catalog_stopped = Some(catalog_stopped);
                 thread::spawn(move || {
                     let mut plugin =
-                        PluginCatalog::new(workspace, plugin_rpc.clone());
+                        PluginCatalog::new(workspace, plugin_rpc.clone())
+                            .with_proxy_rpc(proxy_rpc);
                     plugin_rpc.mainloop(&mut plugin);
                     if let Err(error) = stopped.send(()) {
                         tracing::debug!(
@@ -192,6 +216,8 @@ impl ProxyHandler for Dispatcher {
                 } else {
                     crate::ahead::store::SessionStore::in_memory()
                 };
+                self.shared_session_server = None;
+                *self.shared_session_client.lock() = None;
                 self.ahead_host = None;
                 self.ahead_storage_error = None;
                 match session_store {
@@ -294,12 +320,14 @@ impl ProxyHandler for Dispatcher {
                 self.catalog_rpc.signature_help(request_id, &path, position);
             }
             Shutdown {} => {
+                self.shared_session_server = None;
+                *self.shared_session_client.lock() = None;
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 for cancelled in self.workspace_file_jobs.lock().values() {
                     cancelled.store(true, Ordering::SeqCst);
                 }
                 self.catalog_rpc.shutdown();
-                for (_, sender) in self.terminals.iter() {
+                for sender in self.terminals.values() {
                     sender.send(Msg::Shutdown);
                 }
                 if let Some(host) = &self.ahead_host {
@@ -318,14 +346,18 @@ impl ProxyHandler for Dispatcher {
             RestartLanguageServers {} => {
                 let documents = self
                     .buffers
-                    .iter()
+                    .iter_mut()
                     .filter_map(|(path, buffer)| {
                         let uri = Url::from_file_path(path).ok()?;
+                        let text = buffer.get_document();
+                        buffer.language_id =
+                            language_id_from_path_with_content(path, Some(&text))
+                                .unwrap_or_default();
                         Some(TextDocumentItem {
                             uri,
                             language_id: buffer.language_id.to_string(),
                             version: buffer.rev as i32,
-                            text: buffer.get_document(),
+                            text,
                         })
                     })
                     .collect();
@@ -341,6 +373,13 @@ impl ProxyHandler for Dispatcher {
                 }
             }
             Update { path, delta, rev } => {
+                if self.shared_remote_pending.contains_key(&path) {
+                    tracing::debug!(
+                        ?path,
+                        "host update waits for shared change acknowledgement"
+                    );
+                    return;
+                }
                 let Some(buffer) = self.buffers.get_mut(&path) else {
                     tracing::warn!(path = %path.display(), "ignoring update for unopened editor buffer");
                     return;
@@ -359,8 +398,25 @@ impl ProxyHandler for Dispatcher {
                 );
             }
             EditorSnapshot { path, content } => {
-                if let Err(error) = self.sync_editor_snapshot(path, content) {
-                    tracing::error!(?error, "synchronizing editor buffer");
+                let acknowledging_shared_change =
+                    self.shared_remote_pending.contains_key(&path);
+                if let Some(pending) = self.shared_remote_pending.get(&path) {
+                    if pending.1.content != content {
+                        tracing::debug!(
+                            ?path,
+                            "host snapshot waits for shared change acknowledgement"
+                        );
+                        return;
+                    }
+                }
+                match self.sync_editor_snapshot(path.clone(), content) {
+                    Ok(_) if acknowledging_shared_change => {
+                        self.shared_remote_pending.remove(&path);
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "synchronizing editor buffer");
+                    }
+                    Ok(_) => {}
                 }
             }
             CloseEditorBuffer { path } => self.close_editor_buffer(&path),
@@ -489,87 +545,6 @@ impl ProxyHandler for Dispatcher {
                     tracing::error!("{:?}", err);
                 }
             }
-            GitCommit { message, diffs } => {
-                if let Some(workspace) = self.workspace.as_ref() {
-                    // Paths in the commit, repo-relative, for attribution cleanup.
-                    let committed_paths: Vec<String> = diffs
-                        .iter()
-                        .flat_map(|d| match d {
-                            FileDiff::Renamed(old, new) => {
-                                vec![old.clone(), new.clone()]
-                            }
-                            other => vec![other.path().clone()],
-                        })
-                        .filter_map(|p| {
-                            p.strip_prefix(workspace)
-                                .ok()
-                                .map(|rel| rel.to_string_lossy().to_string())
-                        })
-                        .collect();
-
-                    // A commit is authored as `ahead` only when the changeset
-                    // actually includes agent-authored regions; a human-only
-                    // commit keeps the human author.
-                    let agent_session_id = self
-                        .ahead_host
-                        .as_ref()
-                        .and_then(|host| {
-                            host.read().anchors_for_paths(&committed_paths).ok()
-                        })
-                        .and_then(|anchors| {
-                            anchors
-                                .into_iter()
-                                .find(|a| {
-                                    a.actor_id == ahead_rpc::ahead::AHEAD_ACTOR_ID
-                                })
-                                .map(|anchor| anchor.session_id)
-                        });
-                    match git_commit(
-                        workspace,
-                        &message,
-                        diffs,
-                        agent_session_id.as_deref(),
-                    ) {
-                        Ok(()) => {
-                            if let Some(host) = self.ahead_host.as_ref() {
-                                let head_contents: HashMap<String, String> =
-                                    committed_paths
-                                        .iter()
-                                        .filter_map(|path| {
-                                            fs::read_to_string(workspace.join(path))
-                                                .ok()
-                                                .map(|content| {
-                                                    (path.clone(), content)
-                                                })
-                                        })
-                                        .collect();
-                                match host.read().clear_committed_anchors(
-                                    &committed_paths,
-                                    &head_contents,
-                                ) {
-                                    Ok(cleared) => tracing::debug!(
-                                        "cleared {cleared} committed attribution anchors"
-                                    ),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "failed to clear committed anchors: {e}"
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.core_rpc.show_message(
-                                "Git Commit failure".to_owned(),
-                                ShowMessageParams {
-                                    typ: MessageType::ERROR,
-                                    message: e.to_string(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
             GitCheckout { reference } => {
                 if let Some(workspace) = self.workspace.as_ref() {
                     match git_checkout(workspace, &reference) {
@@ -626,7 +601,12 @@ impl ProxyHandler for Dispatcher {
     fn handle_request(&mut self, id: RequestId, rpc: ProxyRequest) {
         use ProxyRequest::*;
         match rpc {
-            InstallLanguageExtension { url, extension_id } => {
+            InstallLanguageExtension {
+                url,
+                extension_id,
+                version,
+                expected_sha256,
+            } => {
                 let proxy_rpc = self.proxy_rpc.clone();
                 thread::spawn(move || {
                     let result =
@@ -639,6 +619,8 @@ impl ProxyHandler for Dispatcher {
                                     &url,
                                     &root,
                                     &extension_id,
+                                    &version,
+                                    expected_sha256.as_deref(),
                                 )
                             })
                             .map(|_| ProxyResponse::Success {})
@@ -649,7 +631,671 @@ impl ProxyHandler for Dispatcher {
                     proxy_rpc.handle_response(id, result);
                 });
             }
+            GitStageAll {} => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| git_stage_all(&workspace))
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
             AheadRequest { request } => {
+                if let AgentHostRequest::PublishSharedTerminal {
+                    session_id, ..
+                } = &request
+                {
+                    let session_id = session_id.clone();
+                    let result = (|| -> Result<ProxyResponse> {
+                        anyhow::ensure!(
+                            self.shared_session_server.as_ref().is_some_and(
+                                |server| server.offer().session_id == session_id
+                            ),
+                            "No active shared session"
+                        );
+                        let host = self
+                            .ahead_host
+                            .as_ref()
+                            .context("AHEAD session host is not initialized")?;
+                        Ok(ProxyResponse::AheadResponse {
+                            response: host.read().handle_request(request)?,
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::PublishSharedPresence {
+                    session_id,
+                    path,
+                    line,
+                } = &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        anyhow::ensure!(
+                            self.shared_session_server
+                                .as_ref()
+                                .is_some_and(|server| server.offer().session_id
+                                    == *session_id),
+                            "No active shared session"
+                        );
+                        if let Some(path) = path {
+                            self.read_shared_buffer(path)?;
+                        }
+                        self.shared_session_server
+                            .as_ref()
+                            .context("No active shared session")?
+                            .set_owner_location(path.clone(), *line);
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::json!({ "published": true }),
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::DiscardSharedRemoteRecovery { path } =
+                    &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        self.discard_shared_remote_recovery(path)?;
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::json!({ "discarded": true }),
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::GetSharedPresence { session_id } = &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        let server = self
+                            .shared_session_server
+                            .as_ref()
+                            .context("No active shared session")?;
+                        anyhow::ensure!(
+                            server.offer().session_id == *session_id,
+                            "Wrong shared session"
+                        );
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::to_value(server.presence())?,
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::ReadSharedBuffer { session_id, path } =
+                    &request
+                {
+                    if self.shared_session_client.lock().as_ref().is_some_and(
+                        |connection| connection.session_id() == session_id,
+                    ) {
+                        let clients = self.shared_session_client.clone();
+                        let proxy_rpc = self.proxy_rpc.clone();
+                        let session_id = session_id.clone();
+                        let path = path.clone();
+                        thread::spawn(move || {
+                            let result = (|| -> Result<ProxyResponse> {
+                                let mut clients = clients.lock();
+                                let connection = clients
+                                    .as_mut()
+                                    .context("No shared session is joined")?;
+                                anyhow::ensure!(
+                                    connection.session_id() == session_id,
+                                    "Wrong joined session"
+                                );
+                                let snapshot = connection.read_buffer(path)?;
+                                Ok(ProxyResponse::AheadResponse {
+                                    response: serde_json::to_value(snapshot)?,
+                                })
+                            })()
+                            .map_err(|error| RpcError {
+                                code: 0,
+                                message: error.to_string(),
+                            });
+                            proxy_rpc.handle_response(id, result);
+                        });
+                    } else {
+                        let result = (|| -> Result<ProxyResponse> {
+                            self.ahead_host
+                                .as_ref()
+                                .context("AHEAD session host is not initialized")?
+                                .read()
+                                .can_host_share(session_id)?;
+                            let snapshot = self.read_shared_buffer(path)?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(snapshot)?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        self.respond_rpc(id, result);
+                    }
+                    return;
+                }
+                if let AgentHostRequest::ReplaceSharedBuffer {
+                    session_id,
+                    path,
+                    expected_revision,
+                    content,
+                } = &request
+                {
+                    if self.shared_session_client.lock().as_ref().is_some_and(
+                        |connection| connection.session_id() == session_id,
+                    ) {
+                        let clients = self.shared_session_client.clone();
+                        let proxy_rpc = self.proxy_rpc.clone();
+                        let session_id = session_id.clone();
+                        let path = path.clone();
+                        let expected_revision = *expected_revision;
+                        let content = content.clone();
+                        thread::spawn(move || {
+                            let result = (|| -> Result<ProxyResponse> {
+                                let mut clients = clients.lock();
+                                let connection = clients
+                                    .as_mut()
+                                    .context("No shared session is joined")?;
+                                anyhow::ensure!(
+                                    connection.session_id() == session_id,
+                                    "Wrong joined session"
+                                );
+                                let edit = connection.replace_buffer(
+                                    path,
+                                    expected_revision,
+                                    content,
+                                )?;
+                                Ok(ProxyResponse::AheadResponse {
+                                    response: serde_json::to_value(edit)?,
+                                })
+                            })()
+                            .map_err(|error| RpcError {
+                                code: 0,
+                                message: error.to_string(),
+                            });
+                            proxy_rpc.handle_response(id, result);
+                        });
+                    } else {
+                        let result = (|| -> Result<ProxyResponse> {
+                            self.ahead_host
+                                .as_ref()
+                                .context("AHEAD session host is not initialized")?
+                                .read()
+                                .can_host_share(session_id)?;
+                            let edit = self.replace_shared_buffer(
+                                session_id,
+                                path,
+                                *expected_revision,
+                                content.clone(),
+                            )?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(edit)?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        self.respond_rpc(id, result);
+                    }
+                    return;
+                }
+                let shared_comment_session = match &request {
+                    AgentHostRequest::CreateCodeComment { session_id, .. }
+                    | AgentHostRequest::ListCodeComments { session_id }
+                    | AgentHostRequest::ResolveCodeComment { session_id, .. } => {
+                        Some(session_id.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(session_id) = shared_comment_session
+                    && self.shared_session_client.lock().as_ref().is_some_and(
+                        |connection| connection.session_id() == session_id,
+                    )
+                {
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let mut clients = clients.lock();
+                            let connection = clients
+                                .as_mut()
+                                .context("No shared session is joined")?;
+                            anyhow::ensure!(
+                                connection.session_id() == session_id,
+                                "Wrong joined session"
+                            );
+                            let response = match request {
+                                AgentHostRequest::ListCodeComments { .. } => {
+                                    serde_json::to_value(
+                                        connection.list_code_comments()?,
+                                    )?
+                                }
+                                AgentHostRequest::CreateCodeComment {
+                                    path,
+                                    range,
+                                    quote,
+                                    source_sha256,
+                                    body,
+                                    ..
+                                } => serde_json::to_value(
+                                    connection.create_code_comment(
+                                        path,
+                                        range,
+                                        quote,
+                                        source_sha256,
+                                        body,
+                                    )?,
+                                )?,
+                                AgentHostRequest::ResolveCodeComment {
+                                    comment_id,
+                                    ..
+                                } => serde_json::to_value(
+                                    connection.resolve_code_comment(comment_id)?,
+                                )?,
+                                _ => anyhow::bail!(
+                                    "Unsupported shared comment request"
+                                ),
+                            };
+                            Ok(ProxyResponse::AheadResponse { response })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::JoinSharedSession { offer } = &request {
+                    let host = self.ahead_host.clone();
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let offer = offer.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let host = host
+                                .context("AHEAD session host is not initialized")?;
+                            let token = host.read().share_join_token()?;
+                            let (
+                                client,
+                                view,
+                                messages,
+                                code_comments,
+                                terminal_output,
+                                presence,
+                            ) = crate::ahead::share::SharedSessionClient::connect(
+                                &offer, &token,
+                            )?;
+                            let actor_id = client.actor_id().to_string();
+                            *clients.lock() = Some(client);
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(
+                                    ahead_rpc::ahead::SharedSessionUpdate {
+                                        view,
+                                        messages,
+                                        code_comments,
+                                        terminal_output,
+                                        presence,
+                                        actor_id,
+                                    },
+                                )?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::PollSharedSession {
+                    session_id,
+                    after_sequence,
+                    active_path,
+                    active_line,
+                } = &request
+                {
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let session_id = session_id.clone();
+                    let after_sequence = *after_sequence;
+                    let active_path = active_path.clone();
+                    let active_line = *active_line;
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let mut client = clients.lock();
+                            let connection = client
+                                .as_mut()
+                                .context("No shared session is joined")?;
+                            anyhow::ensure!(
+                                connection.session_id() == session_id,
+                                "Wrong joined session"
+                            );
+                            let (
+                                view,
+                                messages,
+                                code_comments,
+                                terminal_output,
+                                presence,
+                            ) = connection.poll(
+                                after_sequence,
+                                active_path,
+                                active_line,
+                            )?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(
+                                    ahead_rpc::ahead::SharedSessionUpdate {
+                                        view,
+                                        messages,
+                                        code_comments,
+                                        terminal_output,
+                                        presence,
+                                        actor_id: connection.actor_id().to_string(),
+                                    },
+                                )?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::PostSharedHumanMessage {
+                    session_id,
+                    content,
+                } = &request
+                {
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let session_id = session_id.clone();
+                    let content = content.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let mut client = clients.lock();
+                            let connection = client
+                                .as_mut()
+                                .context("No shared session is joined")?;
+                            anyhow::ensure!(
+                                connection.session_id() == session_id,
+                                "Wrong joined session"
+                            );
+                            let message = connection.post_human_message(content)?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(message)?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::StartSharedAgentTurn {
+                    session_id,
+                    content,
+                } = &request
+                {
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let session_id = session_id.clone();
+                    let content = content.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let mut client = clients.lock();
+                            let connection = client
+                                .as_mut()
+                                .context("No shared session is joined")?;
+                            anyhow::ensure!(
+                                connection.session_id() == session_id,
+                                "Wrong joined session"
+                            );
+                            let turn_id = connection.start_agent_turn(content)?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(turn_id)?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::LeaveSharedSession { session_id } = &request
+                {
+                    let clients = self.shared_session_client.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let session_id = session_id.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let mut client = clients.lock();
+                            anyhow::ensure!(
+                                client.as_ref().is_some_and(|connection| {
+                                    connection.session_id() == session_id
+                                }),
+                                "This shared session is not joined"
+                            );
+                            *client = None;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::json!({ "left": true }),
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::AddSessionParticipant {
+                    session_id,
+                    user_handle,
+                    role,
+                } = &request
+                {
+                    let host = self.ahead_host.clone();
+                    let proxy_rpc = self.proxy_rpc.clone();
+                    let session_id = session_id.clone();
+                    let user_handle = user_handle.clone();
+                    let role = *role;
+                    thread::spawn(move || {
+                        let result = (|| -> Result<ProxyResponse> {
+                            let host = host
+                                .context("AHEAD session host is not initialized")?;
+                            host.read().can_host_share(&session_id)?;
+                            let token = host.read().share_join_token()?;
+                            let user = crate::ahead::share::resolve_github_user(
+                                &token,
+                                &user_handle,
+                            )?;
+                            let view =
+                                host.read().add_session_participant_verified(
+                                    &session_id,
+                                    user,
+                                    role,
+                                )?;
+                            Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(view)?,
+                            })
+                        })()
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+                    return;
+                }
+                if let AgentHostRequest::RevokeSessionParticipant {
+                    session_id,
+                    user_handle,
+                } = &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        let host = self
+                            .ahead_host
+                            .clone()
+                            .context("AHEAD session host is not initialized")?;
+                        let view = host
+                            .read()
+                            .revoke_session_participant(session_id, user_handle)?;
+                        if let Some(server) = &self.shared_session_server
+                            && server.offer().session_id == *session_id
+                        {
+                            server.revoke_actor(user_handle);
+                        }
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::to_value(view)?,
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::ShareSession {
+                    session_id,
+                    bind_address,
+                } = &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        let host = self
+                            .ahead_host
+                            .clone()
+                            .context("AHEAD session host is not initialized")?;
+                        host.read().can_host_share(session_id)?;
+                        if let Some(server) = &self.shared_session_server {
+                            anyhow::ensure!(
+                                server.offer().session_id == *session_id,
+                                "Stop sharing the current session first"
+                            );
+                            return Ok(ProxyResponse::AheadResponse {
+                                response: serde_json::to_value(server.offer())?,
+                            });
+                        }
+                        #[cfg(feature = "test-support")]
+                        let server = if let Some(api_base) =
+                            &self.share_test_api_base
+                        {
+                            crate::ahead::share::SharedSessionServer::start_with_api(
+                                host,
+                                self.proxy_rpc.clone(),
+                                session_id.clone(),
+                                bind_address,
+                                api_base,
+                            )?
+                        } else {
+                            crate::ahead::share::SharedSessionServer::start(
+                                host,
+                                self.proxy_rpc.clone(),
+                                session_id.clone(),
+                                bind_address,
+                            )?
+                        };
+                        #[cfg(not(feature = "test-support"))]
+                        let server =
+                            crate::ahead::share::SharedSessionServer::start(
+                                host,
+                                self.proxy_rpc.clone(),
+                                session_id.clone(),
+                                bind_address,
+                            )?;
+                        let response = serde_json::to_value(server.offer())?;
+                        self.shared_session_server = Some(server);
+                        Ok(ProxyResponse::AheadResponse { response })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::StopSharingSession { session_id } = &request
+                {
+                    let result = (|| -> Result<ProxyResponse> {
+                        let server = self
+                            .shared_session_server
+                            .as_ref()
+                            .context("This session is not shared")?;
+                        anyhow::ensure!(
+                            server.offer().session_id == *session_id,
+                            "A different session is shared"
+                        );
+                        self.ensure_no_pending_shared_changes(session_id)?;
+                        self.shared_session_server = None;
+                        if let Some(host) = &self.ahead_host {
+                            host.read().clear_shared_terminal(session_id);
+                        }
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::json!({ "stopped": true }),
+                        })
+                    })()
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                    self.respond_rpc(id, result);
+                    return;
+                }
+                if let AgentHostRequest::ArchiveSession { session_id } = &request {
+                    let result = self
+                        .ensure_no_pending_shared_changes(session_id)
+                        .and_then(|_| {
+                            self.ahead_host
+                                .as_ref()
+                                .context("AHEAD session host is not initialized")
+                                .and_then(|host| {
+                                    host.read().handle_request(request.clone())
+                                })
+                        })
+                        .map(|response| ProxyResponse::AheadResponse { response })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    if result.is_ok()
+                        && self.shared_session_server.as_ref().is_some_and(
+                            |server| server.offer().session_id == *session_id,
+                        )
+                    {
+                        self.shared_session_server = None;
+                    }
+                    self.respond_rpc(id, result);
+                    return;
+                }
                 let background = matches!(
                     &request,
                     AgentHostRequest::SearchMemory { .. }
@@ -706,6 +1352,27 @@ impl ProxyHandler for Dispatcher {
                     id,
                     Ok(ProxyResponse::NewBufferResponse { content, read_only }),
                 );
+            }
+            GitCommit { message, diffs } => {
+                let host = self.ahead_host.as_ref().map(|host| host.read());
+                let result = self
+                    .workspace
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no workspace set"))
+                    .and_then(|workspace| {
+                        git_commit_attributed(
+                            workspace,
+                            &message,
+                            diffs,
+                            host.as_deref(),
+                        )
+                    })
+                    .map(|_| ProxyResponse::Success {})
+                    .map_err(|error| RpcError {
+                        code: 0,
+                        message: error.to_string(),
+                    });
+                self.respond_rpc(id, result);
             }
             GitFileState { path, content } => {
                 let workspace = self.workspace.clone();
@@ -1299,22 +1966,32 @@ impl ProxyHandler for Dispatcher {
                 path,
                 create_parents,
             } => {
-                let result =
-                    self.save_buffer(&path, rev, create_parents).map_err(|e| {
-                        RpcError {
+                let result = if self.shared_remote_pending.contains_key(&path) {
+                    Err(RpcError {
+                        code: 0,
+                        message: "Resolve the incoming shared edit before saving"
+                            .into(),
+                    })
+                } else {
+                    self.save_buffer(&path, rev, create_parents)
+                        .and_then(|response| {
+                            self.clear_shared_remote_recovery(&path)?;
+                            Ok(response)
+                        })
+                        .map_err(|error| RpcError {
                             code: 0,
-                            message: e.to_string(),
-                        }
-                    });
+                            message: error.to_string(),
+                        })
+                };
                 self.respond_rpc(id, result);
             }
             SaveEditorBuffer { path, content } => {
-                let result = self
-                    .sync_editor_snapshot(path.clone(), content)
-                    .and_then(|rev| self.save_buffer(&path, rev, false))
-                    .map_err(|error| RpcError {
-                        code: 0,
-                        message: error.to_string(),
+                let result =
+                    self.save_editor_buffer(path, content).map_err(|error| {
+                        RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        }
                     });
                 self.respond_rpc(id, result);
             }
@@ -1325,11 +2002,24 @@ impl ProxyHandler for Dispatcher {
                 content,
                 create_parents,
             } => {
+                if self.shared_remote_pending.contains_key(&path) {
+                    self.respond_rpc(
+                        id,
+                        Err(RpcError {
+                            code: 0,
+                            message:
+                                "Resolve the incoming shared edit before saving"
+                                    .into(),
+                        }),
+                    );
+                    return;
+                }
                 let mut buffer = Buffer::new(buffer_id, path.clone());
                 buffer.rope = Rope::from(content);
                 buffer.rev = rev;
                 let result = buffer
                     .save(rev, create_parents)
+                    .and_then(|()| self.clear_shared_remote_recovery(&path))
                     .map(|_| ProxyResponse::Success {})
                     .map_err(|e| RpcError {
                         code: 0,
@@ -1671,8 +2361,7 @@ fn prediction_prefix_suffix(rope: &Rope, position: Position) -> (String, String)
     }
     let line_start = rope.line_to_byte_idx(line_index, ropey::LineType::LF_CR);
     let line = rope.line(line_index, ropey::LineType::LF_CR).to_string();
-    let line_content =
-        line.trim_end_matches(|character| character == '\r' || character == '\n');
+    let line_content = line.trim_end_matches(['\r', '\n']);
     let column = offset_utf16_to_utf8_str(line_content, position.character as usize);
     let cursor_offset = line_start + column;
     (
@@ -1779,7 +2468,26 @@ fn relevant_open_buffer_contexts(
 }
 
 impl Dispatcher {
+    fn ensure_no_pending_shared_changes(&self, session_id: &str) -> Result<()> {
+        let paths: Vec<_> = self
+            .shared_remote_pending
+            .iter()
+            .filter_map(|(path, (pending_session, _))| {
+                (pending_session == session_id).then(|| path.display().to_string())
+            })
+            .collect();
+        anyhow::ensure!(
+            paths.is_empty(),
+            "Open and save collaborator edits before ending this share: {}",
+            paths.join(", ")
+        );
+        Ok(())
+    }
+
     fn close_editor_buffer(&mut self, path: &Path) {
+        if self.shared_remote_pending.contains_key(path) {
+            return;
+        }
         if self.buffers.remove(path).is_some() {
             self.catalog_rpc.did_close_document(path.to_owned());
             let watched_path =
@@ -1838,6 +2546,198 @@ impl Dispatcher {
         }
     }
 
+    fn shared_buffer_path(&self, relative: &str) -> Result<PathBuf> {
+        anyhow::ensure!(relative.len() <= 1024, "Shared buffer path is too long");
+        let relative = Path::new(relative);
+        anyhow::ensure!(
+            !is_private_file(relative)
+                && !relative.components().any(|component| {
+                    component.as_os_str().to_string_lossy().starts_with('.')
+                }),
+            "This file cannot be shared"
+        );
+        let workspace = self.workspace.as_ref().context("No workspace set")?;
+        resolve_open_buffer_path(workspace, relative)
+            .context("Shared file is outside the workspace or follows a link")
+    }
+
+    fn read_shared_buffer(
+        &mut self,
+        relative: &str,
+    ) -> Result<SharedBufferSnapshot> {
+        let path = self.shared_buffer_path(relative)?;
+        if !self.buffers.contains_key(&path) {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            anyhow::ensure!(
+                bytes.len() <= MAX_SHARED_BUFFER_BYTES
+                    && !bytes.contains(&0)
+                    && !is_binary_content(&bytes),
+                "Shared file must be text smaller than 1 MiB"
+            );
+            let content = String::from_utf8(bytes)
+                .context("Shared file must be UTF-8 text")?;
+            self.sync_editor_snapshot(path.clone(), content)?;
+        }
+        let buffer = self
+            .buffers
+            .get(&path)
+            .context("Shared buffer was closed")?;
+        let content = buffer.get_document();
+        anyhow::ensure!(
+            content.len() <= MAX_SHARED_BUFFER_BYTES,
+            "Shared file is larger than 1 MiB"
+        );
+        Ok(SharedBufferSnapshot {
+            path: relative.to_string(),
+            revision: buffer.rev,
+            content,
+        })
+    }
+
+    fn replace_shared_buffer(
+        &mut self,
+        session_id: &str,
+        relative: &str,
+        expected_revision: u64,
+        content: String,
+    ) -> Result<SharedBufferEditResult> {
+        anyhow::ensure!(
+            content.len() <= MAX_SHARED_BUFFER_BYTES && !content.contains('\0'),
+            "Shared buffer must be text smaller than 1 MiB"
+        );
+        let current = self.read_shared_buffer(relative)?;
+        if current.revision != expected_revision {
+            return Ok(SharedBufferEditResult {
+                applied: false,
+                snapshot: current,
+            });
+        }
+        let path = self.shared_buffer_path(relative)?;
+        anyhow::ensure!(
+            self.buffers
+                .get(&path)
+                .is_some_and(|buffer| !buffer.read_only),
+            "Shared buffer is read-only"
+        );
+        self.persist_shared_remote_recovery(&path, &content)?;
+        self.sync_editor_snapshot(path, content)?;
+        let snapshot = self.read_shared_buffer(relative)?;
+        let path = self.shared_buffer_path(relative)?;
+        self.shared_remote_pending
+            .insert(path, (session_id.to_string(), snapshot.clone()));
+        self.core_rpc.ahead_notification(
+            ahead_rpc::ahead::AheadNotification::SharedBufferChanged {
+                session_id: session_id.to_string(),
+                snapshot: snapshot.clone(),
+                previous_content: current.content,
+            },
+        );
+        Ok(SharedBufferEditResult {
+            applied: true,
+            snapshot,
+        })
+    }
+
+    fn persist_shared_remote_recovery(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<()> {
+        let host = self
+            .ahead_host
+            .as_ref()
+            .context("AHEAD session host is not initialized")?;
+        let workspace = self.workspace.as_ref().context("No workspace set")?;
+        let relative_path = path
+            .strip_prefix(workspace)
+            .context("Shared file is outside the workspace")?
+            .to_path_buf();
+        let (buffer_id, revision) =
+            if let Some(record) = self.shared_remote_recovery.get(path) {
+                (
+                    record.buffer_id.clone(),
+                    record
+                        .revision
+                        .checked_add(1)
+                        .context("recovery revision overflow")?,
+                )
+            } else {
+                (uuid::Uuid::new_v4().to_string(), 1)
+            };
+        let saved_sha256 = match fs::read(path) {
+            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let snapshot = EditorRecoverySnapshot {
+            buffer_id: buffer_id.clone(),
+            revision,
+            path: relative_path.clone(),
+            contents: Some(content.to_string()),
+            saved_sha256,
+        };
+        let stored: bool =
+            serde_json::from_value(host.read().handle_request(
+                AgentHostRequest::WriteEditorRecovery { snapshot },
+            )?)?;
+        anyhow::ensure!(stored, "Could not persist the incoming shared edit");
+        self.shared_remote_recovery.insert(
+            path.to_path_buf(),
+            SharedRemoteRecovery {
+                buffer_id,
+                revision,
+                relative_path,
+            },
+        );
+        Ok(())
+    }
+
+    fn clear_shared_remote_recovery(&mut self, path: &Path) -> Result<()> {
+        let Some(record) = self.shared_remote_recovery.get(path) else {
+            return Ok(());
+        };
+        let host = self
+            .ahead_host
+            .as_ref()
+            .context("AHEAD session host is not initialized")?;
+        let snapshot = EditorRecoverySnapshot {
+            buffer_id: record.buffer_id.clone(),
+            revision: record
+                .revision
+                .checked_add(1)
+                .context("recovery revision overflow")?,
+            path: record.relative_path.clone(),
+            contents: None,
+            saved_sha256: None,
+        };
+        let stored: bool =
+            serde_json::from_value(host.read().handle_request(
+                AgentHostRequest::WriteEditorRecovery { snapshot },
+            )?)?;
+        anyhow::ensure!(stored, "Could not clear the saved shared edit recovery");
+        self.shared_remote_recovery.remove(path);
+        Ok(())
+    }
+
+    fn discard_shared_remote_recovery(&mut self, path: &Path) -> Result<()> {
+        if self.shared_remote_recovery.contains_key(path) {
+            anyhow::ensure!(
+                !self.shared_remote_pending.contains_key(path),
+                "Apply the incoming shared edit before discarding it"
+            );
+            anyhow::ensure!(
+                self.shared_session_server.is_none(),
+                "Stop sharing before discarding a collaborator edit"
+            );
+            self.clear_shared_remote_recovery(path)?;
+        }
+        Ok(())
+    }
+
     fn save_buffer(
         &mut self,
         path: &Path,
@@ -1854,6 +2754,28 @@ impl Dispatcher {
         Ok(ProxyResponse::SaveResponse {})
     }
 
+    fn save_editor_buffer(
+        &mut self,
+        path: PathBuf,
+        content: String,
+    ) -> Result<ProxyResponse> {
+        let acknowledging_shared_change =
+            self.shared_remote_pending.contains_key(&path);
+        if let Some(pending) = self.shared_remote_pending.get(&path) {
+            anyhow::ensure!(
+                pending.1.content == content,
+                "Shared file changed; resolve the incoming edit before saving"
+            );
+        }
+        let rev = self.sync_editor_snapshot(path.clone(), content)?;
+        let response = self.save_buffer(&path, rev, false)?;
+        self.clear_shared_remote_recovery(&path)?;
+        if acknowledging_shared_change {
+            self.shared_remote_pending.remove(&path);
+        }
+        Ok(response)
+    }
+
     pub fn new(core_rpc: CoreRpcHandler, proxy_rpc: ProxyRpcHandler) -> Self {
         let plugin_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
 
@@ -1866,6 +2788,8 @@ impl Dispatcher {
             catalog_rpc: plugin_rpc,
             catalog_stopped: None,
             buffers: HashMap::new(),
+            shared_remote_pending: HashMap::new(),
+            shared_remote_recovery: HashMap::new(),
             terminals: HashMap::new(),
             file_watcher,
             file_index: None,
@@ -1874,8 +2798,17 @@ impl Dispatcher {
             window_id: 1,
             tab_id: 1,
             ahead_host: None,
+            shared_session_server: None,
+            shared_session_client: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            share_test_api_base: None,
             ahead_storage_error: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_share_test_api_base(&mut self, api_base: String) {
+        self.share_test_api_base = Some(api_base);
     }
 
     fn respond_rpc(&self, id: RequestId, result: Result<ProxyResponse, RpcError>) {
@@ -1892,9 +2825,10 @@ impl Dispatcher {
 struct FileWatchNotifier {
     core_rpc: CoreRpcHandler,
     proxy_rpc: ProxyRpcHandler,
+    catalog_rpc: PluginCatalogRpcHandler,
     workspace: Option<PathBuf>,
     file_index: Option<Arc<WorkspaceFileIndex>>,
-    workspace_fs_change_handler: Arc<Mutex<Option<Sender<(bool, bool)>>>>,
+    workspace_fs_change_handler: Arc<Mutex<Option<Sender<(bool, bool, bool)>>>>,
     git_metadata_paths: Vec<PathBuf>,
 }
 
@@ -1909,6 +2843,7 @@ impl FileWatchNotifier {
         workspace: Option<PathBuf>,
         core_rpc: CoreRpcHandler,
         proxy_rpc: ProxyRpcHandler,
+        catalog_rpc: PluginCatalogRpcHandler,
         file_index: Option<Arc<WorkspaceFileIndex>>,
     ) -> Self {
         let git_metadata_paths = workspace
@@ -1927,6 +2862,7 @@ impl FileWatchNotifier {
             file_index,
             core_rpc,
             proxy_rpc,
+            catalog_rpc,
             workspace_fs_change_handler: Arc::new(Mutex::new(None)),
             git_metadata_paths,
         };
@@ -1995,13 +2931,13 @@ impl FileWatchNotifier {
                     .iter()
                     .any(|path| index.affects_search(path, file_set_change))
             });
-        let notify_relevant = search_relevant
-            || self.workspace.as_ref().is_some_and(|workspace| {
-                event
-                    .paths
-                    .iter()
-                    .any(|path| is_provider_settings_path(workspace, path))
-            });
+        let settings_relevant = self.workspace.as_ref().is_some_and(|workspace| {
+            event
+                .paths
+                .iter()
+                .any(|path| is_provider_settings_path(workspace, path))
+        });
+        let notify_relevant = search_relevant || settings_relevant;
         // Git can change without changing the file-status list (for example,
         // amend on the same branch). Invalidate buffer metadata on those events.
         let git_relevant = search_relevant
@@ -2025,18 +2961,23 @@ impl FileWatchNotifier {
 
         let mut handler = self.workspace_fs_change_handler.lock();
         if let Some(sender) = handler.as_mut() {
-            if let Err(err) = sender.send((notify_relevant, git_relevant)) {
+            if let Err(err) =
+                sender.send((notify_relevant, git_relevant, settings_relevant))
+            {
                 tracing::error!("{:?}", err);
             }
             return;
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
-        if let Err(err) = sender.send((notify_relevant, git_relevant)) {
+        if let Err(err) =
+            sender.send((notify_relevant, git_relevant, settings_relevant))
+        {
             tracing::error!("{:?}", err);
         }
 
         let local_handler = self.workspace_fs_change_handler.clone();
         let core_rpc = self.core_rpc.clone();
+        let catalog_rpc = self.catalog_rpc.clone();
         let file_index = self.file_index.clone();
         let workspace = self.workspace.clone().unwrap();
         thread::spawn(move || {
@@ -2046,12 +2987,18 @@ impl FileWatchNotifier {
                 local_handler.lock().take();
             }
 
-            let (notify_relevant, git_relevant) = receiver.into_iter().fold(
-                (false, false),
-                |(notify, git), (next_notify, next_git)| {
-                    (notify || next_notify, git || next_git)
-                },
-            );
+            let (notify_relevant, git_relevant, settings_relevant) =
+                receiver.into_iter().fold(
+                    (false, false, false),
+                    |(notify, git, settings),
+                     (next_notify, next_git, next_settings)| {
+                        (
+                            notify || next_notify,
+                            git || next_git,
+                            settings || next_settings,
+                        )
+                    },
+                );
             if notify_relevant {
                 let generation = file_index
                     .as_ref()
@@ -2061,6 +3008,13 @@ impl FileWatchNotifier {
             }
             if git_relevant {
                 core_rpc.diff_info(git_diff_new(&workspace).unwrap_or_default());
+            }
+            if settings_relevant
+                && let Err(error) = catalog_rpc.catalog_notification(
+                    crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations,
+                )
+            {
+                tracing::error!(?error, "refreshing language-server settings");
             }
         });
         *handler = Some(sender);
@@ -2083,54 +3037,68 @@ fn git_init(workspace_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn git_stage_all(workspace_path: &Path) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(workspace_path)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Could not stage changes: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
 fn git_commit(
     workspace_path: &Path,
     message: &str,
     diffs: Vec<FileDiff>,
-    agent_session_id: Option<&str>,
+    agent_session_ids: &[String],
 ) -> Result<()> {
+    anyhow::ensure!(!message.trim().is_empty(), "Enter a commit message");
     let repo = Repository::discover(workspace_path)?;
     let mut index = repo.index()?;
-    for diff in diffs {
-        match diff {
-            FileDiff::Modified(p) | FileDiff::Added(p) => {
-                index.add_path(p.strip_prefix(workspace_path)?)?;
-            }
-            FileDiff::Renamed(old, new) => {
-                index.add_path(new.strip_prefix(workspace_path)?)?;
-                index.remove_path(old.strip_prefix(workspace_path)?)?;
-            }
-            FileDiff::Deleted(p) => {
-                index.remove_path(p.strip_prefix(workspace_path)?)?;
-            }
-        }
-    }
+    stage_diffs(&mut index, workspace_path, diffs)?;
     index.write()?;
     let tree = index.write_tree()?;
     let tree = repo.find_tree(tree)?;
 
     match repo.signature() {
         Ok(signature) => {
-            let parents = repo
-                .head()
-                .and_then(|head| Ok(vec![head.peel_to_commit()?]))
-                .unwrap_or(vec![]);
+            let parents = match repo.head() {
+                Ok(head) => vec![
+                    head.peel_to_commit()
+                        .context("HEAD does not point to a commit")?,
+                ],
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        NotFound | git2::ErrorCode::UnbornBranch
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Err(error) => return Err(error.into()),
+            };
             let parents_refs = parents.iter().collect::<Vec<_>>();
 
             // Committer is always the human driving the commit. Author is
             // `ahead` when the changeset carries agent-authored regions, so
             // attribution is visible in `git log --author=ahead` / blame.
-            let author = if agent_session_id.is_some() {
+            let author = if !agent_session_ids.is_empty() {
                 git2::Signature::now("ahead", "ahead@ahead.local")
                     .unwrap_or_else(|_| signature.clone())
             } else {
                 signature.clone()
             };
-            let commit_message = match agent_session_id {
-                Some(session_id) => {
-                    format!("{message}\n\nAhead-Session: {session_id}")
-                }
-                None => message.to_string(),
+            let commit_message = if agent_session_ids.is_empty() {
+                message.to_string()
+            } else {
+                format!(
+                    "{message}\n\nAhead-Session: {}",
+                    agent_session_ids.join("\nAhead-Session: ")
+                )
             };
 
             repo.commit(
@@ -2153,6 +3121,99 @@ fn git_commit(
             )),
         },
     }
+}
+
+fn stage_diffs(
+    index: &mut git2::Index,
+    workspace_path: &Path,
+    diffs: Vec<FileDiff>,
+) -> Result<()> {
+    for diff in diffs {
+        match diff {
+            FileDiff::Modified(p) | FileDiff::Added(p) => {
+                index.add_path(p.strip_prefix(workspace_path)?)?;
+            }
+            FileDiff::Renamed(old, new) => {
+                index.add_path(new.strip_prefix(workspace_path)?)?;
+                index.remove_path(old.strip_prefix(workspace_path)?)?;
+            }
+            FileDiff::Deleted(p) => {
+                index.remove_path(p.strip_prefix(workspace_path)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_commit_attributed(
+    workspace_path: &Path,
+    message: &str,
+    diffs: Vec<FileDiff>,
+    host: Option<&crate::ahead::host::AheadSessionHost>,
+) -> Result<()> {
+    anyhow::ensure!(!message.trim().is_empty(), "Enter a commit message");
+    let repo = Repository::discover(workspace_path)?;
+    let mut index = repo.index()?;
+    stage_diffs(&mut index, workspace_path, diffs)?;
+    index.write()?;
+    let head_tree = match repo.head() {
+        Ok(head) => Some(head.peel_to_tree()?),
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::NotFound | git2::ErrorCode::UnbornBranch
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
+    let mut committed_paths: Vec<String> = staged
+        .deltas()
+        .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
+        .flatten()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    committed_paths.sort();
+    committed_paths.dedup();
+    anyhow::ensure!(
+        !committed_paths.is_empty(),
+        "Stage changes before committing"
+    );
+    let committed_contents: HashMap<String, String> = committed_paths
+        .iter()
+        .filter_map(|path| {
+            let entry = index.get_path(Path::new(path), 0)?;
+            let blob = repo.find_blob(entry.id).ok()?;
+            let content = std::str::from_utf8(blob.content()).ok()?;
+            Some((path.clone(), content.to_string()))
+        })
+        .collect();
+    let mut agent_session_ids = host
+        .map(|host| host.anchors_for_paths(&committed_paths))
+        .transpose()?
+        .into_iter()
+        .flatten()
+        .filter(|anchor| {
+            anchor.actor_id == ahead_rpc::ahead::AHEAD_ACTOR_ID
+                && committed_contents.get(&anchor.path).is_some_and(|content| {
+                    crate::ahead::store::anchor_matches_content(anchor, content)
+                })
+        })
+        .map(|anchor| anchor.session_id)
+        .collect::<Vec<_>>();
+    agent_session_ids.sort();
+    agent_session_ids.dedup();
+    git_commit(workspace_path, message, Vec::new(), &agent_session_ids)?;
+    if let Some(host) = host {
+        if let Err(error) =
+            host.clear_committed_anchors(&committed_paths, &committed_contents)
+        {
+            tracing::warn!("failed to clear committed anchors: {error}");
+        }
+    }
+    Ok(())
 }
 
 fn git_checkout(workspace_path: &Path, reference: &str) -> Result<()> {
@@ -2596,11 +3657,13 @@ mod tests {
         is_provider_settings_path, prediction_prefix_suffix,
         relevant_open_buffer_contexts, search_in_path,
     };
+    use crate::plugin::PluginCatalogRpcHandler;
     use ahead_core::search::WorkspaceFileIndex;
     use ahead_rpc::{
-        ahead::{DisplayPosition, DisplayRange},
+        ahead::{AheadRequest, DisplayPosition, DisplayRange},
         buffer::BufferId,
         core::{CoreNotification, CoreRpc, CoreRpcHandler},
+        file::{EditorRecoverySnapshot, EditorRecoverySummary},
         proxy::{
             ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse, ProxyRpc,
             ProxyRpcHandler,
@@ -2695,6 +3758,289 @@ mod tests {
             );
         }
         assert_eq!(fs::read_to_string(file).expect("source retained"), "keep");
+    }
+
+    #[test]
+    fn shared_buffers_use_live_host_text_and_reject_stale_or_private_edits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("main.rs"), "old\n").expect("source");
+        fs::create_dir(workspace.path().join(".ahead")).expect("private directory");
+        fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            "token = 'secret'",
+        )
+        .expect("private settings");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher.workspace = Some(workspace.path().to_path_buf());
+        let host = Arc::new(parking_lot::RwLock::new(
+            crate::ahead::host::AheadSessionHost::in_memory().expect("session host"),
+        ));
+        host.read().set_workspace(workspace.path().to_path_buf());
+        dispatcher.ahead_host = Some(host.clone());
+        let initial = dispatcher
+            .read_shared_buffer("main.rs")
+            .expect("open source");
+        let edited = dispatcher
+            .replace_shared_buffer(
+                "session",
+                "main.rs",
+                initial.revision,
+                "guest edit\n".into(),
+            )
+            .expect("edit source");
+        assert!(edited.applied);
+        assert_eq!(edited.snapshot.content, "guest edit\n");
+        let recoveries: Vec<EditorRecoverySummary> = serde_json::from_value(
+            host.read()
+                .handle_request(AheadRequest::ListEditorRecoveries)
+                .expect("list incoming edit recovery"),
+        )
+        .expect("recovery summaries");
+        assert_eq!(recoveries.len(), 1);
+        let recovery: Option<EditorRecoverySnapshot> = serde_json::from_value(
+            host.read()
+                .handle_request(AheadRequest::ReadEditorRecovery {
+                    buffer_id: recoveries[0].buffer_id.clone(),
+                })
+                .expect("read incoming edit recovery"),
+        )
+        .expect("recovery snapshot");
+        assert_eq!(
+            recovery
+                .expect("recoverable shared edit")
+                .contents
+                .as_deref(),
+            Some("guest edit\n")
+        );
+        let stale = dispatcher
+            .replace_shared_buffer(
+                "session",
+                "main.rs",
+                initial.revision,
+                "stale edit\n".into(),
+            )
+            .expect("report conflict");
+        assert!(!stale.applied);
+        assert_eq!(stale.snapshot, edited.snapshot);
+        assert!(
+            dispatcher
+                .ensure_no_pending_shared_changes("session")
+                .is_err()
+        );
+        let path = workspace.path().join("main.rs");
+        assert!(dispatcher.discard_shared_remote_recovery(&path).is_err());
+        dispatcher.handle_notification(ProxyNotification::EditorSnapshot {
+            path: path.clone(),
+            content: "host edit\n".into(),
+        });
+        assert_eq!(
+            dispatcher
+                .read_shared_buffer("main.rs")
+                .expect("remote preserved")
+                .content,
+            "guest edit\n"
+        );
+        dispatcher.handle_notification(ProxyNotification::EditorSnapshot {
+            path: path.clone(),
+            content: "guest edit\n".into(),
+        });
+        dispatcher
+            .ensure_no_pending_shared_changes("session")
+            .expect("host acknowledged edit");
+        dispatcher.handle_notification(ProxyNotification::EditorSnapshot {
+            path,
+            content: "host edit\n".into(),
+        });
+        assert_eq!(
+            dispatcher
+                .read_shared_buffer("main.rs")
+                .expect("live text")
+                .content,
+            "host edit\n"
+        );
+        dispatcher
+            .discard_shared_remote_recovery(&workspace.path().join("main.rs"))
+            .expect("discard acknowledged remote edit");
+        let recoveries: Vec<EditorRecoverySummary> = serde_json::from_value(
+            host.read()
+                .handle_request(AheadRequest::ListEditorRecoveries)
+                .expect("list discarded recovery"),
+        )
+        .expect("recovery summaries");
+        assert!(recoveries.is_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("main.rs"))
+                .expect("disk was not written"),
+            "old\n"
+        );
+        let before_save = dispatcher
+            .read_shared_buffer("main.rs")
+            .expect("read host text");
+        let next_edit = dispatcher
+            .replace_shared_buffer(
+                "session",
+                "main.rs",
+                before_save.revision,
+                "another guest edit\n".into(),
+            )
+            .expect("edit before save");
+        dispatcher.close_editor_buffer(&workspace.path().join("main.rs"));
+        assert!(
+            dispatcher
+                .ensure_no_pending_shared_changes("session")
+                .is_err()
+        );
+        assert_eq!(
+            dispatcher
+                .read_shared_buffer("main.rs")
+                .expect("remote text survives host tab close"),
+            next_edit.snapshot
+        );
+        let mut permissions = fs::metadata(workspace.path().join("main.rs"))
+            .expect("source metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(workspace.path().join("main.rs"), permissions.clone())
+            .expect("make source read only");
+        assert!(
+            dispatcher
+                .save_editor_buffer(
+                    workspace.path().join("main.rs"),
+                    next_edit.snapshot.content.clone(),
+                )
+                .is_err()
+        );
+        assert!(
+            dispatcher
+                .ensure_no_pending_shared_changes("session")
+                .is_err()
+        );
+        permissions.set_readonly(false);
+        fs::set_permissions(workspace.path().join("main.rs"), permissions)
+            .expect("restore source permissions");
+        dispatcher
+            .save_editor_buffer(
+                workspace.path().join("main.rs"),
+                next_edit.snapshot.content.clone(),
+            )
+            .expect("save collaborator edit");
+        dispatcher
+            .ensure_no_pending_shared_changes("session")
+            .expect("save acknowledged edit");
+        let recoveries: Vec<EditorRecoverySummary> = serde_json::from_value(
+            host.read()
+                .handle_request(AheadRequest::ListEditorRecoveries)
+                .expect("list after save"),
+        )
+        .expect("recovery summaries");
+        assert!(recoveries.is_empty());
+        assert!(
+            dispatcher
+                .read_shared_buffer(".ahead/settings.toml")
+                .is_err()
+        );
+        assert!(dispatcher.read_shared_buffer("../outside.rs").is_err());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("main.rs")).expect("disk"),
+            "another guest edit\n"
+        );
+    }
+
+    #[test]
+    fn incoming_shared_edit_survives_host_process_restart() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir(workspace.path().join(".ahead")).expect("private directory");
+        let database = workspace.path().join(".ahead/session.db");
+        fs::write(workspace.path().join("main.rs"), "disk\n").expect("source");
+        {
+            let host = Arc::new(parking_lot::RwLock::new(
+                crate::ahead::host::AheadSessionHost::new(
+                    crate::ahead::store::SessionStore::open(&database)
+                        .expect("session store"),
+                ),
+            ));
+            host.read().set_workspace(workspace.path().to_path_buf());
+            let mut dispatcher =
+                Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+            dispatcher.workspace = Some(workspace.path().to_path_buf());
+            dispatcher.ahead_host = Some(host);
+            let initial = dispatcher
+                .read_shared_buffer("main.rs")
+                .expect("read host buffer");
+            assert!(
+                dispatcher
+                    .replace_shared_buffer(
+                        "session",
+                        "main.rs",
+                        initial.revision,
+                        "guest unsaved\n".into(),
+                    )
+                    .expect("accept edit")
+                    .applied
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("main.rs"))
+                .expect("unchanged disk"),
+            "disk\n"
+        );
+        let host = crate::ahead::host::AheadSessionHost::new(
+            crate::ahead::store::SessionStore::open(&database)
+                .expect("reopen session store"),
+        );
+        host.set_workspace(workspace.path().to_path_buf());
+        let recoveries: Vec<EditorRecoverySummary> = serde_json::from_value(
+            host.handle_request(AheadRequest::ListEditorRecoveries)
+                .expect("reclaim abandoned recovery"),
+        )
+        .expect("recovery summaries");
+        assert_eq!(recoveries.len(), 1);
+        let recovery: Option<EditorRecoverySnapshot> = serde_json::from_value(
+            host.handle_request(AheadRequest::ReadEditorRecovery {
+                buffer_id: recoveries[0].buffer_id.clone(),
+            })
+            .expect("read recovered edit"),
+        )
+        .expect("recovery snapshot");
+        assert_eq!(
+            recovery
+                .expect("incoming edit was retained")
+                .contents
+                .as_deref(),
+            Some("guest unsaved\n")
+        );
+    }
+
+    #[test]
+    fn incoming_shared_edit_requires_durable_recovery_before_acceptance() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("main.rs"), "disk\n").expect("source");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher.workspace = Some(workspace.path().to_path_buf());
+        dispatcher.ahead_host = Some(Arc::new(parking_lot::RwLock::new(
+            crate::ahead::host::AheadSessionHost::in_memory().expect("session host"),
+        )));
+        let initial = dispatcher
+            .read_shared_buffer("main.rs")
+            .expect("read host buffer");
+        assert!(
+            dispatcher
+                .replace_shared_buffer(
+                    "session",
+                    "main.rs",
+                    initial.revision,
+                    "guest unsaved\n".into(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            dispatcher
+                .read_shared_buffer("main.rs")
+                .expect("host buffer unchanged"),
+            initial
+        );
     }
 
     #[test]
@@ -2853,6 +4199,7 @@ mod tests {
                 Some(workspace.clone()),
                 CoreRpcHandler::new(),
                 ProxyRpcHandler::new(),
+                PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
                 None,
             );
             assert!(
@@ -2897,6 +4244,7 @@ mod tests {
             Some(directory.path().to_owned()),
             core.clone(),
             ProxyRpcHandler::new(),
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
             None,
         );
         let initial = core
@@ -2947,6 +4295,46 @@ mod tests {
             state.blame[0].commit.as_ref().expect("new blame").author,
             "Grace"
         );
+    }
+
+    #[test]
+    fn restarting_language_servers_reclassifies_open_buffers() {
+        let workspace = tempfile::tempdir().expect("test project");
+        let path = workspace.path().join("main.py");
+        let saved = "print('hello')\n";
+        let unsaved = "print('unsaved')\n";
+        fs::write(&path, saved).expect("source");
+        let expected_language =
+            crate::buffer::language_id_from_path_with_content(&path, Some(unsaved))
+                .expect("language ID");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        let mut buffer = Buffer::new(BufferId::next(), path.clone());
+        buffer.language_id = "unknown".into();
+        dispatcher.buffers.insert(path.clone(), buffer);
+        let notifications = dispatcher.catalog_rpc.test_receiver();
+        let revision = dispatcher
+            .sync_editor_snapshot(path.clone(), unsaved.into())
+            .expect("unsaved editor snapshot");
+
+        dispatcher.handle_notification(ProxyNotification::RestartLanguageServers {});
+
+        let documents = notifications
+            .try_iter()
+            .find_map(|notification| match notification {
+                crate::plugin::PluginCatalogRpc::Handler(
+                    crate::plugin::PluginCatalogNotification::RestartLanguageServers {
+                        documents,
+                    },
+                ) => Some(documents),
+                _ => None,
+            })
+            .expect("restart notification");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].language_id, expected_language);
+        assert_eq!(documents[0].text, unsaved);
+        assert_eq!(documents[0].version, revision as i32);
+        assert_eq!(fs::read_to_string(path).expect("saved source"), saved);
     }
 
     #[test]
@@ -3014,6 +4402,86 @@ mod tests {
         assert_eq!(
             fs::read(database).expect("database retained"),
             b"not a database"
+        );
+    }
+
+    #[test]
+    fn slow_agent_prepare_does_not_block_editor_rpc() {
+        let rpc = ProxyRpcHandler::new();
+        let mut dispatcher = Dispatcher::new(CoreRpcHandler::new(), rpc.clone());
+        let host = Arc::new(parking_lot::RwLock::new(
+            crate::ahead::host::AheadSessionHost::new(
+                crate::ahead::store::SessionStore::in_memory()
+                    .expect("session store"),
+            ),
+        ));
+        dispatcher.ahead_host = Some(host.clone());
+        let (held_sender, held_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded::<()>(1);
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_thread = released.clone();
+        let blocker = std::thread::spawn(move || {
+            let guard = host.write();
+            held_sender.send(()).expect("host lock acquired");
+            match release_receiver.recv_timeout(Duration::from_secs(3)) {
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("agent preparation blocked the proxy thread")
+                }
+            }
+            drop(guard);
+            released_for_thread.store(true, Ordering::Release);
+        });
+        held_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host lock held");
+
+        let (prepare_sender, prepare_receiver) = crossbeam_channel::bounded(1);
+        rpc.request_async(
+            ProxyRequest::AheadRequest {
+                request: AheadRequest::AgentSessionPrepare {
+                    session_id: "disposable-session".into(),
+                },
+            },
+            move |result| prepare_sender.send(result).expect("prepare response"),
+        );
+        let ProxyRpc::Request(id, request) =
+            rpc.rx().try_recv().expect("prepare request")
+        else {
+            panic!("expected prepare request");
+        };
+        dispatcher.handle_request(id, request);
+        let prepare_is_pending = prepare_receiver.try_recv().is_err();
+        let host_is_held = !released.load(Ordering::Acquire);
+
+        let (editor_sender, editor_receiver) = crossbeam_channel::bounded(1);
+        rpc.request_async(ProxyRequest::GetOpenFilesContent {}, move |result| {
+            editor_sender.send(result).expect("editor response")
+        });
+        let ProxyRpc::Request(id, request) =
+            rpc.rx().try_recv().expect("editor request")
+        else {
+            panic!("expected editor request");
+        };
+        dispatcher.handle_request(id, request);
+        let editor_response = editor_receiver.recv_timeout(Duration::from_secs(2));
+        drop(release_sender);
+        blocker.join().expect("release host lock");
+
+        assert!(host_is_held, "agent preparation blocked the proxy thread");
+        assert!(
+            prepare_is_pending,
+            "agent preparation bypassed the host lock"
+        );
+        assert!(matches!(
+            editor_response,
+            Ok(Ok(ProxyResponse::GetOpenFilesContentResponse { items })) if items.is_empty()
+        ));
+        assert!(
+            prepare_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("prepare response after host release")
+                .is_err()
         );
     }
 
@@ -3222,6 +4690,7 @@ mod tests {
             Some(workspace.clone()),
             CoreRpcHandler::new(),
             ProxyRpcHandler::new(),
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
             Some(index.clone()),
         );
 
@@ -3250,6 +4719,7 @@ mod tests {
             Some(workspace.clone()),
             core_rpc.clone(),
             ProxyRpcHandler::new(),
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
             Some(index.clone()),
         );
 
@@ -3286,10 +4756,13 @@ mod tests {
             &ahead.join("unrelated.toml")
         ));
         let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let catalog_receiver = catalog_rpc.test_receiver();
         let notifier = FileWatchNotifier::new(
             Some(workspace.path().to_path_buf()),
             core_rpc.clone(),
             ProxyRpcHandler::new(),
+            catalog_rpc,
             Some(index.clone()),
         );
 
@@ -3306,6 +4779,12 @@ mod tests {
             core_rpc.rx().recv_timeout(Duration::from_secs(2)),
             Ok(CoreRpc::Notification(notification))
                 if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 0 })
+        ));
+        assert!(matches!(
+            catalog_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(crate::plugin::PluginCatalogRpc::Handler(
+                crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
+            ))
         ));
     }
 
@@ -3327,6 +4806,7 @@ mod tests {
             Some(workspace.clone()),
             core_rpc.clone(),
             ProxyRpcHandler::new(),
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
             Some(index.clone()),
         );
 
@@ -3474,7 +4954,7 @@ mod tests {
             &workspace,
             "Implement retry",
             vec![FileDiff::Added(path)],
-            Some("session-1"),
+            &["session-1".to_string()],
         )
         .unwrap();
 
@@ -3511,7 +4991,7 @@ mod tests {
             &workspace,
             "Add working document",
             vec![FileDiff::Added(old.clone())],
-            None,
+            &[],
         )
         .unwrap();
         fs::rename(&old, &new).unwrap();
@@ -3520,7 +5000,7 @@ mod tests {
             &workspace,
             "Rename working document",
             vec![FileDiff::Renamed(old.clone(), new.clone())],
-            None,
+            &[],
         )
         .unwrap();
 
@@ -3529,6 +5009,55 @@ mod tests {
         let tree = commit.tree().unwrap();
         assert!(tree.get_path(std::path::Path::new("new.md")).is_ok());
         assert!(tree.get_path(std::path::Path::new("old.md")).is_err());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn commit_rejects_head_that_is_not_a_commit() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-git-invalid-head-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        let repo = Repository::init(&workspace).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Human Developer").unwrap();
+            config.set_str("user.email", "human@example.test").unwrap();
+        }
+        let path = workspace.join("file.txt");
+        fs::write(&path, "before\n").unwrap();
+        git_commit(
+            &workspace,
+            "Initial commit",
+            vec![FileDiff::Added(path.clone())],
+            &[],
+        )
+        .unwrap();
+        let head = repo.head().unwrap();
+        let branch = head.name().unwrap().to_string();
+        let tree_id = head.peel_to_commit().unwrap().tree_id();
+        repo.reference(&branch, tree_id, true, "test invalid HEAD")
+            .unwrap();
+
+        fs::write(&path, "after\n").unwrap();
+        let error = git_commit(
+            &workspace,
+            "Must not replace invalid HEAD",
+            vec![FileDiff::Modified(path)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HEAD does not point to a commit"),
+            "{error}"
+        );
+        assert_eq!(
+            repo.find_reference(&branch).unwrap().target(),
+            Some(tree_id)
+        );
         fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -3579,27 +5108,190 @@ mod tests {
                 ahead_rpc::ahead::AHEAD_ACTOR_ID,
             )
             .unwrap();
+        let second_session_id = host
+            .write()
+            .start_work(
+                Some(ahead_rpc::ahead::WorkKind::ProductChange),
+                "Second commit source".to_string(),
+                "Verify all session trailers".to_string(),
+                None,
+            )
+            .unwrap()
+            .session
+            .id;
+        for (name, quote, end_col) in [
+            ("second.md", "Second agent draft", 18),
+            ("third.md", "Third agent draft", 17),
+        ] {
+            fs::write(workspace.join(name), format!("{quote}\n")).unwrap();
+            host.write()
+                .create_anchor(
+                    &second_session_id,
+                    name.to_string(),
+                    DisplayRange {
+                        start: DisplayPosition { line: 0, col: 0 },
+                        end: DisplayPosition {
+                            line: 0,
+                            col: end_col,
+                        },
+                    },
+                    quote.to_string(),
+                    ahead_rpc::ahead::AHEAD_ACTOR_ID,
+                )
+                .unwrap();
+        }
 
-        dispatcher.handle_notification(ProxyNotification::GitCommit {
-            message: "Commit agent work".to_string(),
-            diffs: vec![FileDiff::Added(path)],
-        });
+        let request_git = |dispatcher: &mut Dispatcher, request: ProxyRequest| {
+            let rpc = dispatcher.proxy_rpc.clone();
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            rpc.request_async(request, move |result| {
+                sender.send(result).expect("Git response")
+            });
+            let ProxyRpc::Request(id, request) =
+                rpc.rx().try_recv().expect("Git request")
+            else {
+                panic!("Git request");
+            };
+            dispatcher.handle_request(id, request);
+            receiver.recv().expect("Git response")
+        };
+        let request_commit =
+            |dispatcher: &mut Dispatcher, message: &str, diffs: Vec<FileDiff>| {
+                request_git(
+                    dispatcher,
+                    ProxyRequest::GitCommit {
+                        message: message.to_string(),
+                        diffs,
+                    },
+                )
+            };
+        assert!(matches!(
+            request_commit(
+                &mut dispatcher,
+                "Commit agent work",
+                vec![
+                    FileDiff::Added(path),
+                    FileDiff::Added(workspace.join("second.md")),
+                    FileDiff::Added(workspace.join("third.md")),
+                ],
+            )
+            .expect("commit"),
+            ProxyResponse::Success {}
+        ));
 
         let repo = Repository::open(&workspace).unwrap();
         let commit = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(commit.author().name(), Some("ahead"));
         assert_eq!(commit.committer().name(), Some("Human Developer"));
-        assert!(
-            commit
-                .message()
-                .unwrap()
-                .contains(&format!("Ahead-Session: {session_id}"))
+        let actual_trailers = commit
+            .message()
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("Ahead-Session: "))
+            .collect::<Vec<_>>();
+        let mut expected_trailers = vec![
+            format!("Ahead-Session: {session_id}"),
+            format!("Ahead-Session: {second_session_id}"),
+        ];
+        expected_trailers.sort();
+        assert_eq!(
+            actual_trailers,
+            expected_trailers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         );
         assert!(
             host.read()
-                .anchors_for_paths(&["agent.md".to_string()])
+                .anchors_for_paths(&[
+                    "agent.md".to_string(),
+                    "second.md".to_string(),
+                    "third.md".to_string(),
+                ])
                 .unwrap()
                 .is_empty()
+        );
+
+        let human_path = workspace.join("human.md");
+        fs::write(&human_path, "Agent draft\n").unwrap();
+        host.write()
+            .create_anchor(
+                &session_id,
+                "human.md".to_string(),
+                DisplayRange {
+                    start: DisplayPosition { line: 0, col: 0 },
+                    end: DisplayPosition { line: 0, col: 11 },
+                },
+                "Agent draft".to_string(),
+                ahead_rpc::ahead::AHEAD_ACTOR_ID,
+            )
+            .unwrap();
+        fs::write(&human_path, "Human rewrite\n").unwrap();
+        assert!(matches!(
+            request_commit(
+                &mut dispatcher,
+                "Commit human rewrite",
+                vec![FileDiff::Added(human_path)],
+            )
+            .expect("commit"),
+            ProxyResponse::Success {}
+        ));
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.author().name(), Some("Human Developer"));
+        assert_eq!(
+            host.read()
+                .anchors_for_paths(&["human.md".to_string()])
+                .unwrap()
+                .len(),
+            1,
+            "a stale anchor must not be silently cleared"
+        );
+
+        let staged_path = workspace.join("staged.md");
+        fs::write(&staged_path, "Agent staged content\n").unwrap();
+        host.write()
+            .create_anchor(
+                &session_id,
+                "staged.md".to_string(),
+                DisplayRange {
+                    start: DisplayPosition { line: 0, col: 0 },
+                    end: DisplayPosition { line: 0, col: 20 },
+                },
+                "Agent staged content".to_string(),
+                ahead_rpc::ahead::AHEAD_ACTOR_ID,
+            )
+            .unwrap();
+        assert!(matches!(
+            request_git(&mut dispatcher, ProxyRequest::GitStageAll {})
+                .expect("stage all"),
+            ProxyResponse::Success {}
+        ));
+        assert!(
+            repo.index()
+                .unwrap()
+                .get_path(std::path::Path::new("staged.md"), 0)
+                .is_some()
+        );
+        fs::write(&staged_path, "Human unstaged rewrite\n").unwrap();
+        assert!(matches!(
+            request_commit(&mut dispatcher, "Commit staged agent work", vec![])
+                .expect("staged commit"),
+            ProxyResponse::Success {}
+        ));
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.author().name(), Some("ahead"));
+        assert_eq!(
+            host.read()
+                .anchors_for_paths(&["staged.md".to_string()])
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            request_commit(&mut dispatcher, "Nothing staged", vec![])
+                .unwrap_err()
+                .message
+                .contains("Stage changes")
         );
 
         fs::remove_dir_all(workspace).unwrap();

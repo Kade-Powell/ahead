@@ -18,7 +18,6 @@ use crate::hook_runtime::drain_async_hook_results;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
-use crate::hook_runtime::run_legacy_after_agent_hook;
 use crate::hook_runtime::run_pending_session_start_hooks;
 use crate::hook_runtime::run_turn_stop_hooks;
 use crate::mention_syntax::TOOL_MENTION_SIGIL;
@@ -366,7 +365,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input)) => {
+            Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -519,16 +518,6 @@ pub(crate) async fn run_turn(
                     }
                     if stop_outcome.should_stop {
                         break;
-                    }
-                    if run_legacy_after_agent_hook(
-                        &sess,
-                        &turn_context,
-                        &sampling_request_input,
-                        last_agent_message.clone(),
-                    )
-                    .await
-                    {
-                        return Ok(None);
                     }
                     break;
                 }
@@ -1112,7 +1101,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_prompt_base_instructions().await;
 
@@ -1129,7 +1118,6 @@ async fn run_sampling_request(
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut initial_input = Some(input);
-    let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
     loop {
         let prompt_input = if let Some(input) = initial_input.take() {
@@ -1164,9 +1152,7 @@ async fn run_sampling_request(
         )
         .await
         {
-            Ok(output) => {
-                return Ok((output, original_input.unwrap_or(prompt.input)));
-            }
+            Ok(output) => return Ok(output),
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
                     sess.set_total_tokens_full(&turn_context).await;
@@ -1182,10 +1168,6 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
-
-        if original_input.is_none() {
-            original_input = Some(prompt.input);
-        }
 
         if !err.is_retryable() {
             return Err(err);

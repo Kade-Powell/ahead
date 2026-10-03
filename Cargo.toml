@@ -306,7 +306,6 @@ rustls-native-certs = "0.8"
 rustls-pki-types = "1.14"
 schemars = "0.8"
 seccompiler = "0.5"
-semver = "1"
 serde_ignored = "0.1"
 serde_path_to_error = "0.1"
 serde_with = "3.17"
@@ -352,7 +351,13 @@ winapi-util = "0.1"
 zip = "2.4"
 zstd = "0.13"
 
-gpui-kit = { version = "=0.6.6", features = ["tree-sitter-rust"] }
+gpui-kit = { version = "=0.6.6", features = [
+    "tree-sitter-javascript",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+] }
 gpui-util = { package = "gpui-pre-util", version = "=0.3.6" }
 
 [patch.crates-io]

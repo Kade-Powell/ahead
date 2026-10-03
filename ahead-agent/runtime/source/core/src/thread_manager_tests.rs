@@ -2,7 +2,6 @@ use super::*;
 use crate::agent::control::SpawnAgentOptions;
 use crate::config::test_config;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
-use crate::rollout::RolloutRecorder;
 use crate::session::session::SessionSettingsUpdate;
 use crate::session::tests::build_world_state_from_turn_context;
 use crate::session::tests::make_session_and_context;
@@ -17,22 +16,17 @@ use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
-use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
-use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
-use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionMeta;
-use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
@@ -133,9 +127,9 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
     assert_eq!(generated.thread_id, generated_ids[2]);
 }
 
-/// One custom ID factory supplies identifiers for roots, actual child agents, and forks.
+/// One custom ID factory supplies identifiers for roots and actual child agents.
 #[tokio::test]
-async fn thread_id_generator_applies_to_roots_children_and_forks() {
+async fn thread_id_generator_applies_to_roots_and_children() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -145,7 +139,6 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
     let generated_ids = [
         ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0001),
         ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0002),
-        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0003),
     ];
     let next_id = std::sync::atomic::AtomicUsize::new(0);
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
@@ -184,20 +177,12 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         )
         .await
         .expect("spawn actual child agent");
-    let fork = manager
-        .spawn_subagent(root.thread_id, StartThreadOptions::new(config))
-        .await
-        .expect("fork root thread");
-
-    assert_eq!(
-        [root.thread_id, child.thread_id, fork.thread_id],
-        generated_ids
-    );
+    assert_eq!([root.thread_id, child.thread_id], generated_ids);
 
     let report = manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
-    assert_eq!(report.completed.len(), 3);
+    assert_eq!(report.completed.len(), 2);
 }
 
 /// Resuming a thread preserves its stored ID instead of invoking the new manager's factory.
@@ -228,10 +213,6 @@ async fn thread_id_generator_does_not_replace_resumed_thread_id() {
         .flush_rollout()
         .await
         .expect("flush source rollout");
-    let rollout_path = original
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
     assert_eq!(original.thread_id, original_thread_id);
     original
         .thread
@@ -248,13 +229,7 @@ async fn thread_id_generator_does_not_replace_resumed_thread_id() {
     )
     .with_thread_id_generator(|| panic!("resuming must not allocate a new thread ID"));
     let resumed = resumed_manager
-        .resume_thread_from_rollout(
-            config,
-            rollout_path,
-            Arc::clone(&resumed_manager.state.auth_manager),
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+        .resume_thread_by_id(original_thread_id, config)
         .await
         .expect("resume existing source thread");
 
@@ -282,7 +257,7 @@ async fn child_session_inherits_client_mcp_extensions() {
     let parent = manager
         .start_thread(StartThreadOptions {
             client_mcp_extensions: ClientMcpExtensions::new(HashMap::from([
-                (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+                ("example/form".to_string(), serde_json::json!({})),
                 (
                     MCP_APP_UI_EXTENSION_ID.to_string(),
                     serde_json::json!({
@@ -301,7 +276,7 @@ async fn child_session_inherits_client_mcp_extensions() {
             .client_mcp_extensions_for_child(Some(parent.thread_id))
             .await,
         ClientMcpExtensions::new(HashMap::from([
-            (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+            ("example/form".to_string(), serde_json::json!({})),
             (
                 MCP_APP_UI_EXTENSION_ID.to_string(),
                 serde_json::json!({
@@ -366,23 +341,6 @@ fn user_msg(text: &str) -> ResponseItem {
         internal_chat_message_metadata_passthrough: None,
     }
 }
-fn assistant_msg(text: &str) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: text.to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
-fn contextual_user_interrupted_marker() -> ResponseItem {
-    interrupted_turn_history_marker(InterruptedTurnHistoryMarker::ContextualUser)
-        .expect("contextual-user interrupted marker should be enabled")
-}
-
 fn developer_interrupted_marker() -> ResponseItem {
     interrupted_turn_history_marker(InterruptedTurnHistoryMarker::Developer)
         .expect("developer interrupted marker should be enabled")
@@ -451,210 +409,6 @@ fn effective_originator_prefers_thread_scoped_sources_before_env_originator() {
             expected_originator
         );
     }
-}
-
-#[test]
-fn truncates_before_requested_user_message() {
-    let items = [
-        user_msg("u1"),
-        assistant_msg("a1"),
-        assistant_msg("a2"),
-        user_msg("u2"),
-        assistant_msg("a3"),
-        ResponseItem::Reasoning {
-            id: Some(ResponseItemId::with_suffix("rs", "1")),
-            summary: vec![ReasoningItemReasoningSummary::SummaryText {
-                text: "s".to_string(),
-            }],
-            content: None,
-            encrypted_content: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCall {
-            id: None,
-            call_id: "c1".to_string(),
-            name: "tool".to_string(),
-            namespace: None,
-            arguments: "{}".to_string(),
-            encrypted_function_args: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        assistant_msg("a4"),
-    ];
-
-    let initial: Vec<RolloutItem> = items
-        .iter()
-        .cloned()
-        .map(|item| RolloutItem::ResponseItem(item.into()))
-        .collect();
-    let truncated = truncate_before_nth_user_message(
-        InitialHistory::Forked(initial),
-        /*n*/ 1,
-        &SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-    let got_items = truncated.get_rollout_items();
-    let expected_items = vec![
-        RolloutItem::ResponseItem(items[0].clone().into()),
-        RolloutItem::ResponseItem(items[1].clone().into()),
-        RolloutItem::ResponseItem(items[2].clone().into()),
-    ];
-    assert_eq!(
-        serde_json::to_value(got_items).unwrap(),
-        serde_json::to_value(&expected_items).unwrap()
-    );
-
-    let initial2: Vec<RolloutItem> = items
-        .iter()
-        .cloned()
-        .map(|item| RolloutItem::ResponseItem(item.into()))
-        .collect();
-    let truncated2 = truncate_before_nth_user_message(
-        InitialHistory::Forked(initial2.clone()),
-        /*n*/ 2,
-        &SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-    assert_eq!(
-        serde_json::to_value(truncated2.get_rollout_items()).unwrap(),
-        serde_json::to_value(initial2).unwrap()
-    );
-}
-
-#[test]
-fn out_of_range_truncation_drops_only_unfinished_suffix_mid_turn() {
-    let items = vec![
-        RolloutItem::ResponseItem(user_msg("u1").into()),
-        RolloutItem::ResponseItem(assistant_msg("a1").into()),
-        RolloutItem::ResponseItem(user_msg("u2").into()),
-        RolloutItem::ResponseItem(assistant_msg("partial").into()),
-    ];
-
-    let truncated = truncate_before_nth_user_message(
-        InitialHistory::Forked(items.clone()),
-        usize::MAX,
-        &SnapshotTurnState {
-            ends_mid_turn: true,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-
-    assert_eq!(
-        serde_json::to_value(truncated.get_rollout_items()).unwrap(),
-        serde_json::to_value(items[..2].to_vec()).unwrap()
-    );
-}
-
-#[test]
-fn fork_thread_accepts_legacy_usize_snapshot_argument() {
-    fn assert_legacy_snapshot_callsite(
-        manager: &ThreadManager,
-        config: Config,
-        path: std::path::PathBuf,
-    ) {
-        let _future = manager.fork_thread(
-            usize::MAX,
-            config,
-            path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        );
-    }
-
-    let _: fn(&ThreadManager, Config, std::path::PathBuf) = assert_legacy_snapshot_callsite;
-}
-
-#[test]
-fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
-    let items = vec![
-        RolloutItem::ResponseItem(user_msg("u1").into()),
-        RolloutItem::ResponseItem(assistant_msg("a1").into()),
-        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: "turn-2".to_string(),
-            trace_id: None,
-            started_at: None,
-            model_context_window: None,
-            collaboration_mode_kind: Default::default(),
-        })),
-        RolloutItem::ResponseItem(user_msg("u2").into()),
-        RolloutItem::ResponseItem(assistant_msg("partial").into()),
-    ];
-
-    let snapshot_state = snapshot_turn_state(&InitialHistory::Forked(items.clone()));
-    assert_eq!(
-        snapshot_state,
-        SnapshotTurnState {
-            ends_mid_turn: true,
-            active_turn_id: Some("turn-2".to_string()),
-            active_turn_started_at: None,
-            active_turn_start_index: Some(2),
-        },
-    );
-
-    let truncated = truncate_before_nth_user_message(
-        InitialHistory::Forked(items.clone()),
-        usize::MAX,
-        &snapshot_state,
-    );
-
-    assert_eq!(
-        serde_json::to_value(truncated.get_rollout_items()).unwrap(),
-        serde_json::to_value(items[..2].to_vec()).unwrap()
-    );
-}
-
-#[tokio::test]
-async fn ignores_session_prefix_messages_when_truncating() {
-    let (session, turn_context) = make_session_and_context().await;
-    let turn_context = Arc::new(turn_context);
-    let world_state = build_world_state_from_turn_context(&session, &turn_context).await;
-    let mut items = session
-        .build_initial_context_with_world_state(&turn_context, &world_state)
-        .await;
-    items.push(user_msg("feature request"));
-    items.push(assistant_msg("ack"));
-    items.push(user_msg("second question"));
-    items.push(assistant_msg("answer"));
-
-    let rollout_items: Vec<RolloutItem> = items
-        .iter()
-        .cloned()
-        .map(|item| RolloutItem::ResponseItem(item.into()))
-        .collect();
-
-    let truncated = truncate_before_nth_user_message(
-        InitialHistory::Forked(rollout_items),
-        /*n*/ 1,
-        &SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-    let got_items = truncated.get_rollout_items();
-
-    let expected: Vec<RolloutItem> = vec![
-        RolloutItem::ResponseItem(items[0].clone().into()),
-        RolloutItem::ResponseItem(items[1].clone().into()),
-        RolloutItem::ResponseItem(items[2].clone().into()),
-        RolloutItem::ResponseItem(items[3].clone().into()),
-    ];
-
-    assert_eq!(
-        serde_json::to_value(got_items).unwrap(),
-        serde_json::to_value(&expected).unwrap()
-    );
 }
 
 #[tokio::test]
@@ -797,7 +551,7 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
 }
 
 #[tokio::test]
-async fn start_thread_rejects_unsupported_guardian_review_source() {
+async fn start_thread_rejects_unsupported_feature_source() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -813,16 +567,16 @@ async fn start_thread_rejects_unsupported_guardian_review_source() {
     let result = manager
         .start_thread(StartThreadOptions {
             thread_source: Some(codex_protocol::protocol::ThreadSource::Feature(
-                "guardian_review".to_string(),
+                "background-review".to_string(),
             )),
             ..StartThreadOptions::new(config)
         })
         .await;
-    assert!(
-        result
-            .err()
-            .is_some_and(|error| error.to_string().contains("not supported by AHEAD"))
-    );
+    assert!(result.err().is_some_and(|error| {
+        error
+            .to_string()
+            .contains("Feature thread sources are not supported by AHEAD")
+    }));
 
     manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
@@ -883,7 +637,6 @@ async fn start_thread_seeds_extension_data_for_lifecycle_contributors() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
     let selected_root_init = |id: &str, environment_id: &str| {
@@ -936,65 +689,7 @@ async fn start_thread_seeds_extension_data_for_lifecycle_contributors() {
 }
 
 #[tokio::test]
-async fn selected_capability_roots_round_trip_through_fork() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-
-    let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-    );
-    let selected_roots = vec![SelectedCapabilityRoot {
-        id: "demo@1".to_string(),
-        location: CapabilityRootLocation::Environment {
-            environment_id: "build".to_string(),
-            path: PathUri::parse("file:///plugins/demo").expect("plugin root URI"),
-        },
-    }];
-    let inherited = manager
-        .start_thread(StartThreadOptions {
-            initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(
-                SessionMetaLine {
-                    meta: SessionMeta {
-                        selected_capability_roots: selected_roots.clone(),
-                        ..SessionMeta::default()
-                    },
-                    git: None,
-                },
-            )]),
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(config)
-        })
-        .await
-        .expect("start inherited fork");
-    inherited.thread.ensure_rollout_materialized().await;
-    inherited
-        .thread
-        .flush_rollout()
-        .await
-        .expect("flush inherited fork");
-    let inherited_history = RolloutRecorder::get_rollout_history(
-        &inherited
-            .thread
-            .rollout_path()
-            .expect("inherited fork rollout path"),
-    )
-    .await
-    .expect("read inherited fork rollout");
-
-    assert_eq!(
-        inherited_history.get_selected_capability_roots(),
-        selected_roots
-    );
-}
-
-#[tokio::test]
-async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
+async fn resume_does_not_restore_thread_environments_from_rollout() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1015,7 +710,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
     let selected_cwd =
@@ -1043,10 +737,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         .flush_rollout()
         .await
         .expect("flush source rollout");
-    let rollout_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
     source
         .thread
         .shutdown_and_wait()
@@ -1055,13 +745,7 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     let _ = manager.remove_thread(&source.thread_id).await;
 
     let resumed = manager
-        .resume_thread_from_rollout(
-            config.clone(),
-            rollout_path.clone(),
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+        .resume_thread_by_id(source.thread_id, config.clone())
         .await
         .expect("resume source thread");
     let (prepared_turn, _) = resumed
@@ -1086,45 +770,6 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
     );
     assert_ne!(
         resumed_turn
-            .environments
-            .primary()
-            .expect("primary environment")
-            .cwd(),
-        &PathUri::from_abs_path(&selected_cwd)
-    );
-
-    let forked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config,
-            rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork source thread");
-    let (prepared_turn, _) = forked
-        .thread
-        .session
-        .new_turn_with_sub_id(
-            "fork-turn".to_string(),
-            SessionSettingsUpdate::default(),
-            Default::default(),
-        )
-        .await
-        .expect("build forked turn context");
-    let forked_turn = prepared_turn;
-    assert_eq!(forked_turn.environments.turn_environments().count(), 1);
-    assert_eq!(
-        forked_turn
-            .environments
-            .primary()
-            .expect("primary environment")
-            .cwd(),
-        &PathUri::from_abs_path(&default_cwd)
-    );
-    assert_ne!(
-        forked_turn
             .environments
             .primary()
             .expect("primary environment")
@@ -1157,7 +802,6 @@ async fn explicit_installation_id_skips_codex_home_file() {
         thread_store,
         None,
         installation_id.clone(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1199,7 +843,6 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1213,19 +856,8 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         .flush_rollout()
         .await
         .expect("flush source rollout");
-    let rollout_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
-
     let resumed = manager
-        .resume_thread_from_rollout(
-            config,
-            rollout_path,
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+        .resume_thread_by_id(source.thread_id, config)
         .await
         .expect("resume active source thread");
     assert_eq!(resumed.thread_id, source.thread_id);
@@ -1260,7 +892,6 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1274,10 +905,6 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         .flush_rollout()
         .await
         .expect("flush source rollout");
-    let rollout_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
     source
         .thread
         .shutdown_and_wait()
@@ -1285,13 +912,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         .expect("shutdown source thread");
 
     let resumed = manager
-        .resume_thread_from_rollout(
-            config,
-            rollout_path,
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+        .resume_thread_by_id(source.thread_id, config)
         .await
         .expect("resume stopped source thread");
     assert_eq!(resumed.thread_id, source.thread_id);
@@ -1327,7 +948,6 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
         thread_store,
         None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1345,10 +965,6 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
         .flush_rollout()
         .await
         .expect("flush source rollout");
-    let rollout_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
     source
         .thread
         .shutdown_and_wait()
@@ -1357,13 +973,7 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
     let _ = manager.remove_thread(&source.thread_id).await;
 
     let resumed = manager
-        .resume_thread_from_rollout(
-            config,
-            rollout_path,
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+        .resume_thread_by_id(source.thread_id, config)
         .await
         .expect("resume source thread");
 
@@ -1411,7 +1021,6 @@ async fn subtree_listing_uses_injected_graph_store() {
         in_memory_thread_store_for_tests(),
         Some(agent_graph_store),
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1427,7 +1036,7 @@ async fn subtree_listing_uses_injected_graph_store() {
 }
 
 #[tokio::test]
-async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
+async fn thread_id_resume_reads_history_through_thread_store() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1454,7 +1063,6 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         thread_store.clone(),
         None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1494,43 +1102,20 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         .expect("shutdown seeded resumed thread");
     let _ = manager.remove_thread(&resumed.thread_id).await;
 
-    let resumed_from_path = manager
-        .resume_thread_from_rollout(
-            config.clone(),
-            rollout_path.clone(),
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
+    let resumed_from_store = manager
+        .resume_thread_by_id(resumed.thread_id, config.clone())
         .await
-        .expect("resume from rollout path");
-    assert_eq!(resumed_from_path.thread_id, resumed.thread_id);
-
-    let forked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config,
-            rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork from rollout path");
-    assert_ne!(forked.thread_id, resumed.thread_id);
+        .expect("resume from thread ID");
+    assert_eq!(resumed_from_store.thread_id, resumed.thread_id);
 
     let calls = in_memory_store.calls().await;
-    assert_eq!(calls.read_thread_by_rollout_path, 2);
+    assert!(calls.read_thread_with_history >= 1);
 
-    resumed_from_path
+    resumed_from_store
         .thread
         .shutdown_and_wait()
         .await
-        .expect("shutdown path-resumed thread");
-    forked
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("shutdown forked thread");
+        .expect("shutdown ID-resumed thread");
 }
 
 #[tokio::test]
@@ -1561,7 +1146,6 @@ async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thr
         thread_store.clone(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
     let started = manager
@@ -1686,7 +1270,6 @@ async fn new_uses_active_provider_for_model_refresh() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1732,7 +1315,6 @@ async fn injected_models_manager_controls_refresh_policy() {
         in_memory_thread_store_for_tests(),
         /*agent_graph_store*/ None,
         TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     );
 
@@ -1752,138 +1334,6 @@ async fn injected_models_manager_controls_refresh_policy() {
         2
     );
     assert!(!config.codex_home.join("models_cache.json").exists());
-}
-
-#[test]
-fn interrupted_fork_snapshot_appends_interrupt_boundary() {
-    let committed_history =
-        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello").into())]);
-
-    assert_eq!(
-        serde_json::to_value(
-            append_interrupted_boundary(
-                committed_history,
-                /*turn_id*/ None,
-                /*started_at*/ None,
-                InterruptedTurnHistoryMarker::ContextualUser,
-            )
-            .get_rollout_items()
-        )
-        .expect("serialize interrupted fork history"),
-        serde_json::to_value(vec![
-            RolloutItem::ResponseItem(user_msg("hello").into()),
-            RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
-            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: None,
-                started_at: None,
-                reason: TurnAbortReason::Interrupted,
-                completed_at: None,
-                duration_ms: None,
-            })),
-        ])
-        .expect("serialize expected interrupted fork history"),
-    );
-    assert_eq!(
-        serde_json::to_value(
-            append_interrupted_boundary(
-                InitialHistory::New,
-                /*turn_id*/ None,
-                /*started_at*/ None,
-                InterruptedTurnHistoryMarker::ContextualUser,
-            )
-            .get_rollout_items()
-        )
-        .expect("serialize interrupted empty fork history"),
-        serde_json::to_value(vec![
-            RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
-            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: None,
-                started_at: None,
-                reason: TurnAbortReason::Interrupted,
-                completed_at: None,
-                duration_ms: None,
-            })),
-        ])
-        .expect("serialize expected interrupted empty history"),
-    );
-}
-
-#[test]
-fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
-    let committed_history =
-        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello").into())]);
-
-    assert_eq!(
-        serde_json::to_value(
-            append_interrupted_boundary(
-                committed_history,
-                /*turn_id*/ None,
-                /*started_at*/ None,
-                InterruptedTurnHistoryMarker::Disabled,
-            )
-            .get_rollout_items()
-        )
-        .expect("serialize disabled interrupted fork history"),
-        serde_json::to_value(vec![
-            RolloutItem::ResponseItem(user_msg("hello").into()),
-            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: None,
-                started_at: None,
-                reason: TurnAbortReason::Interrupted,
-                completed_at: None,
-                duration_ms: None,
-            })),
-        ])
-        .expect("serialize expected disabled interrupted fork history"),
-    );
-    assert_eq!(
-        serde_json::to_value(
-            append_interrupted_boundary(
-                InitialHistory::New,
-                /*turn_id*/ None,
-                /*started_at*/ None,
-                InterruptedTurnHistoryMarker::Disabled,
-            )
-            .get_rollout_items()
-        )
-        .expect("serialize disabled interrupted empty fork history"),
-        serde_json::to_value(vec![RolloutItem::EventMsg(EventMsg::TurnAborted(
-            TurnAbortedEvent {
-                turn_id: None,
-                started_at: None,
-                reason: TurnAbortReason::Interrupted,
-                completed_at: None,
-                duration_ms: None,
-            },
-        ))])
-        .expect("serialize expected disabled interrupted empty fork history"),
-    );
-}
-
-#[test]
-fn interrupted_snapshot_is_not_mid_turn() {
-    let interrupted_history = InitialHistory::Forked(vec![
-        RolloutItem::ResponseItem(user_msg("hello").into()),
-        RolloutItem::ResponseItem(assistant_msg("partial").into()),
-        RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
-        RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: Some("turn-1".to_string()),
-            started_at: None,
-            reason: TurnAbortReason::Interrupted,
-            completed_at: None,
-            duration_ms: None,
-        })),
-    ]);
-
-    assert_eq!(
-        snapshot_turn_state(&interrupted_history),
-        SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
 }
 
 #[test]
@@ -1909,413 +1359,5 @@ fn multi_agent_v2_interrupted_marker_uses_developer_input_message() {
                 }
             ),
         }
-    );
-}
-
-#[test]
-fn completed_legacy_event_history_is_not_mid_turn() {
-    let completed_history = InitialHistory::Forked(vec![
-        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-            client_id: None,
-            message: "hello".to_string(),
-            images: None,
-            text_elements: Vec::new(),
-            local_images: Vec::new(),
-            ..Default::default()
-        })),
-        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-            message: "done".to_string(),
-            phase: None,
-            memory_citation: None,
-            delivery: None,
-        })),
-    ]);
-
-    assert_eq!(
-        snapshot_turn_state(&completed_history),
-        SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-}
-
-#[test]
-fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
-    let mixed_history = InitialHistory::Forked(vec![
-        RolloutItem::ResponseItem(user_msg("hello").into()),
-        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-            client_id: None,
-            message: "hello".to_string(),
-            images: None,
-            text_elements: Vec::new(),
-            local_images: Vec::new(),
-            ..Default::default()
-        })),
-    ]);
-
-    assert_eq!(
-        snapshot_turn_state(&mixed_history),
-        SnapshotTurnState {
-            ends_mid_turn: true,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        },
-    );
-}
-
-#[tokio::test]
-async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_history() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-
-    let auth_manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let manager = ThreadManager::new(
-        &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
-        SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        /*analytics_events_client*/ None,
-        in_memory_thread_store_for_tests(),
-        None,
-        TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
-    );
-
-    let source = manager
-        .resume_thread_with_history(
-            config.clone(),
-            InitialHistory::Forked(vec![
-                RolloutItem::ResponseItem(user_msg("hello").into()),
-                RolloutItem::ResponseItem(assistant_msg("partial").into()),
-            ]),
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
-        .await
-        .expect("create source thread from completed history");
-    let source_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
-    let source_history = RolloutRecorder::get_rollout_history(&source_path)
-        .await
-        .expect("read source rollout history");
-    let source_snapshot_state = snapshot_turn_state(&source_history);
-    assert!(source_snapshot_state.ends_mid_turn);
-    let expected_turn_id = source_snapshot_state.active_turn_id.clone();
-    assert_eq!(expected_turn_id, None);
-
-    let forked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config.clone(),
-            source_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork interrupted snapshot");
-    let forked_path = forked
-        .thread
-        .rollout_path()
-        .expect("forked rollout path should exist");
-    let history = RolloutRecorder::get_rollout_history(&forked_path)
-        .await
-        .expect("read forked rollout history");
-    assert!(!snapshot_turn_state(&history).ends_mid_turn);
-    let rollout_items: Vec<_> = history
-        .get_rollout_items()
-        .iter()
-        .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
-        .collect();
-    let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker().into(),
-    ))
-    .expect("serialize interrupted marker");
-    let interrupted_abort_json = serde_json::to_value(RolloutItem::EventMsg(
-        EventMsg::TurnAborted(TurnAbortedEvent {
-            turn_id: expected_turn_id,
-            started_at: None,
-            reason: TurnAbortReason::Interrupted,
-            completed_at: None,
-            duration_ms: None,
-        }),
-    ))
-    .expect("serialize interrupted abort event");
-    assert_eq!(
-        rollout_items
-            .iter()
-            .filter(|item| {
-                strip_response_item_ids_from_json(
-                    serde_json::to_value(item).expect("serialize rollout item"),
-                ) == interrupted_marker_json
-            })
-            .count(),
-        1,
-    );
-    assert_eq!(
-        rollout_items
-            .iter()
-            .filter(|item| {
-                serde_json::to_value(item).expect("serialize rollout item")
-                    == interrupted_abort_json
-            })
-            .count(),
-        1,
-    );
-}
-
-#[tokio::test]
-async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-
-    let auth_manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let manager = ThreadManager::new(
-        &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
-        SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        /*analytics_events_client*/ None,
-        in_memory_thread_store_for_tests(),
-        None,
-        TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
-    );
-
-    let source = manager
-        .resume_thread_with_history(
-            config.clone(),
-            InitialHistory::Forked(vec![
-                RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-                    turn_id: "turn-explicit".to_string(),
-                    trace_id: None,
-                    started_at: None,
-                    model_context_window: None,
-                    collaboration_mode_kind: Default::default(),
-                })),
-                RolloutItem::ResponseItem(user_msg("hello").into()),
-                RolloutItem::ResponseItem(assistant_msg("partial").into()),
-            ]),
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
-        .await
-        .expect("create source thread from explicit partial history");
-    let source_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
-    let source_history = RolloutRecorder::get_rollout_history(&source_path)
-        .await
-        .expect("read source rollout history");
-    let source_snapshot_state = snapshot_turn_state(&source_history);
-    assert_eq!(
-        source_snapshot_state,
-        SnapshotTurnState {
-            ends_mid_turn: true,
-            active_turn_id: Some("turn-explicit".to_string()),
-            active_turn_started_at: None,
-            active_turn_start_index: Some(1),
-        },
-    );
-
-    let forked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config.clone(),
-            source_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork interrupted snapshot");
-    let forked_path = forked
-        .thread
-        .rollout_path()
-        .expect("forked rollout path should exist");
-    let history = RolloutRecorder::get_rollout_history(&forked_path)
-        .await
-        .expect("read forked rollout history");
-    let rollout_items: Vec<_> = history
-        .get_rollout_items()
-        .iter()
-        .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
-        .collect();
-
-    assert!(rollout_items.iter().any(|item| {
-        matches!(
-            item,
-            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: Some(turn_id),
-                started_at: None,
-                reason: TurnAbortReason::Interrupted,
-            completed_at: None,
-            duration_ms: None,
-            })) if turn_id == "turn-explicit"
-        )
-    }));
-}
-
-#[tokio::test]
-async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_source() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = config.codex_home.abs();
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-
-    let auth_manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let manager = ThreadManager::new(
-        &config,
-        auth_manager.clone(),
-        build_models_manager(&config, auth_manager.clone()),
-        SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
-        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        /*analytics_events_client*/ None,
-        in_memory_thread_store_for_tests(),
-        None,
-        TEST_INSTALLATION_ID.to_string(),
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
-    );
-
-    let source = manager
-        .resume_thread_with_history(
-            config.clone(),
-            InitialHistory::Forked(vec![
-                RolloutItem::ResponseItem(user_msg("hello").into()),
-                RolloutItem::ResponseItem(assistant_msg("partial").into()),
-            ]),
-            auth_manager,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-        )
-        .await
-        .expect("create source thread from partial history");
-    let source_path = source
-        .thread
-        .rollout_path()
-        .expect("source rollout path should exist");
-    let source_history = RolloutRecorder::get_rollout_history(&source_path)
-        .await
-        .expect("read source rollout history");
-    assert!(snapshot_turn_state(&source_history).ends_mid_turn);
-    manager.remove_thread(&source.thread_id).await;
-
-    let forked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config.clone(),
-            source_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork interrupted snapshot");
-    let forked_path = forked
-        .thread
-        .rollout_path()
-        .expect("forked rollout path should exist");
-    let history = RolloutRecorder::get_rollout_history(&forked_path)
-        .await
-        .expect("read forked rollout history");
-    assert!(!snapshot_turn_state(&history).ends_mid_turn);
-
-    let forked_rollout_items: Vec<_> = history
-        .get_rollout_items()
-        .iter()
-        .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
-        .collect();
-    let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker().into(),
-    ))
-    .expect("serialize interrupted marker");
-    assert_eq!(
-        forked_rollout_items
-            .iter()
-            .filter(|item| {
-                strip_response_item_ids_from_json(
-                    serde_json::to_value(item).expect("serialize forked rollout item"),
-                ) == interrupted_marker_json
-            })
-            .count(),
-        1,
-    );
-
-    manager.remove_thread(&forked.thread_id).await;
-    let reforked = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config.clone(),
-            forked_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("re-fork interrupted snapshot");
-    let reforked_path = reforked
-        .thread
-        .rollout_path()
-        .expect("re-forked rollout path should exist");
-    let reforked_history = RolloutRecorder::get_rollout_history(&reforked_path)
-        .await
-        .expect("read re-forked rollout history");
-    let reforked_rollout_items: Vec<_> = reforked_history
-        .get_rollout_items()
-        .iter()
-        .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
-        .collect();
-
-    assert_eq!(
-        reforked_rollout_items
-            .iter()
-            .filter(|item| {
-                strip_response_item_ids_from_json(
-                    serde_json::to_value(item).expect("serialize re-forked rollout item"),
-                ) == interrupted_marker_json
-            })
-            .count(),
-        1,
-    );
-    assert_eq!(
-        reforked_rollout_items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item,
-                    RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                        reason: TurnAbortReason::Interrupted,
-                        ..
-                    }))
-                )
-            })
-            .count(),
-        1,
     );
 }

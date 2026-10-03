@@ -89,7 +89,52 @@ foo = true"#;
 }
 
 #[test]
-fn strict_config_rejects_removed_guardian_feature_keys() {
+fn strict_config_rejects_retired_runtime_settings() {
+    for key in [
+        "forced_login_method",
+        "forced_chatgpt_workspace_id",
+        "cli_auth_credentials_store",
+        "chatgpt_base_url",
+        "feedback",
+        "check_for_update_on_startup",
+        "disable_paste_burst",
+    ] {
+        let contents = format!("{key} = \"chatgpt\"");
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(
+            Path::new("/tmp/config.toml"),
+            &contents,
+        )
+        .expect("retired runtime setting must be rejected");
+        assert_eq!(
+            error.message,
+            format!("unknown configuration field `{key}`")
+        );
+    }
+}
+
+#[test]
+fn strict_config_rejects_retired_tui_settings() {
+    for (contents, path) in [
+        ("[tui]\ntheme = \"dark\"", "tui"),
+        (
+            "[profiles.work.tui]\nsession_picker_view = \"dense\"",
+            "profiles.work.tui",
+        ),
+    ] {
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(
+            Path::new("/tmp/config.toml"),
+            contents,
+        )
+        .expect("retired TUI setting must be rejected");
+        assert_eq!(
+            error.message,
+            format!("unknown configuration field `{path}`")
+        );
+    }
+}
+
+#[test]
+fn strict_config_rejects_removed_runtime_feature_keys() {
     let path = Path::new("/tmp/config.toml");
 
     for key in [
@@ -98,10 +143,45 @@ fn strict_config_rejects_removed_guardian_feature_keys() {
         "guardian_enhanced_node_repl_transcripts",
         "guardian_node_repl_transcript_images",
         "guardian_ext",
+        "use_agent_identity",
+        "undo",
+        "js_repl",
+        "code_mode_buffered_exec",
+        "js_repl_tools_only",
+        "terminal_resize_reflow",
+        "search_tool",
+        "codex_git_commit",
+        "apply_patch_freeform",
+        "use_linux_sandbox_bwrap",
+        "request_rule",
+        "remote_models",
+        "multi_agent_mode",
+        "enable_fanout",
+        "tool_search",
+        "tool_search_always_defer_mcp_tools",
+        "unavailable_dummy_tools",
+        "external_migration",
+        "resize_all_images",
+        "item_ids",
+        "skill_env_var_dependency_prompt",
+        "steer",
+        "send_async_message",
+        "collaboration_modes",
+        "remote_control",
+        "image_detail_original",
+        "tui_app_server",
+        "workspace_owner_usage_nudge",
+        "responses_websockets",
+        "responses_websockets_v2",
+        "plugins",
+        "recommended_plugins",
+        "remote_plugin",
+        "plugin_sharing",
+        "plugin_hooks",
     ] {
         let contents = format!("[features]\n{key} = true\n");
         let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, &contents)
-            .expect("removed Guardian feature key should be rejected");
+            .expect("removed runtime feature key should be rejected");
         assert_eq!(
             error.message,
             format!("unknown configuration field `features.{key}`")

@@ -4,14 +4,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_config::AppToolApproval;
+use codex_mcp::configured_mcp_servers;
 use codex_protocol::items::McpToolCallError;
 use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_tools::ToolName;
 use codex_utils_output_truncation::truncate_text;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
@@ -24,12 +27,18 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::approval::ApprovalReviewContext;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::tools::ApprovalContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::hook_names::HookToolName;
+use crate::tools::sandboxing::ApprovalAction;
+use crate::tools::sandboxing::ToolError;
 use codex_protocol::protocol::McpInvocation;
 
 mod list_mcp_resource_templates;
@@ -39,23 +48,6 @@ mod read_mcp_resource;
 pub use list_mcp_resource_templates::ListMcpResourceTemplatesHandler;
 pub use list_mcp_resources::ListMcpResourcesHandler;
 pub use read_mcp_resource::ReadMcpResourceHandler;
-
-fn model_can_access_mcp_server(turn: &TurnContext, server: &str) -> bool {
-    turn.config.orchestrator_mcp_enabled || server != CODEX_APPS_MCP_SERVER_NAME
-}
-
-fn ensure_model_can_access_mcp_server(
-    turn: &TurnContext,
-    server: &str,
-) -> Result<(), FunctionCallError> {
-    if model_can_access_mcp_server(turn, server) {
-        Ok(())
-    } else {
-        Err(FunctionCallError::RespondToModel(format!(
-            "MCP server '{server}' is disabled by `orchestrator.mcp.enabled`"
-        )))
-    }
-}
 
 #[derive(Debug, Deserialize, Default, PartialEq, Eq)]
 struct ListResourceArgs {
@@ -75,11 +67,9 @@ impl ListResourceArgs {
 
     fn target(
         &self,
-        turn: &TurnContext,
     ) -> Result<Option<(String, Option<PaginatedRequestParams>)>, FunctionCallError> {
         match &self.server {
             Some(server) => {
-                ensure_model_can_access_mcp_server(turn, server)?;
                 let params = self
                     .cursor
                     .clone()
@@ -202,6 +192,100 @@ fn call_tool_result_from_content(content: &str, success: Option<bool>) -> CallTo
     }
 }
 
+fn resource_servers(
+    step_context: &StepContext,
+    requested_server: Option<&str>,
+) -> Result<Vec<String>, FunctionCallError> {
+    let configured = configured_mcp_servers(step_context.mcp.config());
+    if let Some(server) = requested_server {
+        if configured.get(server).is_some_and(|config| config.enabled) {
+            return Ok(vec![server.to_string()]);
+        }
+        return Err(FunctionCallError::RespondToModel(format!(
+            "MCP server `{server}` is not configured for this turn"
+        )));
+    }
+    let mut servers = configured
+        .into_iter()
+        .filter_map(|(name, config)| config.enabled.then_some(name))
+        .collect::<Vec<_>>();
+    servers.sort();
+    Ok(servers)
+}
+
+async fn approve_resource_operation(
+    session: &Arc<Session>,
+    step_context: &Arc<StepContext>,
+    call_id: &str,
+    invocation: &McpInvocation,
+    server: &str,
+) -> Result<(), FunctionCallError> {
+    let config = step_context
+        .mcp
+        .config()
+        .mcp_server_catalog
+        .server(server)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "MCP server `{server}` is not configured for this turn"
+            ))
+        })?;
+    let strict_auto_review = session
+        .active_turn_context_and_strict_auto_review()
+        .await
+        .is_some_and(|(_, _, strict)| strict);
+    if !strict_auto_review
+        && config.config().default_tools_approval_mode == Some(AppToolApproval::Approve)
+    {
+        return Ok(());
+    }
+    let approval_id = format!("{call_id}:{server}");
+    let action = ApprovalAction::McpToolCall {
+        id: approval_id.clone(),
+        server: server.to_string(),
+        tool_name: invocation.tool.clone(),
+        arguments: invocation.arguments.clone(),
+        tool_title: None,
+        tool_description: None,
+        annotations: None,
+        hook_tool_name: HookToolName::new(format!("mcp__{server}__{}", invocation.tool)),
+        approval_policy: step_context.mcp.config().approval_policy.value(),
+        approval_mode: AppToolApproval::Prompt,
+        allow_session_remember: false,
+    };
+    let approval_context = ApprovalContext {
+        review_context: ApprovalReviewContext::from(step_context),
+        call_id: approval_id,
+        tool_name: ToolName::plain(invocation.tool.clone()),
+        strict_auto_review,
+        approval_reason: None,
+        retry_reason: None,
+        network_approval_context: None,
+    };
+    match session.request_approval(action, approval_context).await {
+        Ok(
+            ReviewDecision::Approved
+            | ReviewDecision::ApprovedForSession
+            | ReviewDecision::ApprovedMcpPolicyAmendment
+            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+            | ReviewDecision::NetworkPolicyAmendment { .. },
+        ) => Ok(()),
+        Ok(ReviewDecision::Denied { rejection }) => {
+            Err(FunctionCallError::RespondToModel(rejection))
+        }
+        Ok(ReviewDecision::TimedOut) => Err(FunctionCallError::RespondToModel(
+            crate::tools::APPROVAL_TIMEOUT_MESSAGE.to_string(),
+        )),
+        Ok(ReviewDecision::Abort) => Err(FunctionCallError::RespondToModel(
+            "user cancelled MCP resource operation".to_string(),
+        )),
+        Err(ToolError::Rejected(rejection)) => Err(FunctionCallError::RespondToModel(rejection)),
+        Err(ToolError::Codex(_)) => Err(FunctionCallError::RespondToModel(
+            "user cancelled MCP resource operation".to_string(),
+        )),
+    }
+}
+
 async fn emit_tool_call_begin(
     session: &Arc<Session>,
     turn: &TurnContext,
@@ -218,12 +302,7 @@ async fn emit_tool_call_begin(
         server,
         tool,
         arguments: arguments.unwrap_or(Value::Null),
-        connector_id: None,
         mcp_app_resource_uri: None,
-        link_id: None,
-        app_name: None,
-        action_name: None,
-        plugin_id: None,
         read_only_hint: None,
         status: McpToolCallStatus::InProgress,
         result: None,
@@ -262,12 +341,7 @@ async fn emit_tool_call_end(
         server,
         tool,
         arguments: arguments.unwrap_or(Value::Null),
-        connector_id: None,
         mcp_app_resource_uri: None,
-        link_id: None,
-        app_name: None,
-        action_name: None,
-        plugin_id: None,
         read_only_hint: None,
         status,
         result,
@@ -279,19 +353,27 @@ async fn emit_tool_call_end(
 
 async fn run_resource_operation<T>(
     session: &Arc<Session>,
-    turn: &TurnContext,
+    step_context: &Arc<StepContext>,
     call_id: &str,
     invocation: McpInvocation,
+    servers: &[String],
     operation: impl Future<Output = Result<T, FunctionCallError>>,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError>
 where
     T: Serialize,
 {
+    let turn = step_context.turn.as_ref();
     emit_tool_call_begin(session, turn, call_id, invocation.clone()).await;
     let start = Instant::now();
-    let result = operation.await.and_then(|payload| {
-        serialize_function_output(payload, turn.model_info().truncation_policy.into())
-    });
+    let result = async {
+        for server in servers {
+            approve_resource_operation(session, step_context, call_id, &invocation, server).await?;
+        }
+        operation.await.and_then(|payload| {
+            serialize_function_output(payload, turn.model_info().truncation_policy.into())
+        })
+    }
+    .await;
 
     match result {
         Ok(output) => {

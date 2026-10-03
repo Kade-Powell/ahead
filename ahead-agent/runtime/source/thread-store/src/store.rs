@@ -21,10 +21,7 @@ use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
-use crate::PrepareForkParams;
-use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
-use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
@@ -154,17 +151,6 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
-    /// Freezes source history and model context used to initialize a referenced fork.
-    ///
-    /// Stores without reference-backed fork support can retain this default implementation.
-    fn prepare_fork(&self, _params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
-        Box::pin(async {
-            Err(ThreadStoreError::Unsupported {
-                operation: "prepare_fork",
-            })
-        })
-    }
-
     /// Reverts a paginated thread's durable history so it ends immediately before
     /// `before_turn_id`.
     ///
@@ -182,14 +168,6 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Reads a thread summary and optionally its persisted history.
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>;
-
-    /// Reads a rollout-backed thread by path when the store supports path-addressed lookups.
-    ///
-    /// Deprecated: new callers should use [`ThreadStore::read_thread`] instead.
-    fn read_thread_by_rollout_path(
-        &self,
-        params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreFuture<'_, StoredThread>;
 
     /// Lists stored threads matching the supplied filters.
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;

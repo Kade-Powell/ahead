@@ -1,6 +1,6 @@
 use super::{
-    AgentWorkspacePanel, CloseWindow, Quit, QuitInProgress, Shell,
-    debug_terminal_command, request_close_window, request_quit,
+    AgentWorkspacePanel, CenterPanel, CloseWindow, Quit, QuitInProgress, Shell,
+    ShellShortcut, debug_terminal_command, request_close_window, request_quit,
 };
 use crate::code_panel::CodePanel;
 use crate::proxy_client::ProxyClient;
@@ -9,14 +9,1214 @@ use crate::workspace_panels::{
     SearchPanel,
 };
 use ahead_rpc::ahead::AheadRequest;
+use ahead_rpc::ahead::{
+    DisplayPosition, DisplayRange, GitHubUser, SessionRole, WorkKind,
+};
+use ahead_rpc::core::{CoreRpc, CoreRpcHandler};
 use ahead_rpc::file::EditorRecoverySnapshot;
 use ahead_rpc::proxy::{
-    ProxyNotification, ProxyRequest, ProxyResponse, ProxyRpc, ProxyRpcHandler,
+    ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse, ProxyRpc,
+    ProxyRpcHandler,
 };
 use gpui_kit::component::dock::DockSkin;
-use gpui_kit::{AppContext, Entity, TestAppContext, VisualTestContext};
+use gpui_kit::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn start_mock_github_api() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>)
+{
+    let api = TcpListener::bind("127.0.0.1:0").expect("mock GitHub API");
+    api.set_nonblocking(true).expect("nonblocking API");
+    let api_base = format!("http://{}", api.local_addr().expect("API address"));
+    let api_stop = Arc::new(AtomicBool::new(false));
+    let api_thread = {
+        let api_stop = api_stop.clone();
+        std::thread::spawn(move || {
+            while !api_stop.load(Ordering::Relaxed) {
+                match api.accept() {
+                    Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).expect("blocking API socket");
+                        let mut headers = Vec::new();
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            socket.read_exact(&mut byte).expect("API request");
+                            headers.push(byte[0]);
+                            assert!(headers.len() < 8192, "API headers too large");
+                        }
+                        assert!(
+                            String::from_utf8_lossy(&headers)
+                                .to_ascii_lowercase()
+                                .contains("authorization: bearer guest-token")
+                        );
+                        let body = r#"{"login":"bob","id":42,"name":"Bob"}"#;
+                        write!(
+                            socket,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .expect("API response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("API accept: {error}"),
+                }
+            }
+        })
+    };
+    (api_base, api_stop, api_thread)
+}
+
+fn start_mock_host_model() -> (
+    String,
+    std::sync::mpsc::Receiver<(String, serde_json::Value)>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock host model");
+    listener.set_nonblocking(true).expect("nonblocking model");
+    let endpoint = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("model address")
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "host model request missing"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("host model accept: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("model read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0; 8192];
+        let (headers, body) = loop {
+            let read = socket.read(&mut buffer).expect("host model request");
+            assert_ne!(read, 0, "host model request ended early");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers =
+                String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("host model content length");
+            if request.len() >= header_end + length {
+                let body = serde_json::from_slice(
+                    &request[header_end..header_end + length],
+                )
+                .expect("host model request JSON");
+                break (headers, body);
+            }
+        };
+        let message = serde_json::json!({
+            "id": "message-host-paid",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "HOST_PAID_RESPONSE"}],
+        });
+        let events = [
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": "message-host-paid", "type": "message", "role": "assistant", "content": []},
+                }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "type": "response.output_item.done", "output_index": 0, "item": message,
+                }),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "response-host-paid", "end_turn": true},
+                }),
+            ),
+        ];
+        let response = events
+            .iter()
+            .map(|(event, payload)| format!("event: {event}\ndata: {payload}\n\n"))
+            .collect::<String>();
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+            response.len()
+        )
+        .expect("host model response");
+        sender
+            .send((headers, body))
+            .expect("deliver host model request");
+    });
+    (endpoint, receiver, server)
+}
+
+fn authenticated_test_dispatcher(
+    proxy: &Arc<ProxyClient>,
+    workspace: &Path,
+    token: &str,
+    login: &str,
+    github_id: u64,
+    window_id: usize,
+    api_base: Option<String>,
+) -> (ahead_proxy::dispatch::Dispatcher, CoreRpcHandler) {
+    use ahead_proxy::ahead::GitHubAuthManager;
+    use ahead_proxy::dispatch::Dispatcher;
+
+    let core = CoreRpcHandler::new();
+    let mut dispatcher = Dispatcher::new(core.clone(), proxy.rpc_for_test());
+    dispatcher.handle_notification(ProxyNotification::Initialize {
+        workspace: Some(workspace.to_owned()),
+        window_id,
+        tab_id: window_id,
+    });
+    if let Some(api_base) = api_base {
+        dispatcher.set_share_test_api_base(api_base);
+    }
+    let mut auth = GitHubAuthManager::with_custom_dir(workspace.join("auth"));
+    auth.save_auth(
+        token.into(),
+        GitHubUser {
+            login: login.into(),
+            id: github_id,
+            name: Some(login.into()),
+            avatar_url: None,
+            email: None,
+            is_authenticated: true,
+        },
+    )
+    .expect("test identity");
+    dispatcher
+        .ahead_host
+        .as_ref()
+        .expect("session store")
+        .read()
+        .set_auth_for_test(auth);
+    (dispatcher, core)
+}
+
+#[gpui_kit::test]
+fn two_authenticated_shells_join_a_direct_shared_session(cx: &mut TestAppContext) {
+    use ahead_proxy::ahead::GitHubAuthManager;
+    use ahead_proxy::dispatch::Dispatcher;
+
+    let host_workspace = tempfile::tempdir().expect("host workspace");
+    let guest_workspace = tempfile::tempdir().expect("guest workspace");
+    std::fs::create_dir(host_workspace.path().join(".ahead"))
+        .expect("host config directory");
+    std::fs::write(
+        host_workspace.path().join(".ahead/team.toml"),
+        "[[members]]\ngithub = 'bob'\ndisplay_name = 'Bob'\nrole = 'editor'\n",
+    )
+    .expect("team allowlist");
+
+    let (api_base, api_stop, api_thread) = start_mock_github_api();
+
+    let mut guest_context = cx.clone();
+    let (host_shell, host_cx, host_proxy) =
+        open_shell(host_workspace.path(), &["src.rs"], cx);
+    let (guest_shell, guest_cx, guest_proxy) =
+        open_shell(guest_workspace.path(), &["local.rs"], &mut guest_context);
+
+    let host_rpc = host_proxy.rpc_for_test();
+    let host_core = CoreRpcHandler::new();
+    let mut host_dispatcher = Dispatcher::new(host_core.clone(), host_rpc.clone());
+    host_dispatcher.handle_notification(ProxyNotification::Initialize {
+        workspace: Some(host_workspace.path().to_owned()),
+        window_id: 1,
+        tab_id: 1,
+    });
+    host_dispatcher.set_share_test_api_base(api_base);
+    let host = host_dispatcher
+        .ahead_host
+        .as_ref()
+        .expect("host session store")
+        .clone();
+    let mut host_auth =
+        GitHubAuthManager::with_custom_dir(host_workspace.path().join("auth"));
+    host_auth
+        .save_auth(
+            "host-token".into(),
+            GitHubUser {
+                login: "host".into(),
+                id: 1,
+                name: Some("Host".into()),
+                avatar_url: None,
+                email: None,
+                is_authenticated: true,
+            },
+        )
+        .expect("host identity");
+    host.read().set_auth_for_test(host_auth);
+    let view = host
+        .read()
+        .start_work(
+            Some(WorkKind::ProductChange),
+            "Shared work".into(),
+            "Collaborate".into(),
+            None,
+        )
+        .expect("active managed session");
+    let verified_guest = GitHubUser {
+        login: "bob".into(),
+        id: 42,
+        name: Some("Bob".into()),
+        avatar_url: None,
+        email: None,
+        is_authenticated: true,
+    };
+    host.read()
+        .add_session_participant_verified(
+            &view.session.id,
+            verified_guest.clone(),
+            SessionRole::Editor,
+        )
+        .expect("verified guest");
+    let host_thread = std::thread::spawn({
+        let host_rpc = host_rpc.clone();
+        move || host_rpc.mainloop(&mut host_dispatcher)
+    });
+
+    let guest_rpc = guest_proxy.rpc_for_test();
+    let mut guest_dispatcher =
+        Dispatcher::new(CoreRpcHandler::new(), guest_rpc.clone());
+    guest_dispatcher.handle_notification(ProxyNotification::Initialize {
+        workspace: Some(guest_workspace.path().to_owned()),
+        window_id: 2,
+        tab_id: 2,
+    });
+    let guest_host = guest_dispatcher
+        .ahead_host
+        .as_ref()
+        .expect("guest session store")
+        .clone();
+    let mut guest_auth =
+        GitHubAuthManager::with_custom_dir(guest_workspace.path().join("auth"));
+    guest_auth
+        .save_auth(
+            "guest-token".into(),
+            GitHubUser {
+                login: "bob".into(),
+                id: 42,
+                name: Some("Bob".into()),
+                avatar_url: None,
+                email: None,
+                is_authenticated: true,
+            },
+        )
+        .expect("guest identity");
+    guest_host.read().set_auth_for_test(guest_auth);
+    let guest_thread = std::thread::spawn({
+        let guest_rpc = guest_rpc.clone();
+        move || guest_rpc.mainloop(&mut guest_dispatcher)
+    });
+
+    host_shell.update_in(host_cx, |shell, window, cx| {
+        shell.code_tabs[0].update(cx, |code, cx| {
+            code.watch_shared_buffer_changes(&host_proxy, window, cx);
+            assert_eq!(code.editor.read(cx).value(), "saved\n");
+        });
+    });
+
+    let host_session =
+        host_shell.read_with(host_cx, |shell, _| shell.session.clone());
+    host_session.update(host_cx, |panel, _| panel.set_shell(host_shell.clone()));
+    host_session.update(host_cx, |panel, cx| {
+        panel.attach_session(view.session.id.clone(), cx)
+    });
+    assert_eq!(
+        host_session.read_with(host_cx, |panel, _| panel.session_id.clone()),
+        Some(view.session.id.clone())
+    );
+    let offer = host_proxy
+        .share_session(view.session.id.clone(), "127.0.0.1:0".into())
+        .expect("direct TLS invite");
+    host_session.update(host_cx, |panel, cx| panel.share_active_session(cx));
+    let share_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !host_session.read_with(host_cx, |panel, _| {
+        panel.status.as_ref().starts_with("Sharing on ")
+    }) && std::time::Instant::now() < share_deadline
+    {
+        host_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(host_session.read_with(host_cx, |panel, _| {
+        panel.status.as_ref().starts_with("Sharing on ")
+    }));
+
+    let guest_session =
+        guest_shell.read_with(guest_cx, |shell, _| shell.session.clone());
+    guest_session.update_in(guest_cx, |panel, window, cx| {
+        panel.chat_input.update(cx, |input, cx| {
+            input.set_value(
+                serde_json::to_string(&offer).expect("invite JSON"),
+                window,
+                cx,
+            )
+        });
+        panel.join_shared_session(window, cx);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while guest_session.read_with(guest_cx, |panel, _| panel.session_id.clone())
+        != Some(view.session.id.clone())
+        && std::time::Instant::now() < deadline
+    {
+        guest_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        guest_session.read_with(guest_cx, |panel, _| panel.session_id.clone()),
+        Some(view.session.id.clone()),
+        "{}",
+        guest_session.read_with(guest_cx, |panel, _| panel.status.clone())
+    );
+    assert!(
+        guest_session.read_with(guest_cx, |panel, _| panel.shared_guest_can_edit())
+    );
+    guest_session.update(guest_cx, |panel, _| panel.set_shell(guest_shell.clone()));
+
+    let snapshot = guest_proxy
+        .read_shared_buffer(view.session.id.clone(), "src.rs".into())
+        .expect("host buffer over TLS");
+    guest_shell.update_in(guest_cx, |shell, window, cx| {
+        shell.open_shared_buffer(view.session.id.clone(), snapshot, None, window, cx)
+    });
+    guest_shell.read_with(guest_cx, |shell, cx| {
+        let shared = shell.code_tabs.last().expect("shared editor").read(cx);
+        assert_eq!(
+            shared.shared_session_id.as_deref(),
+            Some(view.session.id.as_str())
+        );
+        assert_eq!(shared.editor.read(cx).value(), "saved\n");
+    });
+
+    edit(&host_shell, 0, "host typed\n", host_cx);
+    let host_edit_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        host_cx.run_until_parked();
+        if guest_proxy
+            .read_shared_buffer(view.session.id.clone(), "src.rs".into())
+            .expect("live host buffer")
+            .content
+            == "host typed\n"
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < host_edit_deadline,
+            "host edit did not reach shared buffer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let guest_update_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        guest_cx
+            .background_executor
+            .advance_clock(std::time::Duration::from_millis(800));
+        guest_cx.run_until_parked();
+        if guest_shell.read_with(guest_cx, |shell, cx| {
+            shell.code_tabs[1].read(cx).editor.read(cx).value() == "host typed\n"
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < guest_update_deadline,
+            "host edit did not reach guest editor"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    edit(&guest_shell, 1, "edited by guest\n", guest_cx);
+    guest_cx.run_until_parked();
+    guest_cx
+        .background_executor
+        .advance_clock(std::time::Duration::from_millis(150));
+    let edit_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        guest_cx.run_until_parked();
+        for message in host_core.rx().try_iter() {
+            if let CoreRpc::Notification(notification) = message {
+                host_proxy.route_core(*notification);
+            }
+        }
+        host_cx.run_until_parked();
+        if host_shell.read_with(host_cx, |shell, cx| {
+            shell.code_tabs[0].read(cx).editor.read(cx).value()
+                == "edited by guest\n"
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < edit_deadline,
+            "guest edit did not reach host editor"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        guest_proxy
+            .read_shared_buffer(view.session.id.clone(), "src.rs".into())
+            .expect("committed host buffer")
+            .content,
+        "edited by guest\n"
+    );
+
+    host.read()
+        .add_session_participant_verified(
+            &view.session.id,
+            verified_guest.clone(),
+            SessionRole::Viewer,
+        )
+        .expect("downgrade guest to viewer");
+    let viewer = guest_proxy
+        .poll_shared_session(view.session.id.clone(), 0, None, None)
+        .expect("viewer role update");
+    guest_session
+        .update(guest_cx, |panel, cx| panel.apply_shared_update(viewer, cx));
+    assert!(
+        !guest_session.read_with(guest_cx, |panel, _| panel.shared_guest_can_edit())
+    );
+    guest_shell.update(guest_cx, |shell, cx| shell.sync_shared_editor_roles(cx));
+    guest_shell.read_with(guest_cx, |shell, cx| {
+        let shared = shell.code_tabs[1].read(cx);
+        assert_eq!(shared.editor.read(cx).value(), "edited by guest\n");
+        assert!(shared.status.contains("read only"));
+    });
+    let snapshot = guest_proxy
+        .read_shared_buffer(view.session.id.clone(), "src.rs".into())
+        .expect("viewer can read shared buffer");
+    assert!(
+        guest_proxy
+            .replace_shared_buffer(
+                view.session.id.clone(),
+                "src.rs".into(),
+                snapshot.revision,
+                "viewer edit must fail\n".into(),
+            )
+            .is_err(),
+        "viewer must not edit host buffer"
+    );
+    host.read()
+        .add_session_participant_verified(
+            &view.session.id,
+            verified_guest,
+            SessionRole::Editor,
+        )
+        .expect("restore guest editor role");
+    let editor = guest_proxy
+        .poll_shared_session(view.session.id.clone(), 0, None, None)
+        .expect("editor role update after reconnect");
+    guest_session
+        .update(guest_cx, |panel, cx| panel.apply_shared_update(editor, cx));
+    assert!(
+        guest_session.read_with(guest_cx, |panel, _| panel.shared_guest_can_edit())
+    );
+    guest_shell.update(guest_cx, |shell, cx| shell.sync_shared_editor_roles(cx));
+    guest_shell.read_with(guest_cx, |shell, cx| {
+        let shared = shell.code_tabs[1].read(cx);
+        assert_eq!(shared.editor.read(cx).value(), "edited by guest\n");
+        assert!(shared.status.contains("live editing"));
+    });
+
+    let message = guest_proxy
+        .post_shared_human_message(
+            view.session.id.clone(),
+            "@host please review".into(),
+        )
+        .expect("guest chat over TLS");
+    assert_eq!(message.human_recipient_ids(), Some(vec!["host"]));
+    assert!(
+        host_proxy
+            .conversation_page(&view.session.id, None, 50)
+            .expect("host conversation")
+            .messages
+            .iter()
+            .any(|item| item.id == message.id)
+    );
+
+    let comment = guest_proxy
+        .create_code_comment(
+            &view.session.id,
+            "src.rs".into(),
+            DisplayRange {
+                start: DisplayPosition { line: 0, col: 0 },
+                end: DisplayPosition { line: 0, col: 6 },
+            },
+            "edited".into(),
+            "0".repeat(64),
+            "Please check this edit".into(),
+        )
+        .expect("guest comment over TLS");
+    let comment_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        host_session.update(host_cx, |panel, cx| panel.poll_stream(cx));
+        host_cx.run_until_parked();
+        if host_session.read_with(host_cx, |panel, _| {
+            panel
+                .code_comments_snapshot()
+                .iter()
+                .any(|item| item.id == comment.id)
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < comment_deadline,
+            "guest comment did not reach host navigator"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    host_proxy
+        .publish_shared_terminal(view.session.id.clone(), "host terminal\n".into())
+        .expect("publish host terminal");
+    host_proxy
+        .publish_shared_presence(
+            view.session.id.clone(),
+            Some("src.rs".into()),
+            Some(1),
+        )
+        .expect("publish host presence");
+    let update = guest_proxy
+        .poll_shared_session(view.session.id.clone(), message.sequence, None, None)
+        .expect("guest poll");
+    assert_eq!(update.terminal_output, "host terminal\n");
+    assert!(update.presence.iter().any(|presence| {
+        presence.actor_id == "host"
+            && presence.path.as_deref() == Some("src.rs")
+            && presence.line == Some(1)
+    }));
+    assert!(
+        update
+            .code_comments
+            .iter()
+            .any(|item| item.id == comment.id)
+    );
+    guest_shell.update(guest_cx, |shell, cx| {
+        shell.set_active_code(shell.code_tabs[0].clone(), cx);
+    });
+    guest_session
+        .update(guest_cx, |panel, cx| panel.apply_shared_update(update, cx));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal == "host terminal\n" && presence_count > 0
+    }));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        panel
+            .code_comments_snapshot()
+            .iter()
+            .any(|item| item.id == comment.id)
+    }));
+    guest_session.update_in(guest_cx, |panel, window, cx| {
+        panel.follow_shared_actor("host".into(), window, cx)
+    });
+    guest_cx.run_until_parked();
+    assert_eq!(
+        guest_shell.read_with(guest_cx, |shell, cx| shell
+            .code
+            .read(cx)
+            .file_path
+            .clone()),
+        "src.rs"
+    );
+
+    host_proxy
+        .publish_shared_terminal(view.session.id.clone(), String::new())
+        .expect("clear closed host terminal");
+    let cleared = guest_proxy
+        .poll_shared_session(view.session.id.clone(), message.sequence, None, None)
+        .expect("guest poll after terminal close");
+    guest_session
+        .update(guest_cx, |panel, cx| panel.apply_shared_update(cleared, cx));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal.is_empty() && presence_count > 0
+    }));
+    host_proxy
+        .publish_shared_terminal(
+            view.session.id.clone(),
+            "host terminal reopened\n".into(),
+        )
+        .expect("publish reopened host terminal");
+    let reopened = guest_proxy
+        .poll_shared_session(view.session.id.clone(), message.sequence, None, None)
+        .expect("guest poll after terminal reopen");
+    guest_session.update(guest_cx, |panel, cx| {
+        panel.apply_shared_update(reopened, cx)
+    });
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal == "host terminal reopened\n" && presence_count > 0
+    }));
+
+    host_proxy
+        .stop_sharing_session(view.session.id.clone())
+        .expect("stop hosting shared session");
+    assert!(
+        guest_proxy
+            .read_shared_buffer(view.session.id.clone(), "src.rs".into())
+            .is_err(),
+        "stopped share must remove host buffer access"
+    );
+    guest_session.update(guest_cx, |panel, cx| panel.poll_stream(cx));
+    let stop_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !guest_session.read_with(guest_cx, |panel, _| {
+        panel
+            .status
+            .as_ref()
+            .starts_with("Shared session disconnected:")
+    }) && std::time::Instant::now() < stop_deadline
+    {
+        guest_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        panel
+            .status
+            .as_ref()
+            .starts_with("Shared session disconnected:")
+    }));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal.is_empty() && presence_count == 0
+    }));
+    guest_shell.update(guest_cx, |shell, cx| shell.sync_shared_editor_roles(cx));
+    guest_shell.read_with(guest_cx, |shell, cx| {
+        let shared = shell.code_tabs[1].read(cx);
+        assert_eq!(shared.editor.read(cx).value(), "edited by guest\n");
+        assert!(shared.status.contains("read only"));
+    });
+
+    guest_rpc.shutdown();
+    host_rpc.shutdown();
+    guest_thread.join().expect("guest dispatcher");
+    host_thread.join().expect("host dispatcher");
+    api_stop.store(true, Ordering::Relaxed);
+    api_thread.join().expect("mock API");
+}
+
+#[gpui_kit::test]
+fn shared_guest_child_process(cx: &mut TestAppContext) {
+    let Ok(offer_json) = std::env::var("AHEAD_COLLAB_PROCESS_OFFER") else {
+        return;
+    };
+    let offer: ahead_rpc::ahead::SharedSessionOffer =
+        serde_json::from_str(&offer_json).expect("shared offer");
+    let guest_workspace = tempfile::tempdir().expect("guest workspace");
+    let (guest_shell, guest_cx, guest_proxy) =
+        open_shell(guest_workspace.path(), &["local.rs"], cx);
+    let guest_rpc = guest_proxy.rpc_for_test();
+    let (mut guest_dispatcher, _) = authenticated_test_dispatcher(
+        &guest_proxy,
+        guest_workspace.path(),
+        "guest-token",
+        "bob",
+        42,
+        2,
+        None,
+    );
+    let guest_thread = std::thread::spawn({
+        let guest_rpc = guest_rpc.clone();
+        move || guest_rpc.mainloop(&mut guest_dispatcher)
+    });
+    let guest_session =
+        guest_shell.read_with(guest_cx, |shell, _| shell.session.clone());
+    guest_session.update_in(guest_cx, |panel, window, cx| {
+        panel
+            .chat_input
+            .update(cx, |input, cx| input.set_value(offer_json, window, cx));
+        panel.join_shared_session(window, cx);
+    });
+    let join_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while guest_session.read_with(guest_cx, |panel, _| panel.session_id.clone())
+        != Some(offer.session_id.clone())
+        && std::time::Instant::now() < join_deadline
+    {
+        guest_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        guest_session.read_with(guest_cx, |panel, _| panel.session_id.clone()),
+        Some(offer.session_id.clone()),
+        "{}",
+        guest_session.read_with(guest_cx, |panel, _| panel.status.clone())
+    );
+    assert!(
+        guest_session.read_with(guest_cx, |panel, _| panel.shared_guest_can_edit())
+    );
+    guest_session.update(guest_cx, |panel, _| panel.set_shell(guest_shell.clone()));
+    let update = guest_proxy
+        .poll_shared_session(offer.session_id.clone(), 0, None, None)
+        .expect("cross-process guest poll");
+    assert_eq!(update.terminal_output, "host terminal across processes\n");
+    assert!(update.presence.iter().any(|presence| {
+        presence.actor_id == "host"
+            && presence.path.as_deref() == Some("src.rs")
+            && presence.line == Some(1)
+    }));
+    guest_session
+        .update(guest_cx, |panel, cx| panel.apply_shared_update(update, cx));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal == "host terminal across processes\n" && presence_count > 0
+    }));
+    guest_session.update_in(guest_cx, |panel, window, cx| {
+        panel.follow_shared_actor("host".into(), window, cx)
+    });
+    guest_cx.run_until_parked();
+    assert_eq!(
+        guest_shell.read_with(guest_cx, |shell, cx| shell
+            .code
+            .read(cx)
+            .file_path
+            .clone()),
+        "src.rs"
+    );
+    let snapshot = guest_proxy
+        .read_shared_buffer(offer.session_id.clone(), "src.rs".into())
+        .expect("host buffer");
+    guest_shell.update_in(guest_cx, |shell, window, cx| {
+        shell.open_shared_buffer(
+            offer.session_id.clone(),
+            snapshot,
+            None,
+            window,
+            cx,
+        )
+    });
+    edit(&guest_shell, 1, "edited across processes\n", guest_cx);
+    guest_cx.run_until_parked();
+    guest_cx
+        .background_executor
+        .advance_clock(std::time::Duration::from_millis(150));
+    let edit_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        guest_cx.run_until_parked();
+        let snapshot = guest_proxy
+            .read_shared_buffer(offer.session_id.clone(), "src.rs".into())
+            .expect("shared buffer after edit");
+        if snapshot.content == "edited across processes\n" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < edit_deadline,
+            "guest edit did not reach host"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let message = guest_proxy
+        .post_shared_human_message(
+            offer.session_id.clone(),
+            "@host the second AHEAD process edited src.rs".into(),
+        )
+        .expect("cross-process chat");
+    assert_eq!(message.human_recipient_ids(), Some(vec!["host"]));
+    guest_proxy
+        .create_code_comment(
+            &offer.session_id,
+            "src.rs".into(),
+            DisplayRange {
+                start: DisplayPosition { line: 0, col: 0 },
+                end: DisplayPosition { line: 0, col: 6 },
+            },
+            "edited".into(),
+            "0".repeat(64),
+            "Guest note from second process".into(),
+        )
+        .expect("cross-process guest comment");
+    assert!(
+        !guest_proxy
+            .start_shared_agent_turn(
+                offer.session_id.clone(),
+                "Reply with HOST_PAID_RESPONSE".into(),
+            )
+            .expect("guest-started host agent turn")
+            .is_empty()
+    );
+    assert!(
+        guest_proxy
+            .start_shared_agent_turn(
+                offer.session_id.clone(),
+                "@host this stays human-only".into(),
+            )
+            .is_err(),
+        "addressed messages must not start the host agent"
+    );
+    let reconnected = guest_proxy
+        .poll_shared_session(offer.session_id.clone(), message.sequence, None, None)
+        .expect("guest reconnect after rejected turn");
+    assert_eq!(reconnected.actor_id, "bob");
+    guest_proxy
+        .post_shared_human_message(
+            offer.session_id.clone(),
+            "@host guest reconnected to the shared session".into(),
+        )
+        .expect("chat after guest reconnect");
+    let revoke_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(70);
+    while !guest_session.read_with(guest_cx, |panel, _| {
+        panel
+            .status
+            .as_ref()
+            .starts_with("Shared session disconnected:")
+    }) && std::time::Instant::now() < revoke_deadline
+    {
+        guest_session.update(guest_cx, |panel, cx| panel.poll_stream(cx));
+        guest_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        panel
+            .status
+            .as_ref()
+            .starts_with("Shared session disconnected:")
+    }));
+    assert!(guest_session.read_with(guest_cx, |panel, _| {
+        let (terminal, presence_count) = panel.shared_remote_state_for_test();
+        terminal.is_empty() && presence_count == 0
+    }));
+    assert!(
+        guest_proxy
+            .read_shared_buffer(offer.session_id, "src.rs".into())
+            .is_err(),
+        "revoked guest must lose host buffer access"
+    );
+    guest_shell.update(guest_cx, |shell, cx| shell.sync_shared_editor_roles(cx));
+    guest_shell.read_with(guest_cx, |shell, cx| {
+        let shared = shell.code_tabs[1].read(cx);
+        assert_eq!(shared.editor.read(cx).value(), "edited across processes\n");
+        assert!(shared.status.contains("read only"));
+    });
+    guest_rpc.shutdown();
+    guest_thread.join().expect("guest dispatcher");
+}
+
+#[gpui_kit::test]
+fn separate_ahead_processes_share_code_and_chat(cx: &mut TestAppContext) {
+    use std::process::{Command, Stdio};
+
+    let host_workspace = tempfile::tempdir().expect("host workspace");
+    std::fs::create_dir(host_workspace.path().join(".ahead"))
+        .expect("host config directory");
+    std::fs::write(
+        host_workspace.path().join(".ahead/team.toml"),
+        "[[members]]\ngithub = 'bob'\ndisplay_name = 'Bob'\nrole = 'editor'\n",
+    )
+    .expect("team allowlist");
+    let (model_endpoint, model_requests, model_server) = start_mock_host_model();
+    std::fs::write(
+        host_workspace.path().join(".ahead/settings.toml"),
+        format!(
+            "[ai]\nactive_connection = 'Host model'\n[[ai.connections]]\nname = 'Host model'\nprovider_id = 'mock'\nbase_url = '{model_endpoint}'\napi_key = 'host-model-key'\nmodel = 'gpt-5.6-sol'\n"
+        ),
+    )
+    .expect("host-only model connection");
+    let (api_base, api_stop, api_thread) = start_mock_github_api();
+    let (host_shell, host_cx, host_proxy) =
+        open_shell(host_workspace.path(), &["src.rs"], cx);
+    let host_rpc = host_proxy.rpc_for_test();
+    let (mut host_dispatcher, host_core) = authenticated_test_dispatcher(
+        &host_proxy,
+        host_workspace.path(),
+        "host-token",
+        "host",
+        1,
+        1,
+        Some(api_base),
+    );
+    let host = host_dispatcher
+        .ahead_host
+        .as_ref()
+        .expect("host session store")
+        .clone();
+    let view = host
+        .read()
+        .start_work(
+            Some(WorkKind::ProductChange),
+            "Shared process test".into(),
+            "Collaborate".into(),
+            None,
+        )
+        .expect("active managed session");
+    host.read()
+        .add_session_participant_verified(
+            &view.session.id,
+            GitHubUser {
+                login: "bob".into(),
+                id: 42,
+                name: Some("Bob".into()),
+                avatar_url: None,
+                email: None,
+                is_authenticated: true,
+            },
+            SessionRole::Editor,
+        )
+        .expect("verified guest");
+    let host_thread = std::thread::spawn({
+        let host_rpc = host_rpc.clone();
+        move || host_rpc.mainloop(&mut host_dispatcher)
+    });
+    host_shell.update_in(host_cx, |shell, window, cx| {
+        shell.code_tabs[0].update(cx, |code, cx| {
+            code.watch_shared_buffer_changes(&host_proxy, window, cx)
+        });
+    });
+    let host_session =
+        host_shell.read_with(host_cx, |shell, _| shell.session.clone());
+    host_session.update(host_cx, |panel, cx| {
+        panel.attach_session(view.session.id.clone(), cx)
+    });
+    let offer = host_proxy
+        .share_session(view.session.id.clone(), "127.0.0.1:0".into())
+        .expect("direct TLS invite");
+    host_session.update(host_cx, |panel, cx| panel.share_active_session(cx));
+    let share_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !host_session.read_with(host_cx, |panel, _| {
+        panel.status.as_ref().starts_with("Sharing on ")
+    }) && std::time::Instant::now() < share_deadline
+    {
+        host_cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(host_session.read_with(host_cx, |panel, _| {
+        panel.status.as_ref().starts_with("Sharing on ")
+    }));
+    host_proxy
+        .publish_shared_terminal(
+            view.session.id.clone(),
+            "host terminal across processes\n".into(),
+        )
+        .expect("cross-process host terminal");
+    host_proxy
+        .publish_shared_presence(
+            view.session.id.clone(),
+            Some("src.rs".into()),
+            Some(1),
+        )
+        .expect("cross-process host presence");
+    let child_test = "app::lifecycle_tests::shared_guest_child_process";
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", child_test, "--nocapture"])
+        .env(
+            "AHEAD_COLLAB_PROCESS_OFFER",
+            serde_json::to_string(&offer).expect("offer JSON"),
+        )
+        .env_remove("ITERATIONS")
+        .env("RUST_BACKTRACE", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("second AHEAD test process");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(75);
+    let mut model_request = None;
+    loop {
+        for message in host_core.rx().try_iter() {
+            if let CoreRpc::Notification(notification) = message {
+                host_proxy.route_core(*notification);
+            }
+        }
+        host_cx.run_until_parked();
+        let host_changed = host_shell.read_with(host_cx, |shell, cx| {
+            shell.code_tabs[0].read(cx).editor.read(cx).value()
+                == "edited across processes\n"
+        });
+        if child.try_wait().expect("child status").is_some() {
+            let output = child.wait_with_output().expect("child output");
+            panic!(
+                "guest process exited before revocation: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let conversation = host_proxy
+            .conversation_page(&view.session.id, None, 50)
+            .expect("host conversation");
+        let posted = conversation.messages.iter().any(|message| {
+            message.content == "@host the second AHEAD process edited src.rs"
+                && message.human_recipient_ids() == Some(vec!["host"])
+        });
+        let reconnected = conversation.messages.iter().any(|message| {
+            message.content == "@host guest reconnected to the shared session"
+                && message.human_recipient_ids() == Some(vec!["host"])
+        });
+        if model_request.is_none() {
+            match model_requests.try_recv() {
+                Ok(request) => model_request = Some(request),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!(
+                        "host model server stopped before a request; session status: {}; messages: {:?}",
+                        host_session
+                            .read_with(host_cx, |panel, _| panel.status.clone()),
+                        conversation
+                            .messages
+                            .iter()
+                            .map(|message| (
+                                &message.role,
+                                &message.content,
+                                &message.status
+                            ))
+                            .collect::<Vec<_>>()
+                    )
+                }
+            }
+        }
+        let commented = host_proxy
+            .code_comments(&view.session.id)
+            .expect("host comments")
+            .iter()
+            .any(|comment| comment.body == "Guest note from second process");
+        if host_changed
+            && posted
+            && reconnected
+            && commented
+            && model_request.is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            if let Err(error) = child.kill() {
+                eprintln!("Could not stop stalled guest process: {error}");
+            }
+            let output = child.wait_with_output().expect("stalled child output");
+            panic!(
+                "separate-process edit did not converge: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    model_server.join().expect("host model server");
+    let (headers, request) = model_request.expect("host model request");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer host-model-key"),
+        "guest turn must use the host's model credential"
+    );
+    let request = request.to_string();
+    assert!(request.contains("Reply with HOST_PAID_RESPONSE"));
+    assert!(
+        !request.contains("@host the second AHEAD process edited src.rs"),
+        "addressed human-only chat reached the model"
+    );
+    host_proxy
+        .revoke_session_participant(view.session.id.clone(), "bob".into())
+        .expect("revoke guest across processes");
+    while child.try_wait().expect("child status").is_none() {
+        if std::time::Instant::now() >= deadline {
+            if let Err(error) = child.kill() {
+                eprintln!("Could not stop stalled guest process: {error}");
+            }
+            let output = child.wait_with_output().expect("stalled child output");
+            panic!(
+                "guest process did not stop after revocation: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().expect("child output");
+    assert!(
+        output.status.success(),
+        "guest process failed after revocation: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let messages = host_proxy
+            .conversation_page(&view.session.id, None, 50)
+            .expect("host conversation after guest turn")
+            .messages;
+        if messages.iter().any(|message| {
+            message.role == "agent" && message.content.contains("HOST_PAID_RESPONSE")
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < answer_deadline,
+            "host agent response missing: {:?}",
+            messages
+                .iter()
+                .map(|message| (&message.role, &message.content))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        host_proxy
+            .conversation_page(&view.session.id, None, 50)
+            .expect("host conversation")
+            .messages
+            .iter()
+            .any(|message| {
+                message.content == "@host the second AHEAD process edited src.rs"
+                    && message.human_recipient_ids() == Some(vec!["host"])
+            })
+    );
+    let comment_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        host_session.update(host_cx, |panel, cx| panel.poll_stream(cx));
+        host_cx.run_until_parked();
+        if host_session.read_with(host_cx, |panel, _| {
+            panel
+                .code_comments_snapshot()
+                .iter()
+                .any(|comment| comment.body == "Guest note from second process")
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < comment_deadline,
+            "guest comment did not reach host navigator across processes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    host_rpc.shutdown();
+    host_thread.join().expect("host dispatcher");
+    api_stop.store(true, Ordering::Relaxed);
+    api_thread.join().expect("mock API");
+}
 
 #[test]
 fn debug_terminal_command_quotes_arguments_and_environment() {
@@ -75,13 +1275,17 @@ fn open_shell<'a>(
                 cx,
             )
         });
+        let extensions = cx.new(|cx| {
+            crate::extensions_panel::ExtensionsPanel::new(proxy.clone(), window, cx)
+        });
         let debug = cx.new(|cx| {
             crate::debug_bar::DebugBar::new(proxy.clone(), &paths[0], window, cx)
         });
         let git = cx.new(|cx| GitPanel::new(&root_path, window, cx));
         let tasks = cx.new(|cx| JustTasksPanel::new(&root_path, cx));
-        let languages =
-            cx.new(|cx| LanguageServersPanel::new(&root_path, proxy.clone(), cx));
+        let languages = cx.new(|cx| {
+            LanguageServersPanel::new(workspace, proxy.clone(), cx)
+        });
         let search = cx.new(|cx| {
             SearchPanel::new(
                 &root_path,
@@ -92,6 +1296,7 @@ fn open_shell<'a>(
             )
         });
         let problems = cx.new(|cx| ProblemsPanel::new(code.clone(), cx));
+        let help = cx.new(crate::help_panel::HelpPanel::new);
         let agent_workspace = cx.new(|cx| {
             AgentWorkspacePanel::new(session.clone(), threads.clone(), cx)
         });
@@ -109,6 +1314,8 @@ fn open_shell<'a>(
                 Vec::new(),
                 problems,
                 settings,
+                extensions,
+                help,
                 search,
                 agent_workspace,
                 activity,
@@ -152,6 +1359,121 @@ fn edit(
     editor.update_in(cx, |editor, window, cx| {
         editor.replace_all(text, window, cx)
     });
+}
+
+#[gpui_kit::test]
+fn agent_command_focuses_the_active_chat_composer(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+    let session = shell.read_with(cx, |shell, _| shell.session.clone());
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.run_shell_command(ShellShortcut::Agent, window, cx);
+        assert!(session.read(cx).focus.is_focused(window));
+    });
+
+    session.update(cx, |session, _| {
+        session.session_id = Some("active-thread".into());
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.run_shell_command(ShellShortcut::Agent, window, cx);
+        assert!(
+            session
+                .read(cx)
+                .chat_input
+                .focus_handle(cx)
+                .is_focused(window)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn extensions_open_as_center_tab_and_close(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_extensions(window, cx);
+    });
+    assert!(shell.read_with(cx, |shell, cx| shell.extensions.read(cx).catalog_busy));
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |shell, _| {
+        shell.open_center_panels.contains(&CenterPanel::Extensions)
+    }));
+    shell.update_in(cx, |shell, window, cx| {
+        let focus = shell.extensions.read(cx).search_input.focus_handle(cx);
+        assert!(focus.is_focused(window));
+    });
+    let panel_id = shell.read_with(cx, |shell, _| {
+        gpui_kit::component::dock::PanelId::from(shell.extensions.entity_id())
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_center_panel(panel_id, window, cx);
+    });
+    assert!(!shell.read_with(cx, |shell, _| {
+        shell.open_center_panels.contains(&CenterPanel::Extensions)
+    }));
+}
+
+#[gpui_kit::test]
+fn center_utility_tabs_remain_open_together(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+    for panel in [
+        CenterPanel::Search,
+        CenterPanel::Help,
+        CenterPanel::Settings,
+        CenterPanel::Problems,
+    ] {
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_center_panel(panel, window, cx);
+        });
+    }
+    let center =
+        shell.read_with(cx, |shell, cx| shell.area.read(cx).dump(cx).center);
+    fn tabs(
+        state: &gpui_kit::component::dock::PanelState,
+    ) -> Option<&gpui_kit::component::dock::PanelState> {
+        if matches!(
+            state.info,
+            gpui_kit::component::dock::PanelInfo::Tabs { .. }
+        ) {
+            Some(state)
+        } else {
+            state.children.iter().find_map(tabs)
+        }
+    }
+    let center_tabs = tabs(&center).expect("center tab group");
+    assert_eq!(center_tabs.children.len(), 5);
+    assert_eq!(center_tabs.info.active_index(), Some(4));
+
+    shell.update_in(cx, |shell, window, cx| shell.show_code(window, cx));
+    let center =
+        shell.read_with(cx, |shell, cx| shell.area.read(cx).dump(cx).center);
+    let center_tabs = tabs(&center).expect("center tab group");
+    assert_eq!(center_tabs.children.len(), 5);
+    assert_eq!(center_tabs.info.active_index(), Some(0));
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_center_panel(CenterPanel::Search, window, cx);
+    });
+    let center =
+        shell.read_with(cx, |shell, cx| shell.area.read(cx).dump(cx).center);
+    let center_tabs = tabs(&center).expect("center tab group");
+    assert_eq!(center_tabs.children.len(), 5);
+    assert_eq!(center_tabs.info.active_index(), Some(1));
+
+    let help_id = shell.read_with(cx, |shell, _| {
+        gpui_kit::component::dock::PanelId::from(shell.help.entity_id())
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_center_panel(help_id, window, cx)
+    });
+    let center =
+        shell.read_with(cx, |shell, cx| shell.area.read(cx).dump(cx).center);
+    assert_eq!(tabs(&center).expect("center tab group").children.len(), 4);
+    assert!(shell.read_with(cx, |shell, _| {
+        shell.open_center_panels.contains(&CenterPanel::Search)
+    }));
 }
 
 #[cfg(unix)]

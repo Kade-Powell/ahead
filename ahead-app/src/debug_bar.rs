@@ -239,9 +239,7 @@ impl Panel for DebugBar {
                         let is_last = group
                             .read_with(cx, |group, _| group.panels().len() == 1)
                             .unwrap_or(false);
-                        if is_last {
-                            return;
-                        } else {
+                        if !is_last {
                             _ = group.update(cx, |group, cx| {
                                 group.close_panel(panel_id, cx);
                             });

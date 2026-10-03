@@ -77,7 +77,6 @@ struct ActiveElicitation {
 pub(crate) struct ElicitationRequestRouter {
     requests: Arc<StdMutex<ResponderMap>>,
     auto_deny: Arc<AtomicBool>,
-    full_access_form_input_enabled: Arc<AtomicBool>,
 }
 
 struct PendingElicitationRequest {
@@ -104,15 +103,6 @@ impl ElicitationRequestRouter {
 
     pub(crate) fn set_auto_deny(&self, auto_deny: bool) {
         self.auto_deny.store(auto_deny, Ordering::Relaxed);
-    }
-
-    pub(crate) fn full_access_form_input_enabled(&self) -> bool {
-        self.full_access_form_input_enabled.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn enable_full_access_form_input(&self) {
-        self.full_access_form_input_enabled
-            .store(true, Ordering::Release);
     }
 
     pub(crate) async fn resolve(
@@ -247,35 +237,12 @@ impl ElicitationRequestManager {
                     });
                 }
 
-                let should_surface_form_in_full_access = router.full_access_form_input_enabled()
-                    && permission_prompt_is_auto_approved
-                    && !elicitation
-                        .meta()
-                        .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
-                    && match &elicitation {
-                        Elicitation::Mcp(
-                            rmcp::model::ElicitRequestParams::FormElicitationParams {
-                                requested_schema,
-                                ..
-                            },
-                        ) => !requested_schema.properties.is_empty(),
-                        Elicitation::OpenAiElicitationForm {
-                            requested_schema, ..
-                        } => requested_schema
-                            .get("properties")
-                            .and_then(Value::as_object)
-                            .is_some_and(|properties| !properties.is_empty()),
-                        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
-                    };
-
-                if !should_surface_form_in_full_access {
-                    if elicitation_is_rejected_by_policy(approval_policy) {
-                        return Ok(ElicitationResponse {
-                            action: ElicitationAction::Decline,
-                            content: None,
-                            meta: None,
-                        });
-                    }
+                if elicitation_is_rejected_by_policy(approval_policy) {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
                 }
 
                 let Some(tx_event) = tx_event else {
@@ -326,24 +293,6 @@ impl ElicitationRequestManager {
                             meta: None,
                         });
                     }
-                    Elicitation::OpenAiForm {
-                        meta,
-                        message,
-                        requested_schema,
-                    } => ElicitationRequest::OpenAiForm {
-                        meta,
-                        message,
-                        requested_schema,
-                    },
-                    Elicitation::OpenAiElicitationForm {
-                        meta,
-                        message,
-                        requested_schema,
-                    } => ElicitationRequest::OpenAiElicitationForm {
-                        meta,
-                        message,
-                        requested_schema,
-                    },
                 };
                 let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
@@ -407,9 +356,7 @@ fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(_)
-        | Elicitation::OpenAiForm { .. }
-        | Elicitation::OpenAiElicitationForm { .. } => false,
+        Elicitation::Mcp(_) => false,
     }
 }
 

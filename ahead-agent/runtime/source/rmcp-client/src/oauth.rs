@@ -14,7 +14,7 @@
 //! keystore that always encrypts secrets when they are transferred across the bus. If DBus isn't installed the keystore will fall back to the json
 //! file because we don't use the "vendored" feature.
 //!
-//! If the keyring is not available or fails, we fall back to CODEX_HOME/.credentials.json which is consistent with other coding CLI agents.
+//! If the keyring is unavailable, the fallback file lives in AHEAD_HOME (or ~/.ahead).
 
 mod issuer_binding;
 mod refresh_lock;
@@ -69,7 +69,7 @@ use codex_keyring_store::KeyringStore;
 use rmcp::transport::auth::AuthorizationManager;
 use tokio::sync::Mutex;
 
-use codex_utils_home_dir::find_codex_home;
+use codex_utils_home_dir::find_ahead_home;
 
 pub(crate) use self::issuer_binding::validate_authorization_server_endpoints;
 pub(crate) use self::issuer_binding::validate_refresh_token_issuer;
@@ -79,7 +79,7 @@ pub(crate) use self::resolved_store::ResolvedOAuthTokens;
 pub(crate) use self::resolved_store::resolve_oauth_tokens_from_store_policy;
 use self::resolved_store::try_resolve_oauth_tokens_from_store_policy;
 
-const KEYRING_SERVICE: &str = "Codex MCP Credentials";
+const KEYRING_SERVICE: &str = "AHEAD MCP Credentials";
 const MCP_OAUTH_SECRET_PREFIX: &str = "MCP_OAUTH";
 const REFRESH_SKEW_MILLIS: u64 = 30_000;
 
@@ -400,9 +400,9 @@ fn load_oauth_tokens_from_secrets_keyring_with_lock_held<K: KeyringStore + Clone
     server_name: &str,
     url: &str,
 ) -> std::result::Result<Option<StoredOAuthTokens>, OAuthKeyringLoadError> {
-    let codex_home = find_codex_home().map_err(anyhow::Error::from)?;
+    let ahead_home = find_ahead_home().map_err(anyhow::Error::from)?;
     let manager = SecretsManager::new_with_keyring_store_and_namespace(
-        codex_home.to_path_buf(),
+        ahead_home.to_path_buf(),
         SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
@@ -519,9 +519,9 @@ fn save_oauth_tokens_to_secrets_keyring_with_lock_held<K: KeyringStore + Clone +
     tokens: &StoredOAuthTokens,
     serialized: &str,
 ) -> Result<()> {
-    let codex_home = find_codex_home()?;
+    let ahead_home = find_ahead_home()?;
     let manager = SecretsManager::new_with_keyring_store_and_namespace(
-        codex_home.to_path_buf(),
+        ahead_home.to_path_buf(),
         SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
@@ -659,9 +659,9 @@ fn delete_oauth_tokens_from_secrets_keyring<K: KeyringStore + Clone + 'static>(
     url: &str,
 ) -> Result<bool> {
     let _store_lock = OAuthStoreLock::acquire_for_write(OAuthStore::Secrets)?;
-    let codex_home = find_codex_home()?;
+    let ahead_home = find_ahead_home()?;
     let manager = SecretsManager::new_with_keyring_store_and_namespace(
-        codex_home.to_path_buf(),
+        ahead_home.to_path_buf(),
         SecretsBackendKind::Local,
         Arc::new(keyring_store.clone()),
         LocalSecretsNamespace::McpOAuth,
@@ -778,7 +778,7 @@ impl OAuthPersistor {
     }
 }
 
-const FALLBACK_FILENAME: &str = ".credentials.json";
+const FALLBACK_FILENAME: &str = "mcp_oauth_credentials.json";
 const MCP_SERVER_TYPE: &str = "http";
 
 type FallbackFile = BTreeMap<String, FallbackTokenEntry>;
@@ -1007,7 +1007,7 @@ fn compute_secret_name(server_name: &str, server_url: &str) -> Result<SecretName
 }
 
 fn fallback_file_path() -> Result<PathBuf> {
-    Ok(find_codex_home()?.join(FALLBACK_FILENAME).to_path_buf())
+    Ok(find_ahead_home()?.join(FALLBACK_FILENAME).to_path_buf())
 }
 
 fn read_fallback_file_unlocked() -> Result<Option<FallbackFile>> {
@@ -1108,6 +1108,17 @@ mod tests {
     mod persistor_tests;
 
     use super::test_support::TempCodexHome;
+
+    #[test]
+    fn fallback_credentials_stay_in_ahead_home() -> Result<()> {
+        let home = TempCodexHome::new();
+        assert_eq!(
+            super::fallback_file_path()?,
+            home.path().join("mcp_oauth_credentials.json")
+        );
+        assert_eq!(KEYRING_SERVICE, "AHEAD MCP Credentials");
+        Ok(())
+    }
 
     #[test]
     fn stored_oauth_credentials_ignore_derived_expiration_and_track_token_changes() -> Result<()> {

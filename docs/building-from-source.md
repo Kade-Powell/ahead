@@ -58,6 +58,21 @@ sidecars are tightened on reopen. Linked/special database paths and orphaned
 sidecars produce a storage error instead of being followed or replaced. Keep
 rejected files intact for recovery with the matching build.
 
+For an isolated native smoke run, set all three absolute paths before starting
+the watcher:
+
+```sh
+AHEAD_DATA_HOME=/private/tmp/ahead-smoke-data \
+AHEAD_HOME=/private/tmp/ahead-smoke-runtime \
+AHEAD_USER_HOME=/private/tmp/ahead-smoke-user \
+just dev /private/tmp/ahead-smoke-workspace
+```
+
+`AHEAD_DATA_HOME` redirects AHEAD's app data, config, plugins, cache and logs;
+`AHEAD_HOME` redirects the managed agent runtime; `AHEAD_USER_HOME` redirects
+user-scope memory. A disposable project path alone does **not** isolate
+installed extensions or user-level settings.
+
 The recipe launches the app once, then rebuilds
 and relaunches it when watched Rust sources, Cargo manifests, or build inputs
 change. It also watches repository-level files embedded at compile time,
@@ -67,9 +82,14 @@ so changing runtime session state does not trigger a rebuild. Language-extension
 host sources and WIT interfaces are watched too. On macOS, the private launch
 recipe builds the root `ahead` binary into a stable development bundle at
 `target/debug/macos/Ahead.app`, then runs that bundle's executable in the
-watcher's process tree. Reuse that app identity and the same disposable workspace
-for native UI checks instead of making a new temporary bundle for each test.
-This does not bypass OS or computer-use approval requirements. Other platforms
+watcher's process tree. On macOS that copied bundle identifies as `io.ahead.dev`
+(`AHEAD Dev`), separate from the installed `io.ahead` app. Bind native UI
+  checks to `AHEAD Dev` and reuse the same disposable workspace instead of making
+  a new temporary bundle for each test.
+  When attaching native UI automation on macOS, wait until that bundle is
+  running and bind its existing bundle ID. Looking it up by path before its
+  window appears can launch a second, unisolated copy.
+  This does not bypass OS or computer-use approval requirements. Other platforms
 use the package-qualified run command. Both select the root `ahead` package; bare
 `cargo run --bin ahead` is ambiguous in this workspace.
 Test-only `tests/` trees and `*_tests.rs` files, plus source `README.md` and
@@ -104,9 +124,12 @@ restart it with `just dev` afterward. Prefer a focused check such as
 After `cargo clean`, build the root executable through `just dev` before
 running `ahead-proxy`'s native-agent tests: they need `target/debug/ahead` as
 the sandbox helper. Stop the watcher before that one-off test and resume it
-afterward. On 2026-10-01, running the app and proxy test packages together
-rebuilt many shared agent crates for the combined feature set; separate
-package-focused runs reused their existing test artifacts more effectively.
+afterward. Keep the package selection stable across repeated checks: switching
+between proxy-only and app-plus-proxy Clippy runs can change Cargo's unified
+dependency features and rebuild much of the retained agent closure. On
+2026-10-01, separate package-focused test runs reused existing test artifacts
+more effectively than a new combined-package run; use the already-cached set
+when possible.
 
 Save or explicitly discard disposable-project edits before stopping or
 restarting the watcher. AHEAD's Close Window and Quit actions check dirty
@@ -237,6 +260,20 @@ real proxy. Restart must preserve unsaved text without saving it, keep TS/JS
 on one replacement server, and reject completion items from the old process.
 The script also checks graceful proxy exit and that its language-server
 process group has stopped. It does not download servers or call a model.
+Check `rust-analyzer --version` before running it: a rustup shim on PATH can
+exist without the component installed. For a local smoke, already-installed
+Zed server binaries can be added to PATH; normal AHEAD startup does not depend
+on Zed's installation. The running app can acquire its built-in npm-backed
+servers into an AHEAD-owned cache when Node.js and npm are on PATH; the
+`lsp-smoke.mjs` protocol check deliberately uses installed binaries instead.
+
+To exercise an installed Zed HTML extension without installing it into
+AHEAD, put `vscode-html-language-server` on PATH and run
+`AHEAD_ZED_EXTENSION_SOURCE=/path/to/html cargo test --locked --offline -p ahead-proxy --lib installed_zed_html_extension_starts_a_real_server -- --ignored`.
+The ignored test copies `extension.toml` and `extension.wasm` into a disposable
+extension root alongside the HTML language config, opens an HTML file, then
+waits for a real LSP handshake. It does not modify the
+source extension or test gallery installation, completion or live settings.
 
 `node tests/lsp-shutdown-smoke.mjs target/debug/ahead` needs only Node and the
 built app on Unix. It creates disposable fake LSP executables to test explicit
@@ -245,9 +282,10 @@ unresponsive server. It checks the actual shutdown/exit messages, process
 termination and unchanged source files. Both smoke scripts kill only their
 own process group if a check fails.
 
-In the app, open Language Servers and select Restart after a server exits or
-after installing a missing server. The panel shows initialization and process
-failures. This restarts workspace language servers, not AHEAD or the dev
+In the app, open Language Servers and select Restart after a server exits, a
+manual installation changes, or an automatic npm install fails. The panel
+shows initialization, install and process failures. This restarts workspace
+language servers, not AHEAD or the dev
 watcher. Stop requests use LSP `shutdown` followed by `exit`, with a five-second
 deadline before force termination. A sent request that gets no reply fails
 after 120 seconds; normal request timeouts send `$/cancelRequest` and keep the
@@ -295,10 +333,13 @@ the old close-only release fails their deterministic duplicate-handle checks.
 They do not prove cross-platform or native process-exit behavior.
 
 `just bacon-test` runs the focused agent, proxy, and viewmodel test set.
-`just test-all` runs maintained workspace test targets and excludes the copied
-`codex-core` and `codex-mcp` unit-test harnesses, which depend on pruned upstream
-test support and are not AHEAD product gates. Those libraries remain workspace
-dependencies and are still compiled when required. The command can take
+`just test-all` explicitly runs maintained AHEAD package tests and the retained
+patch-library security/fixture tests. Copied runtime unit-test harnesses are not
+AHEAD product gates; their production libraries still compile as dependencies.
+The recipe sets `RUST_TEST_THREADS=1`: concurrent native mock-model tests can
+exhaust their ten-second response windows, while the serial agent suite passed
+faster on the development machine.
+The command can take
 substantially longer and use more disk than a focused regression; run it when
 the shared build loop is stopped and workspace build space is available.
 

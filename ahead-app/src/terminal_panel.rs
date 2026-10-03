@@ -298,6 +298,14 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
+    pub(crate) fn shared_snapshot_text(&self) -> String {
+        let output = self
+            .active_terminal()
+            .map(TerminalBackend::shared_history_text)
+            .unwrap_or_default();
+        format!("{}\n{output}", self.terminal.title())
+    }
+
     fn send_bytes(&mut self, bytes: Vec<u8>) {
         if let Some(terminal) = self.terminal.terminal.as_ref()
             && let Err(error) = terminal.send(bytes)

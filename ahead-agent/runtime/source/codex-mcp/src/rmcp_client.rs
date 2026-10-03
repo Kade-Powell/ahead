@@ -19,13 +19,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::codex_apps::normalize_codex_apps_callable_name;
-use crate::codex_apps::normalize_codex_apps_callable_namespace;
-use crate::codex_apps::normalize_codex_apps_tool_title;
-use crate::codex_apps::prepare_openai_file_params_for_model;
 use crate::elicitation::ElicitationRequestManager;
 use crate::executor_environment_http_client::ExecutorEnvironmentHttpClient;
-use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
 use crate::pagination::collect_paginated_with_limit;
 use crate::runtime::McpRuntimeContext;
@@ -54,7 +49,6 @@ use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
-use codex_rmcp_client::ToolWithConnectorId;
 use codex_rmcp_client::is_authentication_required_error;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
@@ -142,7 +136,6 @@ impl ManagedClientStartup {
             cancel_token,
             startup_complete,
         } = self.clone();
-        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let startup_timeout = server
             .config()
             .startup_timeout_sec
@@ -182,7 +175,6 @@ impl ManagedClientStartup {
                     server_name,
                     client,
                     StartServerTaskParams {
-                        is_codex_apps_mcp_server,
                         startup_timeout: Some(startup_timeout),
                         tx_event,
                         elicitation_requests,
@@ -213,7 +205,6 @@ impl ManagedClientStartup {
 #[derive(Clone)]
 pub(crate) struct AsyncManagedClient {
     pub(crate) client: ManagedClientFuture,
-    pub(crate) is_codex_apps_mcp_server: bool,
     pub(crate) tool_catalog_cache_context: Option<McpToolCatalogCacheContext>,
     pub(crate) startup_complete: Arc<AtomicBool>,
     pub(crate) cancel_token: CancellationToken,
@@ -240,7 +231,6 @@ impl AsyncManagedClient {
         protocol_mode: McpProtocolMode,
         catalog_item_limit: usize,
     ) -> Self {
-        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let startup_complete = Arc::new(AtomicBool::new(false));
         let startup = Arc::new(ManagedClientStartup {
             server_name,
@@ -262,7 +252,6 @@ impl AsyncManagedClient {
         let client = startup.start();
         Self {
             client,
-            is_codex_apps_mcp_server,
             tool_catalog_cache_context,
             startup_complete,
             cancel_token,
@@ -365,8 +354,6 @@ impl From<anyhow::Error> for StartupOutcomeError {
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
 pub(crate) async fn list_tools_for_client_uncached(
     server_name: &str,
-    is_codex_apps_mcp_server: bool,
-    codex_apps_refresh_trigger: &'static str,
     client: &Arc<RmcpClient>,
     timeout: Option<Duration>,
     catalog_item_limit: usize,
@@ -377,9 +364,7 @@ pub(crate) async fn list_tools_for_client_uncached(
     let tools = collect_paginated_with_limit("tools/list", timeout, catalog_item_limit, |params| {
         let client = Arc::clone(client);
         async move {
-            let response = client
-                .list_tools_with_connector_ids(params, timeout)
-                .await?;
+            let response = client.list_tools(params, timeout).await?;
             let next_cursor = match protocol_mode {
                 McpProtocolMode::Legacy => None,
                 McpProtocolMode::V20260728 => response.next_cursor,
@@ -389,105 +374,23 @@ pub(crate) async fn list_tools_for_client_uncached(
     })
     .await?
     .into_iter()
-    .map(|tool| {
-        tool_info_from_listed_tool(
-            server_name,
-            is_codex_apps_mcp_server,
-            server_instructions,
-            tool,
-        )
-    })
+    .map(|tool| tool_info_from_listed_tool(server_name, server_instructions, tool))
     .collect();
-    if is_codex_apps_mcp_server {
-        emit_duration(
-            MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
-            fetch_start.elapsed(),
-            &[("trigger", codex_apps_refresh_trigger)],
-        );
-    } else {
-        emit_duration(
-            MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
-            fetch_start.elapsed(),
-            &[],
-        );
-    }
+    emit_duration(
+        MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC,
+        fetch_start.elapsed(),
+        &[],
+    );
     Ok(tools)
 }
 
-/// Presents declared Codex Apps file parameters to the model as local-path inputs.
-pub(crate) fn prepare_codex_apps_tools_for_model(mut tools: Vec<ToolInfo>) -> Vec<ToolInfo> {
-    for tool in &mut tools {
-        prepare_openai_file_params_for_model(tool);
-    }
-    tools
-}
-
+/// Keep ordinary MCP tool names and strip untrusted connector metadata.
 fn tool_info_from_listed_tool(
     server_name: &str,
-    is_codex_apps_mcp_server: bool,
     server_instructions: Option<&str>,
-    tool: ToolWithConnectorId,
+    tool: RmcpTool,
 ) -> ToolInfo {
-    if is_codex_apps_mcp_server {
-        codex_apps_tool_info_from_listed_tool(server_name, server_instructions, tool)
-    } else {
-        regular_mcp_tool_info_from_listed_tool(server_name, server_instructions, tool)
-    }
-}
-
-/// Converts a Codex Apps tool by preserving connector fields, removing connector prefixes from
-/// model-visible names and titles, and using the connector description for its tool namespace.
-fn codex_apps_tool_info_from_listed_tool(
-    server_name: &str,
-    server_instructions: Option<&str>,
-    tool: ToolWithConnectorId,
-) -> ToolInfo {
-    let mut tool_def = tool.tool;
-    let connector_id = tool.connector_id;
-    let connector_name = tool.connector_name;
-    let connector_description = tool.connector_description;
-    let callable_name = normalize_codex_apps_callable_name(
-        &tool_def.name,
-        connector_id.as_deref(),
-        connector_name.as_deref(),
-    );
-    let callable_namespace =
-        normalize_codex_apps_callable_namespace(server_name, connector_name.as_deref());
-    if let Some(title) = tool_def.title.as_deref() {
-        let normalized_title = normalize_codex_apps_tool_title(connector_name.as_deref(), title);
-        if tool_def.title.as_deref() != Some(normalized_title.as_str()) {
-            tool_def.title = Some(normalized_title);
-        }
-    }
-    let has_connector_metadata =
-        connector_id.is_some() || connector_name.is_some() || connector_description.is_some();
-    let namespace_description = if has_connector_metadata {
-        connector_description
-    } else {
-        server_instructions.map(str::to_string)
-    };
-    ToolInfo {
-        server_name: server_name.to_owned(),
-        supports_parallel_tool_calls: false,
-        server_origin: None,
-        callable_name,
-        callable_namespace,
-        namespace_description,
-        tool: tool_def,
-        openai_file_input_optional_fields: HashMap::new(),
-        connector_id,
-        connector_name,
-    }
-}
-
-/// Converts a regular MCP tool by removing reserved connector metadata, keeping its raw tool name,
-/// and using the MCP server name and instructions for the model-visible namespace.
-fn regular_mcp_tool_info_from_listed_tool(
-    server_name: &str,
-    server_instructions: Option<&str>,
-    tool: ToolWithConnectorId,
-) -> ToolInfo {
-    let mut tool_def = tool.tool;
+    let mut tool_def = tool;
     strip_untrusted_connector_meta(&mut tool_def);
     ToolInfo {
         server_name: server_name.to_owned(),
@@ -497,9 +400,6 @@ fn regular_mcp_tool_info_from_listed_tool(
         callable_namespace: server_name.to_string(),
         namespace_description: server_instructions.map(str::to_string),
         tool: tool_def,
-        openai_file_input_optional_fields: HashMap::new(),
-        connector_id: None,
-        connector_name: None,
     }
 }
 
@@ -558,7 +458,6 @@ async fn start_server_task(
     params: StartServerTaskParams,
 ) -> Result<ManagedClient, StartupOutcomeError> {
     let StartServerTaskParams {
-        is_codex_apps_mcp_server,
         startup_timeout,
         tx_event,
         elicitation_requests,
@@ -576,12 +475,7 @@ async fn start_server_task(
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
         .await;
-    record_protocol_discovery_metrics(
-        client.protocol_mode(),
-        is_codex_apps_mcp_server,
-        started_at,
-        &initialize_result,
-    );
+    record_protocol_discovery_metrics(client.protocol_mode(), started_at, &initialize_result);
     let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
 
     let server_disables_tool_catalog_cache = initialize_result
@@ -606,8 +500,6 @@ async fn start_server_task(
     let list_start = Instant::now();
     let client_tools = list_tools_for_client_uncached(
         &server_name,
-        is_codex_apps_mcp_server,
-        /*codex_apps_refresh_trigger*/ "initial",
         &client,
         startup_timeout,
         catalog_item_limit,
@@ -643,7 +535,6 @@ async fn start_server_task(
 
 fn record_protocol_discovery_metrics(
     mode: McpProtocolMode,
-    is_codex_apps_mcp_server: bool,
     started_at: Instant,
     result: &Result<ServerPeerInfo>,
 ) {
@@ -660,10 +551,7 @@ fn record_protocol_discovery_metrics(
         Ok(_) => "legacy",
         Err(_) => "failure",
     };
-    let mut tags = vec![("mode", mode), ("outcome", outcome)];
-    if is_codex_apps_mcp_server {
-        tags.push(("server_kind", "openai_codex_apps"));
-    }
+    let tags = [("mode", mode), ("outcome", outcome)];
     let _ = metrics.counter("codex.mcp.protocol_discovery", /*inc*/ 1, &tags);
     let _ = metrics.record_duration(
         "codex.mcp.protocol_discovery.duration_ms",
@@ -692,7 +580,7 @@ fn mcp_initialize_request_params(
     }
     InitializeRequestParams::new(
         capabilities,
-        Implementation::new("codex-mcp-client", env!("CARGO_PKG_VERSION")).with_title("Codex"),
+        Implementation::new("AHEAD", env!("CARGO_PKG_VERSION")).with_title("AHEAD"),
     )
     .with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
@@ -718,7 +606,6 @@ fn mcp_server_info_from_implementation(
 }
 
 struct StartServerTaskParams {
-    is_codex_apps_mcp_server: bool,
     startup_timeout: Option<Duration>, // TODO: cancel_token should handle this.
     tx_event: Option<Sender<Event>>,
     elicitation_requests: ElicitationRequestManager,
@@ -860,7 +747,6 @@ async fn make_rmcp_client(
 mod tests {
     use super::*;
     use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
-    use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
     use pretty_assertions::assert_eq;
     use rmcp::model::JsonObject;
     use rmcp::model::MetaObject;
@@ -929,14 +815,14 @@ mod tests {
         let supported = mcp_initialize_request_params(
             ElicitationCapability::default(),
             ClientMcpExtensions::new([
-                (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+                ("example/form".to_string(), serde_json::json!({})),
                 (MCP_APP_UI_EXTENSION_ID.to_string(), app_ui.clone()),
             ]),
         );
         assert_eq!(
             supported.capabilities.extensions,
             Some(BTreeMap::from([
-                (OPENAI_FORM_EXTENSION_ID.to_string(), JsonObject::new()),
+                ("example/form".to_string(), JsonObject::new()),
                 (
                     MCP_APP_UI_EXTENSION_ID.to_string(),
                     app_ui.as_object().cloned().expect("app UI settings"),
@@ -991,41 +877,6 @@ mod tests {
         assert_eq!(
             meta.0.get("custom").and_then(|value| value.as_str()),
             Some("kept")
-        );
-    }
-
-    #[test]
-    fn codex_apps_connector_metadata_is_preserved() {
-        let tool = tool_with_connector_meta();
-        let expected_tool = tool.clone();
-
-        let tool_info = tool_info_from_listed_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            /*is_codex_apps_mcp_server*/ true,
-            /*server_instructions*/ None,
-            ToolWithConnectorId {
-                tool,
-                connector_id: Some("connector_gmail".to_string()),
-                connector_name: Some("Gmail".to_string()),
-                connector_description: Some("Mail connector".to_string()),
-            },
-        );
-
-        let expected = ToolInfo {
-            server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            supports_parallel_tool_calls: false,
-            server_origin: None,
-            callable_name: "capture_file_upload".to_string(),
-            callable_namespace: "codex_apps__gmail".to_string(),
-            namespace_description: Some("Mail connector".to_string()),
-            tool: expected_tool,
-            openai_file_input_optional_fields: HashMap::new(),
-            connector_id: Some("connector_gmail".to_string()),
-            connector_name: Some("Gmail".to_string()),
-        };
-        assert_eq!(
-            serde_json::to_value(tool_info).expect("serialize actual tool info"),
-            serde_json::to_value(expected).expect("serialize expected tool info")
         );
     }
 }

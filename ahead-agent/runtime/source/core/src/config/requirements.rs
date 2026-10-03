@@ -1,9 +1,7 @@
 use ahead_model_auth::default_client::RESIDENCY_HEADER_NAME;
 use codex_config::ConfigRequirements;
-use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_config::config_toml::ConfigToml;
-use codex_config::types::FeedbackConfigToml;
 use std::collections::HashMap;
 
 /// Applies managed requirements to regular config before final config construction.
@@ -26,17 +24,9 @@ pub(super) fn apply_to_config(
         };
     }
 
-    apply_exact!(cli_auth_credentials_store);
-    apply_exact!(chatgpt_base_url);
     apply_exact!(log_dir);
     apply_exact!(model_catalog_json);
-    apply_exact!(check_for_update_on_startup);
     apply_exact!(allow_login_shell);
-    apply_feedback_requirement(
-        &mut config.feedback,
-        requirements.feedback.as_ref(),
-        startup_warnings,
-    );
     if requirements.enforce_residency.value().is_some() {
         for (provider_name, provider) in &config.model_providers {
             let has_residency_header = provider
@@ -93,52 +83,4 @@ fn apply_exact_requirement<T>(
         ));
     }
     *configured_value = Some(value.clone());
-}
-
-fn replace_required_leaf<T: Clone + PartialEq>(
-    configured: &mut Option<T>,
-    required: &Option<T>,
-) -> bool {
-    let Some(required) = required else {
-        return false;
-    };
-    let conflict = configured
-        .as_ref()
-        .is_some_and(|configured| configured != required);
-    *configured = Some(required.clone());
-    conflict
-}
-
-fn apply_feedback_requirement(
-    configured: &mut Option<FeedbackConfigToml>,
-    requirement: Option<&Sourced<FeedbackConfigToml>>,
-    startup_warnings: &mut Vec<String>,
-) {
-    let Some(Sourced { value, source }) = requirement else {
-        return;
-    };
-    let FeedbackConfigToml { enabled } = value;
-    let configured = configured.get_or_insert_default();
-    let conflict = replace_required_leaf(&mut configured.enabled, enabled);
-    push_structured_requirement_override_warning("feedback", conflict, source, startup_warnings);
-}
-
-/// Emits one source-aware warning when a structured requirement replaces one
-/// or more configured values.
-fn push_structured_requirement_override_warning(
-    field_name: &str,
-    conflict: bool,
-    source: &RequirementSource,
-    startup_warnings: &mut Vec<String>,
-) {
-    if !conflict {
-        return;
-    }
-    tracing::warn!(
-        ?source,
-        "configured values are overridden by requirements for {field_name}"
-    );
-    startup_warnings.push(format!(
-        "Configured values under `{field_name}` are overridden by requirements from {source}."
-    ));
 }

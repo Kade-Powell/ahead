@@ -66,7 +66,6 @@ const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
 // config layers.
 const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "openai_base_url",
-    "chatgpt_base_url",
     "responses_api_metadata",
     "model_provider",
     "model_providers",
@@ -243,14 +242,7 @@ pub async fn load_config_layers_state(
         requirements_layers.extend(managed_preferences_requirements_layer);
     }
 
-    let mut config_requirements_toml =
-        compose_requirements(requirements_layers)?.unwrap_or_default();
-    // Remote app servers enforce auth policy for their workspaces; do not let local
-    // requirements reintroduce authentication restrictions for those workspaces.
-    if overrides.ignore_login_requirements {
-        config_requirements_toml.allowed_login_methods = None;
-        config_requirements_toml.allowed_chatgpt_workspaces = None;
-    }
+    let config_requirements_toml = compose_requirements(requirements_layers)?.unwrap_or_default();
 
     let thread_config_context = ThreadConfigContext {
         thread_id: None,
@@ -1100,20 +1092,6 @@ fn sanitize_project_config(config: &mut TomlValue) -> Vec<String> {
             ignored_keys.push("features.network_proxy".to_string());
         }
     }
-    // Repository contents must not turn an ordinary key into a permission increase.
-    if let Some(chat) = table
-        .get_mut("tui")
-        .and_then(|tui| tui.get_mut("keymap"))
-        .and_then(|keymap| keymap.get_mut("chat"))
-        .and_then(TomlValue::as_table_mut)
-    {
-        for key in ["previous_permission_mode", "next_permission_mode"] {
-            if chat.remove(key).is_some() {
-                ignored_keys.push(format!("tui.keymap.chat.{key}"));
-            }
-        }
-    }
-
     ignored_keys
 }
 

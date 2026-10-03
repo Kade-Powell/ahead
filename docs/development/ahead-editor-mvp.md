@@ -1,6 +1,12 @@
 # AHEAD Editor: product and architecture proposal
 
-Status: editor/repository direction and Zed extension ecosystem target confirmed by the user; architecture details remain a draft, not an implementation.
+Status: evolving design record. The original Lapce/Floem foundation and
+upstream-fork plan below were superseded by the GPUI/gpui-kit editor, one root
+Cargo workspace, and an AHEAD-owned managed agent. Treat those passages as
+decision history; later settled decisions and implementation notes still apply.
+For current build instructions and remaining gaps, use
+[Building from Source](../building-from-source.md),
+[Zed tracking](zed-tracking.md), and [TODO](../../TODO.md).
 Prepared: 2026-09-17.
 Audience: AHEAD maintainers.
 Companion: [proposed DTOs](ahead-editor-contracts.ts).
@@ -95,9 +101,10 @@ use. Zed extensions are packages with an `extension.toml` manifest and can
 provide languages, Tree-sitter grammars and queries, language servers,
 snippets, themes, icon themes and debuggers. [Zed extension development](https://zed.dev/docs/extensions/developing-extensions), [language extensions](https://zed.dev/docs/extensions/languages)
 
-The single supported path is one installed language extension resolving its
+The supported paths are an installed language extension resolving its
 language-server command through AHEAD's host and starting it through the
-native LSP client. Snippets, themes, icon themes and MCP are excluded for now;
+native LSP client, plus an icon-only extension whose file icon theme is read
+by the explorer. Snippets, color themes and MCP are excluded for now;
 debug adapters remain a later slice.
 
 Zed's Rust/WASM extension API is an explicit compatibility boundary, not a reason to implement the whole Zed runtime. Add only the host capabilities required by useful extensions, with capability checks and an explicit unsupported result for extensions that require unimplemented APIs. Do not target Zed-specific UI customization, deprecated agent/slash-command extensions or arbitrary extension behavior in the initial editor MVP. AHEAD's sessions, agent integrations and policy controls remain native.
@@ -161,7 +168,7 @@ The editor still opens and edits files without starting a wizard. AHEAD sessions
 
 1. **Choose work:** select an issue from this repository, resume saved work, or start locally. Show title, status, assignee and project column. Do not require tracker setup for a first local exploration.
 2. **Describe the outcome and starting point:** one short typed or spoken contribution appropriate to the work. Examples: desired behavior; observed versus expected; an invariant; an unanswered question; a current hypothesis. The host or agent suggests one of the six descriptive work kinds; the human can correct it. Preserve authorship and transcript corrections. The first request creates a teaching task only when the human explicitly asks to learn; all other requests create assistance tasks.
-3. **Set the collaboration:** choose the model, private or explicitly shared session, and optional teammates. Show where code and audio will be processed. Do not ask for a session-wide Learn/Assist choice.
+3. **Set the model:** choose a model and show where code and audio will be processed. The session starts private; sharing and teammate selection are available inside an active AHEAD session. Do not ask for a session-wide Learn/Assist choice.
 4. **Begin:** open the relevant file/context and show the next useful reasoning step. Do not front-load the full workflow.
 
 The editor's versioned session policy determines whether the human starting point is sufficient for a particular AI capability. The wizard's text box is not an automatic approval.
@@ -256,7 +263,7 @@ The end-to-end pilot is: choose a GitHub issue; explain the outcome aloud; have 
 | Presentation | File reveal, range focus, precise pointer, inline questions | Spatial diagrams, cross-app computer control |
 | Predictions | Required editor plus active-session context, including plan and decisions; human-accepted single-file FIM for business logic as well as mechanical code | Cross-file next-edit automation |
 | Tracker | GitHub issues list/read/create/update; one configured Projects v2 board/status field | Full board designer, arbitrary views/automations, Jira/Linear adapters |
-| Collaboration | Two to five humans, live presence/code/comments, shared drafts and review | Fully replicated local execution environments, cloud agents, browser client |
+| Collaboration | Two to five humans, live presence/code/comments, routed conversation and review | Fully replicated local execution environments, cloud agents, browser client |
 | Persistence | Crash recovery, durable handoff, export, current and historical code references | Unbounded operation retention, cross-repository knowledge graph |
 
 This is a substantial editor project. A solo proof of concept is an early milestone, not the whole MVP. Do not attach a calendar promise until the editor and collaboration spikes establish actual effort.
@@ -274,8 +281,7 @@ flowchart TD
     Audio <--> Speech["Configured realtime model or streaming speech pipeline"]
     Host --> Local["Turso/libSQL session records and code versions"]
     Host --> Tracker["GitHub adapter"]
-    Host <--> Team["Optional self-hosted collaboration service"]
-    Team <--> Peer["Other AHEAD editors"]
+    Host <--> Peer["Authenticated AHEAD clients"]
 ```
 
 These are ownership boundaries. Do not create a service per box. The built-in
@@ -307,16 +313,15 @@ The shell visible to the human remains their shell. Do not expose the managed ru
 
 | State | Authority and storage | Merge rule |
 |---|---|---|
-| Code and collaborative draft text | Yrs documents, persisted updates/checkpoints | CRDT merge, with application validation |
-| Workflow changes, identities, grants, final artifacts, issue links and approvals | Sequenced host/server transaction log | Authorize and compare expected version; reject conflicting commands |
+| Code and live shared text | Yrs documents, persisted updates/checkpoints | CRDT merge, with application validation |
+| Conversation, workflow changes, identities, grants, final artifacts, issue links and approvals | Sequenced session-host transaction log | Authorize and compare expected version; reject conflicting commands |
 | Presence, hover, pointer and audio playback state | Memory with expiry | Latest transient state, never a workflow fact |
 
 Do not put permissions or approvals in a last-writer-wins CRDT map. Do not encode every caret move as a durable event. One editor session event stream records workflow changes alongside decisions and conversation; there is no second legacy run log.
 
-Use Turso/libSQL for the local session store and a single team-service
-instance with transactional persistence for the pilot. Do not introduce a
-separate SQLx/SQLite store for managed history. No Kafka, vector database or
-new general workflow engine is needed initially.
+Use the owner's existing Turso/libSQL session store as the durable shared
+authority. Do not introduce a separate SQLx/SQLite store, team service or
+general workflow engine for the first direct-host collaboration slice.
 
 **Project history requirement, updated 2026-09-22:** keep project session details and editor/workflow configuration under `.ahead`. Preserve the existing ignored `.ahead/session.db` runtime path; keep user-level defaults/credentials in private `~/.ahead/settings.toml` and workspace-private credentials/personal settings in ignored `.ahead/settings.toml`. Track non-secret project defaults in `.ahead/config.toml`, optional artifact-template overrides in `.ahead/templates/`, and selected portable session checkpoints in `.ahead/sessions/`. Teammates must be able to distribute selected session history with the repository, view it in the editor and attach a versioned session/artifact excerpt as context for new work, including relevant FIM context. This does not require live team synchronization or resuming the original developer's harness. The canonical layout and sharing rules are in [Workflow atlas §9](ahead-workflows.md#9-storage-and-artifact-convention); implementation gaps are tracked in [TODO.md](../../TODO.md#session-history-and-project-configuration).
 
@@ -347,15 +352,47 @@ optimization.
 
 ### 7.2 A practical first collaboration topology
 
-Start with a shared session and **one execution host/worktree**. Multiple AHEAD clients edit the shared text and draft documents and see live comments. The host provides the filesystem, Git, LSP and explicitly human-run terminal. Guests receive authorized document content and diagnostics through the session connection; they do not need matching local dependencies.
+Only a currently active managed AHEAD session can be shared, using Share inside
+that session. Its owner is the **one execution host/worktree**; other AHEAD
+participants are clients. They edit shared text and see live comments. The host
+provides the filesystem, Git, LSP, terminal and managed agent. Clients receive
+authorized content and diagnostics through the session connection; they do not
+need matching local dependencies. Agent usage is charged to the host's
+configured provider account, including an authorized client's agent turn.
 
-This delivers live collaborative engineering. It deliberately does not reproduce Delta's independent local checkout for every participant. That later step involves filesystem replication, execution ownership, different toolchains and conflicts beyond text.
+The target delivers live collaborative engineering. It does not reproduce Delta's independent local checkout for every participant. That later step involves filesystem replication, execution ownership, different toolchains and conflicts beyond text.
 
-Use a durable self-hosted service for shared session data and membership. The selected execution host materializes acknowledged document versions to its worktree. If it disconnects, comments and planning can continue against persisted content; execution and Git operations remain unavailable until the host reconnects. Do not silently move execution to a teammate's machine.
+The current implementation shares chat and host-run agent turns through a
+direct, certificate-pinned TLS invite. The host checks GitHub identities against
+session membership for every command. Shared buffers, terminal, comments,
+presence and reconnect behavior described below remain planned.
 
-For a shared session, the team service is the only authority assigning durable sequences and accepting workflow gates; local databases are mirrors/outboxes. For a private session, the local host has that role. Sharing private work imports an immutable checkpoint and starts an authenticated shared stream with explicit provenance. A disconnected shared client cannot independently accept team approvals.
+Use a direct LAN/reachable-host connection with authenticated participant
+identities. The owner host assigns durable sequences, checks membership and
+roles, and materializes acknowledged document versions to its worktree. If it
+disconnects, clients retain a read-only cached view until it reconnects; no
+other machine silently takes over execution. Solo sessions continue offline.
+Offline client edits remain private drafts until membership and document epochs
+are revalidated, with explicit reconciliation when needed. Direct connections
+require a reachable host; NAT traversal or a relay is later work.
 
-Solo sessions work offline without a team service. In a shared session, disconnected editing is stored as a visibly private local draft until membership and document epochs are revalidated. The MVP may require explicit reconciliation on reconnect; do not promise seamless offline multi-host execution.
+The composer resolves participant `@` mentions against authenticated session
+members. A message mentioning another participant is human-only: broadcast it
+to the session and exclude it from agent turns, replay, model-facing summaries
+and later agent/FIM context. Without a participant mention, Send requests an
+agent turn under the sender's role, executed and paid for by the host. Persist
+the audience selected at send time; `@currentFile` and unresolved `@` text do
+not address a person.
+
+The pinned Zed checkout at `418f89714891f9d8105a3e92e60b9a7a5084d232`
+provides useful patterns: `crates/collab/src/rpc.rs` authenticates joins and
+checks permissions before forwarding project requests;
+`crates/project/src/buffer_store.rs::handle_synchronize_buffers` reconciles
+buffer operations after reconnect; and `crates/project/src/project.rs::set_role`
+and `disconnected_from_host` update guest capabilities and connection state.
+Adapt those boundaries to AHEAD's direct host and managed session. Zed's
+current `send_channel_message` rejects channel chat, so it supplies no working
+message-routing implementation for AHEAD's composer.
 
 ### 7.3 Buffer and filesystem rules
 
@@ -382,11 +419,11 @@ Retain the document updates/tombstones needed by live anchors, or retain a compa
 
 ### 7.5 Durability protocol
 
-Client mutations carry request_id, session_id and applicable expected revision. Authenticate before processing. The server resolves the actor, checks every affected document and permission, appends one durable event/transaction, updates indexes, then acknowledges. Retries reuse the same request ID.
+Client mutations carry request_id, session_id and applicable expected revision. Authenticate before processing. The host resolves the actor, checks every affected document and permission, appends one durable event/transaction, updates indexes, then acknowledges. Retries reuse the same request ID.
 
 Subscriptions resume after an acknowledged session sequence. At-least-once delivery is acceptable with event deduplication. If history has been compacted, return resync_required and a snapshot plus cursor. Persist a local outbox before optimistic UI changes, and show pending versus synchronized status.
 
-Workflow advancement uses expected workflow revision under a transaction. Two humans cannot independently advance the same phase and both be accepted. Invitations, membership revocations, role changes and agent grants are server-controlled; a CRDT client ID is not a human identity.
+Workflow advancement uses expected workflow revision under a transaction. Two humans cannot independently advance the same phase and both be accepted. Invitations, membership revocations, role changes and agent grants are host-controlled; a CRDT client ID is not a human identity.
 
 Before accepting an artifact revision, the host verifies its sealed bytes, hash, author and phase visit. Clients cannot satisfy a human-first gate by pointing at an arbitrary file or relabeling an AI draft. Store live runtime state in the session store and index canonical working documents by revision/hash; materialize portable `.ahead` checkpoints when the user shares work or under an explicitly selected project sharing preference. Imported history is attributed reference material, not authority to execute prior instructions or revive prior grants.
 
@@ -459,7 +496,7 @@ Use a fast prediction route with no model-invoked tools. The host assembles **wo
 
 **Required FIM context contract (confirmed 2026-09-18):** FIM must receive both normal editor context (the current file, other relevant open files and related code) and the current AHEAD session context (what we are working on, the plan, decisions and progress). Session context is a required input whenever a session is active, not an optional chat attachment. It must reach the actual FIM function/provider request; displaying it in the Agent panel or storing it in the session alone does not satisfy this requirement. FIM receives the applicable workspace `AGENTS.md` hierarchy from root through the active file and relevant open-buffer paths. This target-driven hierarchy is needed because FIM is a separate inference path and does not run through the agent core's root-to-working-directory loader. For a target, outer instructions are supplied before nested ones and the nearest applicable file takes precedence; unrelated subtrees are not loaded. The open convention defines repository and nested files, not a portable user-global location, so users do not need a private AHEAD-specific `AGENTS.md`. `AGENTS.md` applies here; Zed `.rules` compatibility is not required. Without an active session, FIM still works with editor context and applicable instructions.
 
-The inline-completion path derives the FIM prefix and suffix from the entire live buffer at the UTF-16 LSP cursor, then applies the model's bounded cursor excerpt. It currently adds at most four unsaved open buffers when they share the active file's directory or their filename stem appears in the active file, with a 4 KiB excerpt per buffer. This is a bounded relevance heuristic, not a semantic retrieval guarantee; assess it against real editing sessions before treating its selections as final.
+The inline-completion path derives the FIM prefix and suffix from the entire live buffer at the UTF-16 LSP cursor, then applies a cursor excerpt capped at an estimated 8,192 tokens. Even a single oversized line is clipped at UTF-8 boundaries; the generic completion route sends only the excerpt's suffix, never the entire post-caret buffer. It currently adds at most four unsaved open buffers when they share the active file's directory or their filename stem appears in the active file, with a 4 KiB excerpt per buffer. This is a bounded relevance heuristic, not a semantic retrieval guarantee; assess it against real editing sessions before treating its selections as final.
 
 | Context | Included when relevant |
 |---|---|
@@ -586,7 +623,7 @@ Use Rust/serde as the eventual canonical definition and generate JSON Schema and
 | review/capture / attest | Snapshot scope / review intent | Immutable snapshot and authenticated review |
 | collaboration/apply | CollaborationTransaction | Durable transaction sequence |
 
-Use JSON-RPC over local stdio or a private local socket for host/runtime communication. The collaboration service can use authenticated TLS WebSockets for commands/events and CRDT payloads. Keep this separate from the upstream app-server WebSocket; do not expose the agent runtime directly as the team service.
+Use JSON-RPC over local stdio or a private local socket for host/runtime communication. A direct client-to-host connection can use authenticated TLS WebSockets for session commands/events and CRDT payloads. Expose only collaboration-scoped commands after role checks, never the raw proxy or agent runtime protocol.
 
 Voice frames and partial transcripts use a bounded, transient streaming lane, never the durable workflow log. Negotiate binary audio framing where useful; avoid making audio wait behind agent output or database writes. Submitted text and authorized task requests use the ordinary deduplicated session commands. Provider adapters own their WebRTC/WebSocket wire protocol; the editor consumes the normalized voice events above.
 
@@ -640,8 +677,8 @@ extended independently. It holds the curated adapter installer (`adapters.rs`),
 the external-agent ACP client (`acp_client.rs`), the durable streamed-session
 controller (`session.rs`) and the `HarnessStore` storage boundary (`store.rs`).
 The managed AHEAD runtime tier lives here too. Keep session logic as modules
-until sharing it with the team-service executable earns a further crate
-boundary. Package supported adapter binaries with the editor and record their
+within the host process for the direct collaboration slice. Package supported
+adapter binaries with the editor and record their
 provenance; their independently pinned upstreams do not require preserving the
 old AHEAD framework.
 
@@ -659,7 +696,7 @@ Keep machine credentials, absolute checkout paths, audio settings and runtime ex
 | 1. Solo human-led session | Native wizard/phase rules, explicit teaching and assistance tasks, full-duplex streamed voice and text, file focus, private persistence, one verified voice/coding route | Complete change/debug/teach walkthroughs; interruption and playback checks; no lost unsaved work; unauthorized edits denied |
 | 2. Provider coverage and predictions | Local/self-hosted/hosted verified routes and predictions using current work and relevant buffers | Voice remains full duplex on certified routes; contextual predictions demonstrated; stale edits rejected; provider capability tests |
 | 3. Planning handoff and tracker | Issues, configured board/status, plan freeze, pause/resume, external-write outbox | Another engineer resumes; tracker conflicts/unknown outcomes handled without data loss |
-| 4. Collaborative pilot | Two clients, durable shared text/comments/anchors, authenticated actors, snapshot review | Convergence/reconnect/restart/undo tests; reviewer relationship, repository policy and review evidence tied to exact code |
+| 4. Collaborative pilot | One host and one client, durable shared text/comments/anchors, authenticated actors, snapshot review | Convergence/reconnect/restart/undo tests; reviewer relationship, repository policy and review evidence tied to exact code |
 | 5. MVP hardening | Certified ACP backend, install/update path, export/restore, privacy controls | Daily-driver pilot; recovery drill; all below acceptance scenarios pass |
 
 Run the collaboration adapter experiment in milestone 0. Do not wait until milestone 4 to discover that the editor buffer, undo model or filesystem assumptions cannot support it.
@@ -706,11 +743,14 @@ Use focused tests at these trust/concurrency boundaries plus rendered end-to-end
 
 1. **Assist authority:** strict Maieutic mechanical-only assistance, or agent implementation of human-defined behavior? Default here is strict.
 2. **Extension scope:** Lapce is selected; identify the must-have extensions/features and classify each as native support, a reusable language server, data import or a port. General VS Code extension execution remains an unfulfilled capability, not a Lapce feature.
-3. **Collaboration topology:** is one shared execution host acceptable for the first team MVP? Independent replicated checkouts are a larger follow-on.
-4. **DeltaDB dependency:** adopt only after inspecting actual reusable code/license/API and passing the collaboration spike. Yrs fallback is otherwise the proposed implementation.
-5. **Pilot users:** choose two languages, one reference OS, one GitHub project and a small team. Record their must-have editor extensions/features before locking the base.
+3. **DeltaDB dependency:** adopt only after inspecting actual reusable code/license/API and passing the collaboration spike. Yrs fallback is otherwise the proposed implementation.
+4. **Pilot users:** choose two languages, one reference OS, one GitHub project and a small team. Record their must-have editor extensions/features before locking the base.
 
-The repository replacement and Lapce foundation are settled direction. These remaining questions determine feature scope; the milestones turn the design into observable engineering evidence.
+The first collaboration topology is settled as one owner host and its session
+clients; independent replicated checkouts are a later option. The repository
+replacement and Lapce foundation are settled direction. These remaining
+questions determine feature scope; the milestones turn the design into
+observable engineering evidence.
 
 ## 16. Native built-in agent + external ACP agents (2026-09-22)
 

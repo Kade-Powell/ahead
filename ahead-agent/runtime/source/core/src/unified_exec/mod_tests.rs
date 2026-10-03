@@ -147,7 +147,6 @@ async fn exec_command_with_tty(
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
-                /*internal_permissions*/ None,
             ),
             network_approval: None,
             session: Arc::downgrade(session),
@@ -620,7 +619,6 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
-                /*internal_permissions*/ None,
             ),
             network_approval: None,
             session: Arc::downgrade(&session),
@@ -702,7 +700,6 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
                 TerminalSandboxSource::Native,
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
-                /*internal_permissions*/ None,
             ),
             network_approval: None,
             session: Arc::downgrade(&session),
@@ -921,7 +918,6 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
             TerminalSandboxSource::Native,
             SandboxPermissions::RequireEscalated,
             /*additional_permissions*/ None,
-            /*internal_permissions*/ None,
         );
         entry.environment_id = "unselected-executor".to_string();
         entry.cwd = cwd.clone();

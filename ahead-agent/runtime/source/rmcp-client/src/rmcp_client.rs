@@ -47,10 +47,8 @@ use rmcp::model::RequestMetaObject;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::ServerPeerInfo;
 use rmcp::model::ServerResult;
-use rmcp::model::Tool;
 use rmcp::service::ClientCacheConfig;
 use rmcp::service::ClientServiceExt;
-use rmcp::service::RequestHandle;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::AuthorizationManager;
@@ -70,8 +68,6 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
-use crate::event_notification_transport::capture_event_notifications;
-use crate::event_notification_transport::event_notification_channel;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::http_client_adapter::StreamableHttpRedirectMode;
@@ -295,25 +291,12 @@ fn remaining_operation_timeout(
 #[derive(Debug, Clone, PartialEq)]
 pub enum Elicitation {
     Mcp(ElicitRequestParams),
-    OpenAiForm {
-        meta: Option<serde_json::Value>,
-        message: String,
-        requested_schema: serde_json::Value,
-    },
-    OpenAiElicitationForm {
-        meta: Option<serde_json::Value>,
-        message: String,
-        requested_schema: serde_json::Value,
-    },
 }
 
 impl Elicitation {
     pub fn meta(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         match self {
             Self::Mcp(request) => request.meta().map(|meta| &meta.0.0),
-            Self::OpenAiForm { meta, .. } | Self::OpenAiElicitationForm { meta, .. } => {
-                meta.as_ref().and_then(serde_json::Value::as_object)
-            }
         }
     }
 }
@@ -353,24 +336,6 @@ impl From<ElicitationResponse> for ElicitResult {
 pub type SendElicitation = Box<
     dyn Fn(RequestId, Elicitation) -> BoxFuture<'static, Result<ElicitationResponse>> + Send + Sync,
 >;
-
-pub struct ToolWithConnectorId {
-    pub tool: Tool,
-    pub connector_id: Option<String>,
-    pub connector_name: Option<String>,
-    pub connector_description: Option<String>,
-}
-
-pub struct ListToolsWithConnectorIdResult {
-    pub next_cursor: Option<String>,
-    pub tools: Vec<ToolWithConnectorId>,
-}
-
-/// An active Plugin Runtime event request and its request-scoped notifications.
-pub struct CancellableEventStreamRequest {
-    pub handle: RequestHandle<RoleClient>,
-    pub notifications: crate::EventNotificationReceiver,
-}
 
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
@@ -661,52 +626,6 @@ impl RmcpClient {
         Ok(result)
     }
 
-    #[instrument(level = "trace", skip_all)]
-    pub async fn list_tools_with_connector_ids(
-        &self,
-        params: Option<PaginatedRequestParams>,
-        timeout: Option<Duration>,
-    ) -> Result<ListToolsWithConnectorIdResult> {
-        self.refresh_oauth_if_needed().await?;
-        let result = self
-            .run_service_operation("tools/list", timeout, move |service| {
-                let params = params.clone();
-                async move { service.list_tools(params).await }.boxed()
-            })
-            .await?;
-        let tools = result
-            .tools
-            .into_iter()
-            .map(|tool| {
-                let meta = tool.meta.as_ref();
-                let connector_id = Self::meta_string(meta, "connector_id");
-                let connector_name = Self::meta_string(meta, "connector_name")
-                    .or_else(|| Self::meta_string(meta, "connector_display_name"));
-                let connector_description = Self::meta_string(meta, "connector_description")
-                    .or_else(|| Self::meta_string(meta, "connectorDescription"));
-                Ok(ToolWithConnectorId {
-                    tool,
-                    connector_id,
-                    connector_name,
-                    connector_description,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.persist_oauth_tokens().await;
-        Ok(ListToolsWithConnectorIdResult {
-            next_cursor: result.next_cursor,
-            tools,
-        })
-    }
-
-    fn meta_string(meta: Option<&rmcp::model::MetaObject>, key: &str) -> Option<String> {
-        meta.and_then(|meta| meta.get(key))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    }
-
     pub async fn list_resources(
         &self,
         params: Option<PaginatedRequestParams>,
@@ -895,29 +814,6 @@ impl RmcpClient {
             .await?;
         self.persist_oauth_tokens().await;
         Ok(response)
-    }
-
-    /// Starts a Plugin Runtime event stream without waiting for its final response.
-    pub async fn send_event_stream_request(
-        &self,
-        params: Option<serde_json::Value>,
-    ) -> Result<CancellableEventStreamRequest> {
-        let service = self.service().await?;
-        let (sender, notifications) = event_notification_channel();
-        let mut request = CustomRequest::new("events/stream", params);
-        request.extensions.insert(sender);
-        let handle = service
-            .peer()
-            .send_cancellable_request(
-                ClientRequest::CustomRequest(request),
-                rmcp::service::PeerRequestOptions::no_options(),
-            )
-            .await?;
-
-        Ok(CancellableEventStreamRequest {
-            handle,
-            notifications,
-        })
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
@@ -1194,7 +1090,7 @@ impl RmcpClient {
             ),
             PendingTransport::StreamableHttp { transport } => (
                 client_service
-                    .serve_with_lifecycle(capture_event_notifications(transport), lifecycle)
+                    .serve_with_lifecycle(transport, lifecycle)
                     .boxed(),
                 None,
             ),

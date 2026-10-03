@@ -12,7 +12,6 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
-use serde_json::json;
 use std::sync::Arc;
 
 fn terminal_permissions(profile: &PermissionProfile) -> TerminalPermissions {
@@ -28,7 +27,6 @@ fn terminal_permissions(profile: &PermissionProfile) -> TerminalPermissions {
         sandbox_source: TerminalSandboxSource::Native,
         launch_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,
-        internal_permissions: None,
     }
 }
 
@@ -115,7 +113,6 @@ async fn captured_network_changes_require_review_or_a_new_terminal() -> anyhow::
         TerminalSandboxSource::Native,
         SandboxPermissions::UseDefault,
         /*additional_permissions*/ None,
-        /*internal_permissions*/ None,
     );
 
     proxy.mode = NetworkMode::Limited;
@@ -157,39 +154,6 @@ async fn captured_network_changes_require_review_or_a_new_terminal() -> anyhow::
 }
 
 #[tokio::test]
-async fn internal_grants_require_review_without_exposing_paths() -> anyhow::Result<()> {
-    let (_session, turn) = make_session_and_context().await;
-    let mut environment = turn.environments.primary().expect("environment").clone();
-    environment.config_mut().permission_profile =
-        PermissionProfileSnapshot::legacy(PermissionProfile::read_only());
-    let grants = serde_json::from_value(json!({
-        "file_system": {"write": [turn.config.cwd.join("private-metrics")]}
-    }))?;
-    let permissions = TerminalPermissions::for_launch(
-        &environment,
-        &turn,
-        TerminalSandboxSource::Native,
-        SandboxPermissions::UseDefault,
-        /*additional_permissions*/ None,
-        Some(&grants),
-    );
-    let current = TerminalPolicy::capture(
-        &environment,
-        &turn,
-        TerminalSandboxSource::Native,
-        Some(grants),
-    );
-    let expected = SandboxPermissions::WithAdditionalPermissions;
-    assert_eq!(
-        permissions.review_requirement(&current, environment.permission_profile()),
-        Ok(expected)
-    );
-    assert_eq!(permissions.additional_permissions, None);
-    insta::assert_snapshot!("internal_grant", permissions.approval_reason(expected)?);
-    Ok(())
-}
-
-#[tokio::test]
 async fn enabling_windows_sandbox_respects_the_launch_backend() -> anyhow::Result<()> {
     for (source, expected) in [
         (
@@ -213,7 +177,6 @@ async fn enabling_windows_sandbox_respects_the_launch_backend() -> anyhow::Resul
             source,
             SandboxPermissions::UseDefault,
             /*additional_permissions*/ None,
-            /*internal_permissions*/ None,
         );
         let current = TerminalPolicy::capture(
             &environment,

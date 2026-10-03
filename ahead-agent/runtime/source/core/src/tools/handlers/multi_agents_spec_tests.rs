@@ -100,7 +100,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .and_then(|schema| schema.encrypted),
         Some(true)
     );
-    assert!(properties.contains_key("fork_turns"));
+    assert!(!properties.contains_key("fork_turns"));
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
@@ -127,7 +127,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
 }
 
 #[test]
-fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
+fn spawn_agent_tool_v1_has_no_history_fork_option() {
     let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
         available_models: Vec::new(),
         agent_type_description: "role help".to_string(),
@@ -156,7 +156,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         .as_ref()
         .expect("spawn_agent should use object params");
 
-    assert!(properties.contains_key("fork_context"));
+    assert!(!properties.contains_key("fork_context"));
     assert!(!properties.contains_key("fork_turns"));
     assert_eq!(
         properties.get("agent_type"),

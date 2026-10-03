@@ -78,6 +78,11 @@ pub enum ProxyRequest {
         path: PathBuf,
         content: String,
     },
+    GitCommit {
+        message: String,
+        diffs: Vec<FileDiff>,
+    },
+    GitStageAll {},
     GlobalSearch {
         pattern: String,
         case_sensitive: bool,
@@ -241,6 +246,8 @@ pub enum ProxyRequest {
     InstallLanguageExtension {
         url: String,
         extension_id: String,
+        version: String,
+        expected_sha256: Option<String>,
     },
 }
 
@@ -293,10 +300,6 @@ pub enum ProxyNotification {
     NewTerminal {
         term_id: TermId,
         profile: TerminalProfile,
-    },
-    GitCommit {
-        message: String,
-        diffs: Vec<FileDiff>,
     },
     GitCheckout {
         reference: String,
@@ -758,10 +761,6 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::GitInit {});
     }
 
-    pub fn git_commit(&self, message: String, diffs: Vec<FileDiff>) {
-        self.notification(ProxyNotification::GitCommit { message, diffs });
-    }
-
     pub fn git_checkout(&self, reference: String) {
         self.notification(ProxyNotification::GitCheckout { reference });
     }
@@ -845,10 +844,17 @@ impl ProxyRpcHandler {
         &self,
         url: String,
         extension_id: String,
+        version: String,
+        expected_sha256: Option<String>,
         f: impl ProxyCallback + 'static,
     ) {
         self.request_async(
-            ProxyRequest::InstallLanguageExtension { url, extension_id },
+            ProxyRequest::InstallLanguageExtension {
+                url,
+                extension_id,
+                version,
+                expected_sha256,
+            },
             f,
         );
     }

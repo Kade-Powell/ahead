@@ -7,3 +7,4 @@ pub mod meta;
 pub mod search;
 #[cfg(unix)]
 pub mod secure_fs;
+pub mod workspace_trust;

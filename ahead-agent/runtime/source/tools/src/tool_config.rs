@@ -1,7 +1,7 @@
 use codex_features::Feature;
 use codex_features::Features;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
+use codex_protocol::config_types::SUPPORTED_COLLABORATION_MODES;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::PathBuf;
 
@@ -15,7 +15,7 @@ pub enum ToolUserShellType {
 }
 
 pub fn request_user_input_available_modes(features: &Features) -> Vec<ModeKind> {
-    TUI_VISIBLE_COLLABORATION_MODES
+    SUPPORTED_COLLABORATION_MODES
         .into_iter()
         .filter(|mode| {
             mode.allows_request_user_input()

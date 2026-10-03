@@ -49,6 +49,14 @@ pub(super) async fn load_config_layers_internal(
     overrides: LoaderOverrides,
     strict_config: bool,
 ) -> io::Result<LoadedConfigLayers> {
+    if overrides.ignore_managed_config_layers {
+        return Ok(LoadedConfigLayers {
+            managed_config: None,
+            managed_config_from_mdm: None,
+            startup_warnings: Vec::new(),
+        });
+    }
+
     #[cfg(target_os = "macos")]
     let LoaderOverrides {
         managed_config_path,

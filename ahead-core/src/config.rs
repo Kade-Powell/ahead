@@ -13,7 +13,7 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub fn read_ahead_config(root: &Path, filename: &str) -> io::Result<Option<String>> {
     if !matches!(
         filename,
-        "settings.toml" | "config.toml" | "config.local.toml"
+        "settings.toml" | "config.toml" | "config.local.toml" | "team.toml"
     ) {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -64,7 +64,80 @@ pub fn read_ahead_config(root: &Path, filename: &str) -> io::Result<Option<Strin
             "AHEAD config must be a regular file of at most 1 MiB",
         ));
     }
+    if filename == "config.toml" {
+        let table = content.parse::<toml::Table>().map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid TOML in .ahead/config.toml",
+            )
+        })?;
+        validate_tracked_config(&toml::Value::Table(table))?;
+    } else if filename == "team.toml" {
+        let table = content.parse::<toml::Table>().map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid TOML in .ahead/team.toml",
+            )
+        })?;
+        if has_secret_field(&toml::Value::Table(table)) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "tracked .ahead/team.toml contains a credential field",
+            ));
+        }
+    }
     Ok(Some(content))
+}
+
+pub fn validate_tracked_config(value: &toml::Value) -> io::Result<()> {
+    if has_secret_field(value) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "tracked .ahead/config.toml contains a credential field; use ignored settings.toml or config.local.toml",
+        ));
+    }
+    Ok(())
+}
+
+fn has_secret_field(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table.iter().any(|(key, value)| {
+            credential_key(key, value.is_str()) || has_secret_field(value)
+        }),
+        toml::Value::Array(values) => values.iter().any(has_secret_field),
+        toml::Value::String(text) => url::Url::parse(text).ok().is_some_and(|url| {
+            !url.username().is_empty()
+                || url.password().is_some()
+                || url.query_pairs().any(|(key, _)| credential_key(&key, true))
+        }),
+        _ => false,
+    }
+}
+
+fn credential_key(key: &str, string_value: bool) -> bool {
+    let key = key.replace('-', "_").to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "api_key"
+            | "apikey"
+            | "token"
+            | "password"
+            | "private_key"
+            | "secret_key"
+            | "client_secret"
+            | "authorization"
+            | "bearer_token"
+            | "auth_token"
+            | "access_token"
+            | "refresh_token"
+            | "authtoken"
+            | "accesstoken"
+            | "bearertoken"
+            | "clientsecret"
+    ) || (string_value
+        && (key.ends_with("_token")
+            || key.ends_with("_secret")
+            || key.ends_with("_password")))
 }
 
 #[cfg(test)]
@@ -110,5 +183,66 @@ mod tests {
             symlink(root.path(), &ahead).expect("link settings directory");
             assert!(read_ahead_config(root.path(), "config.toml").is_err());
         }
+    }
+
+    #[test]
+    fn tracked_config_rejects_nested_credentials_but_private_settings_allow_them() {
+        let root = tempfile::tempdir().expect("workspace");
+        let ahead = root.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[ai]\nmax_tokens = 2048\n[[ai.connections]]\nname = 'Shared'\nauth_token = 'private'\n",
+        )
+        .expect("write tracked config");
+        assert!(read_ahead_config(root.path(), "config.toml").is_err());
+
+        for address in [
+            "https://name:password@example.invalid/v1",
+            "https://example.invalid/v1?api_key=private",
+        ] {
+            std::fs::write(
+                ahead.join("config.toml"),
+                format!("[ai]\nbase_url = '{address}'\n"),
+            )
+            .expect("write credential URL");
+            assert!(read_ahead_config(root.path(), "config.toml").is_err());
+        }
+
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[ai]\nmax_tokens = 2048\nsemantic_token = true\nbase_url = 'https://example.invalid/v1?max_tokens=2048'\n[[ai.connections]]\nname = 'Shared'\n",
+        )
+        .expect("write shareable config");
+        assert!(
+            read_ahead_config(root.path(), "config.toml")
+                .expect("read shareable config")
+                .is_some()
+        );
+        std::fs::write(ahead.join("settings.toml"), "[ai]\napi_key = 'private'\n")
+            .expect("write private settings");
+        assert!(
+            read_ahead_config(root.path(), "settings.toml")
+                .expect("read private settings")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn team_manifest_is_readable_without_exposing_credentials() {
+        let root = tempfile::tempdir().expect("workspace");
+        let ahead = root.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("team directory");
+        std::fs::write(ahead.join("team.toml"), "members = []\n")
+            .expect("write team manifest");
+        assert_eq!(
+            read_ahead_config(root.path(), "team.toml")
+                .expect("read team manifest")
+                .as_deref(),
+            Some("members = []\n")
+        );
+        std::fs::write(ahead.join("team.toml"), "token = 'private'\n")
+            .expect("write credential");
+        assert!(read_ahead_config(root.path(), "team.toml").is_err());
     }
 }

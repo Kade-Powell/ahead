@@ -283,6 +283,10 @@ pub struct SessionPanel {
     pub focus: FocusHandle,
     workspace: std::path::PathBuf,
     pub chat_input: Entity<TextareaState>,
+    invite_input: Entity<TextareaState>,
+    shared_file_input: Entity<TextareaState>,
+    shared_file_opening: bool,
+    invite_pending: bool,
     code_comments: Vec<ahead_rpc::ahead::CodeComment>,
     comments_expanded: bool,
     resolving_comment_id: Option<String>,
@@ -317,6 +321,25 @@ pub struct SessionPanel {
     pub proxy: Option<std::sync::Arc<crate::proxy_client::ProxyClient>>,
     /// Durable AHEAD work session id backing this conversation.
     pub session_id: Option<String>,
+    share_offer: Option<ahead_rpc::ahead::SharedSessionOffer>,
+    team_members: Vec<ahead_rpc::ahead::SessionParticipantRecord>,
+    share_starting: bool,
+    shared_guest: bool,
+    shared_actor_id: Option<String>,
+    shared_polling: bool,
+    shared_comment_polling: bool,
+    shared_connection_lost: bool,
+    shared_terminal_output: String,
+    shared_presence: Vec<ahead_rpc::ahead::SharedPresence>,
+    following_actor: Option<String>,
+    following_location: Option<(String, u32)>,
+    follow_origin: Option<(String, u32)>,
+    follow_task: Option<Task<()>>,
+    presence_polling: bool,
+    last_presence_poll: Option<std::time::Instant>,
+    last_published_presence: Option<Option<(String, u32)>>,
+    last_published_terminal: Option<String>,
+    publishing_terminal: bool,
     pub external_agent_id: Option<String>,
     thread_launcher: Option<WeakEntity<crate::threads_panel::ThreadsPanel>>,
     shell: Option<WeakEntity<crate::app::Shell>>,
@@ -680,10 +703,20 @@ impl SessionPanel {
     ) -> Self {
         let chat_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder(
-                    "Message the AHEAD Agent, @ to include context, / for commands",
-                )
+                .placeholder("Message the session")
                 .auto_grow(1, 8)
+                .submit_on_enter(true)
+        });
+        let invite_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("GitHub username")
+                .auto_grow(1, 1)
+                .submit_on_enter(true)
+        });
+        let shared_file_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("File in host workspace, for example src/main.rs")
+                .auto_grow(1, 1)
                 .submit_on_enter(true)
         });
         let composer_focus = chat_input.focus_handle(cx);
@@ -694,11 +727,22 @@ impl SessionPanel {
                     return;
                 }
                 let key = event.keystroke.key.as_str();
-                if !matches!(key, "down" | "up" | "escape") {
+                if !matches!(key, "down" | "up" | "escape" | "enter")
+                    || (key == "enter" && event.keystroke.modifiers.shift)
+                {
                     return;
                 }
                 match weak_panel.update(cx, |panel, cx| {
-                    panel.handle_composer_slash_key(key, window, cx)
+                    if key == "enter" {
+                        if panel.show_commands {
+                            panel.confirm_selected_slash_command(window, cx);
+                        } else {
+                            panel.send_chat(window, cx);
+                        }
+                        true
+                    } else {
+                        panel.handle_composer_slash_key(key, window, cx)
+                    }
                 }) {
                     Ok(true) => {
                         window.prevent_default();
@@ -800,6 +844,10 @@ impl SessionPanel {
             focus: cx.focus_handle(),
             workspace,
             chat_input,
+            invite_input,
+            shared_file_input,
+            shared_file_opening: false,
+            invite_pending: false,
             code_comments: Vec::new(),
             comments_expanded: false,
             resolving_comment_id: None,
@@ -831,6 +879,25 @@ impl SessionPanel {
             work_items: Vec::new(),
             proxy: None,
             session_id: None,
+            share_offer: None,
+            team_members: Vec::new(),
+            share_starting: false,
+            shared_guest: false,
+            shared_actor_id: None,
+            shared_polling: false,
+            shared_comment_polling: false,
+            shared_connection_lost: false,
+            shared_terminal_output: String::new(),
+            shared_presence: Vec::new(),
+            following_actor: None,
+            following_location: None,
+            follow_origin: None,
+            follow_task: None,
+            presence_polling: false,
+            last_presence_poll: None,
+            last_published_presence: None,
+            last_published_terminal: None,
+            publishing_terminal: false,
             external_agent_id: None,
             thread_launcher: None,
             shell: None,
@@ -1166,6 +1233,19 @@ impl SessionPanel {
         state: crate::proxy_client::DurableSessionState,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .share_offer
+            .as_ref()
+            .is_some_and(|offer| offer.session_id != state.view.session.id)
+        {
+            self.disconnect_shared_host(cx);
+        }
+        self.disconnect_shared_guest(cx);
+        self.clear_shared_presence();
+        self.shared_guest = false;
+        self.shared_actor_id = None;
+        self.shared_polling = false;
+        self.shared_connection_lost = false;
         let session_id = state.view.session.id.clone();
         ahead_viewmodel::adopt_session(&mut self.session, state.view.clone());
         if self.session_id.as_deref() != Some(session_id.as_str()) {
@@ -1219,6 +1299,19 @@ impl SessionPanel {
     /// Switches the conversation to an already-restored durable session.
     /// The editor remains on its current file; only session context changes.
     pub fn attach_session(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if self
+            .share_offer
+            .as_ref()
+            .is_some_and(|offer| offer.session_id != session_id)
+        {
+            self.disconnect_shared_host(cx);
+        }
+        self.disconnect_shared_guest(cx);
+        self.clear_shared_presence();
+        self.shared_guest = false;
+        self.shared_actor_id = None;
+        self.shared_polling = false;
+        self.shared_connection_lost = false;
         if let Some(proxy) = self.proxy.clone() {
             if let Some(view) = proxy.session_view(&session_id) {
                 ahead_viewmodel::adopt_session(&mut self.session, view.clone());
@@ -1255,6 +1348,9 @@ impl SessionPanel {
     }
 
     pub fn clear_session(&mut self, cx: &mut Context<Self>) {
+        self.disconnect_shared_host(cx);
+        self.disconnect_shared_guest(cx);
+        self.clear_shared_presence();
         self.reset_voice_context_for_session_change();
         if let Some(previous_session_id) = self.session_id.clone() {
             self.clear_session_presentation(&previous_session_id, cx);
@@ -1299,6 +1395,11 @@ impl SessionPanel {
         &self,
     ) -> Vec<ahead_rpc::ahead::CodeComment> {
         self.code_comments.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_remote_state_for_test(&self) -> (&str, usize) {
+        (&self.shared_terminal_output, self.shared_presence.len())
     }
 
     pub fn set_buffers(
@@ -1897,16 +1998,14 @@ impl SessionPanel {
                 self.show_commands = false;
                 self.invalidate_skill_catalog();
                 self.command_query.clear();
-                let input = self.chat_input.clone();
-                input.update(cx, |input, cx| input.set_value("", window, cx));
+                self.clear_chat_input(window, cx);
                 cx.notify();
             }
             SlashPaletteAction::ReviewMemory(scope) => {
                 self.show_commands = false;
                 self.invalidate_skill_catalog();
                 self.command_query.clear();
-                let input = self.chat_input.clone();
-                input.update(cx, |input, cx| input.set_value("", window, cx));
+                self.clear_chat_input(window, cx);
                 self.begin_memory_review(scope, window, cx);
             }
             SlashPaletteAction::Prompt(prompt) => {
@@ -1955,18 +2054,7 @@ impl SessionPanel {
             .map(|state| state.commands.clone())
             .unwrap_or_else(|| proxy.available_commands(session_id));
         self.config_options = proxy.config_options(session_id);
-        let pending_user_input = proxy.pending_user_input(session_id);
-        if pending_user_input
-            .as_ref()
-            .map(|request| &request.request_id)
-            != self
-                .pending_user_input
-                .as_ref()
-                .map(|request| &request.request_id)
-        {
-            self.user_input_answers.clear();
-        }
-        self.pending_user_input = pending_user_input;
+        self.refresh_user_input(proxy, session_id);
         if let Some(usage) = runtime_state
             .and_then(|state| state.usage)
             .or_else(|| proxy.usage(session_id))
@@ -1978,6 +2066,37 @@ impl SessionPanel {
             self.context_used = 0;
             self.harness_context_window = None;
         }
+    }
+
+    fn refresh_user_input(
+        &mut self,
+        proxy: &std::sync::Arc<crate::proxy_client::ProxyClient>,
+        session_id: &str,
+    ) {
+        let pending_user_input = proxy.pending_user_input(session_id);
+        if pending_user_input
+            .as_ref()
+            .map(|request| &request.request_id)
+            != self
+                .pending_user_input
+                .as_ref()
+                .map(|request| &request.request_id)
+        {
+            self.user_input_answers = pending_user_input
+                .as_ref()
+                .map(|request| {
+                    request
+                        .questions
+                        .iter()
+                        .filter(|question| !question.default_answers.is_empty())
+                        .map(|question| {
+                            (question.id.clone(), question.default_answers.clone())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        self.pending_user_input = pending_user_input;
     }
 
     fn load_older_messages(&mut self, cx: &mut Context<Self>) {
@@ -2163,6 +2282,82 @@ impl SessionPanel {
     pub fn poll_stream(&mut self, cx: &mut Context<Self>) {
         self.sync_voice_playback(cx);
         self.poll_voice_capture(cx);
+        if self.shared_guest {
+            if self.shared_polling {
+                return;
+            }
+            let (Some(proxy), Some(session_id)) =
+                (self.proxy.clone(), self.session_id.clone())
+            else {
+                return;
+            };
+            let after_sequence = self
+                .conversation
+                .iter()
+                .map(|message| message.sequence)
+                .max()
+                .unwrap_or(0);
+            let response_session_id = session_id.clone();
+            let active_location = self.shell.as_ref().and_then(|shell| {
+                shell
+                    .read_with(cx, |shell, cx| {
+                        shell.shared_presence_location(&session_id, true, cx)
+                    })
+                    .ok()
+                    .flatten()
+            });
+            let (active_path, active_line) = active_location
+                .map_or((None, None), |(path, line)| (Some(path), Some(line)));
+            self.shared_polling = true;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        proxy.poll_shared_session(
+                            session_id.clone(),
+                            after_sequence,
+                            active_path,
+                            active_line,
+                        )
+                    })
+                    .await;
+                this.update(cx, |panel, cx| {
+                    panel.shared_polling = false;
+                    if !panel.shared_guest
+                        || panel.session_id.as_deref()
+                            != Some(response_session_id.as_str())
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(update) => {
+                            if panel.shared_connection_lost {
+                                panel.status = "Reconnected to host session".into();
+                                panel.shared_connection_lost = false;
+                            }
+                            panel.apply_shared_update(update, cx);
+                        }
+                        Err(error) => {
+                            panel.shared_connection_lost = true;
+                            panel.shared_terminal_output.clear();
+                            panel.clear_shared_presence();
+                            panel.status = format!(
+                                "Shared session disconnected: {}",
+                                error.message
+                            )
+                            .into();
+                            cx.notify();
+                        }
+                    }
+                })
+                .log_err();
+            })
+            .detach();
+            return;
+        }
+        self.publish_shared_terminal(cx);
+        self.poll_shared_presence(cx);
+        // ponytail: poll local comments on the UI tick; push updates if this gets expensive.
+        self.poll_shared_comments(cx);
         let (Some(proxy), Some(session_id)) =
             (self.proxy.clone(), self.session_id.clone())
         else {
@@ -2175,6 +2370,19 @@ impl SessionPanel {
             self.config_options = options;
         }
         if !self.streaming && !self.turn_starting && !proxy_is_streaming {
+            if self
+                .share_offer
+                .as_ref()
+                .is_some_and(|offer| offer.session_id == session_id)
+            {
+                if let Some(messages) = proxy.cached_conversation(&session_id) {
+                    if messages != self.conversation {
+                        self.conversation = messages;
+                        self.sync_conversation_scroller(false, cx);
+                        cx.notify();
+                    }
+                }
+            }
             if options_changed {
                 cx.notify();
             }
@@ -2428,8 +2636,77 @@ impl SessionPanel {
     fn open_code_comment(
         &mut self,
         comment: &ahead_rpc::ahead::CodeComment,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shared_guest {
+            let (Some(proxy), Some(shell), Some(session_id)) = (
+                self.proxy.clone(),
+                self.shell.clone(),
+                self.session_id.clone(),
+            ) else {
+                return;
+            };
+            if session_id != comment.session_id {
+                self.status = "This code comment belongs to another session".into();
+                cx.notify();
+                return;
+            }
+            let path = comment.path.clone();
+            let comment = comment.clone();
+            self.status = format!("Opening {} from host…", path).into();
+            cx.spawn_in(window, async move |this, cx| {
+                let request_session_id = session_id.clone();
+                let result = cx
+                    .background_spawn(async move {
+                        proxy.read_shared_buffer(session_id, path)
+                    })
+                    .await;
+                let still_shared = this.read_with(cx, |panel, _| {
+                    panel.shared_guest
+                        && panel.session_id.as_deref()
+                            == Some(request_session_id.as_str())
+                });
+                if let (Ok(true), Ok(snapshot)) = (still_shared, &result) {
+                    let range = crate::code_panel::current_comment_range(
+                        &comment,
+                        &snapshot.content,
+                    );
+                    let line = range.unwrap_or(comment.range).start.line;
+                    if let Err(error) = shell.update_in(cx, |shell, window, cx| {
+                        shell.open_shared_code_comment(
+                            comment.session_id.clone(),
+                            snapshot.clone(),
+                            line,
+                            window,
+                            cx,
+                        );
+                    }) {
+                        eprintln!("AHEAD could not open shared comment: {error}");
+                    }
+                }
+                this.update_in(cx, |panel, _, cx| {
+                    if !panel.shared_guest
+                        || panel.session_id.as_deref()
+                            != Some(request_session_id.as_str())
+                    {
+                        return;
+                    }
+                    panel.status = match result {
+                        Ok(_) => "Opened shared code comment".into(),
+                        Err(error) => {
+                            format!("Shared code comment failed: {}", error.message)
+                                .into()
+                        }
+                    };
+                    cx.notify();
+                })
+                .log_err();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let Some(shell) = self.shell.clone() else {
             return;
         };
@@ -2797,6 +3074,1150 @@ impl SessionPanel {
         cx.notify();
     }
 
+    pub(crate) fn apply_shared_update(
+        &mut self,
+        update: ahead_rpc::ahead::SharedSessionUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let view = update.view;
+        let mut changed = self.session.active.as_ref() != Some(&view)
+            || self.shared_actor_id.as_deref() != Some(update.actor_id.as_str());
+        self.shared_actor_id = Some(update.actor_id);
+        self.session_id = Some(view.session.id.clone());
+        self.active_work_title = view.session.title.clone();
+        self.active_work_kind = view.session.work_kind;
+        self.active_task_intent = view.task.intent;
+        self.phase_id = view.workflow.phase.id.clone();
+        self.harness_kind = ahead_rpc::ahead::HarnessKind::Ahead;
+        ahead_viewmodel::adopt_session(&mut self.session, view);
+        if self.shared_terminal_output != update.terminal_output {
+            self.shared_terminal_output = update.terminal_output;
+            changed = true;
+        }
+        if self.shared_presence != update.presence {
+            self.shared_presence = update.presence;
+            self.stop_following_disconnected_participant();
+            changed = true;
+        }
+        if self.code_comments != update.code_comments {
+            self.code_comments = update.code_comments;
+            self.sync_editor_comments(cx);
+            changed = true;
+        }
+        for message in update.messages {
+            if let Some(existing) = self
+                .conversation
+                .iter_mut()
+                .find(|item| item.id == message.id)
+            {
+                if *existing != message {
+                    *existing = message;
+                    changed = true;
+                }
+            } else {
+                self.conversation.push(message);
+                changed = true;
+            }
+        }
+        if changed {
+            self.conversation.sort_by_key(|message| message.sequence);
+            self.sync_conversation_scroller(true, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn shared_guest_can_edit(&self) -> bool {
+        let (Some(actor_id), Some(view)) = (
+            self.shared_actor_id.as_deref(),
+            self.session.active.as_ref(),
+        ) else {
+            return false;
+        };
+        self.shared_guest && !self.shared_connection_lost && view.participants.iter().any(|record| {
+            matches!(&record.participant, ahead_rpc::ahead::Participant::Human { id, .. }
+                if id.eq_ignore_ascii_case(actor_id))
+                && matches!(record.role, ahead_rpc::ahead::SessionRole::Owner | ahead_rpc::ahead::SessionRole::Editor)
+        })
+    }
+
+    fn restore_shared_drafts(
+        &self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(proxy), Some(shell)) = (self.proxy.clone(), self.shell.clone())
+        else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let entries = crate::proxy_client::await_editor_recovery(
+                proxy.list_editor_recoveries(),
+                cx.background_executor(),
+            )
+            .await;
+            let mut failures = 0;
+            match entries {
+                Ok(entries) => {
+                    for entry in entries {
+                        let Some(path) = crate::code_panel::shared_draft_file_path(
+                            &entry.path,
+                            &session_id,
+                        ) else {
+                            continue;
+                        };
+                        let Some(path) = path.to_str().map(str::to_owned) else {
+                            failures += 1;
+                            continue;
+                        };
+                        if !this
+                            .read_with(cx, |panel, _| {
+                                panel.shared_guest
+                                    && panel.session_id.as_deref()
+                                        == Some(session_id.as_str())
+                            })
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        let draft = crate::proxy_client::await_editor_recovery(
+                            proxy.read_editor_recovery(entry.buffer_id),
+                            cx.background_executor(),
+                        )
+                        .await;
+                        let Ok(Some(draft)) = draft else {
+                            failures += 1;
+                            continue;
+                        };
+                        let proxy = proxy.clone();
+                        let session = session_id.clone();
+                        let host = cx
+                            .background_spawn(async move {
+                                proxy.read_shared_buffer(session, path)
+                            })
+                            .await;
+                        let Ok(host) = host else {
+                            failures += 1;
+                            continue;
+                        };
+                        if !this
+                            .read_with(cx, |panel, _| {
+                                panel.shared_guest
+                                    && panel.session_id.as_deref()
+                                        == Some(session_id.as_str())
+                            })
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        if !matches!(
+                            shell.update_in(cx, |shell, window, cx| {
+                                shell.restore_shared_draft(
+                                    session_id.clone(),
+                                    draft,
+                                    host,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                            Ok(Ok(()))
+                        ) {
+                            failures += 1;
+                        }
+                    }
+                }
+                Err(_) => failures += 1,
+            }
+            if failures > 0 {
+                this.update(cx, |panel, cx| {
+                    panel.status = format!(
+                        "{failures} shared draft(s) remain recoverable; reconnect to their host"
+                    )
+                    .into();
+                    cx.notify();
+                })
+                .log_err();
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn join_shared_session(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(proxy) = self.proxy.clone() else {
+            self.status = "AHEAD proxy is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let invite = self.chat_input.read(cx).value().to_string();
+        if invite.len() > 32 * 1024 {
+            self.status = "Session invite is too large".into();
+            cx.notify();
+            return;
+        }
+        let offer: ahead_rpc::ahead::SharedSessionOffer =
+            match serde_json::from_str(&invite) {
+                Ok(offer) => offer,
+                Err(error) => {
+                    self.status = format!("Invalid session invite: {error}").into();
+                    cx.notify();
+                    return;
+                }
+            };
+        self.share_starting = true;
+        self.status = "Joining shared session…".into();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { proxy.join_shared_session(offer) })
+                .await;
+            this.update_in(cx, |panel, window, cx| {
+                panel.share_starting = false;
+                if panel.session_id.is_some() {
+                    return;
+                }
+                match result {
+                    Ok(update) => {
+                        let joined_session_id = update.view.session.id.clone();
+                        panel.clear_shared_presence();
+                        panel.conversation.clear();
+                        panel.code_comments.clear();
+                        panel.shared_terminal_output.clear();
+                        panel.work_items.clear();
+                        panel.plan_entries.clear();
+                        panel.tool_calls.clear();
+                        panel.thought.clear();
+                        panel.attached_files.clear();
+                        panel.attached_memories.clear();
+                        panel.shared_guest = true;
+                        panel.shared_connection_lost = false;
+                        panel.apply_shared_update(update, cx);
+                        panel.clear_chat_input(window, cx);
+                        panel.status = "Joined host session".into();
+                        panel.restore_shared_drafts(joined_session_id, window, cx);
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Join failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn leave_shared_session(&mut self, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        let shell = self.shell.clone();
+        let left_session_id = session_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { proxy.leave_shared_session(session_id) },
+                )
+                .await;
+            if result.is_ok() {
+                if let Some(shell) = shell {
+                    shell
+                        .update(cx, |shell, cx| {
+                            shell.stop_shared_buffers(&left_session_id, cx)
+                        })
+                        .log_err();
+                }
+            }
+            this.update(cx, |panel, cx| {
+                match result {
+                    Ok(()) => {
+                        panel.clear_shared_presence();
+                        panel.shared_guest = false;
+                        panel.shared_actor_id = None;
+                        panel.shared_polling = false;
+                        panel.shared_connection_lost = false;
+                        panel.session_id = None;
+                        panel.session = ahead_viewmodel::SessionSnapshot::default();
+                        panel.conversation.clear();
+                        panel.code_comments.clear();
+                        panel.shared_terminal_output.clear();
+                        panel.work_items.clear();
+                        panel.plan_entries.clear();
+                        panel.tool_calls.clear();
+                        panel.thought.clear();
+                        panel.sync_conversation_scroller(false, cx);
+                        panel.status = "Left shared session".into();
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Leave failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn open_shared_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        if !self.shared_guest
+            || self.shared_connection_lost
+            || self.shared_file_opening
+        {
+            return;
+        }
+        let path = self.shared_file_input.read(cx).value().trim().to_string();
+        if path.is_empty() || path.len() > 1024 {
+            self.status = "Enter a workspace-relative file path".into();
+            cx.notify();
+            return;
+        }
+        self.shared_file_opening = true;
+        self.status = format!("Opening {path} from host…").into();
+        cx.spawn_in(window, async move |this, cx| {
+            let request_session_id = session_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    proxy.read_shared_buffer(session_id, path)
+                })
+                .await;
+            if let Ok(snapshot) = &result {
+                if let Ok(Some(shell)) = this.read_with(cx, |panel, _| {
+                    (panel.shared_guest
+                        && panel.session_id.as_deref()
+                            == Some(request_session_id.as_str()))
+                    .then(|| panel.shell.clone())
+                    .flatten()
+                }) {
+                    if let Err(error) = shell.update_in(cx, |shell, window, cx| {
+                        shell.open_shared_buffer(
+                            request_session_id.clone(),
+                            snapshot.clone(),
+                            None,
+                            window,
+                            cx,
+                        );
+                    }) {
+                        eprintln!("AHEAD could not open shared editor: {error}");
+                    }
+                }
+            }
+            this.update_in(cx, |panel, _, cx| {
+                panel.shared_file_opening = false;
+                if panel.session_id.as_deref() != Some(request_session_id.as_str()) {
+                    return;
+                }
+                panel.status = match result {
+                    Ok(snapshot) => {
+                        format!("Opened {} from host", snapshot.path).into()
+                    }
+                    Err(error) => {
+                        format!("Shared file failed: {}", error.message).into()
+                    }
+                };
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn clear_shared_presence(&mut self) {
+        self.shared_presence.clear();
+        self.following_actor = None;
+        self.following_location = None;
+        self.follow_origin = None;
+        self.follow_task = None;
+        self.presence_polling = false;
+        self.last_presence_poll = None;
+        self.last_published_presence = None;
+    }
+
+    fn stop_following_disconnected_participant(&mut self) {
+        if self.following_actor.as_ref().is_some_and(|actor_id| {
+            !self
+                .shared_presence
+                .iter()
+                .any(|presence| &presence.actor_id == actor_id)
+        }) {
+            self.following_actor = None;
+            self.following_location = None;
+            self.follow_task = None;
+            self.status = "Stopped following disconnected participant".into();
+        }
+    }
+
+    pub(crate) fn stop_following_on_edit(&mut self, cx: &mut Context<Self>) {
+        if self.following_actor.take().is_some() {
+            self.following_location = None;
+            self.follow_task = None;
+            self.status = "Stopped following after local edit".into();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn follow_shared_actor(
+        &mut self,
+        actor_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.following_actor.as_deref() == Some(actor_id.as_str()) {
+            self.following_actor = None;
+            self.following_location = None;
+            self.follow_task = None;
+            cx.notify();
+            return;
+        }
+        self.following_actor = Some(actor_id.clone());
+        self.following_location = None;
+        if self.follow_origin.is_none() {
+            self.follow_origin = self.shell.as_ref().and_then(|shell| {
+                let session_id = self.session_id.as_deref()?;
+                shell
+                    .read_with(cx, |shell, cx| {
+                        shell.shared_presence_location(
+                            session_id,
+                            self.shared_guest,
+                            cx,
+                        )
+                    })
+                    .ok()
+                    .flatten()
+            });
+        }
+        self.follow_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let target = this
+                    .read_with(cx, |panel, _| {
+                        if panel.following_actor.as_deref()
+                            != Some(actor_id.as_str())
+                        {
+                            return None;
+                        }
+                        let presence = panel
+                            .shared_presence
+                            .iter()
+                            .find(|presence| presence.actor_id == actor_id)?;
+                        let path = presence.path.clone()?;
+                        let line = presence.line.unwrap_or(0);
+                        let location = (path.clone(), line);
+                        if panel.following_location.as_ref() == Some(&location) {
+                            return None;
+                        }
+                        Some((
+                            panel.shell.clone(),
+                            panel.proxy.clone(),
+                            panel.session_id.clone(),
+                            location,
+                            path,
+                            line,
+                            panel.shared_guest,
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                if let Some((
+                    Some(shell),
+                    Some(proxy),
+                    Some(session_id),
+                    location,
+                    path,
+                    line,
+                    guest,
+                )) = target
+                {
+                    let result = if guest {
+                        let already_open = shell
+                            .update_in(cx, |shell, window, cx| {
+                                shell.follow_shared_line(
+                                    &session_id,
+                                    &path,
+                                    line,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if already_open {
+                            Ok(())
+                        } else {
+                            let read_session = session_id.clone();
+                            let read_path = path.clone();
+                            let snapshot = cx
+                                .background_spawn(async move {
+                                    proxy.read_shared_buffer(read_session, read_path)
+                                })
+                                .await;
+                            match snapshot {
+                                Ok(snapshot) => shell
+                                    .update_in(cx, |shell, window, cx| {
+                                        shell.open_shared_buffer(
+                                            session_id,
+                                            snapshot,
+                                            Some(line),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.message),
+                            }
+                        }
+                    } else {
+                        shell
+                            .update_in(cx, |shell, window, cx| {
+                                shell.follow_host_line(&path, line, window, cx);
+                            })
+                            .map_err(|error| error.to_string())
+                    };
+                    this.update_in(cx, |panel, _, cx| {
+                        if panel.following_actor.as_deref()
+                            == Some(actor_id.as_str())
+                        {
+                            match result {
+                                Ok(()) => panel.following_location = Some(location),
+                                Err(error) => {
+                                    panel.status =
+                                        format!("Follow failed: {error}").into();
+                                    panel.following_actor = None;
+                                    panel.follow_task = None;
+                                }
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+            }
+        }));
+        cx.notify();
+    }
+
+    fn return_to_follow_origin(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some((path, line)), Some(shell), Some(session_id)) = (
+            self.follow_origin.clone(),
+            self.shell.clone(),
+            self.session_id.clone(),
+        ) else {
+            return;
+        };
+        self.following_actor = None;
+        self.following_location = None;
+        self.follow_task = None;
+        let guest = self.shared_guest;
+        let proxy = self.proxy.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let current_session = this
+                .read_with(cx, |panel, _| {
+                    panel.session_id.as_deref() == Some(session_id.as_str())
+                })
+                .unwrap_or(false);
+            if !current_session {
+                return;
+            }
+            let result = if guest {
+                if let Some(proxy) = proxy {
+                    let read_session_id = session_id.clone();
+                    let read_path = path.clone();
+                    let snapshot = cx
+                        .background_spawn(async move {
+                            proxy.read_shared_buffer(read_session_id, read_path)
+                        })
+                        .await;
+                    match snapshot {
+                        Ok(snapshot) => {
+                            let current_session = this
+                                .read_with(cx, |panel, _| {
+                                    panel.session_id.as_deref()
+                                        == Some(session_id.as_str())
+                                })
+                                .unwrap_or(false);
+                            if !current_session {
+                                return;
+                            }
+                            shell
+                                .update_in(cx, |shell, window, cx| {
+                                    shell.open_shared_buffer(
+                                        session_id.clone(),
+                                        snapshot,
+                                        Some(line),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .map_err(|error| error.to_string())
+                        }
+                        Err(error) => Err(error.message),
+                    }
+                } else {
+                    Err("AHEAD proxy is unavailable".into())
+                }
+            } else {
+                shell
+                    .update_in(cx, |shell, window, cx| {
+                        shell.follow_host_line(&path, line, window, cx);
+                    })
+                    .map_err(|error| error.to_string())
+            };
+            this.update_in(cx, |panel, _, cx| {
+                if panel.session_id.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                panel.status = match result {
+                    Ok(()) => {
+                        if panel.follow_origin.as_ref()
+                            == Some(&(path.clone(), line))
+                        {
+                            panel.follow_origin = None;
+                        }
+                        "Returned to previous location".into()
+                    }
+                    Err(error) => format!("Return failed: {error}").into(),
+                };
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn disconnect_shared_guest(&self, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        if !self.shared_guest {
+            return;
+        }
+        let shell = self.shell.clone();
+        let left_session_id = session_id.clone();
+        cx.spawn(async move |_, cx| {
+            if let Some(shell) = shell {
+                shell
+                    .update(cx, |shell, cx| {
+                        shell.stop_shared_buffers(&left_session_id, cx)
+                    })
+                    .log_err();
+            }
+            let result = cx
+                .background_spawn(
+                    async move { proxy.leave_shared_session(session_id) },
+                )
+                .await;
+            if let Err(error) = result {
+                eprintln!("AHEAD could not leave shared session: {}", error.message);
+            }
+        })
+        .detach();
+    }
+
+    fn disconnect_shared_host(&mut self, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(offer)) =
+            (self.proxy.clone(), self.share_offer.clone())
+        else {
+            return;
+        };
+        let stopped_session_id = offer.session_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.stop_sharing_session(offer.session_id)
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                match result {
+                    Ok(())
+                        if panel.share_offer.as_ref().is_some_and(|offer| {
+                            offer.session_id == stopped_session_id
+                        }) =>
+                    {
+                        panel.share_offer = None;
+                        panel.last_published_terminal = None;
+                        panel.clear_shared_presence();
+                    }
+                    Err(error) => {
+                        panel.status = format!(
+                            "Previous share is still active: {}",
+                            error.message
+                        )
+                        .into()
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn send_shared_chat(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_connection_lost {
+            self.status = "Shared session disconnected; leave and rejoin".into();
+            cx.notify();
+            return;
+        }
+        let (Some(proxy), Some(session_id), Some(view)) = (
+            self.proxy.clone(),
+            self.session_id.clone(),
+            self.session.active.as_ref(),
+        ) else {
+            self.status = "Shared session is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let recipients = ahead_rpc::ahead::mentioned_participants(
+            &text,
+            &view.participants,
+            self.shared_actor_id.as_deref().unwrap_or_default(),
+        );
+        let human_only = !recipients.is_empty();
+        let draft = text.clone();
+        let response_session_id = session_id.clone();
+        self.clear_chat_input(window, cx);
+        self.status = if human_only {
+            format!("Sending to {}…", recipients.join(", ")).into()
+        } else {
+            "Asking host agent…".into()
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if human_only {
+                        proxy
+                            .post_shared_human_message(session_id.clone(), text)
+                            .map(|message| Some(message))
+                    } else {
+                        proxy
+                            .start_shared_agent_turn(session_id.clone(), text)
+                            .map(|_| None)
+                    }
+                })
+                .await;
+            this.update_in(cx, |panel, window, cx| {
+                if !panel.shared_guest
+                    || panel.session_id.as_deref()
+                        != Some(response_session_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(Some(message)) => {
+                        if !panel
+                            .conversation
+                            .iter()
+                            .any(|item| item.id == message.id)
+                        {
+                            panel.conversation.push(message);
+                            panel.conversation.sort_by_key(|item| item.sequence);
+                            panel.sync_conversation_scroller(false, cx);
+                        }
+                        panel.status = "Sent to session participants".into();
+                    }
+                    Ok(None) => panel.status = "Host agent turn started".into(),
+                    Err(error) => {
+                        if panel.chat_input.read(cx).value().is_empty() {
+                            panel.chat_input.update(cx, |input, cx| {
+                                input.set_value(draft, window, cx)
+                            });
+                        }
+                        panel.status =
+                            format!("Message failed: {}", error.message).into();
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn share_active_session(&mut self, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        self.share_starting = true;
+        self.status = "Starting direct session sharing…".into();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let members = proxy.workspace_participants()?;
+                    let offer =
+                        proxy.share_session(session_id, "0.0.0.0:0".into())?;
+                    Ok::<_, ahead_rpc::RpcError>((offer, members))
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.share_starting = false;
+                match result {
+                    Ok((offer, members)) => {
+                        panel.status =
+                            format!("Sharing on {}", offer.address).into();
+                        panel.share_offer = Some(offer);
+                        panel.team_members = members;
+                        panel.last_published_terminal = None;
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Share failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn publish_shared_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.publishing_terminal {
+            return;
+        }
+        let (Some(proxy), Some(offer), Some(shell)) = (
+            self.proxy.clone(),
+            self.share_offer.as_ref(),
+            self.shell.as_ref(),
+        ) else {
+            return;
+        };
+        if self.session_id.as_deref() != Some(offer.session_id.as_str()) {
+            return;
+        }
+        let Ok(mut output) =
+            shell.read_with(cx, |shell, cx| shell.shared_terminal_text(cx))
+        else {
+            return;
+        };
+        if output.len() > 64 * 1024 {
+            let first = output
+                .char_indices()
+                .find(|(index, _)| *index >= output.len() - 64 * 1024)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            output = output[first..].to_string();
+        }
+        if self.last_published_terminal.as_deref() == Some(output.as_str()) {
+            return;
+        }
+        let session_id = offer.session_id.clone();
+        let published = output.clone();
+        self.publishing_terminal = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.publish_shared_terminal(session_id, output)
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.publishing_terminal = false;
+                if result.is_ok() {
+                    panel.last_published_terminal = Some(published);
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn poll_shared_comments(&mut self, cx: &mut Context<Self>) {
+        if self.shared_comment_polling || self.shared_guest {
+            return;
+        }
+        let (Some(proxy), Some(offer), Some(session_id)) = (
+            self.proxy.clone(),
+            self.share_offer.as_ref(),
+            self.session_id.clone(),
+        ) else {
+            return;
+        };
+        if offer.session_id != session_id {
+            return;
+        }
+        self.shared_comment_polling = true;
+        cx.spawn(async move |this, cx| {
+            let request_session_id = session_id.clone();
+            let result = cx
+                .background_spawn(
+                    async move { proxy.code_comments(&request_session_id) },
+                )
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.shared_comment_polling = false;
+                if panel.shared_guest
+                    || panel.session_id.as_deref() != Some(session_id.as_str())
+                    || !panel
+                        .share_offer
+                        .as_ref()
+                        .is_some_and(|offer| offer.session_id == session_id)
+                {
+                    return;
+                }
+                match result {
+                    Ok(comments) => {
+                        if panel.code_comments != comments {
+                            panel.code_comments = comments;
+                            panel.sync_editor_comments(cx);
+                            cx.notify();
+                        }
+                        if panel.comment_error.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        if panel.comment_error.as_deref()
+                            != Some(error.message.as_str())
+                        {
+                            panel.comment_error = Some(error.message);
+                            cx.notify();
+                        }
+                    }
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn poll_shared_presence(&mut self, cx: &mut Context<Self>) {
+        if self.presence_polling || self.shared_guest {
+            return;
+        }
+        let (Some(proxy), Some(offer), Some(shell)) = (
+            self.proxy.clone(),
+            self.share_offer.as_ref(),
+            self.shell.as_ref(),
+        ) else {
+            return;
+        };
+        if self.session_id.as_deref() != Some(offer.session_id.as_str())
+            || self.last_presence_poll.is_some_and(|last| {
+                last.elapsed() < std::time::Duration::from_secs(1)
+            })
+        {
+            return;
+        }
+        let Ok(location) = shell.read_with(cx, |shell, cx| {
+            shell.shared_presence_location(&offer.session_id, false, cx)
+        }) else {
+            return;
+        };
+        let session_id = offer.session_id.clone();
+        let request_session_id = session_id.clone();
+        let changed = self.last_published_presence.as_ref() != Some(&location);
+        let published_location = location.clone();
+        self.presence_polling = true;
+        self.last_presence_poll = Some(std::time::Instant::now());
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let published = if changed {
+                        let (path, line) = location
+                            .map_or((None, None), |(path, line)| {
+                                (Some(path), Some(line))
+                            });
+                        proxy.publish_shared_presence(session_id.clone(), path, line)
+                    } else {
+                        Ok(())
+                    };
+                    (published, proxy.shared_presence(session_id))
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.presence_polling = false;
+                if panel
+                    .share_offer
+                    .as_ref()
+                    .is_none_or(|offer| offer.session_id != request_session_id)
+                {
+                    return;
+                }
+                if result.0.is_ok() {
+                    panel.last_published_presence = Some(published_location);
+                } else if let Err(error) = &result.0 {
+                    panel.status =
+                        format!("Presence update failed: {}", error.message).into();
+                    cx.notify();
+                }
+                if let Ok(presence) = result.1 {
+                    if panel.shared_presence != presence {
+                        panel.shared_presence = presence;
+                        panel.stop_following_disconnected_participant();
+                        cx.notify();
+                    }
+                } else if let Err(error) = result.1 {
+                    panel.status =
+                        format!("Presence refresh failed: {}", error.message).into();
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn stop_sharing_session(&mut self, cx: &mut Context<Self>) {
+        let (Some(proxy), Some(offer)) =
+            (self.proxy.clone(), self.share_offer.clone())
+        else {
+            return;
+        };
+        self.status = "Stopping session sharing…".into();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.stop_sharing_session(offer.session_id)
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                match result {
+                    Ok(()) => {
+                        panel.share_offer = None;
+                        panel.clear_shared_presence();
+                        panel.last_published_terminal = None;
+                        panel.status = "Session sharing stopped".into();
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Stop sharing failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn invite_session_participant(
+        &mut self,
+        selected_handle: Option<String>,
+        role: ahead_rpc::ahead::SessionRole,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        let handle = selected_handle
+            .unwrap_or_else(|| self.invite_input.read(cx).value().to_string());
+        if handle.trim().is_empty() {
+            self.status = "Enter a GitHub username".into();
+            cx.notify();
+            return;
+        }
+        self.invite_pending = true;
+        self.status = format!("Adding @{handle} to session…").into();
+        let response_session_id = session_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.add_session_participant(session_id, handle, role)
+                })
+                .await;
+            this.update_in(cx, |panel, window, cx| {
+                panel.invite_pending = false;
+                if panel.session_id.as_deref() != Some(response_session_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(view) => {
+                        ahead_viewmodel::adopt_session(&mut panel.session, view);
+                        panel
+                            .invite_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        panel.status =
+                            "Participant added; copy the invite for them".into();
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Invite failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn revoke_session_participant(
+        &mut self,
+        handle: String,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.session_id.clone())
+        else {
+            return;
+        };
+        self.status = format!("Removing @{handle}…").into();
+        let response_session_id = session_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.revoke_session_participant(session_id, handle)
+                })
+                .await;
+            this.update(cx, |panel, cx| {
+                if panel.session_id.as_deref() != Some(response_session_id.as_str())
+                {
+                    return;
+                }
+                match result {
+                    Ok(view) => {
+                        ahead_viewmodel::adopt_session(&mut panel.session, view);
+                        panel.status = "Participant removed".into();
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Remove failed: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     /// Writes a portable readable checkpoint without interrupting the active
     /// harness turn; the checkpoint contains the durable session snapshot.
     pub fn export_checkpoint(&mut self, cx: &mut Context<Self>) {
@@ -2822,9 +4243,23 @@ impl SessionPanel {
         cx.notify();
     }
 
+    fn clear_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_context_menu = false;
+        self.chat_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
     pub fn send_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.chat_input.read(cx).value().to_string();
         if text.trim().is_empty() {
+            return;
+        }
+        if self.session_id.is_none() && text.trim_start().starts_with('{') {
+            self.join_shared_session(window, cx);
+            return;
+        }
+        if self.shared_guest {
+            self.send_shared_chat(text, window, cx);
             return;
         }
         self.interrupt_speech();
@@ -2838,17 +4273,81 @@ impl SessionPanel {
             cx.notify();
             return;
         }
+        if let Some(view) = self.session.active.as_ref().filter(|view| {
+            self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
+                && self.session_id.as_deref() == Some(view.session.id.as_str())
+                && matches!(
+                    view.session.lifecycle,
+                    ahead_rpc::ahead::SessionLifecycle::Active
+                )
+        }) {
+            let recipients = ahead_rpc::ahead::mentioned_participants(
+                &text,
+                &view.participants,
+                &view.session.owner_id,
+            );
+            if !recipients.is_empty() {
+                let (Some(proxy), Some(session_id)) =
+                    (self.proxy.clone(), self.session_id.clone())
+                else {
+                    self.status =
+                        "Session unavailable — message was not sent".into();
+                    cx.notify();
+                    return;
+                };
+                let draft = text.clone();
+                self.clear_chat_input(window, cx);
+                self.status =
+                    format!("Sending to {}…", recipients.join(", ")).into();
+                cx.spawn_in(window, async move |this, cx| {
+                    let request_session_id = session_id.clone();
+                    let result = cx
+                        .background_spawn(async move {
+                            proxy.post_human_message(request_session_id, text)
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |panel, window, cx| {
+                        if panel.session_id.as_deref() != Some(session_id.as_str()) {
+                            return;
+                        }
+                        match result {
+                            Ok(_) => {
+                                if let Some(proxy) = panel.proxy.clone() {
+                                    panel.refresh_conversation(&proxy, &session_id);
+                                    panel.sync_conversation_scroller(false, cx);
+                                }
+                                panel.status = "Sent to session participants".into();
+                            }
+                            Err(error) => {
+                                if panel.chat_input.read(cx).value().is_empty() {
+                                    panel.chat_input.update(cx, |input, cx| {
+                                        input.set_value(draft, window, cx);
+                                    });
+                                }
+                                panel.status =
+                                    format!("Message failed: {}", error.message)
+                                        .into();
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                cx.notify();
+                return;
+            }
+        }
         if let Some(request) = &self.pending_user_input {
             let unanswered = request.questions.iter().find(|question| {
                 (question.options.is_empty() || question.allows_other)
+                    && question.external_url.is_none()
                     && !question.is_secret
                     && !self.user_input_answers.contains_key(&question.id)
             });
             if let Some(question) = unanswered {
                 self.user_input_answers
                     .insert(question.id.clone(), vec![text.trim().to_string()]);
-                self.chat_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.clear_chat_input(window, cx);
                 self.status = "Answer recorded — submit when ready".into();
                 cx.notify();
                 return;
@@ -2882,8 +4381,7 @@ impl SessionPanel {
             cx.notify();
             return;
         }
-        self.chat_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.clear_chat_input(window, cx);
         self.conversation_scroller
             .update(cx, |state, cx| state.scroll_to_end(cx));
         self.start_agent_turn(text, window, cx);
@@ -2900,7 +4398,28 @@ impl SessionPanel {
             .user_input_answers
             .entry(question_id.to_string())
             .or_default();
-        if question_id.starts_with("mcp_tool_call_approval_") {
+        if self
+            .pending_user_input
+            .as_ref()
+            .is_some_and(|request| request.request_id.starts_with("mcp-form-"))
+            && (answer == ahead_rpc::ahead::MCP_FORM_SKIP_VALUE
+                || !question_id.starts_with("mcp_multi_"))
+        {
+            answers.clear();
+            answers.push(answer.to_string());
+        } else if self
+            .pending_user_input
+            .as_ref()
+            .is_some_and(|request| request.request_id.starts_with("mcp-form-"))
+            && answers
+                .iter()
+                .any(|selected| selected == ahead_rpc::ahead::MCP_FORM_SKIP_VALUE)
+        {
+            answers.clear();
+            answers.push(answer.to_string());
+        } else if question_id.starts_with("mcp_tool_call_approval_")
+            || question_id.starts_with("acp_permission_")
+        {
             answers.clear();
             answers.push(answer.to_string());
         } else if let Some(index) =
@@ -2917,41 +4436,98 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn submit_user_input(&mut self, cx: &mut Context<Self>) {
+    fn clear_user_input_answer(
+        &mut self,
+        question_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.user_input_answers.remove(question_id);
+        cx.notify();
+    }
+
+    fn submit_user_input(
+        &mut self,
+        action: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (Some(proxy), Some(session_id), Some(request)) = (
             self.proxy.clone(),
             self.session_id.clone(),
             self.pending_user_input.clone(),
         ) else {
-            return;
+            return false;
         };
-        if !can_submit_user_input(&request, &self.user_input_answers) {
+        if action.is_none()
+            && !can_submit_user_input(&request, &self.user_input_answers)
+        {
             self.status =
                 "Answer every non-secret question before submitting".into();
             cx.notify();
-            return;
+            return false;
         }
-        let answers = self
-            .user_input_answers
-            .iter()
-            .map(|(id, answers)| (id.clone(), answers.clone()))
-            .collect();
-        match proxy.answer_agent_user_input(
+        if action.is_some()
+            && !request.request_id.starts_with("mcp-form-")
+            && !request.request_id.starts_with("mcp-url-")
+        {
+            return false;
+        }
+        let answers = if let Some(action) = action {
+            HashMap::from([(
+                ahead_rpc::ahead::MCP_FORM_ACTION_KEY.to_string(),
+                vec![action.to_string()],
+            )])
+        } else {
+            self.user_input_answers.clone()
+        };
+        let submitted = match proxy.answer_agent_user_input(
             &session_id,
             &request.request_id,
             answers,
         ) {
             Ok(()) => {
-                self.pending_user_input = None;
-                self.user_input_answers.clear();
-                self.status = "Answer sent — agent resumed".into();
+                self.refresh_user_input(&proxy, &session_id);
+                self.status = if self.pending_user_input.is_some() {
+                    "Answer sent — next request ready".into()
+                } else {
+                    "Answer sent — agent resumed".into()
+                };
+                true
             }
             Err(error) => {
                 self.status =
                     format!("Could not answer agent: {}", error.message).into();
+                false
             }
-        }
+        };
         cx.notify();
+        submitted
+    }
+
+    fn open_mcp_url(
+        &mut self,
+        request_id: &str,
+        raw_url: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.pending_user_input.as_ref().is_some_and(|request| {
+            request.request_id == request_id
+                && request.questions.iter().any(|question| {
+                    question.external_url.as_deref() == Some(raw_url)
+                })
+        }) {
+            self.status =
+                "MCP request changed — review the current destination".into();
+            cx.notify();
+            return;
+        }
+        let Some(url) = ahead_rpc::ahead::validated_mcp_url(raw_url) else {
+            self.status = "Unsafe MCP destination — link was not opened".into();
+            cx.notify();
+            return;
+        };
+        if self.submit_user_input(Some("accept"), cx) {
+            cx.open_url(url.as_str());
+        }
     }
 
     pub fn advance_phase(&mut self, cx: &mut Context<Self>) {
@@ -3113,15 +4689,53 @@ impl Render for SessionPanel {
             );
             Some((name, description))
         });
-        let has_context_attachments = active_editor_context.is_some()
-            || !self.attached_files.is_empty()
-            || !self.attached_memories.is_empty();
+        let has_context_attachments = !self.shared_guest
+            && (active_editor_context.is_some()
+                || !self.attached_files.is_empty()
+                || !self.attached_memories.is_empty());
         let context_window = self
             .harness_context_window
             .unwrap_or(u64::from(model.context_window));
         let pct = (self.context_used as f32 / context_window.max(1) as f32)
             .clamp(0.0, 1.0);
         let chat_available = self.session_id.is_some();
+        let can_share = !self.shared_guest
+            && self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
+            && self.session.active.as_ref().is_some_and(|view| {
+                self.session_id.as_deref() == Some(view.session.id.as_str())
+                    && matches!(
+                        view.session.lifecycle,
+                        ahead_rpc::ahead::SessionLifecycle::Active
+                    )
+            });
+        let human_recipients =
+            if self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead {
+                self.session
+                    .active
+                    .as_ref()
+                    .filter(|view| {
+                        matches!(
+                            view.session.lifecycle,
+                            ahead_rpc::ahead::SessionLifecycle::Active
+                        )
+                    })
+                    .map_or_else(Vec::new, |view| {
+                        ahead_rpc::ahead::mentioned_participants(
+                            self.chat_input.read(cx).value().as_ref(),
+                            &view.participants,
+                            self.shared_actor_id
+                                .as_deref()
+                                .unwrap_or(&view.session.owner_id),
+                        )
+                    })
+            } else {
+                Vec::new()
+            };
+        let human_recipient_label = human_recipients
+            .iter()
+            .map(|id| format!("@{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let managed_ahead =
             self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead;
         let agent_label =
@@ -3140,6 +4754,13 @@ impl Render for SessionPanel {
         let has_older_messages = self.conversation_has_older;
         let loading_older_messages = self.loading_older_messages;
         let pending_user_input = self.pending_user_input.clone();
+        let pending_user_input_count = self
+            .proxy
+            .as_ref()
+            .zip(self.session_id.as_deref())
+            .map_or(0, |(proxy, session_id)| {
+                proxy.pending_user_input_count(session_id)
+            });
         let user_input_answers = self.user_input_answers.clone();
         let session_panel = cx.entity();
         let command_panel = session_panel.clone();
@@ -3465,9 +5086,7 @@ impl Render for SessionPanel {
                         this.invalidate_skill_catalog();
                         this.show_context_menu = false;
                         this.command_query.clear();
-                        let input = this.chat_input.clone();
-                        input
-                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        this.clear_chat_input(window, cx);
                         this.status = "AHEAD memory attached as context".into();
                         cx.notify();
                     });
@@ -3539,6 +5158,7 @@ impl Render for SessionPanel {
                                 .icon(IconName::Plus)
                                 .label("Start new AHEAD session")
                                 .tooltip("Start new AHEAD session")
+                                .disabled(self.share_starting)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_thread(
                                         ahead_rpc::ahead::HarnessKind::Ahead,
@@ -3552,6 +5172,7 @@ impl Render for SessionPanel {
                                 .icon(IconName::Bot)
                                 .label("Start external agent")
                                 .tooltip("Start external agent")
+                                .disabled(self.share_starting)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_thread(
                                         ahead_rpc::ahead::HarnessKind::ExternalAcp,
@@ -3561,6 +5182,30 @@ impl Render for SessionPanel {
                                 })),
                         ),
                 )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().w(px(300.)).child(
+                                Textarea::new(&self.chat_input)
+                                    .aria_label("Paste shared session invite JSON")
+                                    .w_full()
+                                    .max_h(px(80.)),
+                            ),
+                        )
+                        .child(
+                            Button::new("join_shared_ahead_session")
+                                .icon(IconName::Users)
+                                .label("Join shared session")
+                                .tooltip("Join an active host session from a copied invite")
+                                .disabled(self.share_starting)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.join_shared_session(window, cx);
+                                })),
+                        ),
+                )
+                .child(div().text_size(px(11.)).child(self.status.clone()))
                 .into_any_element()
         } else if conversation.is_empty() {
             div()
@@ -3595,12 +5240,17 @@ impl Render for SessionPanel {
                     let Some(message) = conversation.get(index) else {
                         return div().into_any_element();
                     };
-                    let is_human = message.role == "human";
+                    let is_human = message.role == "human"
+                        || message.human_recipient_ids().is_some();
+                    let human_only = message.human_recipient_ids().is_some();
                     let is_streaming = message.status == "streaming"
                         && active_turn_id.as_deref()
                             == Some(message.turn_id.as_str());
-                    let header = if is_human {
-                        "You".to_string()
+                    let header = if let Some(recipients) = message.human_recipient_ids() {
+                        let sender = message.actor_id.as_str();
+                        format!("{sender} · to {}", recipients.iter().map(|id| format!("@{id}")).collect::<Vec<_>>().join(", "))
+                    } else if is_human {
+                        if message.actor_id == "human" { "You".to_string() } else { message.actor_id.clone() }
                     } else if is_streaming {
                         format!("{agent_label_for_messages} · streaming")
                     } else if message.status == "cancelled" {
@@ -3670,8 +5320,8 @@ impl Render for SessionPanel {
                                             .icon(IconName::MessageSquare)
                                             .label(label)
                                             .tooltip("Open referenced code comment")
-                                            .on_click(window.listener_for(&session_panel, move |this, _, _, cx| {
-                                                this.open_code_comment(&comment, cx);
+                                            .on_click(window.listener_for(&session_panel, move |this, _, window, cx| {
+                                                this.open_code_comment(&comment, window, cx);
                                             }))
                                     })),
                             ))
@@ -3745,8 +5395,8 @@ impl Render for SessionPanel {
                                                 .icon(IconName::MessageSquare)
                                                 .label(label)
                                                 .tooltip("Open referenced code comment")
-                                                .on_click(window.listener_for(&session_panel, move |this, _, _, cx| {
-                                                    this.open_code_comment(&comment, cx);
+                                                .on_click(window.listener_for(&session_panel, move |this, _, window, cx| {
+                                                    this.open_code_comment(&comment, window, cx);
                                                 }))
                                         }))
                                         .when(retryable, |footer| {
@@ -3794,7 +5444,7 @@ impl Render for SessionPanel {
                                     ),
                                 ),
                             );
-                            if quoted_content.trim().is_empty() {
+                            if quoted_content.trim().is_empty() || human_only {
                                 return menu;
                             }
                             if let (Some(review), Some(proposal)) = (
@@ -3901,22 +5551,20 @@ impl Render for SessionPanel {
             .track_focus(&self.focus)
             // Top Thread Title Header
             .child(
-                h_flex()
-                    .min_h(px(38.))
+                v_flex()
                     .min_w_0()
-                    .flex_wrap()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
                     .px_3()
                     .border_b_1()
                     .border_color(border_color)
                     .when(chat_available, |bar| bar.child(
                         h_flex()
-                            .flex_1()
+                            .min_h(px(38.))
+                            .w_full()
                             .min_w_0()
+                            .flex_wrap()
                             .gap_2()
                             .items_center()
+                            .justify_between()
                             .child(
                                 div()
                                     .flex_1()
@@ -3944,32 +5592,7 @@ impl Render for SessionPanel {
                                     })
                                     .child(agent_label.clone()),
                             )
-                    )
-                    .when(chat_available, |bar| bar.child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .child(
-                                Button::new("export_checkpoint")
-                                    .icon(IconName::FileOutput)
-                                    .flex_shrink_0()
-                                    .tooltip("Export Session Checkpoint")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                        this.export_checkpoint(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("code_comments_toggle")
-                                    .icon(IconName::MessageSquare)
-                                    .label(format!("Comments ({})", self.code_comments.iter().filter(|comment| comment.resolved_at.is_none()).count()))
-                                    .tooltip("Show or hide this session's code comments")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                        this.comments_expanded = !this.comments_expanded;
-                                        if this.comments_expanded { this.refresh_code_comments(cx); }
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(can_handoff, |actions| actions.child(
+                            .when(can_handoff, |bar| bar.child(
                                 Button::new("handoff_implementation")
                                     .icon(IconName::ArrowRight)
                                     .label("Hand off")
@@ -3979,9 +5602,9 @@ impl Render for SessionPanel {
                                         this.open_implementation_handoff(window, cx);
                                     })),
                             ))
-                            .when_some(parent_thread.clone(), |actions, parent_thread| {
+                            .when_some(parent_thread.clone(), |bar, parent_thread| {
                                 let threads = self.thread_launcher.clone();
-                                actions.child(
+                                bar.child(
                                     Button::new("return_to_ahead_review")
                                         .icon(IconName::ArrowLeft)
                                         .label("Return to review")
@@ -3995,13 +5618,74 @@ impl Render for SessionPanel {
                                         }),
                                 )
                             })
+                    )
+                    .when(chat_available, |bar| bar.child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .justify_end()
+                            .gap_1()
+                            .when(can_share && self.share_offer.is_none(), |actions| actions.child(
+                                Button::new("share_ahead_session")
+                                    .icon(IconName::Users)
+                                    .tooltip("Share session")
+                                    .disabled(self.share_starting)
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.share_active_session(cx);
+                                    })),
+                            ))
+                            .when(self.shared_guest, |actions| actions.child(
+                                Button::new("leave_shared_ahead_session")
+                                    .icon(IconName::LogOut)
+                                    .label("Leave")
+                                    .tooltip("Leave this host session")
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.leave_shared_session(cx);
+                                    })),
+                            ))
+                            .when_some(self.share_offer.clone(), |actions, offer| {
+                                let invite = serde_json::json!({
+                                    "session_id": &offer.session_id,
+                                    "address": &offer.address,
+                                    "certificate": &offer.certificate,
+                                }).to_string();
+                                actions
+                                    .child(div().text_size(px(10.)).child(format!("Sharing session {} on {}", offer.session_id.chars().take(8).collect::<String>(), offer.address)))
+                                    .child(Clipboard::new("copy-session-invite").value(invite))
+                                    .child(
+                                        Button::new("stop_session_sharing")
+                                            .icon(IconName::X)
+                                            .tooltip("Stop sharing this session")
+                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                this.stop_sharing_session(cx);
+                                            })),
+                                    )
+                            })
+                            .child(
+                                Button::new("export_checkpoint")
+                                    .icon(IconName::FileOutput)
+                                    .flex_shrink_0()
+                                    .tooltip("Export session checkpoint")
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.export_checkpoint(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("code_comments_toggle")
+                                    .icon(IconName::MessageSquareCode)
+                                    .tooltip(format!("Comments ({})", self.code_comments.iter().filter(|comment| comment.resolved_at.is_none()).count()))
+                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                        this.comments_expanded = !this.comments_expanded;
+                                        if this.comments_expanded { this.refresh_code_comments(cx); }
+                                        cx.notify();
+                                    })),
+                            )
                     ))
-                    .when(chat_available && self.model_config_warning.is_none() && self.harness_warning.is_none(), |bar| {
+                    .when(chat_available, |bar| {
                         bar.child(
                             div()
                                 .w_full()
                                 .min_w_0()
-                                .truncate()
                                 .text_size(px(10.))
                                 .text_color(muted)
                                 .child(self.status.clone()),
@@ -4032,6 +5716,188 @@ impl Render for SessionPanel {
                         })
                     }))
             )
+            .when(can_share && self.share_offer.as_ref().is_some_and(|offer| {
+                self.session_id.as_deref() == Some(offer.session_id.as_str())
+            }), |panel| {
+                let invited = self.session.active.as_ref().map(|view| {
+                    view.participants.iter().filter_map(|record| {
+                        if record.role == ahead_rpc::ahead::SessionRole::Owner {
+                            return None;
+                        }
+                        match &record.participant {
+                            ahead_rpc::ahead::Participant::Human { id, subject, .. } => {
+                                Some((id.clone(), record.role, subject.starts_with("github:")))
+                            }
+                            _ => None,
+                        }
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                let available_team = self.team_members.iter().filter_map(|record| {
+                    if record.role == ahead_rpc::ahead::SessionRole::Owner {
+                        return None;
+                    }
+                    let ahead_rpc::ahead::Participant::Human { id, display_name, .. } =
+                        &record.participant else {
+                            return None;
+                        };
+                    let already_invited = self.session.active.as_ref().is_some_and(|view| {
+                        view.participants.iter().any(|participant| {
+                            participant.participant.id().eq_ignore_ascii_case(id)
+                        })
+                    });
+                    (!already_invited).then(|| (id.clone(), display_name.clone(), record.role))
+                }).collect::<Vec<_>>();
+                panel.child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_1()
+                        .flex_wrap()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(border_color)
+                        .child(div().w(px(150.)).child(
+                            Textarea::new(&self.invite_input)
+                                .aria_label("GitHub username to invite")
+                                .w_full(),
+                        ))
+                        .child(
+                            Button::new("invite_session_editor")
+                                .icon(IconName::Plus)
+                                .label("Editor")
+                                .tooltip("Invite as editor; can ask the host agent")
+                                .disabled(self.invite_pending)
+                                .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                    this.invite_session_participant(None, ahead_rpc::ahead::SessionRole::Editor, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("invite_session_reviewer")
+                                .icon(IconName::Plus)
+                                .label("Reviewer")
+                                .tooltip("Invite as reviewer; can send human messages")
+                                .disabled(self.invite_pending)
+                                .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                    this.invite_session_participant(None, ahead_rpc::ahead::SessionRole::Reviewer, window, cx);
+                                })),
+                        )
+                        .children(available_team.into_iter().map(|(handle, display_name, role)| {
+                            Button::new(format!("invite_team_member_{handle}"))
+                                .icon(IconName::Plus)
+                                .label(format!("{display_name} ({role:?})"))
+                                .tooltip("Invite this team member to the session")
+                                .disabled(self.invite_pending)
+                                .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                    this.invite_session_participant(Some(handle.clone()), role, window, cx);
+                                }))
+                        }))
+                        .children(invited.into_iter().map(|(handle, role, verified)| {
+                            let label = if verified {
+                                format!("@{handle} ({role:?})")
+                            } else {
+                                format!("@{handle} (unverified)")
+                            };
+                            Button::new(format!("remove_session_participant_{handle}"))
+                                .icon(IconName::X)
+                                .label(label)
+                                .tooltip("Remove participant from this session")
+                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                    this.revoke_session_participant(handle.clone(), cx);
+                                }))
+                        })),
+                )
+            })
+            .when((self.shared_guest || self.share_offer.is_some()) && !self.shared_presence.is_empty(), |panel| panel.child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .flex_wrap()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(IconName::Users)
+                    .children(self.shared_presence.iter().map(|presence| {
+                        let actor_id = presence.actor_id.clone();
+                        let is_following = self.following_actor.as_deref() == Some(actor_id.as_str());
+                        let location = presence.path.as_ref().map_or_else(
+                            || "online".to_string(),
+                            |path| format!("{path}:{}", presence.line.unwrap_or(0).saturating_add(1)),
+                        );
+                        Button::new(SharedString::from(format!("follow-{actor_id}")))
+                            .ghost()
+                            .label(format!("{} · {}{}", actor_id, location, if is_following { " · following" } else { "" }))
+                            .tooltip(if is_following { "Stop following this participant" } else { "Follow this participant's file and line" })
+                            .disabled(self.shared_actor_id.as_deref() == Some(actor_id.as_str()))
+                            .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                                this.follow_shared_actor(actor_id.clone(), window, cx);
+                            }))
+                    }))
+                    .when(self.follow_origin.is_some() && self.following_actor.is_none(), |row| row.child(
+                        Button::new("return_follow_origin")
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .label("Return")
+                            .tooltip("Return to the file and line from before following")
+                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                this.return_to_follow_origin(window, cx);
+                            }))
+                    ))
+            ))
+            .when(self.shared_guest, |panel| panel.child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.shared_file_input)
+                                .aria_label("File to open from host workspace")
+                                .w_full()
+                        )
+                    )
+                    .child(
+                        Button::new("open_shared_file")
+                            .icon(IconName::FileCode)
+                            .label("Open shared file")
+                            .tooltip("Open a host file; editors can make live changes")
+                            .disabled(self.shared_file_opening || self.shared_connection_lost)
+                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                this.open_shared_file(window, cx);
+                            }))
+                    )
+            ))
+            .when(self.shared_guest && !self.shared_terminal_output.is_empty(), |panel| panel.child(
+                v_flex()
+                    .mx_3()
+                    .mt_2()
+                    .p_2()
+                    .gap_1()
+                    .min_w_0()
+                    .max_h(px(180.))
+                    .overflow_y_scrollbar()
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(border_color)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.))
+                            .child(IconName::Terminal)
+                            .child("Host terminal · read only")
+                    )
+                    .children(self.shared_terminal_output.lines().map(|line| {
+                        div()
+                            .text_size(px(10.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .whitespace_nowrap()
+                            .child(line.to_string())
+                    }))
+            ))
             .when(chat_available && self.comments_expanded, |panel| panel.child(
                 v_flex()
                     .mx_3()
@@ -4089,8 +5955,8 @@ impl Render for SessionPanel {
                                             .icon(IconName::FileCode)
                                             .label(format!("{}:{}", comment.path, comment.range.start.line + 1))
                                             .tooltip("Open the commented code range")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_code_comment(&open_comment, cx);
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_code_comment(&open_comment, window, cx);
                                             })),
                                     )
                                     .child(
@@ -4282,10 +6148,25 @@ impl Render for SessionPanel {
                         )
                     })
                     .when_some(pending_user_input, |el, request| {
-                        let request_label = if request.is_blocking {
+                        let is_mcp_form = request.request_id.starts_with("mcp-form-");
+                        let is_mcp_url = request.request_id.starts_with("mcp-url-");
+                        let mcp_url = request
+                            .questions
+                            .iter()
+                            .find_map(|question| question.external_url.clone());
+                        let request_label = if is_mcp_form {
+                            "MCP server needs information"
+                        } else if is_mcp_url {
+                            "MCP server wants to open a website"
+                        } else if request.is_blocking {
                             "Agent needs your input"
                         } else {
                             "Agent requested optional input"
+                        };
+                        let request_label = if pending_user_input_count > 1 {
+                            format!("{request_label} · {pending_user_input_count} pending")
+                        } else {
+                            request_label.to_string()
                         };
                         let can_submit =
                             can_submit_user_input(&request, &user_input_answers);
@@ -4318,6 +6199,7 @@ impl Render for SessionPanel {
                                         .cloned();
                                     let is_secret = question.is_secret;
                                     let accepts_free_text = !is_secret
+                                        && question.external_url.is_none()
                                         && (question.options.is_empty()
                                             || question.allows_other);
                                     let options = question.options;
@@ -4337,6 +6219,25 @@ impl Render for SessionPanel {
                                                 .text_color(text_color)
                                                 .child(question.question),
                                         )
+                                        .when_some(question.external_url, |question, url| {
+                                            let host = ahead_rpc::ahead::validated_mcp_url(&url)
+                                                .and_then(|parsed| parsed.host_str().map(str::to_string))
+                                                .unwrap_or_else(|| "Invalid destination".to_string());
+                                            let characters = url.chars().collect::<Vec<_>>();
+                                            question.child(
+                                                v_flex()
+                                                    .gap_1()
+                                                    .child(div().text_size(px(11.)).text_color(text_color).child(format!("Destination: {host}")))
+                                                    .child(h_flex().min_w_0().flex_wrap().children(
+                                                        characters.chunks(24).map(|chunk| {
+                                                            div()
+                                                                .text_size(px(10.))
+                                                                .text_color(muted)
+                                                                .child(chunk.iter().collect::<String>())
+                                                        }),
+                                                    )),
+                                            )
+                                        })
                                         .when(is_secret, |question| {
                                             question.child(
                                                 div()
@@ -4354,7 +6255,7 @@ impl Render for SessionPanel {
                                                     let selected = selected.clone();
                                                     let question_id = question_id.clone();
                                                     move |(index, option)| {
-                                                        let answer = option.label.clone();
+                                                        let answer = option.value.clone();
                                                         let is_selected = selected
                                                             .as_ref()
                                                             .is_some_and(|answers| answers.contains(&answer));
@@ -4388,30 +6289,91 @@ impl Render for SessionPanel {
                                             accepts_free_text,
                                             |question| {
                                                 question.child(
-                                                    div()
-                                                        .text_size(px(10.))
-                                                        .text_color(muted)
-                                                        .child(match selected {
-                                                            Some(answers) => format!(
-                                                                "Composer answer: {}",
-                                                                answers.join(", ")
-                                                            ),
-                                                            None => "Type an answer in the composer and press Enter".to_string(),
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.))
+                                                                .text_color(muted)
+                                                                .child(match selected.clone() {
+                                                                    Some(answers) => format!(
+                                                                        "Composer answer: {}",
+                                                                        answers.join(", ")
+                                                                    ),
+                                                                    None => "Type an answer in the composer and press Enter".to_string(),
+                                                                }),
+                                                        )
+                                                        .when(selected.is_some(), |row| {
+                                                            row.child(Button::new(SharedString::from(format!("clear-agent-input-{question_id}")))
+                                                                .label("Clear")
+                                                                .ghost()
+                                                                .tooltip("Clear this answer")
+                                                                .on_click({
+                                                                    let panel = session_panel.clone();
+                                                                    let question_id = question_id.clone();
+                                                                    move |_, _, cx| {
+                                                                        panel.update(cx, |this, cx| this.clear_user_input_answer(&question_id, cx));
+                                                                    }
+                                                                }))
                                                         }),
                                                 )
                                             },
                                         )
                                 }))
-                                .child({
+                                .when(is_mcp_form || is_mcp_url, |card| {
+                                    card.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(Button::new("decline-mcp-form")
+                                                .label("Decline")
+                                                .ghost()
+                                                .tooltip("Decline this MCP server request")
+                                                .on_click({
+                                                    let panel = session_panel.clone();
+                                                    move |_, _, cx| {
+                                                        panel.update(cx, |this, cx| this.submit_user_input(Some("decline"), cx));
+                                                    }
+                                                }))
+                                            .child(Button::new("cancel-mcp-form")
+                                                .label("Cancel")
+                                                .ghost()
+                                                .tooltip("Dismiss this MCP server request")
+                                                .on_click({
+                                                    let panel = session_panel.clone();
+                                                    move |_, _, cx| {
+                                                        panel.update(cx, |this, cx| this.submit_user_input(Some("cancel"), cx));
+                                                    }
+                                                })),
+                                    )
+                                })
+                                .when(is_mcp_url, |card| {
+                                    let url = mcp_url.clone();
+                                    let request_id = request.request_id.clone();
+                                    card.child(Button::new("open-mcp-url")
+                                        .label("Open in browser")
+                                        .icon(IconName::ArrowUpRight)
+                                        .tooltip("Open this MCP server destination in your browser")
+                                        .disabled(url.is_none())
+                                        .on_click({
+                                            let panel = session_panel.clone();
+                                            move |_, _, cx| {
+                                                if let Some(url) = &url {
+                                                    panel.update(cx, |this, cx| this.open_mcp_url(&request_id, url, cx));
+                                                }
+                                            }
+                                        }))
+                                })
+                                .when(!is_mcp_url, |card| card.child({
                                     let button = Button::new("submit-agent-input")
-                                        .label(submit_label)
+                                        .label(if is_mcp_form { "Send to MCP server" } else { submit_label })
                                         .icon(IconName::Send)
-                                        .tooltip("Send answers and resume the agent")
+                                        .tooltip(if is_mcp_form { "Review answers and send them to the MCP server" } else { "Send answers and resume the agent" })
                                         .on_click({
                                             let panel = session_panel.clone();
                                             move |_, _, cx| {
                                                 let _ = panel.update(cx, |this, cx| {
-                                                    this.submit_user_input(cx)
+                                                    this.submit_user_input(None, cx)
                                                 });
                                             }
                                         });
@@ -4420,7 +6382,7 @@ impl Render for SessionPanel {
                                     } else {
                                         button.ghost()
                                     }
-                                }),
+                                })),
                         )
                     })
                     .child(
@@ -4597,7 +6559,7 @@ impl Render for SessionPanel {
                                 ),
                         )
                     })
-                    .when(self.show_commands || self.show_context_menu, |composer| {
+                    .when(!self.shared_guest && (self.show_commands || self.show_context_menu), |composer| {
                         composer.child(command_palette)
                     })
                     .when(
@@ -4649,9 +6611,11 @@ impl Render for SessionPanel {
                             .w_full()
                             .child(
                                 Textarea::new(&self.chat_input)
-                                    .aria_label(format!(
-                                        "Message {agent_label}, @ to include context, / for commands"
-                                    ))
+                                    .aria_label(if self.shared_guest {
+                                        "Message host session; @mention a participant or ask the host agent".to_string()
+                                    } else {
+                                        format!("Message {agent_label}, @ to include context, / for commands")
+                                    })
                                     .min_w_0()
                                     .w_full()
                                     .max_h(px(160.)),
@@ -4671,9 +6635,9 @@ impl Render for SessionPanel {
                                     .flex_wrap()
                                     .gap_2()
                                     .items_center()
-                                    .when(self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead, |bar| {
+                                    .when(self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead && !self.shared_guest, |bar| {
                                         bar.child(
-                                            div().w(px(160.)).flex_shrink_0().child(
+                                            div().w(px(120.)).flex_shrink_0().child(
                                             Select::new(&self.model_select)
                                                     .placeholder("Loading models…")
                                                     .disabled(!self.model_config_loaded)
@@ -4682,6 +6646,9 @@ impl Render for SessionPanel {
                                                     .icon(IconName::Bot),
                                             ),
                                         )
+                                    })
+                                    .when(self.shared_guest, |bar| {
+                                        bar.child(div().text_size(px(10.)).text_color(muted).child("Host model · host pays"))
                                     })
                                     .when(self.harness_kind == ahead_rpc::ahead::HarnessKind::ExternalAcp && self.config_options.is_empty(), |bar| {
                                         bar.child(
@@ -4747,7 +6714,7 @@ impl Render for SessionPanel {
                                     .flex_shrink_0()
                                     .gap_2()
                                     .items_center()
-                                    .child(
+                                    .when(!self.shared_guest, |bar| bar.child(
                                         Button::new("add_context_btn")
                                             .icon(IconName::File)
                                             .ghost()
@@ -4756,9 +6723,9 @@ impl Render for SessionPanel {
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.attach_files(window, cx);
                                             })),
-                                    )
+                                    ))
                                     // Context window budget
-                                    .child(
+                                    .when(!self.shared_guest, |bar| bar.child(
                                         h_flex()
                                             .gap_1()
                                             .items_center()
@@ -4787,7 +6754,7 @@ impl Render for SessionPanel {
                                                         context_window as f32 / 1000.0,
                                                     )),
                                             ),
-                                    )
+                                    ))
                                     .when(!self.voice_ready_transcript.is_empty(), |bar| {
                                         bar.child(
                                             Button::new("voice_add_transcript_btn")
@@ -4846,10 +6813,18 @@ impl Render for SessionPanel {
                                                 )),
                                         )
                                     })
+                                    .when(!human_recipients.is_empty(), |bar| {
+                                        bar.child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(muted)
+                                                .child(format!("To people: {human_recipient_label}")),
+                                        )
+                                    })
                                     .child(
                                         Button::new("send_btn")
                                             .primary()
-                                            .disabled(managed_ahead && !self.model_config_loaded && self.pending_user_input.is_none())
+                                            .disabled(managed_ahead && !self.model_config_loaded && self.pending_user_input.is_none() && human_recipients.is_empty())
                                             .icon(IconName::Send)
                                             .flex_shrink_0()
                                             .tooltip("Send Message (Enter)")
@@ -5136,7 +7111,9 @@ mod tests {
                 id: "choice".into(),
                 header: "Scope".into(),
                 question: "Which files?".into(),
+                external_url: None,
                 options: Vec::new(),
+                default_answers: Vec::new(),
                 allows_other: false,
                 is_secret: false,
             }],
@@ -5222,6 +7199,50 @@ mod tests {
             input.replace_all("/plan next step".to_string(), window, cx);
         });
         panel.update(cx, |panel, _| assert!(!panel.show_commands));
+    }
+
+    #[gpui_kit::test]
+    fn composer_shift_enter_inserts_newline_and_enter_submits(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            SessionPanel::new(std::env::temp_dir(), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.session_id = Some("composer-enter-test".into());
+            cx.notify();
+        });
+        let chat_input = panel.update(cx, |panel, _| panel.chat_input.clone());
+        chat_input.update_in(cx, |input, window, cx| {
+            input.focus_handle(cx).focus(window, cx);
+            input.replace_all("first".to_string(), window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            assert!(chat_input.focus_handle(cx).is_focused(window));
+        });
+
+        cx.simulate_keystrokes("enter");
+        panel.update(cx, |panel, cx| {
+            assert_eq!(
+                panel.status.as_ref(),
+                "Agent unavailable — message was not sent"
+            );
+            assert_eq!(panel.chat_input.read(cx).value().as_ref(), "first");
+            panel.status = "Idle".into();
+        });
+
+        cx.simulate_keystrokes("shift-enter");
+        panel.update(cx, |panel, cx| {
+            let value = panel.chat_input.read(cx).value().to_string();
+            assert_eq!(value.replace('\n', ""), "first");
+            assert_eq!(
+                value.chars().filter(|character| *character == '\n').count(),
+                1
+            );
+            assert_eq!(panel.status.as_ref(), "Idle");
+        });
     }
 
     #[gpui_kit::test]
@@ -6104,6 +8125,321 @@ mod tests {
                     .user_input_answers
                     .get("mcp_tool_call_approval_call-1"),
                 Some(&vec!["Cancel".to_string()])
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn rendered_mcp_form_has_server_and_explicit_response_controls(
+        cx: &mut TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{
+            AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
+            AheadNotification,
+        };
+        use gpui_kit::test::TestWindowExt;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = std::env::temp_dir();
+        let proxy =
+            crate::proxy_client::ProxyClient::new_for_test(workspace.clone());
+        let (panel, cx) = cx
+            .add_window_view(|window, cx| SessionPanel::new(workspace, window, cx));
+        proxy.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "message".into(),
+            state: "streaming".into(),
+        });
+        proxy.route_ahead(AheadNotification::AgentUserInputRequested {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            request: AgentUserInputRequest {
+                request_id: "mcp-form-test".into(),
+                is_blocking: true,
+                questions: vec![AgentUserInputQuestion {
+                    id: "mcp_field_0".into(),
+                    header: "MCP server: sample · Color (required)".into(),
+                    question: "Choose a color. Do not enter secrets.".into(),
+                    external_url: None,
+                    options: vec![
+                        AgentUserInputOption {
+                            value: "red".into(),
+                            label: "Red".into(),
+                            description: "Red".into(),
+                        },
+                        AgentUserInputOption {
+                            value: "blue".into(),
+                            label: "Blue".into(),
+                            description: "Blue".into(),
+                        },
+                    ],
+                    default_answers: vec!["blue".into()],
+                    allows_other: false,
+                    is_secret: false,
+                }],
+            },
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.session_id = Some("session".into());
+            panel
+                .conversation
+                .push(ahead_rpc::ahead::ConversationMessage {
+                    id: "human-message".into(),
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    sequence: 1,
+                    role: "human".into(),
+                    actor_id: "human".into(),
+                    content: "Ask the MCP server for colors".into(),
+                    status: "complete".into(),
+                    created_at: String::new(),
+                });
+            panel.refresh_user_input(&proxy, "session");
+            assert_eq!(panel.user_input_answers["mcp_field_0"], vec!["blue"]);
+            panel.select_user_input_answer("mcp_field_0", "red", cx);
+            panel.refresh_user_input(&proxy, "session");
+            assert_eq!(panel.user_input_answers["mcp_field_0"], vec!["red"]);
+            panel.select_user_input_answer("mcp_field_0", "blue", cx);
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("decline-mcp-form").is_some());
+            assert!(window.try_find("cancel-mcp-form").is_some());
+            window.click("agent-input-mcp_field_0-0", cx);
+            window.click("agent-input-mcp_field_0-1", cx);
+        });
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .pending_user_input
+                    .as_ref()
+                    .expect("pending form")
+                    .questions[0]
+                    .header,
+                "MCP server: sample · Color (required)"
+            );
+            assert_eq!(
+                panel.user_input_answers["mcp_field_0"],
+                vec!["blue".to_string()]
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn rendered_mcp_url_requires_open_and_sends_explicit_consent(
+        cx: &mut TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{
+            AgentUserInputQuestion, AgentUserInputRequest, AheadNotification,
+            AheadRequest, MCP_FORM_ACTION_KEY,
+        };
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        use gpui_kit::test::TestWindowExt;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_path_buf(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            SessionPanel::new(workspace.path().to_path_buf(), window, cx)
+        });
+        proxy.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "message".into(),
+            state: "streaming".into(),
+        });
+        proxy.route_ahead(AheadNotification::AgentUserInputRequested {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            request: AgentUserInputRequest {
+                request_id: "mcp-url-test".into(),
+                is_blocking: true,
+                questions: vec![AgentUserInputQuestion {
+                    id: "mcp_url".into(),
+                    header: "MCP server: sample · External site".into(),
+                    question: "Connect your account".into(),
+                    external_url: Some(
+                        "https://example.com/connect?state=abc".into(),
+                    ),
+                    options: Vec::new(),
+                    default_answers: Vec::new(),
+                    allows_other: false,
+                    is_secret: false,
+                }],
+            },
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.session_id = Some("session".into());
+            panel
+                .conversation
+                .push(ahead_rpc::ahead::ConversationMessage {
+                    id: "human-message".into(),
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    sequence: 1,
+                    role: "human".into(),
+                    actor_id: "human".into(),
+                    content: "Connect the MCP server".into(),
+                    status: "complete".into(),
+                    created_at: String::new(),
+                });
+            panel.refresh_user_input(&proxy, "session");
+            cx.notify();
+        });
+        panel.update(cx, |panel, cx| {
+            panel.open_mcp_url(
+                "mcp-url-stale",
+                "https://example.com/connect?state=abc",
+                cx,
+            );
+        });
+        assert!(proxy.rpc_for_test().rx().try_recv().is_err());
+        assert!(cx.opened_url().is_none());
+        let outgoing = proxy.rpc_for_test().rx().clone();
+        let responder_proxy = proxy.clone();
+        let responder = std::thread::spawn(move || {
+            let ProxyRpc::Request(
+                request_id,
+                ProxyRequest::AheadRequest {
+                    request: AheadRequest::AgentUserInputAnswer { answers, .. },
+                },
+            ) = outgoing
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("URL answer")
+            else {
+                panic!("expected URL answer request");
+            };
+            assert_eq!(
+                answers.get(MCP_FORM_ACTION_KEY),
+                Some(&vec!["accept".into()])
+            );
+            responder_proxy.rpc_for_test().handle_response(
+                request_id,
+                Ok(ProxyResponse::AheadResponse {
+                    response: serde_json::json!({}),
+                }),
+            );
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("open-mcp-url").is_some());
+            assert!(window.try_find("decline-mcp-form").is_some());
+            assert!(window.try_find("submit-agent-input").is_none());
+            window.click("open-mcp-url", cx);
+        });
+        responder.join().expect("URL responder");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/connect?state=abc")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn rendered_parallel_mcp_approval_shows_first_request(cx: &mut TestAppContext) {
+        use ahead_rpc::ahead::{
+            AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
+            AheadNotification,
+        };
+        use gpui_kit::test::TestWindowExt;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = std::env::temp_dir();
+        let proxy =
+            crate::proxy_client::ProxyClient::new_for_test(workspace.clone());
+        let (panel, cx) = cx
+            .add_window_view(|window, cx| SessionPanel::new(workspace, window, cx));
+        proxy.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "message".into(),
+            state: "streaming".into(),
+        });
+        for id in ["first", "second"] {
+            proxy.route_ahead(AheadNotification::AgentUserInputRequested {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                request: AgentUserInputRequest {
+                    request_id: id.into(),
+                    is_blocking: true,
+                    questions: vec![AgentUserInputQuestion {
+                        id: format!("mcp_tool_call_approval_{id}"),
+                        header: "Approve MCP tool?".into(),
+                        question: format!("Allow tool {id}?"),
+                        external_url: None,
+                        options: vec![AgentUserInputOption {
+                            value: "Allow".into(),
+                            label: "Allow".into(),
+                            description: "Run the tool".into(),
+                        }],
+                        default_answers: Vec::new(),
+                        allows_other: false,
+                        is_secret: false,
+                    }],
+                },
+            });
+        }
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.session_id = Some("session".into());
+            panel
+                .conversation
+                .push(ahead_rpc::ahead::ConversationMessage {
+                    id: "human-message".into(),
+                    session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    sequence: 1,
+                    role: "human".into(),
+                    actor_id: "human".into(),
+                    content: "Call two MCP tools".into(),
+                    status: "complete".into(),
+                    created_at: String::new(),
+                });
+            panel.pending_user_input = proxy.pending_user_input("session");
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("agent-input-mcp_tool_call_approval_second-0")
+                    .is_none(),
+                "second approval waits for the first answer"
+            );
+            window.click("agent-input-mcp_tool_call_approval_first-0", cx);
+        });
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.user_input_answers.get("mcp_tool_call_approval_first"),
+                Some(&vec!["Allow".to_string()])
+            );
+        });
+        proxy.route_ahead(AheadNotification::AgentUserInputCancelled {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            request_id: "first".into(),
+        });
+        panel.update(cx, |panel, cx| {
+            panel.refresh_user_input(&proxy, "session");
+            assert!(panel.user_input_answers.is_empty());
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("agent-input-mcp_tool_call_approval_first-0")
+                    .is_none()
+            );
+            assert!(
+                window
+                    .try_find("agent-input-mcp_tool_call_approval_second-0")
+                    .is_some()
             );
         });
     }

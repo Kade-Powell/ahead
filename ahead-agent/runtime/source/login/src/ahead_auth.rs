@@ -5,14 +5,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use codex_config::{
-    ManagedAuthPolicy,
-    types::{AuthCredentialsStoreMode, AuthKeyringBackendKind},
-};
 use codex_protocol::{
     account::PlanType as AccountPlanType,
     auth::{AuthMode, RefreshTokenFailedError, RefreshTokenFailedReason},
-    config_types::{ForcedLoginMethod, ModelProviderAuthInfo},
+    config_types::ModelProviderAuthInfo,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -20,12 +16,6 @@ use tokio::sync::watch;
 use crate::{AuthHeaders, AuthRouteConfig, external_bearer::BearerTokenRefresher};
 
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
-pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
-pub const CODEX_ACCESS_TOKEN_ENV_VAR: &str = "CODEX_ACCESS_TOKEN";
-pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
-pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
-pub const CLIENT_ID_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
-pub const CLIENT_ID: &str = "";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiKeyAuth {
@@ -147,12 +137,6 @@ pub enum AgentIdentityAuthError {
         attempts: usize,
         message: String,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentIdentityAuthPolicy {
-    JwtOnly,
-    ChatGptAuth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,10 +274,6 @@ impl CodexAuth {
         }
     }
 
-    pub fn is_workspace_account(&self) -> bool {
-        false
-    }
-
     #[doc(hidden)]
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
         Self::ChatgptAuthTokens(ChatgptAuthTokens(ChatgptAuth {
@@ -335,10 +315,6 @@ impl RefreshTokenError {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("AHEAD model authentication initialization failed")]
-pub struct AuthManagerInitializationError;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalAuthRefreshReason {
     Unauthorized,
@@ -359,35 +335,6 @@ pub trait ExternalAuth: Send + Sync {
     fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
         RefreshTokenError::Transient(error)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthConfig {
-    pub codex_home: PathBuf,
-    pub auth_credentials_store_mode: AuthCredentialsStoreMode,
-    pub keyring_backend_kind: AuthKeyringBackendKind,
-    pub forced_login_method: Option<ForcedLoginMethod>,
-    pub chatgpt_base_url: Option<String>,
-    pub forced_chatgpt_workspace_id: Option<Vec<String>>,
-    pub managed_auth_policy: ManagedAuthPolicy,
-    pub auth_route_config: AuthRouteConfig,
-}
-
-impl AuthConfig {
-    pub fn validate(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub trait AuthManagerConfig {
-    fn codex_home(&self) -> PathBuf;
-    fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode;
-    fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind;
-    fn forced_login_method(&self) -> Option<ForcedLoginMethod>;
-    fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>>;
-    fn managed_auth_policy(&self) -> ManagedAuthPolicy;
-    fn chatgpt_base_url(&self) -> String;
-    fn auth_route_config(&self) -> AuthRouteConfig;
 }
 
 pub struct AuthManager {
@@ -416,55 +363,8 @@ impl AuthManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new(
-        _codex_home: PathBuf,
-        _enable_codex_api_key_env: bool,
-        _auth_credentials_store_mode: AuthCredentialsStoreMode,
-        _forced_chatgpt_workspace_id: Option<Vec<String>>,
-        _chatgpt_base_url: Option<String>,
-        _keyring_backend_kind: AuthKeyringBackendKind,
-        _auth_route_config: AuthRouteConfig,
-    ) -> Self {
-        Self::empty()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn shared(
-        codex_home: PathBuf,
-        enable_codex_api_key_env: bool,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-        forced_chatgpt_workspace_id: Option<Vec<String>>,
-        chatgpt_base_url: Option<String>,
-        keyring_backend_kind: AuthKeyringBackendKind,
-        auth_route_config: AuthRouteConfig,
-    ) -> Arc<Self> {
-        Arc::new(
-            Self::new(
-                codex_home,
-                enable_codex_api_key_env,
-                auth_credentials_store_mode,
-                forced_chatgpt_workspace_id,
-                chatgpt_base_url,
-                keyring_backend_kind,
-                auth_route_config,
-            )
-            .await,
-        )
-    }
-
-    pub async fn shared_from_config(
-        _config: &impl AuthManagerConfig,
-        _enable_codex_api_key_env: bool,
-    ) -> Result<Arc<Self>, AuthManagerInitializationError> {
-        Ok(Arc::new(Self::empty()))
-    }
-
-    pub async fn shared_from_auth_config(
-        _auth_config: AuthConfig,
-        _enable_codex_api_key_env: bool,
-    ) -> Result<Arc<Self>, AuthManagerInitializationError> {
-        Ok(Arc::new(Self::empty()))
+    pub fn shared_empty() -> Arc<Self> {
+        Arc::new(Self::empty())
     }
 
     pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
@@ -480,14 +380,6 @@ impl AuthManager {
     }
 
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, _codex_home: PathBuf) -> Arc<Self> {
-        Self::from_auth_for_testing(auth)
-    }
-
-    #[doc(hidden)]
-    pub fn from_auth_for_testing_with_agent_identity_authapi_base_url(
-        auth: CodexAuth,
-        _agent_identity_authapi_base_url: String,
-    ) -> Arc<Self> {
         Self::from_auth_for_testing(auth)
     }
 
@@ -551,27 +443,8 @@ impl AuthManager {
         Ok(())
     }
 
-    pub fn clear_external_auth(&self) {
-        if let Ok(mut external_auth) = self.external_auth.write() {
-            external_auth.take();
-        }
-        self.set_cached_auth(None);
-    }
-
     pub fn has_external_auth(&self) -> bool {
         self.external_auth_provider().is_some()
-    }
-
-    pub fn is_workload_identity_selected(&self) -> bool {
-        false
-    }
-
-    pub fn is_external_chatgpt_auth_active(&self) -> bool {
-        false
-    }
-
-    pub fn codex_api_key_env_enabled(&self) -> bool {
-        false
     }
 
     pub fn auth_mode(&self) -> Option<AuthMode> {
@@ -613,15 +486,6 @@ impl AuthManager {
             .map_err(|error| provider.classify_error(error))?;
         self.set_cached_auth(Some(auth));
         Ok(())
-    }
-
-    pub async fn logout(&self) -> std::io::Result<bool> {
-        self.clear_external_auth();
-        Ok(false)
-    }
-
-    pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
-        self.logout().await
     }
 
     fn external_auth_provider(&self) -> Option<Arc<dyn ExternalAuth>> {
@@ -700,12 +564,4 @@ impl UnauthorizedRecovery {
             auth_state_changed: Some(true),
         })
     }
-}
-
-pub fn oauth_client_id() -> String {
-    String::new()
-}
-
-pub fn is_workload_identity_selected() -> bool {
-    false
 }

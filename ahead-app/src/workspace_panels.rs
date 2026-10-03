@@ -20,7 +20,7 @@ use gpui_kit::component::dock::{
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{ActiveTheme, Selectable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Selectable, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -79,10 +79,22 @@ impl ActivityBar {
         let language_servers = self.language_servers.clone();
         window.defer(cx, move |window, cx| {
             let panel = match view {
-                WorkspaceView::Explorer => panel_handle(explorer),
-                WorkspaceView::Git => panel_handle(git),
+                WorkspaceView::Explorer => {
+                    explorer.update(cx, |explorer, cx| explorer.refresh(cx));
+                    panel_handle(explorer)
+                }
+                WorkspaceView::Git => {
+                    git.update(cx, |git, cx| {
+                        git.refresh();
+                        cx.notify();
+                    });
+                    panel_handle(git)
+                }
                 WorkspaceView::Tasks => panel_handle(tasks),
-                WorkspaceView::LanguageServers => panel_handle(language_servers),
+                WorkspaceView::LanguageServers => {
+                    language_servers.update(cx, |panel, cx| panel.refresh_trust(cx));
+                    panel_handle(language_servers)
+                }
             };
             area.update(cx, |area, cx| {
                 area.set_dock(
@@ -417,6 +429,9 @@ pub struct GitPanel {
     pub files: Vec<GitFile>,
     pub commit_message: Entity<InputState>,
     pub status: SharedString,
+    proxy: Option<Arc<ProxyClient>>,
+    stage_pending: bool,
+    commit_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -436,9 +451,17 @@ impl GitPanel {
             files: Vec::new(),
             commit_message,
             status: "Source control ready".into(),
+            proxy: None,
+            stage_pending: false,
+            commit_pending: false,
         };
         panel.refresh();
         panel
+    }
+
+    pub fn with_proxy(mut self, proxy: Arc<ProxyClient>) -> Self {
+        self.proxy = Some(proxy);
+        self
     }
 
     pub fn refresh(&mut self) {
@@ -455,20 +478,92 @@ impl GitPanel {
         .into();
     }
 
-    fn stage_all(&mut self, cx: &mut Context<Self>) {
-        let result = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&self.root)
-            .output();
-        self.status = if result
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            "All changes staged".into()
-        } else {
-            "Could not stage changes".into()
+    fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stage_pending || self.commit_pending {
+            return;
+        }
+        let Some(proxy) = self.proxy.as_ref() else {
+            self.status = "Git service unavailable".into();
+            cx.notify();
+            return;
         };
-        self.refresh();
+        self.stage_pending = true;
+        self.status = "Staging changes…".into();
+        let response = proxy.git_stage_all();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = response
+                .recv()
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            if let Err(error) = this.update_in(cx, |panel, _, cx| {
+                panel.stage_pending = false;
+                match result {
+                    Ok(()) => {
+                        panel.refresh();
+                        panel.status = "All changes staged".into();
+                    }
+                    Err(error) => {
+                        panel.status = format!("Stage failed: {error}").into();
+                    }
+                }
+                cx.notify();
+            }) {
+                eprintln!(
+                    "Source Control panel closed before stage response: {error}"
+                );
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn commit_staged(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stage_pending || self.commit_pending {
+            return;
+        }
+        let message = self.commit_message.read(cx).value().trim().to_string();
+        if message.is_empty() {
+            self.status = "Enter a commit message".into();
+            cx.notify();
+            return;
+        }
+        let Some(proxy) = self.proxy.as_ref() else {
+            self.status = "Git service unavailable".into();
+            cx.notify();
+            return;
+        };
+        self.commit_pending = true;
+        self.status = "Committing staged changes…".into();
+        let response = proxy.git_commit(message.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = response
+                .recv()
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+            if let Err(error) = this.update_in(cx, |panel, window, cx| {
+                panel.commit_pending = false;
+                match result {
+                    Ok(()) => {
+                        if panel.commit_message.read(cx).value().trim() == message {
+                            panel.commit_message.update(cx, |input, cx| {
+                                input.set_value("", window, cx)
+                            });
+                        }
+                        panel.refresh();
+                        panel.status = "Commit created".into();
+                    }
+                    Err(error) => {
+                        panel.status = format!("Commit failed: {error}").into();
+                    }
+                }
+                cx.notify();
+            }) {
+                eprintln!(
+                    "Source Control panel closed before commit response: {error}"
+                );
+            }
+        })
+        .detach();
         cx.notify();
     }
 }
@@ -543,7 +638,17 @@ impl Render for GitPanel {
                             .label(format!("Changes ({})", self.files.len()))
                             .primary(),
                     )
-                    .child(Button::new("git_history").label("History").ghost()),
+                    .child(Button::new("git_history").label("History").ghost())
+                    .child(
+                        Button::new("git_refresh")
+                            .icon(IconName::RefreshCw)
+                            .ghost()
+                            .tooltip("Refresh source control")
+                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                this.refresh();
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 h_flex()
@@ -558,11 +663,19 @@ impl Render for GitPanel {
                     .child(
                         Button::new("git_stage_all")
                             .icon(IconName::Plus)
-                            .label("Stage All")
+                            .label(if self.stage_pending {
+                                "Staging…"
+                            } else {
+                                "Stage All"
+                            })
                             .ghost()
-                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                this.stage_all(cx)
-                            })),
+                            .disabled(self.stage_pending || self.commit_pending)
+                            .tooltip("Stage all workspace changes")
+                            .on_click(cx.listener(
+                                |this: &mut Self, _, window, cx| {
+                                    this.stage_all(window, cx)
+                                },
+                            )),
                     ),
             )
             .child(
@@ -587,9 +700,10 @@ impl Render for GitPanel {
                     };
                     h_flex()
                         .id(("git_file", index))
-                        .debug_selector(move || format!("git-file-{index}").into())
+                        .debug_selector(move || format!("git-file-{index}"))
                         .w_full()
                         .min_w_0()
+                        .flex_nowrap()
                         .items_center()
                         .gap_2()
                         .px_2()
@@ -599,16 +713,17 @@ impl Render for GitPanel {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
                                 .text_ellipsis_start()
+                                .debug_selector(move || format!("git-path-{index}"))
                                 .text_color(text)
                                 .child(file.path.clone()),
                         )
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .debug_selector(move || {
-                                    format!("git-state-{index}").into()
-                                })
+                                .debug_selector(move || format!("git-state-{index}"))
                                 .text_color(muted)
                                 .child(file.state.clone()),
                         )
@@ -616,7 +731,7 @@ impl Render for GitPanel {
                             div()
                                 .flex_shrink_0()
                                 .debug_selector(move || {
-                                    format!("git-select-{index}").into()
+                                    format!("git-select-{index}")
                                 })
                                 .child(
                                     Button::new(("git_select", index))
@@ -632,20 +747,41 @@ impl Render for GitPanel {
             ))
             .child(Input::new(&self.commit_message).aria_label("Commit message"))
             .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
+                v_flex()
+                    .gap_1()
                     .child(
                         div()
+                            .w_full()
+                            .debug_selector(|| "git-commit-status".to_string())
                             .text_color(muted)
                             .text_size(px(11.))
                             .child(self.status.clone()),
                     )
                     .child(
-                        Button::new("git_commit")
-                            .icon(IconName::Check)
-                            .label("Commit Tracked")
-                            .primary(),
+                        h_flex().justify_end().child(
+                            div()
+                                .debug_selector(|| "git-commit-action".to_string())
+                                .child(
+                                    Button::new("git_commit")
+                                        .icon(IconName::Check)
+                                        .label(if self.commit_pending {
+                                            "Committing…"
+                                        } else {
+                                            "Commit Staged"
+                                        })
+                                        .primary()
+                                        .disabled(
+                                            self.stage_pending
+                                                || self.commit_pending,
+                                        )
+                                        .tooltip("Commit staged changes")
+                                        .on_click(cx.listener(
+                                            |this: &mut Self, _, window, cx| {
+                                                this.commit_staged(window, cx)
+                                            },
+                                        )),
+                                ),
+                        ),
                     ),
             )
             .child(div().text_size(px(10.)).text_color(muted).child(root))
@@ -1563,13 +1699,25 @@ impl Render for ProblemsPanel {
 
 pub struct LanguageServersPanel {
     pub focus: FocusHandle,
-    pub root: String,
+    root: PathBuf,
     proxy: Arc<ProxyClient>,
+    trusted: bool,
+    trust_pending: bool,
+    trust_error: Option<String>,
     _updates: Task<()>,
 }
 
 impl LanguageServersPanel {
-    pub fn new(root: &str, proxy: Arc<ProxyClient>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: &Path,
+        proxy: Arc<ProxyClient>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (trusted, trust_error) =
+            match ahead_core::workspace_trust::is_trusted(root) {
+                Ok(trusted) => (trusted, None),
+                Err(error) => (false, Some(error.to_string())),
+            };
         let updates = proxy.subscribe_diagnostics();
         let task = cx.spawn(async move |this, cx| {
             while updates.recv().await.is_ok() {
@@ -1580,10 +1728,99 @@ impl LanguageServersPanel {
         });
         Self {
             focus: cx.focus_handle(),
-            root: root.to_string(),
+            root: root.to_path_buf(),
             proxy,
+            trusted,
+            trust_pending: false,
+            trust_error,
             _updates: task,
         }
+    }
+
+    fn refresh_trust(&mut self, cx: &mut Context<Self>) {
+        if self.trust_pending {
+            return;
+        }
+        match ahead_core::workspace_trust::is_trusted(&self.root) {
+            Ok(trusted) => {
+                if self.trusted != trusted {
+                    self.proxy.restart_language_servers();
+                }
+                self.trusted = trusted;
+                self.trust_error = None;
+            }
+            Err(error) => {
+                if self.trusted {
+                    self.proxy.restart_language_servers();
+                }
+                self.trusted = false;
+                self.trust_error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn change_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trust_pending {
+            return;
+        }
+        let trusted = !self.trusted;
+        let confirmation = trusted.then(|| {
+            window.prompt(
+                PromptLevel::Warning,
+                "Trust this workspace?",
+                Some("Project settings can choose language-server commands. Installed extensions may run processes with your user permissions. Trust only projects you recognize."),
+                &["Trust & Start", "Keep Restricted"],
+                cx,
+            )
+        });
+        self.trust_pending = true;
+        self.trust_error = None;
+        let root = self.root.clone();
+        let proxy = self.proxy.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(confirmation) = confirmation
+                && confirmation.await.ok() != Some(0)
+            {
+                if let Err(error) = this.update_in(cx, |panel, _, cx| {
+                    panel.trust_pending = false;
+                    cx.notify();
+                }) {
+                    eprintln!(
+                        "Language Servers panel closed during trust prompt: {error}"
+                    );
+                }
+                return;
+            }
+            let result = cx
+                .background_spawn(async move {
+                    ahead_core::workspace_trust::set_trusted(&root, trusted)?;
+                    if ahead_core::workspace_trust::is_trusted(&root)? != trusted {
+                        return Err(std::io::Error::other(
+                            "Workspace trust decision could not be verified",
+                        ));
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = this.update_in(cx, |panel, _, cx| {
+                panel.trust_pending = false;
+                match result {
+                    Ok(()) => {
+                        panel.trusted = trusted;
+                        proxy.restart_language_servers();
+                    }
+                    Err(error) => panel.trust_error = Some(error.to_string()),
+                }
+                cx.notify();
+            }) {
+                eprintln!(
+                    "Language Servers panel closed before trust update: {error}"
+                );
+            }
+        })
+        .detach();
+        cx.notify();
     }
 }
 
@@ -1616,6 +1853,7 @@ impl Render for LanguageServersPanel {
         let text = cx.theme().sidebar_foreground;
         let muted = cx.theme().muted_foreground;
         let servers = self.proxy.lsp_servers();
+        let extension_issues = self.proxy.language_extension_issues();
         v_flex()
             .size_full()
             .gap_2()
@@ -1638,38 +1876,73 @@ impl Render for LanguageServersPanel {
                             })),
                     ),
             )
-            .child(div().text_color(muted).child("Workspace language services"))
             .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
-                    .p_2()
-                    .bg(cx.theme().group_box)
-                    .child(IconName::Activity)
+                v_flex()
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(if self.trusted {
+                                IconName::ShieldCheck
+                            } else {
+                                IconName::ShieldAlert
+                            })
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .text_color(text)
-                                    .child("Managed by ahead-proxy"),
+                                    .child(if self.trusted {
+                                        "Workspace trusted"
+                                    } else {
+                                        "Restricted workspace"
+                                    }),
                             )
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(muted)
-                                    .child(self.root.clone()),
+                                Button::new("workspace_trust")
+                                    .label(if self.trust_pending {
+                                        "Saving…"
+                                    } else if self.trusted {
+                                        "Restrict"
+                                    } else {
+                                        "Trust"
+                                    })
+                                    .ghost()
+                                    .disabled(self.trust_pending)
+                                    .tooltip(if self.trusted {
+                                        "Stop workspace language servers"
+                                    } else {
+                                        "Trust this workspace to start language servers"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.change_trust(window, cx)
+                                    })),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(if self.trusted {
+                                "Project language servers may run."
+                            } else {
+                                "Language servers wait until you trust this project."
+                            }),
                     ),
             )
+            .when_some(self.trust_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().danger)
+                        .child(format!("Trust settings: {error}")),
+                )
+            })
             .children(servers.iter().map(|server| {
                 let (icon, state, color) = if server.is_ready() {
                     (IconName::CircleCheck, "Ready", cx.theme().success)
-                } else if server.message.is_some() {
+                } else if server.is_error() {
                     (IconName::CircleX, "Error", cx.theme().danger)
                 } else {
                     (IconName::CircleDashed, "Starting", cx.theme().warning)
@@ -1703,7 +1976,6 @@ impl Render for LanguageServersPanel {
                                 el.child(
                                     div()
                                         .min_w_0()
-                                        .truncate()
                                         .text_size(px(11.))
                                         .text_color(muted)
                                         .child(message),
@@ -1718,7 +1990,44 @@ impl Render for LanguageServersPanel {
                             .child(state),
                     )
             }))
-            .when(servers.is_empty(), |el| {
+            .when(!extension_issues.is_empty(), |el| {
+                el.child(
+                    div()
+                        .pt_2()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("Extension issues"),
+                )
+            })
+            .children(extension_issues.iter().map(|issue| {
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().danger)
+                                    .child(IconName::TriangleAlert),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(text)
+                                    .child(issue.name.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(issue.message.clone()),
+                    )
+            }))
+            .when(self.trusted && servers.is_empty() && extension_issues.is_empty(), |el| {
                 el.child(
                     div()
                         .text_size(px(11.))
@@ -1764,18 +2073,49 @@ mod tests {
                 state: "??".into(),
                 selected: false,
             }];
+            panel.status = "Commit failed: Git identity is not configured for this disposable project; set user.name and user.email before retrying".into();
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
 
         let row = cx.debug_bounds("git-file-0").expect("Git row");
+        let path = cx.debug_bounds("git-path-0").expect("Git path");
         let state = cx.debug_bounds("git-state-0").expect("Git status");
         let select = cx.debug_bounds("git-select-0").expect("Git selection");
         assert!(row.size.width <= px(260.));
+        assert!(path.origin.x + path.size.width <= state.origin.x);
         assert!(state.origin.x + state.size.width <= select.origin.x);
         assert!(
             select.origin.x + select.size.width <= row.origin.x + row.size.width
         );
+        let status = cx.debug_bounds("git-commit-status").expect("Git status");
+        let action = cx.debug_bounds("git-commit-action").expect("Commit action");
+        assert!(status.origin.y + status.size.height <= action.origin.y);
+        assert!(
+            action.origin.x + action.size.width <= row.origin.x + row.size.width
+        );
+    }
+
+    #[gpui_kit::test]
+    fn commit_requires_message_and_connected_service(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            NarrowGitPanel(cx.new(|cx| GitPanel::new(".", window, cx)))
+        });
+        let panel = cx.update(|_, cx| view.read(cx).0.clone());
+        cx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.commit_staged(window, cx);
+                assert_eq!(panel.status.as_ref(), "Enter a commit message");
+                panel.commit_message.update(cx, |input, cx| {
+                    input.set_value("Ready to commit", window, cx)
+                });
+                panel.commit_staged(window, cx);
+                assert_eq!(panel.status.as_ref(), "Git service unavailable");
+                panel.stage_all(window, cx);
+                assert_eq!(panel.status.as_ref(), "Git service unavailable");
+            });
+        });
     }
 
     #[test]

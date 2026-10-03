@@ -450,7 +450,6 @@ fn extract_apply_patch_from_bash(
 mod tests {
     use super::*;
     use crate::unified_diff_from_chunks;
-    use assert_matches::assert_matches;
     use codex_exec_server::LOCAL_FS;
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -539,13 +538,13 @@ mod tests {
 
     fn assert_not_match(script: &str) {
         let args = args_bash(script);
-        assert_matches!(
+        assert!(matches!(
             maybe_parse_apply_patch(
                 &args,
                 &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
             ),
             MaybeApplyPatch::NotApplyPatch
-        );
+        ));
     }
 
     #[tokio::test]
@@ -553,7 +552,7 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch".to_string();
         let args = vec![patch];
         let dir = tempdir().unwrap();
-        assert_matches!(
+        assert!(matches!(
             maybe_parse_apply_patch_verified(
                 &args,
                 &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
@@ -562,7 +561,7 @@ mod tests {
             )
             .await,
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)
-        );
+        ));
     }
 
     #[tokio::test]
@@ -570,7 +569,7 @@ mod tests {
         let script = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch";
         let args = args_bash(script);
         let dir = tempdir().unwrap();
-        assert_matches!(
+        assert!(matches!(
             maybe_parse_apply_patch_verified(
                 &args,
                 &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
@@ -579,7 +578,7 @@ mod tests {
             )
             .await,
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)
-        );
+        ));
     }
 
     #[tokio::test]

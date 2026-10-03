@@ -37,7 +37,11 @@ gpui_kit::actions!(
     [
         Quit,
         CloseWindow,
+        NewWindow,
+        OpenFile,
+        OpenFolder,
         RecoverUnsavedChanges,
+        OpenHelp,
         SaveFile,
         GoToFile,
         GoToDefinition,
@@ -241,6 +245,54 @@ fn request_close_window(_: &CloseWindow, cx: &mut App) {
     });
 }
 
+fn launch_ahead_with_path(path: std::path::PathBuf) -> std::io::Result<()> {
+    // ponytail: spawn per workspace until the project window factory is reusable in-process.
+    std::process::Command::new(std::env::current_exe()?)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+}
+
+fn request_open_path(options: PathPromptOptions, cx: &mut App) {
+    let selection = cx.prompt_for_paths(options);
+    cx.spawn(async move |cx| {
+        let path = match selection.await {
+            Ok(Ok(Some(paths))) => paths.into_iter().next(),
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                eprintln!("AHEAD path picker failed: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!("AHEAD path picker was interrupted");
+                None
+            }
+        };
+        if let Some(path) = path {
+            let result = cx
+                .background_spawn(async move { launch_ahead_with_path(path) })
+                .await;
+            if let Err(error) = result {
+                eprintln!("AHEAD could not open the selected path: {error}");
+            }
+        }
+    })
+    .detach();
+}
+
+fn request_new_window(_: &NewWindow, cx: &mut App) {
+    let active = cx.active_window();
+    let workspace = editor_windows(cx)
+        .into_iter()
+        .find(|(window, _)| Some(*window) == active)
+        .map(|(_, shell)| shell.read(cx).explorer.read(cx).root.clone());
+    if let Some(workspace) = workspace
+        && let Err(error) = launch_ahead_with_path(workspace.into())
+    {
+        eprintln!("AHEAD could not open a new window: {error}");
+    }
+}
+
 fn request_shell_command(command: ShellShortcut, cx: &mut App) {
     let active = cx.active_window();
     cx.defer(move |cx| {
@@ -291,6 +343,8 @@ pub(crate) enum ShellShortcut {
     ToggleBottom,
     ToggleRight,
     Settings,
+    Extensions,
+    Help,
     Explorer,
     Search,
     SourceControl,
@@ -340,6 +394,7 @@ fn shell_shortcut(
             ("m", true) => Problems,
             ("p", false) => QuickOpen,
             ("p", true) => CommandPalette,
+            ("x", true) => Extensions,
             ("d", true) => Debug,
             _ => return control_shortcut(key, platform, control, alt, shift),
         };
@@ -730,8 +785,10 @@ fn closes_code_tab(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CenterPanel {
     Settings,
+    Extensions,
     Search,
     Problems,
+    Help,
 }
 
 pub struct Shell {
@@ -752,6 +809,8 @@ pub struct Shell {
         std::collections::HashMap<ahead_rpc::dap_types::DapId, Vec<usize>>,
     pub problems: Entity<ProblemsPanel>,
     pub settings: Entity<crate::settings_panel::SettingsPanel>,
+    extensions: Entity<crate::extensions_panel::ExtensionsPanel>,
+    help: Entity<crate::help_panel::HelpPanel>,
     pub search: Entity<SearchPanel>,
     pub agent_workspace: Entity<AgentWorkspacePanel>,
     pub activity: Entity<ActivityBar>,
@@ -776,6 +835,14 @@ pub struct Shell {
 }
 
 impl Shell {
+    pub(crate) fn shared_terminal_text(&self, cx: &App) -> String {
+        self.terminals
+            .iter()
+            .map(|terminal| terminal.read(cx).shared_snapshot_text())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     fn install_window_close_handler(
         shell: &Entity<Self>,
         window: &Window,
@@ -809,6 +876,8 @@ impl Shell {
         terminals: Vec<Entity<crate::terminal_panel::TerminalPanel>>,
         problems: Entity<ProblemsPanel>,
         settings: Entity<crate::settings_panel::SettingsPanel>,
+        extensions: Entity<crate::extensions_panel::ExtensionsPanel>,
+        help: Entity<crate::help_panel::HelpPanel>,
         search: Entity<SearchPanel>,
         agent_workspace: Entity<AgentWorkspacePanel>,
         activity: Entity<ActivityBar>,
@@ -888,6 +957,8 @@ impl Shell {
             debug_terminals: std::collections::HashMap::new(),
             problems,
             settings,
+            extensions,
+            help,
             search,
             agent_workspace,
             activity,
@@ -1038,6 +1109,14 @@ impl Shell {
         self.refresh_center_layout(window, cx);
     }
 
+    fn open_extensions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_center_panel(CenterPanel::Extensions, window, cx);
+        self.extensions
+            .update(cx, |extensions, cx| extensions.load_catalog_if_needed(cx));
+        let search = self.extensions.read(cx).search_input.clone();
+        search.focus_handle(cx).focus(window, cx);
+    }
+
     fn show_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_center_panel = None;
         self.refresh_center_layout(window, cx);
@@ -1051,6 +1130,8 @@ impl Shell {
         let open_center_panels = self.open_center_panels.clone();
         let active_center_panel = self.active_center_panel;
         let settings = self.settings.clone();
+        let extensions = self.extensions.clone();
+        let help = self.help.clone();
         let search = self.search.clone();
         let problems = self.problems.clone();
         let code_tabs = self.code_tabs.clone();
@@ -1071,11 +1152,16 @@ impl Shell {
                     match panel {
                         CenterPanel::Settings => editor_tabs
                             .panel_view(panel_handle(settings.clone()), cx),
+                        CenterPanel::Extensions => editor_tabs
+                            .panel_view(panel_handle(extensions.clone()), cx),
                         CenterPanel::Search => {
                             editor_tabs.panel_view(panel_handle(search.clone()), cx)
                         }
                         CenterPanel::Problems => editor_tabs
                             .panel_view(panel_handle(problems.clone()), cx),
+                        CenterPanel::Help => {
+                            editor_tabs.panel_view(panel_handle(help.clone()), cx)
+                        }
                     };
             }
             let active_index = active_center_panel
@@ -1084,7 +1170,8 @@ impl Shell {
                 })
                 .map(|index| code_count + index)
                 .unwrap_or(active_code_index);
-            area.set_center(editor_tabs.active_index(active_index), window, cx);
+            let editor_tabs = editor_tabs.active_index(active_index);
+            area.set_center(editor_tabs, window, cx);
         });
         cx.notify();
     }
@@ -1099,14 +1186,22 @@ impl Shell {
             gpui_kit::component::dock::PanelId::from(self.search.entity_id());
         let settings_panel =
             gpui_kit::component::dock::PanelId::from(self.settings.entity_id());
+        let extensions_panel =
+            gpui_kit::component::dock::PanelId::from(self.extensions.entity_id());
         let problems_panel =
             gpui_kit::component::dock::PanelId::from(self.problems.entity_id());
+        let help_panel =
+            gpui_kit::component::dock::PanelId::from(self.help.entity_id());
         let closed = if panel == search_panel {
             CenterPanel::Search
         } else if panel == settings_panel {
             CenterPanel::Settings
+        } else if panel == extensions_panel {
+            CenterPanel::Extensions
         } else if panel == problems_panel {
             CenterPanel::Problems
+        } else if panel == help_panel {
+            CenterPanel::Help
         } else {
             return;
         };
@@ -1298,6 +1393,7 @@ impl Shell {
                         .with_proxy(
                             proxy.clone(),
                             &workspace,
+                            window,
                             cx,
                         )
                     })
@@ -1472,7 +1568,7 @@ impl Shell {
             };
             let code = cx.new(|cx| {
                 crate::code_panel::CodePanel::new(&request.path, window, cx)
-                    .with_proxy(proxy, &workspace, cx)
+                    .with_proxy(proxy, &workspace, window, cx)
             });
             code.update(cx, |code, cx| {
                 code.is_preview = !request.permanent;
@@ -1500,6 +1596,247 @@ impl Shell {
             let focus = code.read(cx).focus.clone();
             window.focus(&focus, cx);
         }
+    }
+
+    pub(crate) fn open_shared_buffer(
+        &mut self,
+        session_id: String,
+        snapshot: ahead_rpc::ahead::SharedBufferSnapshot,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editable = self.session.read(cx).shared_guest_can_edit();
+        if let Some(code) = self
+            .code_tabs
+            .iter()
+            .find(|code| {
+                let code = code.read(cx);
+                code.shared_session_id.as_deref() == Some(session_id.as_str())
+                    && code.file_path == snapshot.path
+            })
+            .cloned()
+        {
+            code.update(cx, |code, cx| {
+                code.apply_shared_snapshot(snapshot, window, cx);
+                code.set_shared_editable(editable, cx);
+                code.start_shared_poll(window, cx);
+            });
+            self.set_active_code(code.clone(), cx);
+            self.show_code(window, cx);
+            if let Some(line) = line {
+                code.update(cx, |code, cx| {
+                    code.reveal_location(
+                        crate::ross::OpenLocation {
+                            line: line as usize,
+                            column: crate::ross::OpenColumn::Character(0),
+                            end_line: line as usize,
+                            end_column: crate::ross::OpenColumn::Character(0),
+                        },
+                        window,
+                        cx,
+                    )
+                });
+            }
+            return;
+        }
+        let Some(proxy) = self.session.read(cx).proxy.clone() else {
+            return;
+        };
+        let workspace = self.explorer.read(cx).root.clone();
+        let code = cx.new(|cx| {
+            crate::code_panel::CodePanel::new_shared(
+                session_id, snapshot, editable, window, cx,
+            )
+            .with_proxy(proxy, &workspace, window, cx)
+        });
+        code.update(cx, |code, cx| code.start_shared_poll(window, cx));
+        self.configure_code(code.clone(), cx);
+        self.code_tabs.push(code.clone());
+        let buffers = self.code_tabs.clone();
+        self.session.update(cx, |session, cx| {
+            session.set_buffers(buffers.clone(), cx);
+        });
+        self.search
+            .update(cx, |search, cx| search.set_buffers(buffers, cx));
+        self.set_active_code(code.clone(), cx);
+        self.show_code(window, cx);
+        if let Some(line) = line {
+            code.update(cx, |code, cx| {
+                code.reveal_location(
+                    crate::ross::OpenLocation {
+                        line: line as usize,
+                        column: crate::ross::OpenColumn::Character(0),
+                        end_line: line as usize,
+                        end_column: crate::ross::OpenColumn::Character(0),
+                    },
+                    window,
+                    cx,
+                )
+            });
+        }
+    }
+
+    pub(crate) fn restore_shared_draft(
+        &mut self,
+        session_id: String,
+        draft: ahead_rpc::file::EditorRecoverySnapshot,
+        host_snapshot: ahead_rpc::ahead::SharedBufferSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let path = host_snapshot.path.clone();
+        self.open_shared_buffer(session_id.clone(), host_snapshot, None, window, cx);
+        let code = self
+            .code_tabs
+            .iter()
+            .find(|code| {
+                let code = code.read(cx);
+                code.shared_session_id.as_deref() == Some(session_id.as_str())
+                    && code.file_path == path
+            })
+            .ok_or("Shared file could not be opened")?
+            .clone();
+        code.update(cx, |code, cx| code.restore_shared_draft(draft, window, cx))
+    }
+
+    pub(crate) fn open_shared_code_comment(
+        &mut self,
+        session_id: String,
+        snapshot: ahead_rpc::ahead::SharedBufferSnapshot,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = snapshot.path.clone();
+        self.open_shared_buffer(
+            session_id.clone(),
+            snapshot,
+            Some(line),
+            window,
+            cx,
+        );
+        if let Some(code) = self.code_tabs.iter().find(|code| {
+            let code = code.read(cx);
+            code.shared_session_id.as_deref() == Some(session_id.as_str())
+                && code.file_path == path
+        }) {
+            code.update(cx, |code, cx| {
+                code.show_code_comment_line(line.saturating_add(1), cx)
+            });
+        }
+    }
+
+    pub(crate) fn follow_shared_line(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(code) = self
+            .code_tabs
+            .iter()
+            .find(|code| {
+                let code = code.read(cx);
+                code.shared_session_id.as_deref() == Some(session_id)
+                    && code.file_path == path
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        self.set_active_code(code.clone(), cx);
+        self.show_code(window, cx);
+        code.update(cx, |code, cx| {
+            code.reveal_location(
+                crate::ross::OpenLocation {
+                    line: line as usize,
+                    column: crate::ross::OpenColumn::Character(0),
+                    end_line: line as usize,
+                    end_column: crate::ross::OpenColumn::Character(0),
+                },
+                window,
+                cx,
+            )
+        });
+        true
+    }
+
+    pub(crate) fn follow_host_line(
+        &mut self,
+        path: &str,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.explorer.read(cx).root.clone();
+        self.open_file_request(
+            crate::ross::OpenRequest {
+                path: std::path::Path::new(&root)
+                    .join(path)
+                    .to_string_lossy()
+                    .to_string(),
+                permanent: true,
+                location: Some(crate::ross::OpenLocation {
+                    line: line as usize,
+                    column: crate::ross::OpenColumn::Character(0),
+                    end_line: line as usize,
+                    end_column: crate::ross::OpenColumn::Character(0),
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn stop_shared_buffers(
+        &mut self,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        for code in &self.code_tabs {
+            if code.read(cx).shared_session_id.as_deref() == Some(session_id) {
+                code.update(cx, |code, cx| code.stop_shared_poll(cx));
+            }
+        }
+    }
+
+    pub(crate) fn sync_shared_editor_roles(&mut self, cx: &mut Context<Self>) {
+        let editable = self.session.read(cx).shared_guest_can_edit();
+        for code in &self.code_tabs {
+            if code.read(cx).shared_session_id.is_some() {
+                code.update(cx, |code, cx| code.set_shared_editable(editable, cx));
+            }
+        }
+    }
+
+    pub(crate) fn shared_presence_location(
+        &self,
+        session_id: &str,
+        guest: bool,
+        cx: &App,
+    ) -> Option<(String, u32)> {
+        let code = self.code.read(cx);
+        let line = code.current_line(cx);
+        if guest {
+            return (code.shared_session_id.as_deref() == Some(session_id))
+                .then(|| (code.file_path.clone(), line));
+        }
+        if code.shared_session_id.is_some() {
+            return None;
+        }
+        let root = self.explorer.read(cx).root.clone();
+        let path = std::path::Path::new(&code.file_path)
+            .strip_prefix(root)
+            .ok()?;
+        if path.components().any(|component| {
+            component.as_os_str().to_string_lossy().starts_with('.')
+        }) {
+            return None;
+        }
+        Some((path.to_string_lossy().to_string(), line))
     }
 
     fn window_close_snapshot(&self, cx: &App) -> WindowCloseSnapshot {
@@ -1556,6 +1893,9 @@ impl Shell {
                 let entries = crate::proxy_client::await_editor_recovery(proxy.list_editor_recoveries(), cx.background_executor()).await?;
                 proxy.enable_editor_recovery();
                 for entry in entries {
+                    if crate::code_panel::is_shared_draft_path(&entry.path) {
+                        continue;
+                    }
                     let already_open = this.read_with(cx, |this, cx| this.code_tabs.iter().any(|code| code.read(cx).recovery_id() == entry.buffer_id)).map_err(|error| error.to_string())?;
                     if already_open { continue; }
                     let Some(snapshot) = crate::proxy_client::await_editor_recovery(proxy.read_editor_recovery(entry.buffer_id), cx.background_executor()).await? else { continue; };
@@ -1881,25 +2221,34 @@ impl Shell {
                     .map(|context| context.file_content)
             })
             .or_else(|| std::fs::read_to_string(&path).ok());
-        let source_matches = current_source.is_some_and(|source| {
+        let source_matches = current_source.as_deref().is_some_and(|source| {
             format!("{:x}", sha2::Sha256::digest(source.as_bytes()))
                 == comment.source_sha256
         });
+        let current_range = current_source.as_deref().and_then(|source| {
+            crate::code_panel::current_comment_range(comment, source)
+        });
         if !source_matches {
-            self.status_message = "Commented source changed; opened its original line without selecting stale code".into();
+            self.status_message = if current_range.is_some() {
+                "Commented source changed; found the quoted code at its new location"
+            } else {
+                "Commented source changed; original line may be stale"
+            }
+            .into();
         }
+        let range = current_range.unwrap_or(comment.range);
         let location = crate::ross::OpenLocation {
-            line: comment.range.start.line as usize,
-            column: crate::ross::OpenColumn::Utf16(comment.range.start.col as usize),
-            end_line: if source_matches {
-                comment.range.end.line
+            line: range.start.line as usize,
+            column: crate::ross::OpenColumn::Utf16(range.start.col as usize),
+            end_line: if current_range.is_some() {
+                range.end.line
             } else {
-                comment.range.start.line
+                range.start.line
             } as usize,
-            end_column: crate::ross::OpenColumn::Utf16(if source_matches {
-                comment.range.end.col
+            end_column: crate::ross::OpenColumn::Utf16(if current_range.is_some() {
+                range.end.col
             } else {
-                comment.range.start.col
+                range.start.col
             } as usize),
         };
         crate::ross::request_open_at(
@@ -1908,7 +2257,7 @@ impl Shell {
             location,
         );
         let path_text = path.to_string_lossy().into_owned();
-        let line = comment.range.start.line.saturating_add(1);
+        let line = range.start.line.saturating_add(1);
         if let Some(code) = self
             .code_tabs
             .iter()
@@ -2238,7 +2587,7 @@ impl Shell {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
                     .await;
-                _ = cx.update_entity(&terminal, |terminal, cx| {
+                cx.update_entity(&terminal, |terminal, cx| {
                     terminal.run_command(&command, cx);
                 });
             })
@@ -2566,6 +2915,8 @@ impl Shell {
                 area.toggle_dock(DockPlacement::Right, window, cx)
             }),
             Settings => self.open_center_panel(CenterPanel::Settings, window, cx),
+            Extensions => self.open_extensions(window, cx),
+            Help => self.open_center_panel(CenterPanel::Help, window, cx),
             Explorer => self.show_left_panel(WorkspaceView::Explorer, window, cx),
             Search => self.open_center_panel(CenterPanel::Search, window, cx),
             SourceControl => self.show_left_panel(WorkspaceView::Git, window, cx),
@@ -2594,7 +2945,13 @@ impl Shell {
                         area.toggle_dock(DockPlacement::Right, window, cx)
                     });
                 }
-                let focus = self.session.read(cx).focus.clone();
+                let focus = self.session.read_with(cx, |session, cx| {
+                    if session.session_id.is_some() {
+                        session.chat_input.focus_handle(cx)
+                    } else {
+                        session.focus.clone()
+                    }
+                });
                 window.focus(&focus, cx);
             }
             ChatZoom => self.toggle_chat_zoom(window, cx),
@@ -2747,10 +3104,12 @@ impl Render for Shell {
         });
         let (lsp_color, lsp_state) = if lsp_servers.is_empty() {
             (cx.theme().warning, "starting")
+        } else if lsp_servers.iter().any(|server| server.is_error()) {
+            (cx.theme().danger, "error")
         } else if lsp_servers.iter().all(|server| server.is_ready()) {
             (cx.theme().success, "ready")
         } else {
-            (cx.theme().danger, "error")
+            (cx.theme().warning, "starting")
         };
 
         v_flex()
@@ -2936,6 +3295,17 @@ impl Render for Shell {
                             )
                             .child(
                                 active_button(
+                                    Button::new("extensions_btn")
+                                        .icon(IconName::Puzzle)
+                                        .tooltip(format!("Open Extensions ({})", shortcut_hint("⌘⇧X", "Ctrl+Shift+X"))),
+                                    self.open_center_panels.contains(&CenterPanel::Extensions),
+                                )
+                                .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                    this.open_extensions(window, cx);
+                                })),
+                            )
+                            .child(
+                                active_button(
                                     Button::new("settings_btn")
                                         .icon(IconName::Settings)
                                         .tooltip(format!("Open Settings ({})", shortcut_hint("⌘,", "Ctrl+,"))),
@@ -2944,6 +3314,17 @@ impl Render for Shell {
                                     .on_click(cx.listener(|this: &mut Self, _, window, cx| {
                                         this.open_center_panel(CenterPanel::Settings, window, cx);
                                     }))
+                            )
+                            .child(
+                                active_button(
+                                    Button::new("help_btn")
+                                        .icon(IconName::BookOpen)
+                                        .tooltip("Open AHEAD Guide"),
+                                    self.open_center_panels.contains(&CenterPanel::Help),
+                                )
+                                .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                    this.open_center_panel(CenterPanel::Help, window, cx);
+                                })),
                             )
                     )
                     // Center Region: Active work session chip
@@ -3022,16 +3403,8 @@ impl Render for Shell {
                                         .tooltip(format!("AHEAD Agent ({})", shortcut_hint("⌃⌘I", "Ctrl+Alt+I"))),
                                     right_open,
                                 )
-                                    .on_click(cx.listener({
-                                        let area = self.area.clone();
-                                        move |_, _, window, cx| {
-                                            area.update(cx, |area, cx| {
-                                                if !area.is_dock_open(DockPlacement::Right) {
-                                                    area.toggle_dock(DockPlacement::Right, window, cx);
-                                                }
-                                            });
-                                            cx.notify();
-                                        }
+                                    .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                        this.run_shell_command(ShellShortcut::Agent, window, cx);
                                     }))
                             )
                             .child(
@@ -3163,6 +3536,15 @@ fn workspace_prompt_options() -> PathPromptOptions {
     }
 }
 
+fn file_prompt_options() -> PathPromptOptions {
+    PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("Open File".into()),
+    }
+}
+
 fn launch_paths(
     mut file_path: String,
     root_arg: Option<String>,
@@ -3236,6 +3618,16 @@ pub fn launch() {
             cx.on_action(request_quit);
             cx.on_action(request_close_window);
             cx.on_action(request_recovery);
+            cx.on_action(request_new_window);
+            cx.on_action(|_: &OpenFile, cx| {
+                request_open_path(file_prompt_options(), cx);
+            });
+            cx.on_action(|_: &OpenFolder, cx| {
+                request_open_path(workspace_prompt_options(), cx);
+            });
+            cx.on_action(|_: &OpenHelp, cx| {
+                request_shell_command(ShellShortcut::Help, cx);
+            });
             cx.on_action(|_: &GoToFile, cx| {
                 request_shell_command(ShellShortcut::QuickOpen, cx);
             });
@@ -3331,6 +3723,24 @@ pub fn launch() {
                 ),
                 KeyBinding::new(
                     if cfg!(target_os = "macos") {
+                        "cmd-o"
+                    } else {
+                        "ctrl-o"
+                    },
+                    OpenFile,
+                    None,
+                ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-shift-n"
+                    } else {
+                        "ctrl-shift-n"
+                    },
+                    NewWindow,
+                    None,
+                ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
                         "cmd-p"
                     } else {
                         "ctrl-p"
@@ -3368,6 +3778,11 @@ pub fn launch() {
             cx.set_menus([
                 Menu::new("AHEAD").items([MenuItem::action("Quit AHEAD", Quit)]),
                 Menu::new("File").items([
+                    MenuItem::action("New Window", NewWindow),
+                    MenuItem::separator(),
+                    MenuItem::action("Open File…", OpenFile),
+                    MenuItem::action("Open Folder…", OpenFolder),
+                    MenuItem::separator(),
                     MenuItem::action("Save", SaveFile),
                     MenuItem::separator(),
                     MenuItem::action(
@@ -3396,6 +3811,7 @@ pub fn launch() {
                     MenuItem::separator(),
                     MenuItem::action("Close Window", CloseWindow),
                 ]),
+                Menu::new("Help").items([MenuItem::action("AHEAD Guide", OpenHelp)]),
             ]);
             #[cfg(target_os = "macos")]
             if let Err(error) = set_application_icon() {
@@ -3447,418 +3863,429 @@ pub fn launch() {
                 } else {
                     explorer_root
                 };
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds {
-                            origin: Point::new(px(40.), px(40.)),
-                            size: Size::new(px(1600.), px(1000.)),
-                        })),
-                        ..TitleBar::window_options()
-                    },
-                    |window, cx| {
-                        let (area, skin) =
-                            DockSkin::dock_area("ahead-shell", None, window, cx);
-                        skin.set_panel_style(PanelStyle::TabBar, cx);
-                        let proxy = crate::proxy_client::ProxyClient::new(
+                cx.open_window(TitleBar::window_options(), |window, cx| {
+                    let (area, skin) =
+                        DockSkin::dock_area("ahead-shell", None, window, cx);
+                    skin.set_panel_style(PanelStyle::TabBar, cx);
+                    let proxy = crate::proxy_client::ProxyClient::new(
+                        std::path::PathBuf::from(&explorer_root),
+                    );
+                    let code = cx.new(|cx| {
+                        crate::code_panel::CodePanel::new(&path, window, cx)
+                            .with_proxy(proxy.clone(), &explorer_root, window, cx)
+                    });
+                    let session = cx.new(|cx| {
+                        crate::session_panel::SessionPanel::new(
                             std::path::PathBuf::from(&explorer_root),
-                        );
-                        let code = cx.new(|cx| {
-                            crate::code_panel::CodePanel::new(&path, window, cx)
-                                .with_proxy(proxy.clone(), &explorer_root, cx)
-                        });
-                        let session = cx.new(|cx| {
-                            crate::session_panel::SessionPanel::new(
-                                std::path::PathBuf::from(&explorer_root),
-                                window,
-                                cx,
-                            )
-                            .with_code(code.clone())
-                            .with_proxy_client(proxy.clone())
-                        });
-                        session.update(cx, |panel, cx| {
-                            panel.watch_config_changes(window, cx);
-                        });
-                        let threads = cx.new(|cx| {
-                            crate::threads_panel::ThreadsPanel::new(window, cx)
-                                .with_proxy(proxy.clone())
-                                .with_session(session.clone())
-                        });
-                        cx.spawn({
-                            let proxy = proxy.clone();
-                            let threads = threads.clone();
-                            let session = session.clone();
-                            async move |cx| {
-                                let restore = cx
-                                    .background_spawn(async move {
-                                        proxy.durable_session_restore()
-                                    })
-                                    .await;
-                                match restore {
-                                    Ok(restore) => {
-                                        cx.update_entity(&threads, |panel, cx| {
-                                            panel.restore_durable_sessions(
-                                                Ok(restore.sessions),
-                                                cx,
-                                            )
-                                        });
-                                        if let Some(active) = restore.active {
-                                            cx.update_entity(
-                                                &session,
-                                                |panel, cx| {
-                                                    panel.restore_durable_session(
-                                                        active, cx,
-                                                    )
-                                                },
-                                            );
-                                        }
-                                    }
-                                    Err(error) => {
-                                        cx.update_entity(&threads, |panel, cx| {
-                                            panel.restore_durable_sessions(
-                                                Err(error),
-                                                cx,
-                                            )
-                                        });
-                                    }
-                                }
-                            }
-                        })
-                        .detach();
-                        session.update(cx, |panel, cx| {
-                            panel.set_thread_launcher(threads.clone(), cx);
-                        });
-                        let explorer = cx.new(|cx| {
-                            crate::explorer_panel::ExplorerPanel::new(
-                                &explorer_root,
-                                window,
-                                cx,
-                            )
-                        });
-                        let explorer_id = explorer.read(cx).mailbox_id;
-                        let settings = cx.new(|cx| {
-                            crate::settings_panel::SettingsPanel::new(
-                                std::path::PathBuf::from(&explorer_root),
-                                window,
-                                cx,
-                            )
+                            window,
+                            cx,
+                        )
+                        .with_code(code.clone())
+                        .with_proxy_client(proxy.clone())
+                    });
+                    session.update(cx, |panel, cx| {
+                        panel.watch_config_changes(window, cx);
+                    });
+                    let threads = cx.new(|cx| {
+                        crate::threads_panel::ThreadsPanel::new(window, cx)
                             .with_proxy(proxy.clone())
-                        });
-                        settings.update(cx, |settings, cx| {
-                            settings.watch_config_changes(window, cx);
-                            settings.load_mcp_server_declarations(cx);
-                        });
-                        let terminal = cx.new(|cx| {
-                            crate::terminal_panel::TerminalPanel::new_with_cwd(
-                                1,
-                                explorer_root.clone(),
-                                cx,
-                            )
-                        });
-                        let terminals = vec![terminal.clone()];
-                        let debug_bar = cx.new(|cx| {
-                            crate::debug_bar::DebugBar::new(
-                                proxy.clone(),
-                                &path,
-                                window,
-                                cx,
-                            )
-                        });
-                        let git =
-                            cx.new(|cx| GitPanel::new(&explorer_root, window, cx));
-                        let search = cx.new(|cx| {
-                            SearchPanel::new(
-                                &explorer_root,
-                                explorer_id,
-                                code.clone(),
-                                window,
-                                cx,
-                            )
-                        });
-                        let problems =
-                            cx.new(|cx| ProblemsPanel::new(code.clone(), cx));
-                        let language_servers = cx.new(|cx| {
-                            LanguageServersPanel::new(
-                                &explorer_root,
-                                proxy.clone(),
-                                cx,
-                            )
-                        });
-                        let tasks =
-                            cx.new(|cx| JustTasksPanel::new(&explorer_root, cx));
-                        tasks.update(cx, |tasks, cx| tasks.refresh(cx));
-                        let agent_workspace = cx.new(|cx| {
-                            AgentWorkspacePanel::new(
-                                session.clone(),
-                                threads.clone(),
-                                cx,
-                            )
-                        });
-                        let activity = cx.new(|_| {
-                            ActivityBar::new(
-                                area.clone(),
-                                explorer.clone(),
-                                git.clone(),
-                                tasks.clone(),
-                                language_servers.clone(),
-                            )
-                        });
-                        let shell = cx.new(|cx| {
-                            Shell::new(
-                                area.clone(),
-                                session.clone(),
-                                threads.clone(),
-                                code.clone(),
-                                explorer.clone(),
-                                debug_bar.clone(),
-                                terminals.clone(),
-                                problems.clone(),
-                                settings.clone(),
-                                search.clone(),
-                                agent_workspace.clone(),
-                                activity.clone(),
-                                cx,
-                            )
-                        });
-                        session
-                            .update(cx, |panel, _| panel.set_shell(shell.clone()));
-                        let shell_for_settings_reload = shell.downgrade();
-                        let session_for_settings_reload = session.downgrade();
-                        let workspace_for_settings_reload = explorer_root.clone();
-                        settings.update(cx, |settings, _| {
-                            settings.set_save_handler(move |window, cx| {
-                                if let Err(error) = session_for_settings_reload
-                                    .update(cx, |session, cx| {
-                                        session.reload_configured_models(window, cx)
-                                    })
-                                {
-                                    eprintln!(
-                                        "AHEAD model picker reload failed: {error}"
-                                    );
+                            .with_session(session.clone())
+                    });
+                    cx.spawn({
+                        let proxy = proxy.clone();
+                        let threads = threads.clone();
+                        let session = session.clone();
+                        async move |cx| {
+                            let restore = cx
+                                .background_spawn(async move {
+                                    proxy.durable_session_restore()
+                                })
+                                .await;
+                            match restore {
+                                Ok(restore) => {
+                                    cx.update_entity(&threads, |panel, cx| {
+                                        panel.restore_durable_sessions(
+                                            Ok(restore.sessions),
+                                            cx,
+                                        )
+                                    });
+                                    if let Some(active) = restore.active {
+                                        cx.update_entity(&session, |panel, cx| {
+                                            panel.restore_durable_session(active, cx)
+                                        });
+                                    }
                                 }
-                                let inline_blame =
-                                    crate::settings_panel::inline_blame_enabled(
-                                        std::path::Path::new(
-                                            &workspace_for_settings_reload,
-                                        ),
-                                    );
-                                if let Err(error) = shell_for_settings_reload.update(
-                                    cx,
-                                    |shell, cx| {
-                                        for code in &shell.code_tabs {
-                                            code.update(cx, |code, cx| {
-                                                code.set_inline_blame_enabled(
-                                                    inline_blame,
-                                                    cx,
-                                                )
-                                            });
-                                        }
-                                    },
-                                ) {
-                                    eprintln!(
-                                        "AHEAD inline blame reload failed: {error}"
-                                    );
-                                }
-                            });
-                        });
-                        Shell::install_window_close_handler(&shell, window, cx);
-                        shell.update(cx, |shell, cx| {
-                            shell.start_debug_terminal_pump(
-                                proxy.clone(),
-                                window,
-                                cx,
-                            );
-                        });
-                        cx.spawn({
-                            let shell = shell.downgrade();
-                            let session = session.downgrade();
-                            let proxy = proxy.clone();
-                            async move |cx| loop {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(250))
-                                    .await;
-                                if session
-                                    .update(cx, |panel, cx| panel.poll_stream(cx))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                if shell
-                                    .update(cx, |shell, cx| {
-                                        for code in &shell.code_tabs {
-                                            code.update(cx, |code, cx| {
-                                                code.poll_recovery(cx)
-                                            });
-                                        }
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                if let Some(message) = proxy.take_core_message()
-                                    && shell
-                                        .update(cx, |shell, cx| {
-                                            shell.status_message = message;
-                                            cx.notify();
-                                        })
-                                        .is_err()
-                                {
-                                    break;
+                                Err(error) => {
+                                    cx.update_entity(&threads, |panel, cx| {
+                                        panel
+                                            .restore_durable_sessions(Err(error), cx)
+                                    });
                                 }
                             }
-                        })
-                        .detach();
-                        shell.update(cx, |shell, cx| {
-                            shell.configure_code(code.clone(), cx);
-                            shell.restore_unsaved_buffers(window, cx);
+                        }
+                    })
+                    .detach();
+                    session.update(cx, |panel, cx| {
+                        panel.set_thread_launcher(threads.clone(), cx);
+                    });
+                    let explorer = cx.new(|cx| {
+                        crate::explorer_panel::ExplorerPanel::new(
+                            &explorer_root,
+                            window,
+                            cx,
+                        )
+                    });
+                    let explorer_id = explorer.read(cx).mailbox_id;
+                    let settings = cx.new(|cx| {
+                        crate::settings_panel::SettingsPanel::new(
+                            std::path::PathBuf::from(&explorer_root),
+                            window,
+                            cx,
+                        )
+                        .with_proxy(proxy.clone())
+                    });
+                    settings.update(cx, |settings, cx| {
+                        settings.watch_config_changes(window, cx);
+                        settings.load_mcp_server_declarations(cx);
+                    });
+                    let extensions = cx.new(|cx| {
+                        crate::extensions_panel::ExtensionsPanel::new(
+                            proxy.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                    extensions.update(cx, |panel, _| {
+                        let explorer = explorer.downgrade();
+                        panel.set_icon_theme_changed_handler(move |cx| {
+                            if let Err(error) = explorer
+                                .update(cx, |panel, cx| panel.reload_icon_theme(cx))
+                            {
+                                eprintln!("Failed to refresh file icons: {error}");
+                            }
                         });
-                        let shell_for_trash = shell.downgrade();
-                        explorer.update(cx, |explorer, _| {
-                            explorer.set_trash_handler(move |path, window, cx| {
-                                if let Err(error) =
-                                    shell_for_trash.update(cx, |shell, cx| {
-                                        shell.trash_workspace_path(path, window, cx);
-                                    })
-                                {
-                                    eprintln!(
-                                        "Moving explorer entry to Trash: {error}"
-                                    );
-                                }
-                            });
-                        });
-                        let shell_for_tasks = shell.downgrade();
-                        tasks.update(cx, |tasks, _| {
-                            tasks.set_run_handler(move |recipe, cwd, window, cx| {
-                                _ = shell_for_tasks.update(cx, |shell, cx| {
-                                    shell.new_task_terminal(recipe, cwd, window, cx);
-                                });
-                            });
-                        });
-                        let shell_for_session_settings = shell.downgrade();
-                        session.update(cx, |session, _| {
-                            session.set_open_settings_handler(move |window, cx| {
-                                _ = shell_for_session_settings.update(
-                                    cx,
-                                    |shell, cx| {
-                                        shell.open_center_panel(
-                                            CenterPanel::Settings,
-                                            window,
-                                            cx,
-                                        );
-                                    },
+                    });
+                    let terminal = cx.new(|cx| {
+                        crate::terminal_panel::TerminalPanel::new_with_cwd(
+                            1,
+                            explorer_root.clone(),
+                            cx,
+                        )
+                    });
+                    let terminals = vec![terminal.clone()];
+                    let debug_bar = cx.new(|cx| {
+                        crate::debug_bar::DebugBar::new(
+                            proxy.clone(),
+                            &path,
+                            window,
+                            cx,
+                        )
+                    });
+                    let git = cx.new(|cx| {
+                        GitPanel::new(&explorer_root, window, cx)
+                            .with_proxy(proxy.clone())
+                    });
+                    let search = cx.new(|cx| {
+                        SearchPanel::new(
+                            &explorer_root,
+                            explorer_id,
+                            code.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                    let problems = cx.new(|cx| ProblemsPanel::new(code.clone(), cx));
+                    let help = cx.new(crate::help_panel::HelpPanel::new);
+                    let language_servers = cx.new(|cx| {
+                        LanguageServersPanel::new(
+                            std::path::Path::new(&explorer_root),
+                            proxy.clone(),
+                            cx,
+                        )
+                    });
+                    let tasks = cx.new(|cx| JustTasksPanel::new(&explorer_root, cx));
+                    tasks.update(cx, |tasks, cx| tasks.refresh(cx));
+                    let agent_workspace = cx.new(|cx| {
+                        AgentWorkspacePanel::new(
+                            session.clone(),
+                            threads.clone(),
+                            cx,
+                        )
+                    });
+                    let activity = cx.new(|_| {
+                        ActivityBar::new(
+                            area.clone(),
+                            explorer.clone(),
+                            git.clone(),
+                            tasks.clone(),
+                            language_servers.clone(),
+                        )
+                    });
+                    let shell = cx.new(|cx| {
+                        Shell::new(
+                            area.clone(),
+                            session.clone(),
+                            threads.clone(),
+                            code.clone(),
+                            explorer.clone(),
+                            debug_bar.clone(),
+                            terminals.clone(),
+                            problems.clone(),
+                            settings.clone(),
+                            extensions.clone(),
+                            help.clone(),
+                            search.clone(),
+                            agent_workspace.clone(),
+                            activity.clone(),
+                            cx,
+                        )
+                    });
+                    session.update(cx, |panel, _| panel.set_shell(shell.clone()));
+                    let shell_for_settings_reload = shell.downgrade();
+                    let session_for_settings_reload = session.downgrade();
+                    let workspace_for_settings_reload = explorer_root.clone();
+                    settings.update(cx, |settings, _| {
+                        settings.set_save_handler(move |window, cx| {
+                            if let Err(error) = session_for_settings_reload.update(
+                                cx,
+                                |session, cx| {
+                                    session.reload_configured_models(window, cx)
+                                },
+                            ) {
+                                eprintln!(
+                                    "AHEAD model picker reload failed: {error}"
                                 );
-                            });
+                            }
+                            let inline_blame =
+                                crate::settings_panel::inline_blame_enabled(
+                                    std::path::Path::new(
+                                        &workspace_for_settings_reload,
+                                    ),
+                                );
+                            if let Err(error) =
+                                shell_for_settings_reload.update(cx, |shell, cx| {
+                                    for code in &shell.code_tabs {
+                                        code.update(cx, |code, cx| {
+                                            code.set_inline_blame_enabled(
+                                                inline_blame,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                })
+                            {
+                                eprintln!(
+                                    "AHEAD inline blame reload failed: {error}"
+                                );
+                            }
                         });
-                        let shell_for_settings = shell.downgrade();
-                        settings.update(cx, |settings, _| {
-                            settings.set_close_handler(move |panel, window, cx| {
-                                _ = shell_for_settings.update(cx, |shell, cx| {
-                                    shell.close_center_panel(panel, window, cx);
-                                });
-                            });
-                        });
-                        let shell_for_search = shell.downgrade();
-                        search.update(cx, |search, _| {
-                            search.set_close_handler(move |panel, window, cx| {
-                                _ = shell_for_search.update(cx, |shell, cx| {
-                                    shell.close_center_panel(panel, window, cx);
-                                });
-                            });
-                        });
-                        let shell_for_problems = shell.downgrade();
-                        problems.update(cx, |problems, _| {
-                            problems.set_close_handler(move |panel, window, cx| {
-                                _ = shell_for_problems.update(cx, |shell, cx| {
-                                    shell.close_center_panel(panel, window, cx);
-                                });
-                            });
-                        });
-                        shell.update(cx, |shell, cx| {
-                            shell.configure_terminal(terminal.clone(), cx);
-                        });
-                        let shell_for_debug = shell.downgrade();
-                        debug_bar.update(cx, |debug_bar, _| {
-                            let shell_for_close = shell_for_debug.clone();
-                            debug_bar.set_close_handler(move |window, cx| {
-                                _ = shell_for_debug.update(cx, |shell, cx| {
-                                    shell.close_debug(window, cx);
-                                });
-                            });
-                            debug_bar.set_new_terminal_handler(move |window, cx| {
-                                _ = shell_for_close.update(cx, |shell, cx| {
-                                    shell.new_terminal(window, cx);
-                                });
-                            });
-                        });
-                        // Center: editor tabs. Bottom utility dock: Terminal and Debug tabs.
-                        shell.update(cx, |shell, cx| {
-                            shell.show_code(window, cx);
-                            shell.set_bottom_layout(false, window, cx);
-                        });
-
-                        // Right dock: Agent and Threads share one panel header and always stay together.
-                        let right = DockLayout::tabs()
-                            .panel_view(panel_handle(agent_workspace.clone()), cx);
-
-                        area.update(cx, |area, cx| {
-                            area.set_dock(DockPlacement::Right, right, window, cx);
-                            area.set_dock_size(
-                                DockPlacement::Right,
-                                px(640.),
-                                window,
-                                cx,
-                            );
-                            area.set_dock_size(
-                                DockPlacement::Left,
-                                px(240.),
-                                window,
-                                cx,
-                            );
-                        });
-                        activity.update(cx, |activity, cx| {
-                            activity.show(WorkspaceView::Explorer, window, cx)
-                        });
-                        let window_handle = window.window_handle();
-                        let shell_for_shortcuts = shell.downgrade();
-                        let shortcut_interceptor =
-                            cx.intercept_keystrokes(move |event, window, cx| {
-                                if window.window_handle() != window_handle
-                                    || window.has_active_dialog(cx)
-                                {
-                                    return;
-                                }
-                                let modifiers = event.keystroke.modifiers;
-                                let Some(command) = shell_shortcut(
-                                    event.keystroke.key.as_str(),
-                                    modifiers.platform,
-                                    modifiers.control,
-                                    modifiers.alt,
-                                    modifiers.shift,
-                                ) else {
-                                    return;
-                                };
-                                if let Err(error) =
-                                    shell_for_shortcuts.update(cx, |shell, cx| {
-                                        shell.run_shell_command(command, window, cx);
+                    });
+                    Shell::install_window_close_handler(&shell, window, cx);
+                    shell.update(cx, |shell, cx| {
+                        shell.start_debug_terminal_pump(proxy.clone(), window, cx);
+                    });
+                    cx.spawn({
+                        let shell = shell.downgrade();
+                        let session = session.downgrade();
+                        let proxy = proxy.clone();
+                        async move |cx| loop {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(250))
+                                .await;
+                            if session
+                                .update(cx, |panel, cx| panel.poll_stream(cx))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if shell
+                                .update(cx, |shell, cx| {
+                                    for code in &shell.code_tabs {
+                                        code.update(cx, |code, cx| {
+                                            code.poll_recovery(cx)
+                                        });
+                                    }
+                                    shell.sync_shared_editor_roles(cx);
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if let Some(message) = proxy.take_core_message()
+                                && shell
+                                    .update(cx, |shell, cx| {
+                                        shell.status_message = message;
+                                        cx.notify();
                                     })
-                                {
-                                    eprintln!(
-                                        "AHEAD could not run shortcut: {error}"
-                                    );
-                                }
-                                window.prevent_default();
-                                cx.stop_propagation();
+                                    .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                    shell.update(cx, |shell, cx| {
+                        shell.configure_code(code.clone(), cx);
+                        shell.restore_unsaved_buffers(window, cx);
+                    });
+                    let shell_for_trash = shell.downgrade();
+                    explorer.update(cx, |explorer, _| {
+                        explorer.set_trash_handler(move |path, window, cx| {
+                            if let Err(error) =
+                                shell_for_trash.update(cx, |shell, cx| {
+                                    shell.trash_workspace_path(path, window, cx);
+                                })
+                            {
+                                eprintln!("Moving explorer entry to Trash: {error}");
+                            }
+                        });
+                    });
+                    let shell_for_tasks = shell.downgrade();
+                    tasks.update(cx, |tasks, _| {
+                        tasks.set_run_handler(move |recipe, cwd, window, cx| {
+                            _ = shell_for_tasks.update(cx, |shell, cx| {
+                                shell.new_task_terminal(recipe, cwd, window, cx);
                             });
-                        shell.update(cx, |shell, _| {
-                            shell._shortcut_interceptor = Some(shortcut_interceptor);
                         });
-                        let shell_focus = shell.read(cx).focus.clone();
-                        let root = cx.new(|cx| {
-                            gpui_kit::component::Root::new(shell, window, cx)
+                    });
+                    let shell_for_session_settings = shell.downgrade();
+                    session.update(cx, |session, _| {
+                        session.set_open_settings_handler(move |window, cx| {
+                            _ = shell_for_session_settings.update(
+                                cx,
+                                |shell, cx| {
+                                    shell.open_center_panel(
+                                        CenterPanel::Settings,
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            );
                         });
-                        window.focus(&shell_focus, cx);
-                        root
-                    },
-                )
+                    });
+                    let shell_for_settings = shell.downgrade();
+                    settings.update(cx, |settings, _| {
+                        settings.set_close_handler(move |panel, window, cx| {
+                            _ = shell_for_settings.update(cx, |shell, cx| {
+                                shell.close_center_panel(panel, window, cx);
+                            });
+                        });
+                    });
+                    let shell_for_extensions = shell.downgrade();
+                    extensions.update(cx, |extensions, _| {
+                        extensions.set_close_handler(move |panel, window, cx| {
+                            _ = shell_for_extensions.update(cx, |shell, cx| {
+                                shell.close_center_panel(panel, window, cx);
+                            });
+                        });
+                    });
+                    let shell_for_search = shell.downgrade();
+                    let shell_for_help = shell.downgrade();
+                    help.update(cx, |help, _| {
+                        help.set_close_handler(move |panel, window, cx| {
+                            _ = shell_for_help.update(cx, |shell, cx| {
+                                shell.close_center_panel(panel, window, cx);
+                            });
+                        });
+                    });
+                    search.update(cx, |search, _| {
+                        search.set_close_handler(move |panel, window, cx| {
+                            _ = shell_for_search.update(cx, |shell, cx| {
+                                shell.close_center_panel(panel, window, cx);
+                            });
+                        });
+                    });
+                    let shell_for_problems = shell.downgrade();
+                    problems.update(cx, |problems, _| {
+                        problems.set_close_handler(move |panel, window, cx| {
+                            _ = shell_for_problems.update(cx, |shell, cx| {
+                                shell.close_center_panel(panel, window, cx);
+                            });
+                        });
+                    });
+                    shell.update(cx, |shell, cx| {
+                        shell.configure_terminal(terminal.clone(), cx);
+                    });
+                    let shell_for_debug = shell.downgrade();
+                    debug_bar.update(cx, |debug_bar, _| {
+                        let shell_for_close = shell_for_debug.clone();
+                        debug_bar.set_close_handler(move |window, cx| {
+                            _ = shell_for_debug.update(cx, |shell, cx| {
+                                shell.close_debug(window, cx);
+                            });
+                        });
+                        debug_bar.set_new_terminal_handler(move |window, cx| {
+                            _ = shell_for_close.update(cx, |shell, cx| {
+                                shell.new_terminal(window, cx);
+                            });
+                        });
+                    });
+                    // Center: editor tabs. Bottom utility dock: Terminal and Debug tabs.
+                    shell.update(cx, |shell, cx| {
+                        shell.show_code(window, cx);
+                        shell.set_bottom_layout(false, window, cx);
+                    });
+
+                    // Right dock: Agent and Threads share one panel header and always stay together.
+                    let right = DockLayout::tabs()
+                        .panel_view(panel_handle(agent_workspace.clone()), cx);
+
+                    area.update(cx, |area, cx| {
+                        area.set_dock(DockPlacement::Right, right, window, cx);
+                        area.set_dock_size(
+                            DockPlacement::Right,
+                            px(640.),
+                            window,
+                            cx,
+                        );
+                        area.set_dock_size(
+                            DockPlacement::Left,
+                            px(240.),
+                            window,
+                            cx,
+                        );
+                    });
+                    activity.update(cx, |activity, cx| {
+                        activity.show(WorkspaceView::Explorer, window, cx)
+                    });
+                    let window_handle = window.window_handle();
+                    let shell_for_shortcuts = shell.downgrade();
+                    let shortcut_interceptor =
+                        cx.intercept_keystrokes(move |event, window, cx| {
+                            if window.window_handle() != window_handle
+                                || window.has_active_dialog(cx)
+                            {
+                                return;
+                            }
+                            let modifiers = event.keystroke.modifiers;
+                            let Some(command) = shell_shortcut(
+                                event.keystroke.key.as_str(),
+                                modifiers.platform,
+                                modifiers.control,
+                                modifiers.alt,
+                                modifiers.shift,
+                            ) else {
+                                return;
+                            };
+                            if let Err(error) =
+                                shell_for_shortcuts.update(cx, |shell, cx| {
+                                    shell.run_shell_command(command, window, cx);
+                                })
+                            {
+                                eprintln!("AHEAD could not run shortcut: {error}");
+                            }
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        });
+                    shell.update(cx, |shell, _| {
+                        shell._shortcut_interceptor = Some(shortcut_interceptor);
+                    });
+                    let shell_focus = shell.read(cx).focus.clone();
+                    let root = cx
+                        .new(|cx| gpui_kit::component::Root::new(shell, window, cx));
+                    window.focus(&shell_focus, cx);
+                    root
+                })
                 .expect("Failed to open AHEAD window");
             })
             .detach();
@@ -3906,6 +4333,7 @@ mod shortcut_tests {
         assert_eq!(primary("e", false, true), Some(ShellShortcut::Explorer));
         assert_eq!(primary("f", false, true), Some(ShellShortcut::Search));
         assert_eq!(primary("d", false, true), Some(ShellShortcut::Debug));
+        assert_eq!(primary("x", false, true), Some(ShellShortcut::Extensions));
         assert_eq!(primary("b", true, false), Some(ShellShortcut::ToggleRight));
         assert_eq!(
             primary("p", false, true),

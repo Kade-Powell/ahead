@@ -27,7 +27,8 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W15 | Settled 2026-09-22 | Treat pull-request review as a distinct work type over an immutable base/head snapshot. A contributor may review the code and explicitly shared session artifacts, mark each artifact's review status and disposition, and record findings. AHEAD records reviewer identity, reviewer relationship to the implementers, revisions and policy context, then offers an advisory merge-readiness suggestion. The repository/team's normal PR requirements—including whether independent review is required—and the team's or solo contributor's merge timing remain authoritative; AHEAD neither requires a second person universally nor authorizes, blocks or performs the merge. |
 | W16 | Required | Presentation Core is an editor capability available to every supported AHEAD agent implementation and version, across managed models/providers and external adapters. Agent adapters expose the same inspect, highlight, label/note, pointer and speech tools by forwarding requests to the editor; availability does not depend on teaching versus assistance intent. Presentation actions do not edit source files or move the human caret. |
 | W17 | Settled 2026-10-01 | Human implementation remains the default. At any point during implementation, the human may hand work to a new external agent thread with the session context and work directly with that agent. Show it indented beneath the originating AHEAD thread in the unified sidebar. The human returns to the original thread for verification, review and the remaining workflow; child completion does not complete the parent. |
-| W18 | Settled 2026-10-01; local slice implemented | Session participants select code and write comments in an editor popover. A gutter icon and range rail expose open comments; the session panel lists them for navigation, chat attachment and resolution. Comments retain author, range, quote and source hash and expire with the archived session after 30 days. Opening a changed source avoids selecting the stale range. Live multi-client sync, diff-hunk anchoring, stale-range relocation and explicit child-thread attachment remain implementation work. |
+| W18 | Settled 2026-10-01; direct comment sync implemented | Session participants select code and write comments in an editor popover. A gutter icon and range rail expose open comments; the session panel lists them for navigation, chat attachment and resolution. Comments retain author, range, quote and source hash and expire with the archived session after 30 days. Opening a changed source avoids selecting the stale range. Directly shared comments enforce participant roles; headless two-window and separate-process tests cover guest comments reaching the host navigator. Rendered multi-client verification, diff-hunk anchoring, stale-range relocation and explicit child-thread attachment remain implementation work. |
+| W19 | Settled 2026-10-02; direct chat and shared editing implemented | An active AHEAD session may be shared from within that session. Its owner is the execution host and pays for agent model usage; other participants are clients of that host. A message with an `@` mention of another session participant is for people in the session and does not reach the agent. A message without a participant mention is sent to the agent under session role policy. A checked-in team manifest lists allowed GitHub accounts and default roles; the owner selects members for each session. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
@@ -102,6 +103,61 @@ agent.
 Proposed first version: a context snapshot at handoff and a return-to-review
 action, without continuous synchronization of two plans. Worktree isolation and
 handling simultaneous edits remain open implementation choices.
+
+### 1.3 Shared AHEAD sessions
+
+Sharing is an action inside a currently active managed AHEAD session. The session
+owner hosts its worktree, proxy, terminal and agent runtime; invited participants
+connect as clients. The host authenticates each participant and checks their
+session role on every command. The host's configured model account pays for agent
+turns, including turns started by an authorized client. Clients never receive the
+host's provider credentials or direct control of its terminal process.
+
+The composer resolves `@` mentions against current session participants. If a
+message addresses another participant, it is recorded and shown to the humans
+without starting an agent turn or entering later agent/FIM context or
+model-facing summaries.
+Without a participant mention, Send starts an agent turn if the sender's role
+allows it. Show the resolved recipient before Send; `@currentFile` and unresolved
+`@` text remain context/plain text rather than human recipients. Store the
+resolved audience with each durable message so reconnect and replay preserve the
+same boundary.
+
+```mermaid
+flowchart LR
+  Owner["Owner opens active AHEAD session"] --> Share["Share this session"]
+  Share --> Clients["Authenticated clients join host"]
+  Clients --> Send{"Message mentions a session participant?"}
+  Send -->|Yes| People["Host records and broadcasts human message"]
+  Send -->|No, role permits| Agent["Host runs agent using host account"]
+  People --> HumanHistory["Human-only history; excluded from model context"]
+  Agent --> AgentHistory["Agent-visible session history"]
+```
+
+The first connection is directly to a reachable host. The host assigns durable
+event order and owns the session database. The current slice shares conversation
+snapshots, code comments, bounded host terminal scrollback and host-run agent turns over certificate-pinned TLS, with GitHub ID
+membership and the current workspace team allowlist checked on each command. Removing
+an account from `.ahead/team.toml` rejects its next command and blocks reconnect. Polling clients
+reconnect with the same pinned certificate and identity after a dropped socket.
+Guests can open live host text; owner/editor tabs send revision-checked edits,
+reviewer/viewer tabs remain read-only, and stale writes preserve local text for
+explicit conflict resolution. File/line presence supports opt-in follow and
+return navigation. Shared code comment links open host buffers and relocate a
+unique quoted range after the source changes. Direct TLS tests cover competing
+edits, role changes, terminal output clearing and a separate guest proxy's
+join/read/edit/poll/leave path. A separate-process headless Shell test covers
+code, human-only chat, comments, terminal output, presence, follow and
+revocation across the process boundary. Its guest-started managed turn reaches
+the host's mock model with the host-only provider key while addressed chat stays
+out of model input; the guest reconnects after a rejected direct turn and
+posts another message. A two-window GPUI test checks bidirectional live editor
+convergence, Viewer downgrade, Editor restoration, terminal clear/reopen and
+host Stop Sharing, which clears terminal output and presence on guest
+disconnect. Recovery of shared edits is implemented; rendered two-app
+verification remains open. The [collaboration topology and
+Zed implementation references](ahead-editor-mvp.md#72-a-practical-first-collaboration-topology)
+detail the host and buffer boundaries.
 
 ## 2. SDLC map and responsibility legend
 
@@ -459,6 +515,7 @@ that directory:
 |---|---|---|
 | `.ahead/.gitignore` | tracked and created on project setup/open | Default-deny boundary that travels with the project without changing its root `.gitignore`. |
 | `.ahead/config.toml` | tracked | Non-secret project workflow/editor/provider defaults; MCP declarations remain inert until local opt-in. |
+| `.ahead/team.toml` | tracked when configured | Non-secret GitHub names, display names and default roles for inviting session participants; no credentials, endpoints or live grants. |
 | `.ahead/templates/` | tracked when present | Project overrides for built-in artifact templates. |
 | `.ahead/sessions/<id>/` | tracked when explicitly published | Portable session checkpoint and selected human-readable artifacts. |
 | `docs/{research,design,plans,verification,reviews}/` by default | tracked when committed | Canonical lasting documents, named for their subject. `[documentation].root` changes the root. |
@@ -475,6 +532,11 @@ from tracked config. This is a proposed config contract, not a working
 server-launch path. The native host must keep MCP unavailable in Learn until it
 can enforce read-only behavior for external server effects; MCP writes are not
 AHEAD CodeAnchors. See the [agent standards boundary](ahead-agent-standards.md#protocols).
+
+Live shared conversation, participant membership and message audience remain
+private session database state on the host. An explicitly exported checkpoint
+may contain human-only messages; preserve their audience so importing or
+attaching that history never silently sends them to an agent.
 
 Built-in artifact templates live in `defaults/artifacts/`. A project may override
 a template by placing a file with the same name in `.ahead/templates/`; it need

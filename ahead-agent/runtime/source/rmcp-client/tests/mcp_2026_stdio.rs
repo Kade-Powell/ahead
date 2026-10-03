@@ -64,11 +64,8 @@ async fn exercise_stdio_server(
     let legacy_session = server_mode.starts_with("legacy");
     let initialized = client
         .initialize(
-            InitializeRequestParams::new(
-                capabilities,
-                Implementation::new("codex-mcp-client", "0.0.0-test"),
-            )
-            .with_protocol_version(ProtocolVersion::V_2025_06_18),
+            InitializeRequestParams::new(capabilities, Implementation::new("AHEAD", "0.0.0-test"))
+                .with_protocol_version(ProtocolVersion::V_2025_06_18),
             Some(Duration::from_secs(5)),
             Box::new(move |_request_id, request| {
                 let observed_elicitations = Arc::clone(&observed_elicitations);

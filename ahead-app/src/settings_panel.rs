@@ -10,14 +10,14 @@ use std::{
     time::SystemTime,
 };
 
-use ahead_rpc::ahead::McpServerDeclaration;
+use ahead_rpc::ahead::{McpServerApprovalAction, McpServerDeclaration};
 use fs4::fs_std::FileExt;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{
     BasePanel, Panel, PanelControl, PanelEvent, PanelId, TabGroup,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputContentType, InputEvent, InputState};
 use gpui_kit::component::setting::{
     SettingGroup, SettingItem, SettingPage, Settings,
 };
@@ -28,7 +28,6 @@ use gpui_kit::*;
 use gpui_kit_assets::IconName;
 
 const DEFAULT_SETTINGS: &str = include_str!("../../defaults/settings.toml");
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AiConnection {
     name: String,
@@ -344,6 +343,7 @@ fn lock_settings_file(path: &Path) -> std::io::Result<SettingsFileLock> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)?;
     file.lock_exclusive()?;
     Ok(SettingsFileLock(file))
@@ -490,10 +490,7 @@ pub struct SettingsPanel {
     pub base_url_input: Entity<InputState>,
     pub api_key_input: Entity<InputState>,
     pub model_input: Entity<InputState>,
-    pub extension_id_input: Entity<InputState>,
-    pub extension_url_input: Entity<InputState>,
     pub test_status: SharedString,
-    pub extension_status: SharedString,
     mcp_declarations: Vec<McpServerDeclaration>,
     mcp_status: SharedString,
     mcp_busy: bool,
@@ -528,11 +525,8 @@ impl SettingsPanel {
     ) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx));
         let base_url_input = cx.new(|cx| InputState::new(window, cx));
-        let api_key_input = cx.new(|cx| InputState::new(window, cx));
+        let api_key_input = cx.new(|cx| InputState::new(window, cx).masked(true));
         let model_input = cx.new(|cx| InputState::new(window, cx));
-        let extension_id_input = cx.new(|cx| InputState::new(window, cx));
-        let extension_url_input = cx.new(|cx| InputState::new(window, cx));
-
         for (input, invalidates_model_discovery) in [
             (name_input.clone(), false),
             (base_url_input.clone(), true),
@@ -568,10 +562,7 @@ impl SettingsPanel {
             base_url_input,
             api_key_input,
             model_input,
-            extension_id_input,
-            extension_url_input,
             test_status: "Endpoint not tested".into(),
-            extension_status: "No language extension install started".into(),
             mcp_declarations: Vec::new(),
             mcp_status: "MCP declarations not loaded".into(),
             mcp_busy: false,
@@ -654,7 +645,7 @@ impl SettingsPanel {
         &mut self,
         server_id: String,
         fingerprint: String,
-        enabled: bool,
+        action: McpServerApprovalAction,
         cx: &mut Context<Self>,
     ) {
         if self.mcp_busy {
@@ -672,7 +663,7 @@ impl SettingsPanel {
         cx.spawn(async move |this, cx| {
             let (change, current) = cx.background_spawn(async move {
                 let change = proxy
-                    .set_mcp_server_approval(&workspace, &server_id, &fingerprint, enabled)
+                    .set_mcp_server_approval(&workspace, &server_id, &fingerprint, action)
                     .map_err(|error| error.message);
                 let current = proxy.mcp_server_declarations(&workspace).map_err(|error| error.message);
                 (change, current)
@@ -682,10 +673,12 @@ impl SettingsPanel {
                 if let Ok(declarations) = current {
                     this.mcp_declarations = declarations;
                 }
-                this.mcp_status = match change {
-                    Ok(()) if enabled => "MCP server approved for new managed sessions".into(),
-                    Ok(()) => "MCP server disabled for new sessions; stop existing sessions separately".into(),
-                    Err(error) => format!("MCP approval failed: {error}; refresh the declaration").into(),
+                this.mcp_status = match (change, action) {
+                    (Ok(()), McpServerApprovalAction::ApproveAndEnable) => "MCP server approved for new managed sessions".into(),
+                    (Ok(()), McpServerApprovalAction::Disable) => "MCP server disabled for new sessions; stop existing sessions separately".into(),
+                    (Ok(()), McpServerApprovalAction::AutoApproveAll) => "Permitted calls from this MCP server will be auto-approved in new managed sessions".into(),
+                    (Ok(()), McpServerApprovalAction::ReviewEachCall) => "MCP calls will require review in new managed sessions".into(),
+                    (Err(error), _) => format!("MCP approval failed: {error}; refresh the declaration").into(),
                 };
                 cx.notify();
             });
@@ -968,8 +961,10 @@ impl SettingsPanel {
             .update(cx, |input, cx| input.set_value(&name, window, cx));
         self.base_url_input
             .update(cx, |input, cx| input.set_value(&base_url, window, cx));
-        self.api_key_input
-            .update(cx, |input, cx| input.set_value(&api_key, window, cx));
+        self.api_key_input.update(cx, |input, cx| {
+            input.set_value(&api_key, window, cx);
+            input.set_masked(true, window, cx);
+        });
         self.model_input
             .update(cx, |input, cx| input.set_value(&model, window, cx));
         self.suppress_autosave = false;
@@ -1150,45 +1145,6 @@ impl SettingsPanel {
                 this.test_status = match result {
                     Ok(status) => status.into(),
                     Err(error) => format!("Endpoint unavailable · {error}").into(),
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    pub fn install_language_extension(&mut self, cx: &mut Context<Self>) {
-        let Some(proxy) = self.proxy.clone() else {
-            self.extension_status = "AHEAD proxy is unavailable".into();
-            cx.notify();
-            return;
-        };
-        let extension_id =
-            self.extension_id_input.read(cx).value().trim().to_string();
-        let url = self.extension_url_input.read(cx).value().trim().to_string();
-        if extension_id.is_empty() || url.is_empty() {
-            self.extension_status = "Enter an extension ID and package URL".into();
-            cx.notify();
-            return;
-        }
-
-        self.extension_status = format!("Installing {extension_id}…").into();
-        cx.notify();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        proxy.install_language_extension(url, extension_id, move |result| {
-            let _ = tx.send(result);
-        });
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    rx.recv()
-                        .map_err(|_| "AHEAD proxy connection closed".to_string())?
-                })
-                .await;
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                this.extension_status = match result {
-                    Ok(()) => "Language extension installed; open a matching file to start its LSP".into(),
-                    Err(error) => format!("Language extension install failed · {error}").into(),
                 };
                 cx.notify();
             });
@@ -1389,7 +1345,15 @@ mod tests {
                 fingerprint: format!("sha256:{}", "0".repeat(64)),
                 enabled: false,
                 approved: false,
+                auto_approve_all: false,
             }];
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        panel.update(cx, |panel, cx| {
+            panel.mcp_declarations[0].enabled = true;
+            panel.mcp_declarations[0].approved = true;
+            panel.mcp_declarations[0].auto_approve_all = true;
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1438,6 +1402,15 @@ mod tests {
             assert!(panel.status.to_string().contains("Settings reloaded"));
         });
         assert_eq!(reloads.get(), 1, "chat model picker should reload");
+
+        std::fs::write(&shared, "[ai]\napi_key = 'tracked-secret'\n")
+            .expect("credential in shared settings");
+        panel.update_in(cx, |panel, window, cx| panel.refresh_from_disk(window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        panel.update(cx, |panel, _| {
+            assert!(panel.status.to_string().contains("credential field"));
+        });
     }
 
     #[test]
@@ -1520,6 +1493,7 @@ mod tests {
             assert!(panel.loaded);
             assert_eq!(panel.model_input.read(cx).value(), "existing-model");
             assert_eq!(panel.api_key_input.read(cx).value(), "fixture-secret");
+            assert!(panel.api_key_input.read(cx).presentation().is_masked());
             assert_eq!(
                 panel.save_generation, 0,
                 "loading must not trigger autosave"
@@ -1529,6 +1503,14 @@ mod tests {
             std::fs::read_to_string(path).expect("unchanged settings"),
             original
         );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.api_key_input.update(cx, |input, cx| {
+                input.set_masked(false, window, cx);
+            });
+            assert!(!panel.api_key_input.read(cx).presentation().is_masked());
+            panel.load_connection_into_inputs(window, cx);
+            assert!(panel.api_key_input.read(cx).presentation().is_masked());
+        });
     }
 
     #[gpui_kit::test(iterations = 5)]
@@ -1878,7 +1860,7 @@ mod tests {
         )
         .unwrap();
         let existing = format!(
-            "{}\n[mcp]\nenabled_servers = ['docs']\n[mcp.tool_permissions.docs]\nsearch = 'allow'\n",
+            "{}\n[mcp]\nenabled_servers = ['docs']\n[mcp.server_permissions]\ndocs = 'allow'\n[mcp.tool_permissions.docs]\nsearch = 'allow'\n",
             super::DEFAULT_SETTINGS
         );
         let merged = super::merge_ai_config(&existing, &ai).unwrap();
@@ -1886,6 +1868,10 @@ mod tests {
 
         assert!(config.get("core").is_some());
         assert!(config.get("editor").is_some());
+        assert_eq!(
+            config["mcp"]["server_permissions"]["docs"].as_str(),
+            Some("allow")
+        );
         assert_eq!(
             config
                 .get("mcp")
@@ -2022,8 +2008,8 @@ impl SettingsPanel {
         let card = cx.theme().sidebar;
         let _group = cx.theme().group_box;
         let is_dark = cx.theme().mode.is_dark();
+        let api_key_masked = self.api_key_input.read(cx).presentation().is_masked();
         let settings_panel = cx.entity();
-
         v_flex()
             .w_full()
             .p_4()
@@ -2198,6 +2184,12 @@ impl SettingsPanel {
                     )
                     .child(
                         div()
+                            .text_size(px(11.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("New chats use saved connections. Open built-in chats reconnect on the next turn after other managed turns finish."),
+                    )
+                    .child(
+                        div()
                             .text_size(px(10.))
                             .text_color(cx.theme().muted_foreground)
                             .child(format!(
@@ -2287,9 +2279,42 @@ impl SettingsPanel {
                                     .child("API Key (optional)"),
                             )
                             .child(
-                                Input::new(&self.api_key_input)
-                                    .disabled(!self.loaded)
-                                    .aria_label("API Key"),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div().flex_1().min_w_0().child({
+                                            let input = Input::new(&self.api_key_input)
+                                                .disabled(!self.loaded)
+                                                .aria_label("API Key");
+                                            if api_key_masked {
+                                                input.content_type(InputContentType::Password)
+                                            } else {
+                                                input
+                                            }
+                                        }),
+                                    )
+                                    .child(
+                                        Button::new("toggle_api_key")
+                                            .disabled(!self.loaded)
+                                            .icon(if api_key_masked {
+                                                IconName::Eye
+                                            } else {
+                                                IconName::EyeOff
+                                            })
+                                            .label(if api_key_masked { "Show" } else { "Hide" })
+                                            .tooltip(if api_key_masked {
+                                                "Show API key"
+                                            } else {
+                                                "Hide API key"
+                                            })
+                                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                                this.api_key_input.update(cx, |input, cx| {
+                                                    input.toggle_masked(window, cx);
+                                                });
+                                                cx.notify();
+                                            })),
+                                    ),
                             ),
                     )
                     .child(
@@ -2308,30 +2333,33 @@ impl SettingsPanel {
                                     .aria_label("Model Catalog"),
                             ),
                     )
-                    // Test and Save buttons
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
+                        v_flex()
+                            .gap_1()
                             .child(
-                                Button::new("test_conn_btn")
-                                    .disabled(!self.loaded)
-                                    .icon(IconName::Activity)
-                                    .label("Test Endpoint")
-                                    .tooltip("Check reachability")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                        this.test_connection(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("discover_models_btn")
-                                    .disabled(!self.loaded)
-                                    .icon(IconName::Search)
-                                    .label("Discover Models")
-                                    .tooltip("Discover model ids from the endpoint")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                        this.discover_models(cx);
-                                    })),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Button::new("test_conn_btn")
+                                            .disabled(!self.loaded)
+                                            .icon(IconName::Activity)
+                                            .label("Test Endpoint")
+                                            .tooltip("Check reachability")
+                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                this.test_connection(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("discover_models_btn")
+                                            .disabled(!self.loaded)
+                                            .icon(IconName::Search)
+                                            .label("Discover Models")
+                                            .tooltip("Discover model ids from the endpoint")
+                                            .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                this.discover_models(cx);
+                                            })),
+                                    )
                             )
                             .child(
                                 div()
@@ -2430,6 +2458,7 @@ impl SettingsPanel {
                         let fingerprint = declaration.fingerprint.clone();
                         let enabled = declaration.enabled
                             && (declaration.approved || !declaration.declared);
+                        let auto_approve_all = declaration.auto_approve_all;
                         // ponytail: render at most 16 KiB inline; add a paged inspector if real declarations exceed this.
                         let reviewable = declaration.declared
                             && declaration.declaration_toml.len() <= 16 * 1024;
@@ -2491,90 +2520,56 @@ impl SettingsPanel {
                                         this.set_mcp_server_approval(
                                             id.clone(),
                                             fingerprint.clone(),
-                                            !enabled,
+                                            if enabled {
+                                                McpServerApprovalAction::Disable
+                                            } else {
+                                                McpServerApprovalAction::ApproveAndEnable
+                                            },
                                             cx,
                                         );
                                     })),
                             )
+                            .when(enabled && declaration.declared, |card| {
+                                let id = declaration.id.clone();
+                                let fingerprint = declaration.fingerprint.clone();
+                                card.child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new(format!("mcp_call_policy_{id}"))
+                                                .label(if auto_approve_all {
+                                                    "Require review for each call"
+                                                } else {
+                                                    "Auto-approve permitted calls"
+                                                })
+                                                .tooltip(if auto_approve_all {
+                                                    "Review each tool and resource call in new managed sessions"
+                                                } else {
+                                                    "Trust this server's tools and resources without per-call review in new managed sessions"
+                                                })
+                                                .disabled(self.mcp_busy)
+                                                .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                    this.set_mcp_server_approval(
+                                                        id.clone(),
+                                                        fingerprint.clone(),
+                                                        if auto_approve_all {
+                                                            McpServerApprovalAction::ReviewEachCall
+                                                        } else {
+                                                            McpServerApprovalAction::AutoApproveAll
+                                                        },
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Auto-approval skips prompts for this server's permitted tools and resources. The server runs with your OS permissions; choose it only if you trust it."),
+                                        ),
+                                )
+                            })
                     })),
-            )
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_3()
-                    .bg(card)
-                    .border_1()
-                    .border_color(border)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(IconName::Code)
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(12.))
-                                    .text_color(text)
-                                    .child("LANGUAGE EXTENSIONS"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Install a Zed language extension package for additional languages. Rust Analyzer, Vtsls (TypeScript/JavaScript), and BasedPyright (Python) can also run from PATH. Matching extensions take precedence; manual LSP command settings are not supported."),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(text)
-                                    .child("Package URL"),
-                            )
-                            .child(
-                                Input::new(&self.extension_url_input)
-                                    .aria_label("Language extension package URL"),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .text_size(px(11.))
-                                    .text_color(text)
-                                    .child("Extension ID"),
-                            )
-                            .child(
-                                Input::new(&self.extension_id_input)
-                                    .aria_label("Language extension ID"),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("install_language_extension")
-                                    .primary()
-                                    .icon(IconName::Download)
-                                    .label("Install / Update")
-                                    .tooltip("Install or update a language extension")
-                                    .on_click(cx.listener(|this: &mut Self, _, _, cx| {
-                                        this.install_language_extension(cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(self.extension_status.clone()),
-                            ),
-                    ),
             )
             // Footer status
             .child(

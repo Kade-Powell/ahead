@@ -143,18 +143,17 @@ async fn reused_elicitation_senders_follow_each_servers_latest_permission_author
     config.approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
     config.permission_profile = PermissionProfile::Disabled;
 
-    let hosted_server = crate::mcp::tests::test_http_server_config("https://example.com/mcp");
-    let mut attached_server = hosted_server.clone();
+    let local_server = crate::mcp::tests::test_http_server_config("https://example.com/mcp");
+    let mut attached_server = local_server.clone();
     attached_server.environment_id = "attached".to_string();
     let mut catalog = crate::ResolvedMcpCatalog::builder();
     catalog.register(crate::McpServerRegistration::from_config(
         "attached".to_string(),
         attached_server,
     ));
-    catalog.register(crate::McpServerRegistration::from_hosted_apps(
-        "host",
-        /*contribution_order*/ 0,
-        hosted_server,
+    catalog.register(crate::McpServerRegistration::from_config(
+        "local".to_string(),
+        local_server,
     ));
     config.mcp_server_catalog = catalog.build();
     let servers = crate::effective_mcp_servers(&config);
@@ -169,17 +168,14 @@ async fn reused_elicitation_senders_follow_each_servers_latest_permission_author
         ElicitationRequestRouter::default(),
     );
     let attached = manager.make_sender("attached".to_string(), /*tx_event*/ None);
-    let hosted = manager.make_sender(
-        crate::CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        /*tx_event*/ None,
-    );
+    let local = manager.make_sender("local".to_string(), /*tx_event*/ None);
 
     assert_eq!(
         send_elicitation(&attached, /*marker*/ None).await.action,
         ElicitationAction::Decline
     );
     assert_eq!(
-        send_elicitation(&hosted, /*marker*/ None).await.action,
+        send_elicitation(&local, /*marker*/ None).await.action,
         ElicitationAction::Accept
     );
 
@@ -217,7 +213,7 @@ async fn reused_elicitation_senders_follow_each_servers_latest_permission_author
     config.set_server_permission_profiles(&servers, std::iter::empty());
     assert!(manager.update(Arc::new(config.clone()), /*lifecycle*/ None,));
     assert_eq!(
-        send_elicitation(&hosted, /*marker*/ None).await.action,
+        send_elicitation(&local, /*marker*/ None).await.action,
         ElicitationAction::Decline
     );
 }

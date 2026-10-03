@@ -12,10 +12,10 @@ use rmcp::model::ReadResourceRequestParams;
 
 use super::ReadResourceArgs;
 use super::ReadResourcePayload;
-use super::ensure_model_can_access_mcp_server;
 use super::normalize_required_string;
 use super::parse_args;
 use super::parse_arguments;
+use super::resource_servers;
 use super::run_resource_operation;
 
 pub struct ReadMcpResourceHandler;
@@ -53,7 +53,6 @@ impl ReadMcpResourceHandler {
             payload,
             ..
         } = invocation;
-        let turn = std::sync::Arc::clone(&step_context.turn);
         let mcp = &step_context.mcp;
 
         let arguments = match payload {
@@ -70,6 +69,7 @@ impl ReadMcpResourceHandler {
         let ReadResourceArgs { server, uri } = args;
         let server = normalize_required_string("server", server)?;
         let uri = normalize_required_string("uri", uri)?;
+        let servers = resource_servers(&step_context, Some(&server))?;
 
         let invocation = McpInvocation {
             server: server.clone(),
@@ -77,21 +77,27 @@ impl ReadMcpResourceHandler {
             arguments: arguments.clone(),
         };
 
-        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
-            ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
-            let result = mcp
-                .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
-                })?;
+        run_resource_operation(
+            &session,
+            &step_context,
+            &call_id,
+            invocation,
+            &servers,
+            async {
+                let result = mcp
+                    .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
+                    .await
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
+                    })?;
 
-            Ok(ReadResourcePayload {
-                server,
-                uri,
-                result,
-            })
-        })
+                Ok(ReadResourcePayload {
+                    server,
+                    uri,
+                    result,
+                })
+            },
+        )
         .await
     }
 }

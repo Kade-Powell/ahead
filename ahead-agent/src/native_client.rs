@@ -24,17 +24,24 @@ use ahead_rpc::ahead::{
     AgentSkillSource, validate_agent_buffer_snapshots,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use codex_config::types::OtelExporterKind;
 use codex_core::{CodexThread, StartThreadOptions, ThreadManager};
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_protocol::{
     ThreadId,
+    approvals::{ElicitationAction, ElicitationRequest, ElicitationRequestEvent},
     config_types::SandboxMode,
     dynamic_tools::{
         DynamicToolCallOutputContentItem, DynamicToolFunctionSpec,
         DynamicToolResponse, DynamicToolSpec,
     },
     items::{SubAgentActivityItem, TurnItem},
+    mcp::RequestId,
+    mcp_approval_meta::{
+        APPROVAL_KIND_KEY, APPROVAL_KIND_MCP_TOOL_CALL, PERSIST_KEY,
+        PERSIST_SESSION, TOOL_PARAMS_KEY,
+    },
     plan_tool::StepStatus,
     protocol::{
         AskForApproval, EventMsg, FileChange, Op, ReviewDecision, SessionSource,
@@ -58,6 +65,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 use crate::editor_tools::{
     AHEAD_CLEAR_PRESENTATION_TOOL, AHEAD_MOVE_CODE_POINTER_TOOL,
@@ -66,6 +74,7 @@ use crate::editor_tools::{
     presentation_tool_definitions,
 };
 use crate::instructions::EmptyUserInstructionsProvider;
+use crate::mcp_form::McpForm;
 use crate::{
     acp_client::{
         HarnessEvent, HarnessFileChange, HarnessPlanEntry, HarnessSink,
@@ -74,6 +83,7 @@ use crate::{
     runtime_support::{
         AgentScope, McpServerPolicy, file_change_allowed, mcp_servers_for_workspace,
         path_is_allowed, permission_profile, prepare_runtime_home,
+        runtime_config_from_sources,
     },
     store::{HarnessStore, LegacyNativeThreadImport},
     turso_agent_graph_store::TursoAgentGraphStore,
@@ -129,11 +139,69 @@ struct SessionSettings {
     mode_id: String,
     model: Option<String>,
     model_provider: Option<String>,
+    loaded_provider_fingerprint: [u8; 32],
+}
+
+fn provider_fingerprint(config: &codex_core::config::Config) -> Result<[u8; 32]> {
+    let provider = serde_json::to_vec(&config.model_provider)
+        .context("failed to inspect the AHEAD model connection")?;
+    let mut digest = Sha256::new();
+    digest.update(config.model_provider_id.as_bytes());
+    digest.update([0]);
+    digest.update(provider);
+    Ok(digest.finalize().into())
 }
 
 type UserInputAnswers = HashMap<String, Vec<String>>;
-type PendingUserInput = oneshot::Sender<UserInputAnswers>;
+struct PendingUserInput {
+    sender: oneshot::Sender<UserInputAnswers>,
+    kind: PendingUserInputKind,
+}
+
+enum PendingUserInputKind {
+    AgentQuestion,
+    McpForm(McpForm),
+    McpUrl,
+}
+// Child runtime threads share the parent work-session queue, so model call IDs
+// cannot identify pending host requests by themselves.
 type PendingUserInputs = HashMap<String, HashMap<String, PendingUserInput>>;
+
+struct TurnPendingInputs<'a> {
+    pending: &'a Mutex<PendingUserInputs>,
+    session_id: &'a str,
+    request_ids: Vec<String>,
+    sink: HarnessSink,
+}
+
+impl Drop for TurnPendingInputs<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock();
+        let mut cancelled = Vec::new();
+        let remove_session = if let Some(requests) = pending.get_mut(self.session_id)
+        {
+            for request_id in &self.request_ids {
+                if requests.remove(request_id).is_some() {
+                    cancelled.push(request_id.clone());
+                }
+            }
+            requests.is_empty()
+        } else {
+            false
+        };
+        if remove_session {
+            pending.remove(self.session_id);
+        }
+        drop(pending);
+        for request_id in cancelled {
+            (self.sink)(HarnessEvent::UserInputCancelled {
+                acp_session_id: self.session_id.to_string(),
+                request_id,
+            });
+        }
+    }
+}
+
 type PendingBufferSnapshots = HashMap<
     (String, String),
     oneshot::Sender<std::result::Result<Vec<AgentBufferSnapshot>, String>>,
@@ -149,6 +217,118 @@ fn validate_mcp_approval_answers(answers: &UserInputAnswers) -> Result<()> {
         "AHEAD MCP approval requires exactly one choice"
     );
     Ok(())
+}
+
+fn mcp_url_action(answers: &UserInputAnswers) -> Result<ElicitationAction> {
+    anyhow::ensure!(answers.len() == 1, "invalid MCP URL response");
+    match answers
+        .get(ahead_rpc::ahead::MCP_FORM_ACTION_KEY)
+        .map(Vec::as_slice)
+    {
+        Some([action]) if action == "accept" => Ok(ElicitationAction::Accept),
+        Some([action]) if action == "decline" => Ok(ElicitationAction::Decline),
+        Some([action]) if action == "cancel" => Ok(ElicitationAction::Cancel),
+        _ => anyhow::bail!("invalid MCP URL response"),
+    }
+}
+
+fn mcp_approval_elicitation_question(
+    event: &ElicitationRequestEvent,
+) -> Option<(String, HarnessUserInputQuestion)> {
+    let RequestId::String(request_id) = &event.id else {
+        return None;
+    };
+    let ElicitationRequest::Form {
+        meta: Some(meta),
+        message,
+        requested_schema,
+    } = &event.request
+    else {
+        return None;
+    };
+    if !request_id.starts_with("mcp_tool_call_approval_")
+        || meta.get(APPROVAL_KIND_KEY).and_then(Value::as_str)
+            != Some(APPROVAL_KIND_MCP_TOOL_CALL)
+        || requested_schema != &json!({"type": "object", "properties": {}})
+    {
+        return None;
+    }
+    let mut options = vec![HarnessUserInputOption {
+        value: "Allow".to_string(),
+        label: "Allow".to_string(),
+        description: "Run the tool and continue.".to_string(),
+    }];
+    if meta.get(PERSIST_KEY).and_then(Value::as_str) == Some(PERSIST_SESSION) {
+        options.push(HarnessUserInputOption {
+            value: "Allow for this session".to_string(),
+            label: "Allow for this session".to_string(),
+            description: "Run the tool and remember this choice for this session."
+                .to_string(),
+        });
+    }
+    options.push(HarnessUserInputOption {
+        value: "Cancel".to_string(),
+        label: "Cancel".to_string(),
+        description: "Cancel this tool call.".to_string(),
+    });
+    let question = match meta.get(TOOL_PARAMS_KEY) {
+        Some(arguments) => format!("{message}\nArguments: {arguments}"),
+        None => message.clone(),
+    };
+    Some((
+        request_id.clone(),
+        HarnessUserInputQuestion {
+            id: request_id.clone(),
+            header: "Approve MCP tool?".to_string(),
+            question,
+            external_url: None,
+            options,
+            default_answers: Vec::new(),
+            allows_other: false,
+            is_secret: false,
+        },
+    ))
+}
+
+fn mcp_url_elicitation_question(
+    event: &ElicitationRequestEvent,
+) -> Option<HarnessUserInputQuestion> {
+    let ElicitationRequest::Url {
+        message,
+        url,
+        elicitation_id,
+        ..
+    } = &event.request
+    else {
+        return None;
+    };
+    if event.server_name.is_empty()
+        || event.server_name.len() > 256
+        || event.server_name.chars().any(char::is_control)
+        || message.trim().is_empty()
+        || message.len() > 4096
+        || message.chars().any(|character| {
+            character.is_control() && character != '\n' && character != '\t'
+        })
+        || elicitation_id.is_empty()
+        || elicitation_id.len() > 256
+        || elicitation_id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let url = ahead_rpc::ahead::validated_mcp_url(url)?;
+    Some(HarnessUserInputQuestion {
+        id: "mcp_url".to_string(),
+        header: format!("MCP server: {} · External site", event.server_name),
+        question: format!(
+            "{message}\nVerify the destination before opening it in your browser."
+        ),
+        external_url: Some(url.to_string()),
+        options: Vec::new(),
+        default_answers: Vec::new(),
+        allows_other: false,
+        is_secret: false,
+    })
 }
 
 fn mcp_server_policy(mode_id: &str, read_only: bool) -> McpServerPolicy {
@@ -260,6 +440,12 @@ impl NativeClient {
         model_provider: Option<&str>,
         mcp_server_policy: McpServerPolicy,
     ) -> Result<codex_core::config::Config> {
+        let user_home = crate::instructions::user_home();
+        let provider_overrides =
+            runtime_config_from_sources(cwd, user_home.as_deref())?
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
         let codex_self_exe = std::env::current_exe()
             .context("failed to resolve the AHEAD proxy executable")?;
         #[cfg(any(test, feature = "test-support"))]
@@ -283,11 +469,16 @@ impl NativeClient {
         };
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(runtime_home.to_path_buf())
+            .cli_overrides(provider_overrides)
             .harness_overrides(overrides)
             .loader_overrides(codex_core::config::LoaderOverrides {
-                ignore_login_requirements: true,
+                ignore_managed_requirements: true,
+                ignore_managed_config_layers: true,
+                // AHEAD provider settings arrive in memory; never reload a stale runtime file.
+                ignore_user_config: true,
                 ignore_project_config: true,
                 ignore_system_config: true,
+                ignore_user_and_project_exec_policy_rules: true,
                 ..Default::default()
             })
             .build()
@@ -310,6 +501,11 @@ impl NativeClient {
         config.memories.generate_memories = false;
         config.memories.use_memories = false;
         config.memories.dedicated_tools = false;
+        // Runtime-home config cannot opt the editor's managed agent into telemetry.
+        config.otel.exporter = OtelExporterKind::None;
+        config.otel.trace_exporter = OtelExporterKind::None;
+        config.otel.metrics_exporter = OtelExporterKind::None;
+        config.otel.log_user_prompt = false;
         let mut developer_instructions = config
             .developer_instructions
             .take()
@@ -463,6 +659,7 @@ impl NativeClient {
             model_provider,
             mcp_server_policy(mode_id, false),
         ))?;
+        let loaded_provider_fingerprint = provider_fingerprint(&config)?;
         let mut options = StartThreadOptions::new(config);
         options.dynamic_tools = ahead_dynamic_tools(true);
         let new_thread = self
@@ -483,6 +680,7 @@ impl NativeClient {
                 mode_id: mode_id.to_string(),
                 model: model.map(str::to_string),
                 model_provider: model_provider.map(str::to_string),
+                loaded_provider_fingerprint,
             },
         );
         Ok(thread_id)
@@ -499,13 +697,15 @@ impl NativeClient {
         let _admission = self.runtime.block_on(self.thread_admission.read());
         anyhow::ensure!(self.is_running(), "AHEAD agent is shutting down");
         if self.threads.lock().contains_key(thread_id) {
-            return self.set_session_selection(
-                thread_id,
-                cwd,
-                mode_id,
-                model,
-                model_provider,
-            );
+            let mut settings = self.settings.lock();
+            let current = settings.get_mut(thread_id).with_context(|| {
+                format!("AHEAD agent settings for `{thread_id}` are missing")
+            })?;
+            current.cwd = cwd.to_path_buf();
+            current.mode_id = mode_id.to_string();
+            current.model = model.map(str::to_string);
+            current.model_provider = model_provider.map(str::to_string);
+            return Ok(());
         }
         let parsed = ThreadId::from_string(thread_id).map_err(|error| {
             anyhow!("invalid AHEAD thread id `{thread_id}`: {error}")
@@ -517,6 +717,7 @@ impl NativeClient {
             model_provider,
             mcp_server_policy(mode_id, false),
         ))?;
+        let loaded_provider_fingerprint = provider_fingerprint(&config)?;
         self.import_legacy_thread_if_missing(
             parsed,
             cwd,
@@ -539,7 +740,17 @@ impl NativeClient {
         self.thread_depths
             .lock()
             .insert(thread_id.to_string(), u8::from(is_subagent));
-        self.set_session_selection(thread_id, cwd, mode_id, model, model_provider)
+        self.settings.lock().insert(
+            thread_id.to_string(),
+            SessionSettings {
+                cwd: cwd.to_path_buf(),
+                mode_id: mode_id.to_string(),
+                model: model.map(str::to_string),
+                model_provider: model_provider.map(str::to_string),
+                loaded_provider_fingerprint,
+            },
+        );
+        Ok(())
     }
 
     fn import_legacy_thread_if_missing(
@@ -618,9 +829,38 @@ impl NativeClient {
         let before_modified = before
             .modified()
             .context("reading legacy AHEAD rollout modification time")?;
+        #[cfg(unix)]
+        let opened_file =
+            ahead_core::secure_fs::open_canonical_regular_file(&canonical_path)
+                .context("opening legacy AHEAD rollout without following links")?;
+        #[cfg(not(unix))]
+        let opened_file = std::fs::File::open(&canonical_path)
+            .context("opening legacy AHEAD rollout")?;
+        let opened_before = opened_file
+            .metadata()
+            .context("inspecting opened legacy AHEAD rollout")?;
+        anyhow::ensure!(
+            opened_before.is_file()
+                && opened_before.len() == before.len()
+                && opened_before.modified().ok() == Some(before_modified),
+            "legacy AHEAD rollout changed before it could be opened"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                opened_before.dev() == before.dev()
+                    && opened_before.ino() == before.ino(),
+                "legacy AHEAD rollout changed before it could be opened"
+            );
+        }
+        let opened_for_recheck = opened_file
+            .try_clone()
+            .context("retaining legacy AHEAD rollout for verification")?;
         let (items, loaded_thread_id, parse_errors) = self
             .runtime
-            .block_on(RolloutRecorder::load_rollout_items_with_limits(
+            .block_on(RolloutRecorder::load_rollout_items_from_file_with_limits(
+                opened_file,
                 &canonical_path,
                 MAX_LEGACY_ROLLOUT_BYTES,
                 MAX_LEGACY_ROLLOUT_RECORDS,
@@ -665,13 +905,27 @@ impl NativeClient {
         let after = std::fs::symlink_metadata(&path)
             .context("rechecking legacy AHEAD rollout")?;
         let canonical_after = path.canonicalize().ok();
+        let opened_after = opened_for_recheck
+            .metadata()
+            .context("rechecking opened legacy AHEAD rollout")?;
         anyhow::ensure!(
             after.file_type().is_file()
                 && after.len() == before.len()
                 && after.modified().ok() == Some(before_modified)
+                && opened_after.len() == before.len()
+                && opened_after.modified().ok() == Some(before_modified)
                 && canonical_after.as_deref() == Some(canonical_path.as_path()),
             "legacy AHEAD rollout changed while it was being imported"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                after.dev() == opened_before.dev()
+                    && after.ino() == opened_before.ino(),
+                "legacy AHEAD rollout changed while it was being imported"
+            );
+        }
         let created_at = chrono::DateTime::parse_from_rfc3339(&meta.timestamp)
             .context("parsing legacy AHEAD session creation time")?
             .with_timezone(&chrono::Utc);
@@ -746,29 +1000,6 @@ impl NativeClient {
             })?;
         let is_subagent = thread.parent_thread_id.is_some();
         Ok((is_subagent, ahead_dynamic_tools(!is_subagent)))
-    }
-
-    fn set_session_selection(
-        &self,
-        thread_id: &str,
-        cwd: &Path,
-        mode_id: &str,
-        model: Option<&str>,
-        model_provider: Option<&str>,
-    ) -> Result<()> {
-        if !self.threads.lock().contains_key(thread_id) {
-            bail!("AHEAD agent thread `{thread_id}` is not loaded");
-        }
-        self.settings.lock().insert(
-            thread_id.to_string(),
-            SessionSettings {
-                cwd: cwd.to_path_buf(),
-                mode_id: mode_id.to_string(),
-                model: model.map(str::to_string),
-                model_provider: model_provider.map(str::to_string),
-            },
-        );
-        Ok(())
     }
 
     pub fn set_session_mode(&self, thread_id: &str, mode_id: &str) -> Result<()> {
@@ -860,6 +1091,7 @@ impl NativeClient {
 
     pub fn prompt(&self, thread_id: &str, text: &str) -> Result<String> {
         anyhow::ensure!(self.is_running(), "AHEAD agent is shutting down");
+        self.ensure_thread_history_healthy(thread_id)?;
         let thread =
             self.threads
                 .lock()
@@ -876,6 +1108,16 @@ impl NativeClient {
                 .with_context(|| {
                     format!("AHEAD agent settings for `{thread_id}` are missing")
                 })?;
+        ensure!(
+            !self.provider_changed(
+                thread_id,
+                &settings.cwd,
+                &settings.mode_id,
+                settings.model.as_deref(),
+                settings.model_provider.as_deref(),
+            )?,
+            "AHEAD model connection changed before this turn began; retry after other managed turns finish"
+        );
         let user_input = self.prompt_user_input(&settings, text)?;
         let scope = self.scopes.lock().get(thread_id).cloned();
         let permission_profile =
@@ -906,6 +1148,30 @@ impl NativeClient {
         })
     }
 
+    /// Detects whether a loaded thread's next selection needs a fresh runtime.
+    /// An unloaded thread will read current settings when it is restored.
+    pub fn provider_changed(
+        &self,
+        thread_id: &str,
+        cwd: &Path,
+        mode_id: &str,
+        model: Option<&str>,
+        model_provider: Option<&str>,
+    ) -> Result<bool> {
+        let Some(settings) = self.settings.lock().get(thread_id).cloned() else {
+            return Ok(false);
+        };
+        let current_config = self.runtime.block_on(Self::build_config(
+            &self.runtime_home,
+            cwd,
+            model,
+            model_provider,
+            mcp_server_policy(mode_id, false),
+        ))?;
+        Ok(provider_fingerprint(&current_config)?
+            != settings.loaded_provider_fingerprint)
+    }
+
     async fn consume_turn(
         &self,
         acp_session_id: &str,
@@ -921,8 +1187,38 @@ impl NativeClient {
         let mut saw_reasoning_delta = false;
         let mut agent_message = String::new();
         let mut agent_message_truncated = false;
+        let mut pending_input_cleanup = TurnPendingInputs {
+            pending: &self.pending_inputs,
+            session_id: thread_id,
+            request_ids: Vec::new(),
+            sink: self.sink.clone(),
+        };
+        let mut input_responses = JoinSet::<Result<()>>::new();
         loop {
-            let event = thread.next_event().await?;
+            let event = tokio::select! {
+                event = thread.next_event() => event?,
+                completed = input_responses.join_next(), if !input_responses.is_empty() => {
+                    if let Some(completed) = completed {
+                        completed.context("AHEAD agent input responder failed")??;
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = self.ensure_thread_history_healthy(runtime_thread_id)
+            {
+                if !matches!(
+                    &event.msg,
+                    EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                        | EventMsg::ShutdownComplete
+                ) && let Err(interrupt_error) = thread.submit(Op::Interrupt).await
+                {
+                    tracing::warn!(
+                        "failed to interrupt unsafe AHEAD agent turn after a history write failure: {interrupt_error}"
+                    );
+                }
+                return Err(error);
+            }
             match event.msg {
                 EventMsg::AgentMessageContentDelta(event) => {
                     saw_agent_delta = true;
@@ -1215,6 +1511,7 @@ impl NativeClient {
                 }
                 EventMsg::RequestUserInput(event) => {
                     let call_id = event.call_id;
+                    let host_request_id = uuid::Uuid::new_v4().to_string();
                     let is_blocking = event.is_blocking;
                     let (sender, receiver) = oneshot::channel();
                     {
@@ -1223,14 +1520,20 @@ impl NativeClient {
                             self.is_running(),
                             "AHEAD agent is shutting down"
                         );
-                        pending
-                            .entry(thread_id.to_string())
-                            .or_default()
-                            .insert(call_id.clone(), sender);
+                        pending.entry(thread_id.to_string()).or_default().insert(
+                            host_request_id.clone(),
+                            PendingUserInput {
+                                sender,
+                                kind: PendingUserInputKind::AgentQuestion,
+                            },
+                        );
                     }
+                    pending_input_cleanup
+                        .request_ids
+                        .push(host_request_id.clone());
                     (self.sink)(HarnessEvent::UserInputRequested {
                         acp_session_id: thread_id.to_string(),
-                        request_id: call_id.clone(),
+                        request_id: host_request_id,
                         is_blocking,
                         questions: event
                             .questions
@@ -1239,36 +1542,43 @@ impl NativeClient {
                                 id: question.id,
                                 header: question.header,
                                 question: question.question,
+                                external_url: None,
                                 options: question
                                     .options
                                     .unwrap_or_default()
                                     .into_iter()
                                     .map(|option| HarnessUserInputOption {
+                                        value: option.label.clone(),
                                         label: option.label,
                                         description: option.description,
                                     })
                                     .collect(),
+                                default_answers: Vec::new(),
                                 allows_other: question.is_other,
                                 is_secret: question.is_secret,
                             })
                             .collect(),
                     });
-                    let Ok(answers) = receiver.await else {
-                        continue;
-                    };
-                    thread
-                        .submit(Op::UserInputAnswer {
-                            id: call_id,
-                            response: RequestUserInputResponse {
-                                answers: answers
-                                    .into_iter()
-                                    .map(|(id, answers)| {
-                                        (id, RequestUserInputAnswer { answers })
-                                    })
-                                    .collect(),
-                            },
-                        })
-                        .await?;
+                    let thread = Arc::clone(thread);
+                    input_responses.spawn(async move {
+                        let Ok(answers) = receiver.await else {
+                            return Ok(());
+                        };
+                        thread
+                            .submit(Op::UserInputAnswer {
+                                id: call_id,
+                                response: RequestUserInputResponse {
+                                    answers: answers
+                                        .into_iter()
+                                        .map(|(id, answers)| {
+                                            (id, RequestUserInputAnswer { answers })
+                                        })
+                                        .collect(),
+                                },
+                            })
+                            .await?;
+                        Ok(())
+                    });
                 }
                 EventMsg::ContextCompacted(_) => {
                     if !is_child_thread {
@@ -1405,15 +1715,152 @@ impl NativeClient {
                         .await?;
                 }
                 EventMsg::ElicitationRequest(event) => {
-                    thread
-                        .submit(Op::ResolveElicitation {
-                            server_name: event.server_name,
-                            request_id: event.id,
-                            decision: codex_protocol::approvals::ElicitationAction::Decline,
-                            content: None,
-                            meta: None,
-                        })
-                        .await?;
+                    let approval = mcp_approval_elicitation_question(&event);
+                    let form = if approval.is_none() {
+                        match &event.request {
+                            ElicitationRequest::Form {
+                                message,
+                                requested_schema,
+                                ..
+                            } => {
+                                match McpForm::new(
+                                    &event.server_name,
+                                    message,
+                                    requested_schema,
+                                ) {
+                                    Ok(form) => Some(form),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "unsupported MCP elicitation form");
+                                        None
+                                    }
+                                }
+                            }
+                            ElicitationRequest::Url { .. } => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let url_question = if approval.is_none() && form.is_none() {
+                        mcp_url_elicitation_question(&event)
+                    } else {
+                        None
+                    };
+                    if approval.is_none() && form.is_none() && url_question.is_none()
+                    {
+                        thread
+                            .submit(Op::ResolveElicitation {
+                                server_name: event.server_name,
+                                request_id: event.id,
+                                decision: ElicitationAction::Decline,
+                                content: None,
+                                meta: None,
+                            })
+                            .await?;
+                        continue;
+                    }
+                    let questions = if let Some((_, question)) = &approval {
+                        vec![question.clone()]
+                    } else if let Some((_, questions)) = &form {
+                        questions.clone()
+                    } else {
+                        vec![url_question.clone().expect("URL was checked above")]
+                    };
+                    let is_url = url_question.is_some();
+                    let (sender, receiver) = oneshot::channel();
+                    let host_request_id = if form.is_some() {
+                        format!("mcp-form-{}", uuid::Uuid::new_v4())
+                    } else if is_url {
+                        format!("mcp-url-{}", uuid::Uuid::new_v4())
+                    } else {
+                        uuid::Uuid::new_v4().to_string()
+                    };
+                    let allow_session = questions.iter().any(|question| {
+                        question
+                            .options
+                            .iter()
+                            .any(|option| option.label == "Allow for this session")
+                    });
+                    {
+                        let mut pending = self.pending_inputs.lock();
+                        anyhow::ensure!(
+                            self.is_running(),
+                            "AHEAD agent is shutting down"
+                        );
+                        pending.entry(thread_id.to_string()).or_default().insert(
+                            host_request_id.clone(),
+                            PendingUserInput {
+                                sender,
+                                kind: if let Some((form, _)) = &form {
+                                    PendingUserInputKind::McpForm(form.clone())
+                                } else if is_url {
+                                    PendingUserInputKind::McpUrl
+                                } else {
+                                    PendingUserInputKind::AgentQuestion
+                                },
+                            },
+                        );
+                    }
+                    pending_input_cleanup
+                        .request_ids
+                        .push(host_request_id.clone());
+                    (self.sink)(HarnessEvent::UserInputRequested {
+                        acp_session_id: thread_id.to_string(),
+                        request_id: host_request_id,
+                        is_blocking: true,
+                        questions,
+                    });
+                    let thread = Arc::clone(thread);
+                    input_responses.spawn(async move {
+                        let (decision, content, meta) = match (receiver.await, form, is_url) {
+                            (Ok(answers), Some((form, _)), _) => match form.response(&answers) {
+                                Ok((decision, content)) => (decision, content, None),
+                                Err(error) => {
+                                    tracing::warn!(%error, "invalid MCP form response");
+                                    (ElicitationAction::Decline, None, None)
+                                }
+                            },
+                            (Ok(answers), None, true) => match mcp_url_action(&answers) {
+                                Ok(decision) => (decision, None, None),
+                                Err(error) => {
+                                    tracing::warn!(%error, "invalid MCP URL response");
+                                    (ElicitationAction::Decline, None, None)
+                                }
+                            },
+                            (Ok(answers), None, false) => {
+                                let request_id = &approval.as_ref().expect("approval was checked above").0;
+                                match answers.get(request_id).map(Vec::as_slice) {
+                                    Some([answer]) if answer == "Allow" => {
+                                        (ElicitationAction::Accept, None, None)
+                                    }
+                                    Some([answer])
+                                        if allow_session
+                                            && answer == "Allow for this session" =>
+                                    {
+                                        (
+                                            ElicitationAction::Accept,
+                                            None,
+                                            Some(json!({ "persist": PERSIST_SESSION })),
+                                        )
+                                    }
+                                    Some([answer]) if answer == "Cancel" => {
+                                        (ElicitationAction::Cancel, None, None)
+                                    }
+                                    _ => (ElicitationAction::Decline, None, None),
+                                }
+                            }
+                            (Err(_), _, _) => (ElicitationAction::Decline, None, None),
+                        };
+                        thread
+                            .submit(Op::ResolveElicitation {
+                                server_name: event.server_name,
+                                request_id: event.id,
+                                decision,
+                                content,
+                                meta,
+                            })
+                            .await?;
+                        Ok(())
+                    });
                 }
                 EventMsg::Error(event) => {
                     terminal_error = Some(event.message);
@@ -1455,6 +1902,15 @@ impl NativeClient {
                 }
             }
         }
+    }
+
+    fn ensure_thread_history_healthy(&self, thread_id: &str) -> Result<()> {
+        if let Some(error) = self.thread_store.persistence_error(thread_id) {
+            bail!(
+                "AHEAD agent history was not saved; restart AHEAD before retrying and review any tools that ran: {error}"
+            );
+        }
+        Ok(())
     }
 
     async fn handle_spawn_agent_tool(
@@ -1634,6 +2090,7 @@ impl NativeClient {
             .get(&child_session_id)
             .cloned()
             .context("AHEAD child thread was not registered")?;
+        self.ensure_thread_history_healthy(&child_session_id)?;
         self.store.set_native_agent_edge_status(
             &child_session_id,
             crate::NativeAgentEdgeStatus::Open,
@@ -1796,6 +2253,7 @@ impl NativeClient {
 
     pub fn compact(&self, thread_id: &str) -> Result<String> {
         anyhow::ensure!(self.is_running(), "AHEAD agent is shutting down");
+        self.ensure_thread_history_healthy(thread_id)?;
         let thread =
             self.threads
                 .lock()
@@ -1827,18 +2285,28 @@ impl NativeClient {
         request_id: &str,
         answers: HashMap<String, Vec<String>>,
     ) -> Result<()> {
-        validate_mcp_approval_answers(&answers)?;
-        let sender = self
-            .pending_inputs
-            .lock()
-            .get_mut(thread_id)
-            .and_then(|requests| requests.remove(request_id))
-            .with_context(|| {
-                format!(
-                    "AHEAD agent input request `{request_id}` is no longer pending"
-                )
-            })?;
-        sender.send(answers).map_err(|_| {
+        let mut pending = self.pending_inputs.lock();
+        let requests = pending.get_mut(thread_id).with_context(|| {
+            format!("AHEAD agent input request `{request_id}` is no longer pending")
+        })?;
+        let request = requests.get(request_id).with_context(|| {
+            format!("AHEAD agent input request `{request_id}` is no longer pending")
+        })?;
+        match &request.kind {
+            PendingUserInputKind::McpForm(form) => {
+                form.response(&answers)?;
+            }
+            PendingUserInputKind::McpUrl => {
+                mcp_url_action(&answers)?;
+            }
+            PendingUserInputKind::AgentQuestion => {
+                validate_mcp_approval_answers(&answers)?;
+            }
+        }
+        let request = requests
+            .remove(request_id)
+            .context("validated input disappeared")?;
+        request.sender.send(answers).map_err(|_| {
             anyhow!("AHEAD agent input request `{request_id}` was cancelled")
         })
     }
@@ -2101,20 +2569,11 @@ impl NativeClient {
                 )
             })
             .transpose()?;
-        let legacy_offset = match arguments.get("offset") {
-            Some(value) => usize::try_from(value.as_u64().context(
-                "AHEAD file_search offset must be a non-negative integer",
-            )?)
-            .context("AHEAD file_search offset is too large")?,
-            None => 0,
-        };
         ensure!(
-            cursor.is_none() || legacy_offset == 0,
-            "AHEAD file_search accepts either cursor or legacy offset, not both"
+            arguments.get("offset").is_none(),
+            "AHEAD file_search accepts a cursor, not an offset"
         );
-        let offset = cursor
-            .as_ref()
-            .map_or(legacy_offset, |cursor| cursor.offset);
+        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
         if offset > MAX_AGENT_SEARCH_OFFSET {
             bail!("AHEAD file_search offset exceeds {MAX_AGENT_SEARCH_OFFSET}");
         }
@@ -2628,11 +3087,7 @@ fn skill_matches_slash_invocation(
     invocation: &str,
 ) -> bool {
     match invocation.rsplit_once(':') {
-        Some((scope, name)) => {
-            skill_name == name
-                && (source.slash_prefix() == scope
-                    || (scope.is_empty() && source == AgentSkillSource::User))
-        }
+        Some((scope, name)) => skill_name == name && source.slash_prefix() == scope,
         None => skill_name == invocation,
     }
 }
@@ -2767,6 +3222,7 @@ const AHEAD_DISABLED_FEATURES: &[Feature] = &[
     Feature::CodeModeOnly,
     Feature::CodeModePrewarm,
     Feature::Collab,
+    Feature::CodexHooks,
     Feature::EnableMcpApps,
     Feature::ExecutorCapabilityDiscovery,
     Feature::ExternalAgentMemoryImport,
@@ -2776,7 +3232,6 @@ const AHEAD_DISABLED_FEATURES: &[Feature] = &[
     Feature::NetworkProxy,
     Feature::RespectSystemProxy,
     Feature::StandaloneWebSearch,
-    Feature::ToolCallMcpElicitation,
     Feature::WebSearchCached,
     Feature::WebSearchRequest,
 ];
@@ -2797,8 +3252,7 @@ fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
                     "case_sensitive": { "type": "boolean", "default": false },
                     "whole_word": { "type": "boolean", "default": false },
                     "is_regex": { "type": "boolean", "default": false },
-                    "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_AGENT_SEARCH_CURSOR_BYTES },
-                    "offset": { "type": "integer", "minimum": 0, "maximum": 5000, "default": 0, "description": "Legacy page offset; use the returned cursor for stable pagination." }
+                    "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_AGENT_SEARCH_CURSOR_BYTES }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -2886,6 +3340,178 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completed_turn_removes_only_its_own_pending_inputs() {
+        let (own_sender, _) = oneshot::channel();
+        let (other_sender, _) = oneshot::channel();
+        let pending = Mutex::new(HashMap::from([(
+            "session".to_string(),
+            HashMap::from([
+                (
+                    "own".to_string(),
+                    PendingUserInput {
+                        sender: own_sender,
+                        kind: PendingUserInputKind::AgentQuestion,
+                    },
+                ),
+                (
+                    "other".to_string(),
+                    PendingUserInput {
+                        sender: other_sender,
+                        kind: PendingUserInputKind::AgentQuestion,
+                    },
+                ),
+            ]),
+        )]));
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        {
+            let _cleanup = TurnPendingInputs {
+                pending: &pending,
+                session_id: "session",
+                request_ids: vec!["own".to_string()],
+                sink: Arc::new(move |event| {
+                    event_sender.send(event).expect("record cancellation");
+                }),
+            };
+        }
+        let requests = pending.lock();
+        assert!(!requests["session"].contains_key("own"));
+        assert!(requests["session"].contains_key("other"));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(HarnessEvent::UserInputCancelled {
+                acp_session_id,
+                request_id,
+            }) if acp_session_id == "session" && request_id == "own"
+        ));
+        assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn managed_mcp_form_keeps_pending_request_after_invalid_answer() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            Arc::new(TestHarnessStore::default()),
+            Arc::new(|_| {}),
+        )
+        .expect("start managed agent");
+        let schema = json!({"type":"object","properties":{"count":{"type":"integer","minimum":1}},"required":["count"]});
+        let (form, _) = McpForm::new("sample", "Count", &schema).expect("form");
+        let (sender, receiver) = oneshot::channel();
+        client
+            .pending_inputs
+            .lock()
+            .entry("thread".to_string())
+            .or_default()
+            .insert(
+                "mcp-form-test".to_string(),
+                PendingUserInput {
+                    sender,
+                    kind: PendingUserInputKind::McpForm(form),
+                },
+            );
+        let invalid =
+            HashMap::from([("mcp_field_0".to_string(), vec!["0".to_string()])]);
+        assert!(
+            client
+                .answer_user_input("thread", "mcp-form-test", invalid)
+                .is_err()
+        );
+        assert!(
+            client.pending_inputs.lock()["thread"].contains_key("mcp-form-test")
+        );
+        let valid =
+            HashMap::from([("mcp_field_0".to_string(), vec!["2".to_string()])]);
+        client
+            .answer_user_input("thread", "mcp-form-test", valid.clone())
+            .expect("valid answer");
+        assert_eq!(client.runtime.block_on(receiver).expect("delivered"), valid);
+        assert!(
+            !client.pending_inputs.lock()["thread"].contains_key("mcp-form-test")
+        );
+    }
+
+    #[test]
+    fn managed_mcp_url_requires_explicit_https_consent() {
+        let mut event = ElicitationRequestEvent {
+            turn_id: None,
+            server_name: "sample".to_string(),
+            id: RequestId::String("url-request".to_string()),
+            request: ElicitationRequest::Url {
+                meta: None,
+                message: "Connect your account".to_string(),
+                url: "https://example.com/connect?state=abc".to_string(),
+                elicitation_id: "flow-1".to_string(),
+            },
+        };
+        let question =
+            mcp_url_elicitation_question(&event).expect("safe URL question");
+        assert_eq!(
+            question.external_url.as_deref(),
+            Some("https://example.com/connect?state=abc")
+        );
+        if let ElicitationRequest::Url { url, .. } = &mut event.request {
+            *url = "http://example.com/connect".to_string();
+        }
+        assert!(mcp_url_elicitation_question(&event).is_none());
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            Arc::new(TestHarnessStore::default()),
+            Arc::new(|_| {}),
+        )
+        .expect("start managed agent");
+        let (sender, receiver) = oneshot::channel();
+        client
+            .pending_inputs
+            .lock()
+            .entry("thread".to_string())
+            .or_default()
+            .insert(
+                "mcp-url-test".to_string(),
+                PendingUserInput {
+                    sender,
+                    kind: PendingUserInputKind::McpUrl,
+                },
+            );
+        assert!(
+            client
+                .answer_user_input("thread", "mcp-url-test", HashMap::new())
+                .is_err()
+        );
+        assert!(client.pending_inputs.lock()["thread"].contains_key("mcp-url-test"));
+        let accepted = HashMap::from([(
+            ahead_rpc::ahead::MCP_FORM_ACTION_KEY.to_string(),
+            vec!["accept".to_string()],
+        )]);
+        client
+            .answer_user_input("thread", "mcp-url-test", accepted.clone())
+            .expect("consent");
+        assert_eq!(
+            client.runtime.block_on(receiver).expect("delivered"),
+            accepted
+        );
+        assert_eq!(
+            mcp_url_action(&accepted).expect("action"),
+            ElicitationAction::Accept
+        );
+        for (answer, action) in [
+            ("decline", ElicitationAction::Decline),
+            ("cancel", ElicitationAction::Cancel),
+        ] {
+            let answers = HashMap::from([(
+                ahead_rpc::ahead::MCP_FORM_ACTION_KEY.to_string(),
+                vec![answer.to_string()],
+            )]);
+            assert_eq!(mcp_url_action(&answers).expect("action"), action);
+        }
+        let mut extra = accepted;
+        extra.insert("unrelated".to_string(), vec!["accept".to_string()]);
+        assert!(mcp_url_action(&extra).is_err());
+    }
+
+    #[test]
     fn test_helper_selection_requires_built_ahead_and_preserves_app_path()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -2923,6 +3549,101 @@ mod tests {
                 vec!["Cancel".to_string()],
             )]))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn managed_mcp_elicitation_only_surfaces_tool_approvals() {
+        let mut event = ElicitationRequestEvent {
+            turn_id: None,
+            server_name: "echo".to_string(),
+            id: RequestId::String("mcp_tool_call_approval_call-1".to_string()),
+            request: ElicitationRequest::Form {
+                meta: Some(json!({
+                    APPROVAL_KIND_KEY: APPROVAL_KIND_MCP_TOOL_CALL,
+                    PERSIST_KEY: PERSIST_SESSION,
+                    TOOL_PARAMS_KEY: {"text": "example"}
+                })),
+                message: "Allow the echo MCP tool?".to_string(),
+                requested_schema: json!({"type": "object", "properties": {}}),
+            },
+        };
+        let (_, question) =
+            mcp_approval_elicitation_question(&event).expect("tool approval");
+        assert!(question.question.contains("\"text\":\"example\""));
+        assert!(
+            question
+                .options
+                .iter()
+                .any(|option| option.label == "Allow for this session")
+        );
+        if let ElicitationRequest::Form { meta, .. } = &mut event.request {
+            *meta = None;
+        }
+        assert!(mcp_approval_elicitation_question(&event).is_none());
+        for mode in ["openai/form", "openaiForm"] {
+            assert!(
+                serde_json::from_value::<ElicitationRequest>(json!({
+                    "mode": mode,
+                    "message": "Unsupported proprietary form",
+                    "requested_schema": {"type": "object", "properties": {}},
+                }))
+                .is_err(),
+                "{mode} must not be accepted as an MCP form"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_mcp_item_preserves_standard_metadata_in_legacy_events() {
+        use codex_protocol::items::McpToolCallError;
+        use codex_protocol::items::McpToolCallItem;
+        use codex_protocol::items::McpToolCallStatus;
+        use codex_protocol::protocol::EventMsg;
+
+        let item = McpToolCallItem {
+            id: "call-1".to_string(),
+            server: "calendar_server".to_string(),
+            tool: "create_event".to_string(),
+            arguments: serde_json::json!({"title": "Review"}),
+            mcp_app_resource_uri: Some("ui://calendar/event".to_string()),
+            read_only_hint: Some(false),
+            status: McpToolCallStatus::Failed,
+            result: None,
+            error: Some(McpToolCallError {
+                message: "approval denied".to_string(),
+            }),
+            duration: Some(std::time::Duration::from_millis(5)),
+        };
+
+        let EventMsg::McpToolCallBegin(begin) = item.as_legacy_begin_event() else {
+            panic!("expected MCP begin event");
+        };
+        assert_eq!(begin.invocation.server, "calendar_server");
+        assert_eq!(begin.invocation.tool, "create_event");
+        assert_eq!(
+            begin.invocation.arguments,
+            Some(serde_json::json!({"title": "Review"}))
+        );
+        assert_eq!(
+            begin.mcp_app_resource_uri.as_deref(),
+            Some("ui://calendar/event")
+        );
+        assert_eq!(begin.read_only_hint, Some(false));
+
+        let Some(EventMsg::McpToolCallEnd(end)) = item.as_legacy_end_event() else {
+            panic!("expected MCP end event");
+        };
+        assert_eq!(end.call_id, "call-1");
+        assert_eq!(
+            end.mcp_app_resource_uri.as_deref(),
+            Some("ui://calendar/event")
+        );
+        assert_eq!(end.read_only_hint, Some(false));
+        assert_eq!(end.duration, std::time::Duration::from_millis(5));
+        assert_eq!(
+            end.result.expect_err("tool call should fail"),
+            "approval denied"
         );
     }
     use ahead_rpc::ahead::{
@@ -2978,7 +3699,7 @@ mod tests {
             AgentSkillSource::User,
             "user:review",
         ));
-        assert!(skill_matches_slash_invocation(
+        assert!(!skill_matches_slash_invocation(
             "review",
             AgentSkillSource::User,
             ":review",
@@ -3093,6 +3814,27 @@ mod tests {
         assert!(managed_tools.iter().any(|tool| {
             matches!(tool, DynamicToolSpec::Function(spec) if spec.name == AHEAD_SKILL_RESOURCE_READ_TOOL)
         }));
+        let file_search = managed_tools
+            .iter()
+            .find_map(|tool| match tool {
+                DynamicToolSpec::Function(spec)
+                    if spec.name == AHEAD_FILE_SEARCH_TOOL =>
+                {
+                    Some(spec)
+                }
+                _ => None,
+            })
+            .expect("managed file_search tool");
+        assert!(
+            file_search.input_schema["properties"]
+                .get("cursor")
+                .is_some()
+        );
+        assert!(
+            file_search.input_schema["properties"]
+                .get("offset")
+                .is_none()
+        );
         assert!(!child_tools.iter().any(|tool| {
             matches!(tool, DynamicToolSpec::Function(spec) if spec.name == AHEAD_SPAWN_AGENT_TOOL)
         }));
@@ -3174,7 +3916,8 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_disables_unmanaged_mcp_and_includes_path_preflight() {
+    fn managed_config_disables_unmanaged_mcp_telemetry_and_includes_path_preflight()
+    {
         let temporary = tempfile::tempdir().expect("create runtime home");
         let runtime_home = temporary.path().join("runtime");
         let workspace = temporary.path().join("workspace");
@@ -3189,9 +3932,99 @@ mod tests {
         .expect("write project memory");
         std::fs::write(
             runtime_home.join("config.toml"),
-            "[mcp_servers.unmanaged]\ncommand = \"echo\"\nargs = [\"must not launch\"]\n",
+            "[mcp_servers.unmanaged]\ncommand = \"echo\"\nargs = [\"must not launch\"]\n[otel]\nexporter = \"statsig\"\ntrace_exporter = \"statsig\"\nmetrics_exporter = \"statsig\"\nlog_user_prompt = true\n",
         )
         .expect("write runtime-home MCP config");
+
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let retained_config = runtime
+            .block_on(
+                codex_core::config::ConfigBuilder::default()
+                    .codex_home(runtime_home.clone())
+                    .harness_overrides(codex_core::config::ConfigOverrides {
+                        cwd: Some(workspace.clone()),
+                        ..Default::default()
+                    })
+                    .loader_overrides(codex_core::config::LoaderOverrides {
+                        ignore_project_config: true,
+                        ignore_system_config: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .expect("load retained runtime config");
+        assert_eq!(retained_config.otel.exporter, OtelExporterKind::Statsig);
+        assert_eq!(
+            retained_config.otel.trace_exporter,
+            OtelExporterKind::Statsig
+        );
+        assert_eq!(
+            retained_config.otel.metrics_exporter,
+            OtelExporterKind::Statsig
+        );
+        assert!(retained_config.otel.log_user_prompt);
+        let config = runtime
+            .block_on(NativeClient::build_config(
+                &runtime_home,
+                &workspace,
+                None,
+                None,
+                McpServerPolicy::Disabled,
+            ))
+            .expect("build managed config");
+
+        assert!(config.mcp_servers.get().is_empty());
+        assert_eq!(config.otel.exporter, OtelExporterKind::None);
+        assert_eq!(config.otel.trace_exporter, OtelExporterKind::None);
+        assert_eq!(config.otel.metrics_exporter, OtelExporterKind::None);
+        assert!(!config.otel.log_user_prompt);
+        let mcp_config =
+            runtime.block_on(codex_core::McpManager::new().runtime_config(&config));
+        assert_eq!(
+            serde_json::to_value(mcp_config.client_elicitation_capability)
+                .expect("serialize managed MCP elicitation capability"),
+            json!({"form": {}, "url": {}}),
+            "managed MCP advertises only the reviewed form and URL modes"
+        );
+        assert!(!config.features.enabled(Feature::Collab));
+        assert!(!config.features.enabled(Feature::CodexHooks));
+        assert!(!config.features.enabled(Feature::MultiAgentV2));
+        assert!(config.features.enabled(Feature::ToolCallMcpElicitation));
+        let instructions =
+            config.developer_instructions.as_deref().unwrap_or_default();
+        assert!(instructions.contains(AHEAD_PATH_INSTRUCTION_PREFLIGHT));
+        assert!(!instructions.contains("AGENTS.override.md"));
+        assert!(!instructions.contains("project-memory-only-on-explicit-selection"));
+
+        let servers =
+            runtime.block_on(codex_core::McpManager::new().runtime_servers(&config));
+        assert!(
+            servers.is_empty(),
+            "managed sessions must not gain undeclared MCP servers"
+        );
+    }
+
+    #[test]
+    fn managed_provider_uses_ahead_settings_without_runtime_config_file() {
+        let temporary = tempfile::tempdir().expect("disposable workspace");
+        let runtime_home = temporary.path().join("runtime");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&runtime_home).expect("runtime home");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(workspace.join(".ahead"))
+            .expect("AHEAD settings directory");
+        std::fs::write(runtime_home.join("config.toml"), "invalid = [")
+            .expect("stale runtime config");
+        std::fs::write(runtime_home.join("managed_config.toml"), "invalid = [")
+            .expect("stale managed config");
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            "[ai]\nactive_connection = 'Local'\n[[ai.connections]]\nname = 'Local'\nprovider_id = 'local'\nbase_url = 'https://local.example/v1'\nmodel = 'test-model'\napi_key = 'private-token'\n",
+        )
+        .expect("private provider settings");
 
         let runtime = Builder::new_multi_thread()
             .enable_all()
@@ -3205,31 +4038,80 @@ mod tests {
                 None,
                 McpServerPolicy::Disabled,
             ))
-            .expect("build managed config");
-
-        assert!(config.mcp_servers.get().is_empty());
-        let mcp_config =
-            runtime.block_on(codex_core::McpManager::new().runtime_config(&config));
+            .expect("load AHEAD provider without runtime config file");
+        assert_eq!(config.model.as_deref(), Some("test-model"));
+        assert_eq!(config.model_provider_id, "local");
         assert_eq!(
-            serde_json::to_value(mcp_config.client_elicitation_capability)
-                .expect("serialize managed MCP elicitation capability"),
-            json!({}),
-            "managed MCP must not advertise URL elicitation without an AHEAD UI"
+            config.model_provider.base_url.as_deref(),
+            Some("https://local.example/v1")
         );
-        assert!(!config.features.enabled(Feature::Collab));
-        assert!(!config.features.enabled(Feature::MultiAgentV2));
-        let instructions =
-            config.developer_instructions.as_deref().unwrap_or_default();
-        assert!(instructions.contains(AHEAD_PATH_INSTRUCTION_PREFLIGHT));
-        assert!(!instructions.contains("AGENTS.override.md"));
-        assert!(!instructions.contains("project-memory-only-on-explicit-selection"));
-
-        let servers =
-            runtime.block_on(codex_core::McpManager::new().runtime_servers(&config));
+        assert!(config.model_provider.experimental_bearer_token.is_some());
+        let effective = config.config_layer_stack.effective_config();
+        for retired_key in [
+            "history",
+            "file_opener",
+            "cli_auth_credentials_store",
+            "chatgpt_base_url",
+        ] {
+            assert!(
+                effective.get(retired_key).is_none(),
+                "AHEAD must not inherit packaged Codex setting {retired_key}"
+            );
+        }
         assert!(
-            servers.is_empty(),
-            "managed sessions must not gain undeclared MCP servers"
+            config
+                .config_layer_stack
+                .ignore_user_and_project_exec_policy_rules()
         );
+    }
+
+    #[test]
+    fn managed_turn_rejects_changed_connection_before_network() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("private settings directory");
+        let settings_path = ahead.join("settings.toml");
+        let settings = |endpoint: &str, key: &str| {
+            format!(
+                "[ai]\nactive_connection = 'Mock'\n[[ai.connections]]\nname = 'Mock'\nprovider_id = 'mock'\nbase_url = '{endpoint}'\nmodel = 'gpt-5.5'\napi_key = '{key}'\n"
+            )
+        };
+        std::fs::write(
+            &settings_path,
+            settings("http://127.0.0.1:49111/v1", "first-key"),
+        )
+        .expect("initial private connection");
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            Arc::new(TestHarnessStore::default()),
+            Arc::new(|_| {}),
+        )
+        .expect("start managed agent");
+        let thread_id = client
+            .new_session(
+                workspace.path(),
+                "read-only",
+                Some("gpt-5.5"),
+                Some("mock"),
+            )
+            .expect("create managed thread");
+
+        for changed in [
+            settings("http://127.0.0.1:49112/v1", "first-key"),
+            settings("http://127.0.0.1:49111/v1", "rotated-key"),
+        ] {
+            std::fs::write(&settings_path, changed).expect("edit connection");
+            let error = client
+                .prompt(&thread_id, "Do not send this to the old connection")
+                .expect_err("changed connection must fail before a model call");
+            assert!(
+                error
+                    .to_string()
+                    .contains("retry after other managed turns finish"),
+                "{error}"
+            );
+        }
+        client.shutdown();
     }
 
     #[test]
@@ -3287,6 +4169,395 @@ mod tests {
         let servers =
             runtime.block_on(codex_core::McpManager::new().runtime_servers(&config));
         assert_eq!(servers, *config.mcp_servers.get());
+    }
+
+    #[test]
+    fn managed_parallel_stdio_mcp_calls_wait_for_individual_approval() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir_all(&ahead).expect("create private settings directory");
+        let script = ahead.join("mcp_echo.py");
+        let trace = ahead.join("mcp_calls.jsonl");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/editor-smoke/mcp_echo.py"),
+        )
+        .expect("copy offline MCP server into disposable workspace");
+        let declaration = format!(
+            "[mcp.servers.echo]\ncommand = \"python3\"\nargs = [\"-u\", {}, {}]\n",
+            toml::Value::String(script.to_string_lossy().into_owned()),
+            toml::Value::String(trace.to_string_lossy().into_owned()),
+        );
+        std::fs::write(ahead.join("config.toml"), &declaration)
+            .expect("declare local MCP server");
+        let parsed = declaration.parse::<toml::Table>().expect("MCP declaration");
+        let fingerprint = crate::runtime_support::mcp_declaration_fingerprint(
+            &parsed["mcp"]["servers"]["echo"],
+        )
+        .expect("fingerprint MCP declaration");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = listener.local_addr().expect("mock model address");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\n[mcp]\nenabled_servers = [\"echo\"]\n[mcp.approved_declarations]\necho = \"{fingerprint}\"\n"
+            ),
+        )
+        .expect("enable reviewed MCP server and local model");
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let model_requests = captured_requests.clone();
+        let model_server = std::thread::spawn(move || {
+            for turn in 0..10 {
+                let (mut stream, _) =
+                    listener.accept().expect("accept model request");
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking model socket");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("bound model read");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut buffer).expect("read model request");
+                    assert_ne!(read, 0, "model request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .expect("model request content length");
+                    if request.len() >= header_end + content_length {
+                        break (header_end, content_length);
+                    }
+                };
+                model_requests.lock().push(
+                    serde_json::from_slice::<Value>(
+                        &request[header_end..header_end + content_length],
+                    )
+                    .expect("model request JSON"),
+                );
+                let events = match turn {
+                    0 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-search","type":"tool_search_call","call_id":"mcp-search","execution":"client","arguments":{"query":"echo","limit":1}}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-search","type":"tool_search_call","call_id":"mcp-search","execution":"client","arguments":{"query":"echo","limit":1}}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-1","end_turn":false}}),
+                    ],
+                    1 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-call-1","type":"function_call","call_id":"mcp-call-1","namespace":"mcp__echo","name":"echo","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-call-1","type":"function_call","call_id":"mcp-call-1","namespace":"mcp__echo","name":"echo","arguments":"{\"text\":\"MCP_ECHO_SENTINEL_1\",\"payload\":{\"depth\":1}}"}}),
+                        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"mcp-call-2","type":"function_call","call_id":"mcp-call-2","namespace":"mcp__echo","name":"echo","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":1,"item":{"id":"mcp-call-2","type":"function_call","call_id":"mcp-call-2","namespace":"mcp__echo","name":"echo","arguments":"{\"text\":\"MCP_ECHO_SENTINEL_2\",\"payload\":{\"depth\":2}}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-2","end_turn":false}}),
+                    ],
+                    2 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"resource-list-denied","type":"function_call","call_id":"resource-list-denied","name":"list_mcp_resources","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"resource-list-denied","type":"function_call","call_id":"resource-list-denied","name":"list_mcp_resources","arguments":"{}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-3","end_turn":false}}),
+                    ],
+                    3 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"resource-list","type":"function_call","call_id":"resource-list","name":"list_mcp_resources","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"resource-list","type":"function_call","call_id":"resource-list","name":"list_mcp_resources","arguments":"{}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-4","end_turn":false}}),
+                    ],
+                    4 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"resource-templates","type":"function_call","call_id":"resource-templates","name":"list_mcp_resource_templates","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"resource-templates","type":"function_call","call_id":"resource-templates","name":"list_mcp_resource_templates","arguments":"{}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-5","end_turn":false}}),
+                    ],
+                    5 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"resource-read","type":"function_call","call_id":"resource-read","name":"read_mcp_resource","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"resource-read","type":"function_call","call_id":"resource-read","name":"read_mcp_resource","arguments":"{\"server\":\"echo\",\"uri\":\"memo://ahead-smoke\"}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-6","end_turn":false}}),
+                    ],
+                    7 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-auto-search","type":"tool_search_call","call_id":"mcp-auto-search","execution":"client","arguments":{"query":"echo","limit":1}}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-auto-search","type":"tool_search_call","call_id":"mcp-auto-search","execution":"client","arguments":{"query":"echo","limit":1}}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-8","end_turn":false}}),
+                    ],
+                    8 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-auto-call","type":"function_call","call_id":"mcp-auto-call","namespace":"mcp__echo","name":"echo","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-auto-call","type":"function_call","call_id":"mcp-auto-call","namespace":"mcp__echo","name":"echo","arguments":"{\"text\":\"MCP_AUTO_SENTINEL\"}"}}),
+                        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"mcp-auto-resource","type":"function_call","call_id":"mcp-auto-resource","name":"list_mcp_resources","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":1,"item":{"id":"mcp-auto-resource","type":"function_call","call_id":"mcp-auto-resource","name":"list_mcp_resources","arguments":"{}"}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-9","end_turn":false}}),
+                    ],
+                    9 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-auto-message","type":"message","role":"assistant","content":[]}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-auto-message","type":"message","role":"assistant","content":[{"type":"output_text","text":"MCP auto-approved"}]}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-10","end_turn":true}}),
+                    ],
+                    _ => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"mcp-message","type":"message","role":"assistant","content":[]}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"mcp-message","type":"message","role":"assistant","content":[{"type":"output_text","text":"MCP finished"}]}}),
+                        json!({"type":"response.completed","response":{"id":"mcp-response-7","end_turn":true}}),
+                    ],
+                };
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+            }
+        });
+
+        let (approval_sender, approval_receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(TestHarnessStore::default());
+        let client = Arc::new(
+            NativeClient::spawn(
+                &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+                store,
+                Arc::new(move |event| {
+                    if let HarnessEvent::UserInputRequested { .. } = event {
+                        approval_sender.send(event).expect("send approval request");
+                    }
+                }),
+            )
+            .expect("start managed agent"),
+        );
+        let thread_id = client
+            .new_session(workspace.path(), "agent", Some("gpt-5.5"), Some("mock"))
+            .expect("create managed session");
+        let configured_servers = client.runtime.block_on(async {
+            let thread = client.threads.lock()[&thread_id].clone();
+            thread.config().await.mcp_servers.get().clone()
+        });
+        assert!(configured_servers.contains_key("echo"));
+        let (prompt_sender, prompt_receiver) = std::sync::mpsc::channel();
+        let prompt_client = client.clone();
+        let prompt_thread_id = thread_id.clone();
+        std::thread::spawn(move || {
+            drop(prompt_sender.send(prompt_client.prompt(
+                &prompt_thread_id,
+                "Call echo twice with MCP_ECHO_SENTINEL_1 and MCP_ECHO_SENTINEL_2, then list resources and templates and read the smoke resource",
+            )));
+        });
+        let mut approvals = Vec::new();
+        for _ in 0..2 {
+            let HarnessEvent::UserInputRequested {
+                request_id,
+                questions,
+                ..
+            } = approval_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("each MCP call asks for approval")
+            else {
+                panic!("expected MCP approval request");
+            };
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].header, "Approve MCP tool?");
+            assert!(questions[0].question.starts_with(
+                "Allow the echo MCP server to run tool \"echo\"?\nArguments: "
+            ));
+            assert!(
+                questions[0]
+                    .options
+                    .iter()
+                    .any(|option| option.label == "Allow")
+            );
+            let unapproved_sentinel =
+                if questions[0].id == "mcp_tool_call_approval_mcp-call-1" {
+                    "MCP_ECHO_SENTINEL_1"
+                } else {
+                    assert_eq!(questions[0].id, "mcp_tool_call_approval_mcp-call-2");
+                    "MCP_ECHO_SENTINEL_2"
+                };
+            assert!(questions[0].question.contains(unapproved_sentinel));
+            assert!(
+                !std::fs::read_to_string(&trace)
+                    .unwrap_or_default()
+                    .contains(unapproved_sentinel),
+                "MCP call must not run before its own approval"
+            );
+            approvals.push((request_id, questions[0].id.clone()));
+        }
+        approvals.sort_by(|left, right| left.1.cmp(&right.1));
+        assert_ne!(approvals[0].0, approvals[1].0);
+        assert_eq!(
+            approvals
+                .iter()
+                .map(|(_, question_id)| question_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "mcp_tool_call_approval_mcp-call-1",
+                "mcp_tool_call_approval_mcp-call-2"
+            ]
+        );
+        for (request_id, question_id) in approvals {
+            client
+                .answer_user_input(
+                    &thread_id,
+                    &request_id,
+                    HashMap::from([(question_id, vec!["Allow".to_string()])]),
+                )
+                .expect("approve MCP call");
+        }
+        for (call_id, operation, answer) in [
+            ("resource-list-denied", "list_mcp_resources", "Cancel"),
+            ("resource-list", "list_mcp_resources", "Allow"),
+            ("resource-templates", "list_mcp_resource_templates", "Allow"),
+            ("resource-read", "read_mcp_resource", "Allow"),
+        ] {
+            let HarnessEvent::UserInputRequested {
+                request_id,
+                questions,
+                ..
+            } = approval_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("each resource operation asks for approval")
+            else {
+                panic!("expected MCP resource approval request");
+            };
+            assert_eq!(
+                questions[0].id,
+                format!("mcp_tool_call_approval_{call_id}:echo")
+            );
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].header, "Approve MCP tool?");
+            assert!(questions[0].question.starts_with(&format!(
+                "Allow the echo MCP server to run tool \"{operation}\"?"
+            )));
+            let method = match operation {
+                "list_mcp_resources" => "resources/list",
+                "list_mcp_resource_templates" => "resources/templates/list",
+                "read_mcp_resource" => "resources/read",
+                _ => panic!("unexpected resource operation"),
+            };
+            assert!(
+                !std::fs::read_to_string(&trace)
+                    .unwrap_or_default()
+                    .contains(&format!("\"method\": \"{method}\"")),
+                "MCP resource operation must not run before approval"
+            );
+            client
+                .answer_user_input(
+                    &thread_id,
+                    &request_id,
+                    HashMap::from([(
+                        questions[0].id.clone(),
+                        vec![answer.to_string()],
+                    )]),
+                )
+                .expect("answer MCP resource approval");
+        }
+        let result = prompt_receiver.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            client.cancel(&thread_id).expect("cancel timed out turn");
+            panic!(
+                "managed MCP turn timed out after approval; model_requests={}; trace_exists={}",
+                captured_requests.lock().len(),
+                trace.exists(),
+            );
+        }
+        result
+            .expect("managed turn timed out")
+            .expect("complete managed turn");
+        {
+            let requests = captured_requests.lock();
+            assert!(requests[1].to_string().contains("mcp__echo"));
+            assert!(requests[2].to_string().contains("MCP_ECHO_SENTINEL_1"));
+            assert!(requests[2].to_string().contains("MCP_ECHO_SENTINEL_2"));
+            assert!(
+                requests[3]
+                    .to_string()
+                    .contains("user cancelled MCP resource operation")
+            );
+            assert!(requests[4].to_string().contains("memo://ahead-smoke"));
+            assert!(requests[5].to_string().contains("memo://{id}"));
+            assert!(requests[6].to_string().contains("MCP_RESOURCE_SENTINEL"));
+        }
+        let mut calls = std::fs::read_to_string(&trace)
+            .expect("MCP call trace")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("MCP arguments JSON")
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|value| {
+            value["params"]["arguments"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            calls,
+            vec![
+                json!({"method":"resources/list","params":{}}),
+                json!({"method":"resources/templates/list","params":{}}),
+                json!({"method":"resources/read","params":{"uri":"memo://ahead-smoke"}}),
+                json!({"method":"tools/call","params":{"name":"echo","arguments":{"text":"MCP_ECHO_SENTINEL_1","payload":{"depth":1}}}}),
+                json!({"method":"tools/call","params":{"name":"echo","arguments":{"text":"MCP_ECHO_SENTINEL_2","payload":{"depth":2}}}}),
+            ]
+        );
+        crate::runtime_support::set_mcp_server_approval(
+            workspace.path(),
+            "echo",
+            &fingerprint,
+            ahead_rpc::ahead::McpServerApprovalAction::AutoApproveAll,
+        )
+        .expect("auto-approve reviewed server");
+        let auto_thread_id = client
+            .new_session(workspace.path(), "agent", Some("gpt-5.5"), Some("mock"))
+            .expect("create auto-approved managed session");
+        let (auto_sender, auto_receiver) = std::sync::mpsc::channel();
+        let auto_client = client.clone();
+        let auto_prompt_thread_id = auto_thread_id.clone();
+        std::thread::spawn(move || {
+            drop(auto_sender.send(auto_client.prompt(
+                &auto_prompt_thread_id,
+                "Call echo with MCP_AUTO_SENTINEL and list resources",
+            )));
+        });
+        let auto_result = auto_receiver.recv_timeout(Duration::from_secs(10));
+        if auto_result.is_err() {
+            client
+                .cancel(&auto_thread_id)
+                .expect("cancel timed out auto-approved turn");
+            panic!("auto-approved MCP turn timed out");
+        }
+        auto_result
+            .expect("auto-approved turn timed out")
+            .expect("complete auto-approved turn");
+        assert!(
+            approval_receiver.try_recv().is_err(),
+            "auto-approved tool and resource calls must not request per-call review"
+        );
+        model_server.join().expect("join local model server");
+        let requests = captured_requests.lock();
+        assert!(requests[9].to_string().contains("MCP_AUTO_SENTINEL"));
+        assert!(requests[9].to_string().contains("memo://ahead-smoke"));
+        let auto_trace =
+            std::fs::read_to_string(&trace).expect("auto-approved MCP trace");
+        assert!(auto_trace.contains("MCP_AUTO_SENTINEL"));
+        assert_eq!(
+            auto_trace.matches("\"method\": \"resources/list\"").count(),
+            2
+        );
+        client.shutdown();
     }
 
     #[test]
@@ -3485,6 +4756,481 @@ mod tests {
                 .to_string()
                 .contains("snapshot limit")
         );
+
+        let source = temporary.path().join("src/live.rs");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
+        std::fs::write(&source, "UNSAVED_SEARCH_MARKER disk-only")
+            .expect("write saved source");
+        let requester = client.clone();
+        let workspace = temporary.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            requester.runtime.block_on(requester.file_search(
+                "thread",
+                &SessionSettings {
+                    cwd: workspace,
+                    mode_id: "read-only".into(),
+                    model: None,
+                    model_provider: None,
+                    loaded_provider_fingerprint: [0; 32],
+                },
+                None,
+                json!({"pattern": "UNSAVED_SEARCH_MARKER"}),
+            ))
+        });
+        let event = event_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive file search buffer request");
+        let HarnessEvent::BufferSnapshotsRequested { request_id, .. } = event else {
+            panic!("expected file search buffer request");
+        };
+        client
+            .answer_buffer_snapshots(
+                "thread",
+                &request_id,
+                vec![AgentBufferSnapshot {
+                    path: "src/live.rs".into(),
+                    content: "UNSAVED_SEARCH_MARKER editor-only".into(),
+                }],
+                None,
+            )
+            .expect("answer file search buffer request");
+        let result = worker
+            .join()
+            .expect("join file search worker")
+            .expect("search unsaved buffer");
+        assert!(result.contains("src/live.rs"), "{result}");
+        assert!(
+            result.contains("UNSAVED_SEARCH_MARKER editor-only"),
+            "{result}"
+        );
+        assert!(!result.contains("disk-only"), "{result}");
+        client.shutdown();
+    }
+
+    #[test]
+    fn managed_stdio_mcp_form_reaches_server_with_typed_answers() {
+        managed_stdio_mcp_elicitation_reaches_server("form");
+    }
+
+    #[test]
+    fn managed_stdio_mcp_url_reaches_server_after_explicit_consent() {
+        managed_stdio_mcp_elicitation_reaches_server("url");
+    }
+
+    fn managed_stdio_mcp_elicitation_reaches_server(mode: &str) {
+        let tool_name: &'static str =
+            if mode == "url" { "ask_url" } else { "ask_form" };
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir_all(&ahead).expect("private settings directory");
+        let script = ahead.join("mcp_echo.py");
+        let trace = ahead.join("mcp_calls.jsonl");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/editor-smoke/mcp_echo.py"),
+        )
+        .expect("copy offline MCP server");
+        let declaration = format!(
+            "[mcp.servers.echo]\ncommand = \"python3\"\nargs = [\"-u\", {}, {}, \"--{mode}\"]\n",
+            toml::Value::String(script.to_string_lossy().into_owned()),
+            toml::Value::String(trace.to_string_lossy().into_owned()),
+        );
+        std::fs::write(ahead.join("config.toml"), &declaration)
+            .expect("declare offline MCP server");
+        let parsed = declaration.parse::<toml::Table>().expect("MCP declaration");
+        let fingerprint = crate::runtime_support::mcp_declaration_fingerprint(
+            &parsed["mcp"]["servers"]["echo"],
+        )
+        .expect("fingerprint MCP declaration");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = listener.local_addr().expect("mock model address");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\n[mcp]\nenabled_servers = [\"echo\"]\n[mcp.approved_declarations]\necho = \"{fingerprint}\"\n"
+            ),
+        )
+        .expect("configure local model and MCP server");
+        let model_server = std::thread::spawn(move || {
+            for turn in 0..3 {
+                let (mut stream, _) =
+                    listener.accept().expect("accept model request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("bound model read");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read model request");
+                    assert_ne!(read, 0, "model request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .expect("model request content length");
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+                let events = match turn {
+                    0 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"form-search","type":"tool_search_call","call_id":"form-search","execution":"client","arguments":{"query":tool_name,"limit":1}}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"form-search","type":"tool_search_call","call_id":"form-search","execution":"client","arguments":{"query":tool_name,"limit":1}}}),
+                        json!({"type":"response.completed","response":{"id":"form-response-1","end_turn":false}}),
+                    ],
+                    1 => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"form-call","type":"function_call","call_id":"form-call","namespace":"mcp__echo","name":tool_name,"arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"form-call","type":"function_call","call_id":"form-call","namespace":"mcp__echo","name":tool_name,"arguments":"{}"}}),
+                        json!({"type":"response.completed","response":{"id":"form-response-2","end_turn":false}}),
+                    ],
+                    _ => vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"form-message","type":"message","role":"assistant","content":[]}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"form-message","type":"message","role":"assistant","content":[{"type":"output_text","text":"MCP form complete"}]}}),
+                        json!({"type":"response.completed","response":{"id":"form-response-3","end_turn":true}}),
+                    ],
+                };
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).expect("write model response");
+            }
+        });
+        let (input_sender, input_receiver) = std::sync::mpsc::channel();
+        let client = Arc::new(
+            NativeClient::spawn(
+                &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+                Arc::new(TestHarnessStore::default()),
+                Arc::new(move |event| {
+                    if let HarnessEvent::UserInputRequested { .. } = event {
+                        input_sender
+                            .send(event)
+                            .expect("forward agent input request");
+                    }
+                }),
+            )
+            .expect("start managed agent"),
+        );
+        let thread_id = client
+            .new_session(workspace.path(), "agent", Some("gpt-5.5"), Some("mock"))
+            .expect("create managed session");
+        let (prompt_sender, prompt_receiver) = std::sync::mpsc::channel();
+        let prompt_client = client.clone();
+        let prompt_thread = thread_id.clone();
+        std::thread::spawn(move || {
+            prompt_sender
+                .send(prompt_client.prompt(
+                    &prompt_thread,
+                    &format!("Call {tool_name} on echo and use the user's answer"),
+                ))
+                .expect("send prompt result");
+        });
+        let HarnessEvent::UserInputRequested {
+            request_id,
+            questions,
+            ..
+        } = input_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP tool approval")
+        else {
+            panic!("expected tool approval");
+        };
+        assert_eq!(questions[0].header, "Approve MCP tool?");
+        client
+            .answer_user_input(
+                &thread_id,
+                &request_id,
+                HashMap::from([(
+                    questions[0].id.clone(),
+                    vec!["Allow".to_string()],
+                )]),
+            )
+            .expect("approve MCP tool");
+        let HarnessEvent::UserInputRequested {
+            request_id,
+            questions,
+            ..
+        } = input_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP elicitation request")
+        else {
+            panic!("expected MCP elicitation");
+        };
+        let answers = if mode == "url" {
+            assert!(request_id.starts_with("mcp-url-"));
+            assert_eq!(questions.len(), 1);
+            assert!(questions[0].header.contains("MCP server: echo"));
+            assert_eq!(
+                questions[0].external_url.as_deref(),
+                Some("https://example.test/connect?state=abc")
+            );
+            HashMap::from([(
+                ahead_rpc::ahead::MCP_FORM_ACTION_KEY.to_string(),
+                vec!["accept".to_string()],
+            )])
+        } else {
+            assert!(request_id.starts_with("mcp-form-"));
+            assert_eq!(questions.len(), 3);
+            assert!(
+                questions
+                    .iter()
+                    .all(|question| question.header.contains("MCP server: echo"))
+            );
+            let field_id = |name: &str| {
+                questions
+                    .iter()
+                    .find(|question| {
+                        question.header.contains(&format!(" · {name} ("))
+                    })
+                    .expect("MCP form field")
+                    .id
+                    .clone()
+            };
+            let color_id = field_id("color");
+            let skip_value = questions
+                .iter()
+                .find(|question| question.id == color_id)
+                .and_then(|question| {
+                    question
+                        .options
+                        .iter()
+                        .find(|option| option.label == "Skip")
+                })
+                .expect("Skip option")
+                .value
+                .clone();
+            HashMap::from([
+                (color_id, vec![skip_value]),
+                (field_id("count"), vec!["2".to_string()]),
+                (field_id("nickname"), vec!["Nora".to_string()]),
+            ])
+        };
+        client
+            .answer_user_input(&thread_id, &request_id, answers)
+            .expect("submit MCP elicitation");
+        prompt_receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("managed turn completed")
+            .expect("managed turn succeeded");
+        model_server.join().expect("join model server");
+        let trace = std::fs::read_to_string(&trace).expect("MCP server trace");
+        assert!(
+            trace.contains("\"method\": \"elicitation/result\""),
+            "{trace}"
+        );
+        assert!(trace.contains("\"action\": \"accept\""), "{trace}");
+        if mode == "url" {
+            let response: Value = serde_json::from_str(
+                trace.lines().last().expect("MCP URL response trace"),
+            )
+            .expect("MCP URL response JSON");
+            assert_eq!(response["params"]["content"], json!({}));
+        } else {
+            assert!(trace.contains("\"nickname\": \"Nora\""), "{trace}");
+            assert!(trace.contains("\"count\": 2"), "{trace}");
+            assert!(
+                !trace.contains("\"color\""),
+                "optional color was skipped: {trace}"
+            );
+        }
+        client.shutdown();
+    }
+
+    #[test]
+    fn managed_model_file_search_uses_live_editor_buffer() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        std::fs::create_dir_all(workspace.path().join(".ahead"))
+            .expect("create private settings directory");
+        std::fs::create_dir_all(workspace.path().join("src"))
+            .expect("create source directory");
+        std::fs::write(
+            workspace.path().join("src/live.rs"),
+            "SEARCH_MARKER disk-only",
+        )
+        .expect("write saved source");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = listener.local_addr().expect("mock model address");
+        let (model_request_sender, model_request_receiver) =
+            std::sync::mpsc::channel();
+        std::fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\n"
+            ),
+        )
+        .expect("configure local model");
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for turn in 0..2 {
+                let (mut stream, _) =
+                    listener.accept().expect("accept model request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("bound model read");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut buffer).expect("read model request");
+                    assert_ne!(read, 0, "model request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .expect("model request content length");
+                    if request.len() >= header_end + content_length {
+                        break (header_end, content_length);
+                    }
+                };
+                requests.push(
+                    serde_json::from_slice::<Value>(
+                        &request[header_end..header_end + content_length],
+                    )
+                    .expect("model request JSON"),
+                );
+                model_request_sender
+                    .send(turn)
+                    .expect("record model request");
+                let events = if turn == 0 {
+                    vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"search-call","type":"function_call","call_id":"search-call","name":"file_search","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"search-call","type":"function_call","call_id":"search-call","name":"file_search","arguments":"{\"pattern\":\"SEARCH_MARKER\"}"}}),
+                        json!({"type":"response.completed","response":{"id":"search-response-1","end_turn":false}}),
+                    ]
+                } else {
+                    vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"search-message","type":"message","role":"assistant","content":[]}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"search-message","type":"message","role":"assistant","content":[{"type":"output_text","text":"Search complete"}]}}),
+                        json!({"type":"response.completed","response":{"id":"search-response-2","end_turn":true}}),
+                    ]
+                };
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+            }
+            requests
+        });
+
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let client = Arc::new(
+            NativeClient::spawn(
+                &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+                Arc::new(TestHarnessStore::default()),
+                Arc::new(move |event| {
+                    if let HarnessEvent::BufferSnapshotsRequested { .. } = event {
+                        event_sender.send(event).expect("send buffer request");
+                    }
+                }),
+            )
+            .expect("start managed agent"),
+        );
+        let thread_id = client
+            .new_session(
+                workspace.path(),
+                "read-only",
+                Some("gpt-5.5"),
+                Some("mock"),
+            )
+            .expect("create managed session");
+        let prompt_client = client.clone();
+        let prompt_thread_id = thread_id.clone();
+        let (prompt_sender, prompt_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(prompt_sender.send(
+                prompt_client.prompt(&prompt_thread_id, "Search for SEARCH_MARKER"),
+            ));
+        });
+        let HarnessEvent::BufferSnapshotsRequested { request_id, .. } =
+            event_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "model search did not ask for live buffers: {error}; prompt={:?}; model requests={:?}",
+                        prompt_receiver.try_recv().map(|result| result.map(|_| ())),
+                        model_request_receiver.try_iter().collect::<Vec<_>>()
+                    )
+                })
+        else {
+            panic!("expected live buffer request");
+        };
+        client
+            .answer_buffer_snapshots(
+                &thread_id,
+                &request_id,
+                vec![
+                    AgentBufferSnapshot {
+                        path: "src/live.rs".into(),
+                        content: "SEARCH_MARKER editor-only".into(),
+                    },
+                    AgentBufferSnapshot {
+                        path: ".ahead/settings.toml".into(),
+                        content: "SEARCH_MARKER private-only".into(),
+                    },
+                ],
+                None,
+            )
+            .expect("answer live editor request");
+        prompt_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("managed search turn timed out")
+            .expect("complete managed search turn");
+        let requests = server.join().expect("join local model server");
+        assert!(
+            requests[0]["tools"]
+                .as_array()
+                .expect("model tools")
+                .iter()
+                .any(|tool| tool["name"] == AHEAD_FILE_SEARCH_TOOL),
+            "file_search must be advertised to the direct-tool model"
+        );
+        let continuation = requests[1].to_string();
+        assert!(continuation.contains("SEARCH_MARKER editor-only"));
+        assert!(!continuation.contains("disk-only"));
+        assert!(!continuation.contains("private-only"));
         client.shutdown();
     }
 
@@ -3667,6 +5413,8 @@ mod tests {
     struct TestHarnessStore {
         agent_runtime_states: Mutex<HashMap<String, AgentRuntimeState>>,
         native_threads: Mutex<HashMap<String, crate::NativeThreadSnapshot>>,
+        fail_native_append: AtomicBool,
+        fail_native_metadata_append: AtomicBool,
         native_agent_edges:
             Mutex<HashMap<String, (String, crate::NativeAgentEdgeStatus)>>,
         header_timestamps: Mutex<
@@ -3806,6 +5554,10 @@ mod tests {
             thread_id: &str,
             items: Vec<Value>,
         ) -> Result<()> {
+            anyhow::ensure!(
+                !self.fail_native_append.load(Ordering::Relaxed),
+                "injected native history write failure"
+            );
             self.native_threads
                 .lock()
                 .get_mut(thread_id)
@@ -3820,6 +5572,10 @@ mod tests {
             thread_id: &str,
             patch: Value,
         ) -> Result<()> {
+            anyhow::ensure!(
+                !self.fail_native_metadata_append.load(Ordering::Relaxed),
+                "injected native metadata write failure"
+            );
             self.native_threads
                 .lock()
                 .get_mut(thread_id)
@@ -4072,6 +5828,16 @@ mod tests {
             .enable_all()
             .build()
             .expect("create test runtime");
+        let cold_read = runtime
+            .block_on(fresh.read_thread(codex_thread_store::ReadThreadParams {
+                thread_id:
+                    ThreadId::from_string(&active).expect("valid active thread id"),
+                include_archived: false,
+                include_history: false,
+            }))
+            .expect("read active thread metadata before listing");
+        assert_eq!(cold_read.created_at, created_at);
+        assert_eq!(cold_read.updated_at, updated_at);
         let params = codex_thread_store::ListThreadsParams {
             page_size: 20,
             cursor: None,
@@ -4121,6 +5887,258 @@ mod tests {
             }))
             .expect("read active thread metadata after listing");
         assert_eq!(store.full_thread_loads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn native_runtime_rejects_unsupported_feature_thread_sources() {
+        let temporary = tempfile::tempdir().expect("create workspace");
+        let store = Arc::new(TestHarnessStore::default());
+        let native_config =
+            NativeClientConfig::ahead(temporary.path().to_path_buf());
+        let client =
+            NativeClient::spawn(&native_config, store.clone(), Arc::new(|_| {}))
+                .expect("start native client");
+        let config = client
+            .runtime
+            .block_on(NativeClient::build_config(
+                &client.runtime_home,
+                temporary.path(),
+                None,
+                None,
+                McpServerPolicy::Disabled,
+            ))
+            .expect("load native config");
+        let mut options = StartThreadOptions::new(config);
+        options.thread_source =
+            Some(codex_protocol::protocol::ThreadSource::Feature(
+                "background-review".to_string(),
+            ));
+        let error = client
+            .runtime
+            .block_on(client.manager.start_thread(options))
+            .err()
+            .expect("feature source must not create a managed thread");
+        assert!(
+            error
+                .to_string()
+                .contains("Feature thread sources are not supported by AHEAD")
+        );
+        let thread_id = client
+            .new_session(temporary.path(), "agent", None, None)
+            .expect("create ordinary managed thread");
+        client.shutdown();
+
+        store
+            .native_threads
+            .lock()
+            .get_mut(&thread_id)
+            .expect("persisted managed thread")
+            .create_params["thread_source"] = json!("background-review");
+        let fresh = NativeClient::spawn(&native_config, store, Arc::new(|_| {}))
+            .expect("restart native client");
+        let config = fresh
+            .runtime
+            .block_on(NativeClient::build_config(
+                &fresh.runtime_home,
+                temporary.path(),
+                None,
+                None,
+                McpServerPolicy::Disabled,
+            ))
+            .expect("load restore config");
+        let thread_id = ThreadId::from_string(&thread_id).expect("stored thread id");
+        let error = fresh
+            .runtime
+            .block_on(fresh.manager.resume_thread_by_id(thread_id, config))
+            .err()
+            .expect("feature source must not restore as a managed thread");
+        assert!(
+            error
+                .to_string()
+                .contains("Feature thread sources are not supported by AHEAD")
+        );
+        fresh.shutdown();
+    }
+
+    #[test]
+    fn archived_native_thread_appends_remain_durable() {
+        let temporary = tempfile::tempdir().expect("create workspace");
+        let store = Arc::new(TestHarnessStore::default());
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(temporary.path().to_path_buf()),
+            store.clone(),
+            Arc::new(|_| {}),
+        )
+        .expect("start native client");
+        let thread_id = client
+            .new_session(temporary.path(), "agent", None, None)
+            .expect("create native thread");
+        client.shutdown();
+        store
+            .set_native_thread_archived(&thread_id, true)
+            .expect("archive native thread");
+
+        let parsed = ThreadId::from_string(&thread_id).expect("valid thread id");
+        let fresh = TursoThreadStore::new(store.clone());
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let item = turn_complete_item("resumed-turn");
+        runtime
+            .block_on(fresh.append_items(
+                codex_thread_store::AppendThreadItemsParams {
+                    thread_id: parsed,
+                    items: vec![item.clone()],
+                },
+            ))
+            .expect("append resumed turn to archived thread");
+
+        let snapshot = store
+            .load_native_thread(&thread_id)
+            .expect("read durable thread")
+            .expect("thread remains durable");
+        assert!(snapshot.archived);
+        assert_eq!(
+            snapshot.rollout_items,
+            vec![serde_json::to_value(item).expect("encode item")]
+        );
+    }
+
+    #[test]
+    fn native_history_write_failure_poisoned_until_restart() {
+        let temporary = tempfile::tempdir().expect("create workspace");
+        let store = Arc::new(TestHarnessStore::default());
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(temporary.path().to_path_buf()),
+            store.clone(),
+            Arc::new(|_| {}),
+        )
+        .expect("start native client");
+        let thread_id = client
+            .new_session(temporary.path(), "agent", None, None)
+            .expect("create native thread");
+        store.fail_native_append.store(true, Ordering::Relaxed);
+        let parsed = ThreadId::from_string(&thread_id).expect("valid thread id");
+        client
+            .runtime
+            .block_on(client.thread_store.append_items(
+                codex_thread_store::AppendThreadItemsParams {
+                    thread_id: parsed,
+                    items: vec![turn_complete_item("failed-write")],
+                },
+            ))
+            .expect_err("injected history write must fail");
+        store.fail_native_append.store(false, Ordering::Relaxed);
+
+        let error = client
+            .prompt(&thread_id, "Do not send this turn")
+            .expect_err("poisoned thread must reject another turn");
+        assert!(error.to_string().contains("restart AHEAD before retrying"));
+        assert!(client.compact(&thread_id).is_err());
+
+        let metadata_thread_id = client
+            .new_session(temporary.path(), "agent", None, None)
+            .expect("create another native thread");
+        store
+            .fail_native_metadata_append
+            .store(true, Ordering::Relaxed);
+        client
+            .runtime
+            .block_on(
+                client.thread_store.update_thread_metadata(
+                    codex_thread_store::UpdateThreadMetadataParams {
+                        thread_id: ThreadId::from_string(&metadata_thread_id)
+                            .expect("valid metadata thread id"),
+                        patch: codex_thread_store::ThreadMetadataPatch {
+                            title: Some("Updated title".to_string()),
+                            ..Default::default()
+                        },
+                        include_archived: false,
+                    },
+                ),
+            )
+            .expect_err("injected metadata write must fail");
+        store
+            .fail_native_metadata_append
+            .store(false, Ordering::Relaxed);
+        let metadata_error = client
+            .prompt(&metadata_thread_id, "Do not send this turn either")
+            .expect_err("metadata failure must poison that thread");
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("injected native metadata write failure")
+        );
+        client.shutdown();
+    }
+
+    #[test]
+    fn native_turn_reports_a_failed_history_write() {
+        // The model never answers; a failed history write must interrupt first.
+        let unanswered_model =
+            TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = unanswered_model.local_addr().expect("mock model address");
+
+        let workspace = tempfile::tempdir().expect("create workspace");
+        std::fs::create_dir_all(workspace.path().join(".ahead"))
+            .expect("create private settings directory");
+        std::fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.6-sol\"\n"
+            ),
+        )
+        .expect("write local model settings");
+        let store = Arc::new(TestHarnessStore::default());
+        let client = Arc::new(
+            NativeClient::spawn(
+                &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+                store.clone(),
+                Arc::new(|_| {}),
+            )
+            .expect("start native client"),
+        );
+        let thread_id = client
+            .new_session(
+                workspace.path(),
+                "read-only",
+                Some("gpt-5.6-sol"),
+                Some("mock"),
+            )
+            .expect("create native thread");
+        store.fail_native_append.store(true, Ordering::Relaxed);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let prompt_client = client.clone();
+        let prompt_thread_id = thread_id.clone();
+        std::thread::spawn(move || {
+            drop(sender.send(prompt_client.prompt(&prompt_thread_id, "Reply PONG")));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            client.cancel(&thread_id).expect("cancel timed out turn");
+        }
+        let error = result
+            .expect("turn timed out")
+            .expect_err("failed history write must fail the turn");
+        assert!(error.to_string().contains("restart AHEAD before retrying"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected native history write failure")
+        );
+        drop(unanswered_model);
+        assert!(
+            store
+                .load_native_thread(&thread_id)
+                .expect("read native history")
+                .expect("thread exists")
+                .rollout_items
+                .is_empty()
+        );
+        store.fail_native_append.store(false, Ordering::Relaxed);
+        assert!(client.prompt(&thread_id, "Do not retry yet").is_err());
+        client.shutdown();
     }
 
     #[test]
@@ -4627,7 +6645,13 @@ mod tests {
             .lock()
             .entry("thread".into())
             .or_default()
-            .insert("input".into(), input_sender);
+            .insert(
+                "input".into(),
+                PendingUserInput {
+                    sender: input_sender,
+                    kind: PendingUserInputKind::AgentQuestion,
+                },
+            );
         let (buffer_sender, mut buffer_receiver) = oneshot::channel();
         client
             .pending_buffer_snapshots
@@ -4686,6 +6710,10 @@ mod tests {
             std::sync::mpsc::channel();
         let requests_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model_requests_seen = requests_seen.clone();
+        let connections_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_connections_seen = connections_seen.clone();
+        let bytes_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model_bytes_seen = bytes_seen.clone();
         let model_server = std::thread::spawn(move || {
             let read_request = |stream: &mut TcpStream| {
                 let mut request = Vec::new();
@@ -4693,6 +6721,7 @@ mod tests {
                 loop {
                     let read = stream.read(&mut buffer).expect("read model request");
                     assert_ne!(read, 0, "model request ended before its body");
+                    model_bytes_seen.fetch_add(read, Ordering::SeqCst);
                     request.extend_from_slice(&buffer[..read]);
                     let Some(header_end) = request
                         .windows(4)
@@ -4735,6 +6764,7 @@ mod tests {
 
             let (mut parent_stream, _) =
                 listener.accept().expect("accept parent model request");
+            model_connections_seen.fetch_add(1, Ordering::SeqCst);
             read_request(&mut parent_stream);
             model_requests_seen.fetch_add(1, Ordering::SeqCst);
             let call_id = "call-ahead-cancel-child";
@@ -4793,6 +6823,7 @@ mod tests {
             let (mut child_stream, _) = listener
                 .accept()
                 .expect("accept active child model request");
+            model_connections_seen.fetch_add(1, Ordering::SeqCst);
             read_request(&mut child_stream);
             model_requests_seen.fetch_add(1, Ordering::SeqCst);
             child_active_sender
@@ -4844,7 +6875,9 @@ mod tests {
             child_active_receiver.recv_timeout(Duration::from_secs(10))
         {
             panic!(
-                "child model request did not start: {error}; requests={}; prompt={:?}; events={:?}",
+                "child model request did not start: {error}; connections={}; request_bytes={}; complete_requests={}; prompt={:?}; events={:?}",
+                connections_seen.load(Ordering::SeqCst),
+                bytes_seen.load(Ordering::SeqCst),
                 requests_seen.load(Ordering::SeqCst),
                 prompt_receiver.try_recv(),
                 events.lock()
@@ -4947,60 +6980,75 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
         let address = listener.local_addr().expect("mock model address");
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept model request");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let read = stream.read(&mut buffer).expect("read model request");
-                if read == 0 {
-                    break;
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) =
+                    listener.accept().expect("accept model request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read model request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&buffer[..read]);
-                let Some(header_end) = request
+                let body = concat!(
+                    "event: response.output_item.added\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-ahead-test\",\"output_index\":0,\"content_index\":0,\"delta\":\"PONG\"}\n\n",
+                    "event: response.output_item.done\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"PONG\"}]}}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ahead-test\",\"end_turn\":true}}\n\n"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+                let header_end = request
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
-                    .map(|index| index + 4)
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
+                    .expect("model request headers")
+                    + 4;
+                let authorization = String::from_utf8_lossy(&request[..header_end])
                     .lines()
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + content_length {
-                    break;
-                }
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    });
+                requests.push((
+                    authorization,
+                    serde_json::from_slice::<Value>(&request[header_end..])
+                        .expect("model request JSON"),
+                ));
             }
-            let body = concat!(
-                "event: response.output_item.added\n",
-                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
-                "event: response.output_text.delta\n",
-                "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-ahead-test\",\"output_index\":0,\"content_index\":0,\"delta\":\"PONG\"}\n\n",
-                "event: response.output_item.done\n",
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"PONG\"}]}}\n\n",
-                "event: response.completed\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ahead-test\",\"end_turn\":true}}\n\n"
-            );
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write model response");
-            let header_end = request
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("model request headers")
-                + 4;
-            serde_json::from_slice::<Value>(&request[header_end..])
-                .expect("model request JSON")
+            requests
         });
 
         let workspace = std::env::temp_dir()
@@ -5010,7 +7058,7 @@ mod tests {
         std::fs::write(
             workspace.join(".ahead/settings.toml"),
             format!(
-                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.6-sol\"\n"
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.6-sol\"\napi_key = \"ahead-test-key\"\n"
             ),
         )
         .expect("write test model config");
@@ -5061,6 +7109,21 @@ mod tests {
         assert!(events.lock().iter().any(|event| {
             matches!(event, HarnessEvent::AgentDelta { text, .. } if text == "PONG")
         }));
+        let (compact_sender, compact_receiver) = std::sync::mpsc::channel();
+        let compact_client = client.clone();
+        let compact_thread_id = thread_id.clone();
+        std::thread::spawn(move || {
+            drop(compact_sender.send(compact_client.compact(&compact_thread_id)));
+        });
+        let compact_result = compact_receiver.recv_timeout(Duration::from_secs(10));
+        if compact_result.is_err() {
+            client
+                .cancel(&thread_id)
+                .expect("cancel timed out compaction");
+        }
+        compact_result
+            .expect("native compaction timed out")
+            .expect("run native compaction");
         let snapshot = store
             .load_native_thread(&thread_id)
             .expect("load persisted test thread")
@@ -5075,12 +7138,22 @@ mod tests {
             "native turn context should be written to the harness store"
         );
         assert!(
+            snapshot
+                .rollout_items
+                .iter()
+                .any(|item| item["type"] == "compacted"),
+            "manual compaction should persist a replay checkpoint"
+        );
+        assert!(
             world_states.iter().all(|item| {
                 item["payload"]["state"].get("apps_instructions").is_none()
             }),
             "AHEAD must not persist hosted Apps instruction state"
         );
-        let request = server.join().expect("join mock model");
+        let requests = server.join().expect("join mock model");
+        assert_eq!(requests.len(), 2);
+        let (authorization, request) = &requests[0];
+        assert_eq!(authorization.as_deref(), Some("Bearer ahead-test-key"));
         let input = request["input"].as_array().expect("model input messages");
         let texts = input
             .iter()
@@ -5102,6 +7175,16 @@ mod tests {
             "AHEAD must not inject hosted Apps instructions"
         );
         assert_eq!(request["model"].as_str(), Some("gpt-5.6-sol"));
+        assert!(
+            requests[1].1["input"]
+                .as_array()
+                .expect("compaction input")
+                .iter()
+                .any(|item| item
+                    .to_string()
+                    .contains("CONTEXT CHECKPOINT COMPACTION")),
+            "manual compaction should make a model request with its summary prompt"
+        );
         let tool_names = request
             .get("tools")
             .map(|tools| tools.as_array().expect("model tools must be an array"))

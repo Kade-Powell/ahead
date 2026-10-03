@@ -44,6 +44,224 @@
 
 ## Review log
 
+- 2026-10-02: compared pinned Zed's UTF-16 open test in
+  `../zed/crates/editor/src/editor_tests.rs` (around line 42230) with
+  `ahead-app/src/code_panel.rs::read_editor_file`. Zed auto-detects a
+  BOM-marked UTF-16 file; AHEAD safely declines to edit it. In a rebuilt,
+  uniquely named native AHEAD app against only a disposable project, opening
+  a SQLite database and a UTF-16 file rendered the unavailable-text card;
+  a chmod-denied file rendered `Permission denied (os error 13)`. The UTF-16
+  fixture retained SHA-256
+  `3966f6d6e1c4b36d2ec8cd12afd2139b79b5ad247eb75153226000b27073c4be`.
+  A UTF-8 file and a zero-byte file both accepted edits and saved on disk.
+  With five files open, the active empty file's path appeared in the editor
+  header but its tab was outside the visible strip; tab-overflow visibility
+  remains a UI gap. After reopening the same test app, an immutable SQLite
+  copy retained SHA-256
+  `33bac128232d266bdf2eb10403b3aa855d088150665a917de0e84f79ba59b11a`
+  after an attempted edit and Cmd+S on its unavailable-text card. The
+  reused-preview transition is still unverified.
+  Zed-compatible, lossless UTF-16 editing remains a separate decision; no
+  Zed source was copied.
+
+- 2026-10-02: compared the current Extensions panel with Zed's pinned
+  `crates/extension_host/src/extension_host.rs` gallery query and
+  `crates/extensions_ui/src/extensions_ui.rs`. The rebuilt, isolated native
+  app displayed 338 live Zed catalog candidates; `html` narrowed them to
+  HTML and RsHtml, with Install controls. Clicking HTML Install rendered an
+  installed/reloading notice. This is a working browse/install surface, not a
+  vetted AHEAD registry or language-server-startup proof. Shell DNS could not
+  resolve `api.zed.dev`, although the unsandboxed app fetched the catalog and
+  package. The test exposed an isolation leak: `AHEAD_HOME` affected the
+  managed agent but not `Directory::plugins_directory`, so HTML was installed
+  into the normal debug-profile plugin directory. That newly created package
+  was moved intact to a disposable recovery folder; the pre-existing icon
+  theme remained untouched. `ahead-core/src/directory.rs` now honors an
+  absolute `AHEAD_DATA_HOME` for app data/config/plugins/cache/logs. Its
+  focused test passes. A rebuilt native install under that override placed the
+  HTML package in the disposable app-data root while the normal debug profile
+  remained untouched. The row lingered in Installing after the package reached
+  disk; refreshing the gallery showed Installed. After restarting that same
+  isolated app with Zed's already-cached `vscode-html-language-server` on PATH,
+  opening a disposable `.html` file yielded a Ready HTML server in AHEAD's
+  Language Servers panel. The editor footer still said `text`: gpui-kit's
+  highlighter registry lacks HTML even though the proxy classified it for LSP.
+  In a second native run, the HTML file was open before install. The server
+  became Ready within seconds of clicking Install without an app restart, but
+  the gallery row remained Installing for over 20 seconds. The proxy callback
+  had fired because it dispatched the restart; the panel's foreground result
+  wait was the remaining suspect. It now uses the app's async-channel wait
+  pattern. In a rebuilt disposable native retest, the row changed to Installed
+  without Refresh and the already-open file's HTML server became Ready without
+  restarting the app. The
+  production path still needs AHEAD-published, reviewed packages and hashes
+  sourced from Zed's public `extensions.toml`; no Zed source was copied.
+
+- 2026-10-02: the rebuilt AHEAD binary passed `tests/dap-shutdown-smoke.mjs`
+  (running, initializing and full-stderr adapters) and
+  `tests/editor-recovery-smoke.mjs` (SIGKILL persistence, stale-snapshot
+  fencing, owner-only Turso database permissions) in disposable workspaces
+  `ahead-dap-shutdown-ThVFd0` and `ahead-recovery-smoke-Hcf5aY`.
+  The same binary passed `tests/agent-shutdown-smoke.mjs`: explicit shutdown
+  and stdin EOF both persisted the cancelled partial turn across Turso reopen
+  in `ahead-agent-shutdown-4d6YT8` using a loopback fake model.
+  The current checkout also passed the focused managed-agent parallel stdio
+  MCP regression with two independently approved tool calls, MCP resources,
+  and an auto-approved follow-up; it remains a test, not a rendered chat pass.
+  These are process and harness checks, not native debugger, recovery or chat
+  UI proof.
+
+- 2026-10-02: the opt-in
+  `installed_zed_html_extension_starts_a_real_server` test copied the
+  already-installed HTML API-0.7 package into a temporary extension root,
+  detected `index.html` through its language config, opened the document,
+  let AHEAD's Wasm host resolve its command, and observed a successful LSP
+  handshake from the installed HTML server. The test passed with the server
+  on PATH. This verifies the extension-to-proxy startup seam without
+  changing Zed's installation. A further completion probe found a concrete
+  incompatibility: `vscode-html-language-server` omits `completionProvider`
+  unless the client advertises snippet support. AHEAD currently advertises
+  false and rejects snippet edits, so its checked completion request returned
+  no items; a diagnostic unchecked request returned HTML tag suggestions.
+  Zed advertises true in `../zed/crates/lsp/src/lsp.rs` and parses snippets
+  through its GPL-3.0-or-later `crates/snippet`, which is not copied into
+  AHEAD. Snippet insertion, live settings changes and the native editor remain
+  open gates. The complete proxy library suite then passed (191 tests, one
+  opt-in real-extension test ignored by default); the headless app library
+  suite also passed (172 tests). Neither is a native-window acceptance pass.
+
+- 2026-10-02: compared `../zed/crates/lsp/src/lsp.rs::LanguageServer::new`
+  with AHEAD's `ahead-proxy/src/plugin/lsp.rs::LspClient::new`. Zed spawns
+  the selected server directly; AHEAD was running `chmod +x` on every
+  absolute server path, including user-owned binaries. AHEAD no longer
+  changes executable permissions. A focused non-executable-file regression
+  passes, and the rebuilt root binary again passed the full disposable
+  Rust/TypeScript/JavaScript/Python LSP smoke (`ahead-lsp-smoke-pgQWKZ`).
+  This does not prove real extension startup or rendered editor controls.
+
+- 2026-10-02: rebuilt `ahead --bin ahead` and ran the unchanged
+  `tests/lsp-smoke.mjs` in a disposable project using already-installed Zed
+  Vtsls, BasedPyright and standalone Rust Analyzer binaries. TypeScript,
+  JavaScript, Python and Rust passed unsaved diagnostics, completion,
+  definition and repair. TypeScript also passed auto-import resolve; restart
+  replaced server instances, replayed unsaved buffers, rejected stale
+  completion items and ended with an empty server process group. The successful
+  copy was `ahead-lsp-smoke-Nwx1YV`. A restricted first run could not spawn
+  Vtsls, and an unrestricted run found a rustup shim without a Rust Analyzer
+  component; these were environment prerequisites, not counted product
+  failures. The same rebuilt binary passed all four
+  `tests/lsp-shutdown-smoke.mjs` cases (shutdown, stdin EOF, delayed
+  initialization and unresponsive server) in disposable
+  `ahead-lsp-shutdown-eGWJfk`. This proves the rebuilt proxy/server path,
+  not rendered editor controls or a first-run language-server installer. No
+  Zed source was copied.
+
+- 2026-10-01: compared ACP package launch with Zed's
+  `crates/project/src/agent_server_store.rs::LocalRegistryNpxAgent` at
+  `418f89714891f9d8105a3e92e60b9a7a5084d232`. Zed installs a registry
+  npx package and resolves its executable before launching Node. AHEAD keeps
+  its existing atomic, provenance-checked generations because multiple agent
+  threads can resolve and launch concurrently. Under the install lock, AHEAD
+  now removes abandoned staging directories and reclaims only generations
+  published by this app process after their resolved configs and ACP children
+  release shared file leases. Prior-process and pre-lease generations remain
+  untouched to avoid deleting a package used by a child orphaned by an app
+  crash. Eleven adapter tests and the disposable offline real-npm/Node smoke
+  test passed; installed-agent UI and cross-restart reclamation remain in
+  `TODO.md`. No Zed source was copied.
+
+- 2026-10-02: checked the live ACP Registry index against Zed's pinned
+  `crates/project/src/agent_registry_store.rs`. AHEAD's three curated entries
+  (Pi, Codex, Claude Code) currently use npx distributions; binary-only agents
+  remain outside its picker. The existing cache reader and background fetch
+  were unbounded, and a fixed `.tmp` cache filename could follow a symlink.
+  AHEAD now caps both reads at 4 MiB, rejects malformed replacement indexes
+  before publishing, rejects symlinked/non-regular cache leaves on Unix, and
+  publishes through a unique temporary file. A disposable regression verifies
+  the bound and preserves an outside sentinel; the full AHEAD agent library
+  suite passes with loopback enabled (134 passed, two ignored). This is cache
+  hardening, not binary archive support or a native ACP install proof. No Zed
+  source was copied.
+
+- 2026-10-01: Zed's `crates/agent_ui/src/agent_panel.rs::load_agent_thread`
+  unarchives a thread when activating it (commit
+  `418f89714891f9d8105a3e92e60b9a7a5084d232`). AHEAD's legacy import
+  instead preserves the source archive flag. Its Turso wrapper had rejected
+  writes to such a resumed thread, although the retained recorder accepts
+  them. A focused regression failed before the shared append fix and passes
+  after it. In a disposable native app with a synthetic local provider, an
+  archived `.jsonl.zst` source imported with three records; after a new turn,
+  restart and another turn, Turso held 24 replay records and the provider
+  confirmed the previous new prompt was in context. A separate malformed
+  rollout displayed a parse error and kept the draft without a provider call
+  or new runtime-thread row. These are native UI/model-request observations,
+  not authenticated-provider proof. `TODO.md` retains the persistence-error
+  surfacing and broader release gates. No Zed source was copied.
+
+- 2026-10-02: compared Zed's
+  `crates/agent_ui/src/agent_panel.rs::{new_thread_with_workspace,activate_new_thread}`
+  at `418f89714891f9d8105a3e92e60b9a7a5084d232` with AHEAD's
+  `ahead-app/src/threads_panel.rs::open_new_thread`. Zed activates an
+  ephemeral draft; AHEAD uses a Describe → Review → Start wizard. A rebuilt
+  native AHEAD window in a disposable project completed that wizard with a
+  loopback provider selected and restored the resulting thread after restart.
+  The mock received no model request: the chat composer was not present in
+  macOS's accessibility tree, and attempted coordinate input did not reliably
+  focus it. This verifies creation and restore, not a managed model turn or
+  Zed-equivalent composer accessibility. No Zed source was copied.
+
+- 2026-10-02: compared Zed's
+  `crates/agent_ui/src/agent_panel.rs::focus` and active-thread focus handling
+  at `418f89714891f9d8105a3e92e60b9a7a5084d232` with AHEAD's Agent
+  shortcut and status-bar button. Both AHEAD entry points now focus the chat
+  composer when a thread exists, while keeping the panel focusable before
+  thread creation. The focused GPUI test passed. In the disposable native app,
+  the shortcut accepted keyboard text, Enter sent an authorized request to a
+  loopback fake provider, the streamed reply rendered, and both messages
+  restored after restart. A later isolated window exposed the composer as a
+  labeled AX text entry after it was clicked, although AX still reported the
+  window as focused; screen-reader operation remains unverified. The
+  model's CodeModeOnly metadata omitted top-level tools because AHEAD does not
+  bundle the required host; this remains a release gate in `TODO.md`. A second
+  native loopback turn with direct-tool `gpt-5.5` showed `file_search` and
+  `read_editor_buffer` calls in one model response, both tool results in the
+  next request, rendered tool activity, and a final answer. The buffer read
+  correctly reported that the requested file was not open. In a fresh,
+  uniquely identified test bundle, AHEAD created a thread, opened a Python
+  file, and kept a typed marker unsaved. The next native `read_editor_buffer`
+  call returned that marker to the model, the activity row completed, and the
+  disk file remained unchanged. No Zed source was copied.
+
+- 2026-10-02: Zed renders a completed context-compaction entry in
+  `crates/agent_ui/src/conversation_view/thread_view.rs::render_context_compaction`
+  at `418f89714891f9d8105a3e92e60b9a7a5084d232`. In AHEAD's isolated
+  native app, `/compact` reached the loopback model with the retained runtime's
+  checkpoint prompt, but the completed chat turn showed "No response received
+  from the agent." The managed controller now persists and streams the concise
+  completion notice "Context compacted." after a successful explicit compact.
+  A rebuilt app rendered the notice, and it restored after process restart.
+  This proves the synthetic-provider UI path, not an authenticated provider or
+  failed/cancelled compaction path. No Zed source was copied.
+
+- 2026-10-02: Compared Zed's repository event subscriptions in
+  `crates/git_ui/src/git_panel.rs` and Git commit path in
+  `crates/git/src/repository.rs` at
+  `418f89714891f9d8105a3e92e60b9a7a5084d232`. In an isolated AHEAD app
+  and disposable Git project, a synthetic `gpt-5.5` Responses turn issued
+  `apply_patch`; AHEAD applied it and showed a violet CodeAnchor rail. Source
+  Control initially stayed at zero changes because it only refreshed at
+  construction or after stage/commit. It now refreshes on activation and has
+  a manual refresh control; the rebuilt app showed the changed Python file,
+  staged it and completed a native commit. Git recorded `ahead` as author,
+  the test human as committer and an `Ahead-Session` trailer. The rail cleared
+  after commit. Explorer still needed manual refresh to clear its stale `M`
+  badge, so switching back to Explorer now refreshes it. A rebuilt-app pass
+  added and removed a disposable external edit: Source Control and Explorer
+  both showed the change on activation and cleared it on the next activation.
+  Event-driven status updates,
+  authenticated models, multi-session trailers and hooks/signing remain open.
+  No Zed source was copied.
+
 - 2026-10-01: compared Zed's diff-hunk gutter and expansion in
   `crates/editor/src/element.rs`, `crates/editor/src/git.rs` and
   `crates/buffer_diff/src/buffer_diff.rs` at
@@ -57,10 +275,9 @@
   rows into the editor display map; the gpui-kit editor lacks that block
   mechanism. `TODO.md` tracks the remaining editor work. No Zed source was
   copied. A root binary rebuild passed and the continuous rail was visible
-  in the disposable project, but the native click result was inconclusive:
-  multiple AHEAD windows shared one app identity and two `just dev` bundle
-  launches aborted after a macOS LaunchServices error. The isolated native
-  click/hover check is tracked in `TODO.md`.
+  in the disposable project. In an isolated native copy, clicking the Git
+  marker opened the hunk card and did not set a breakpoint. The hover tooltip
+  and narrow-gutter layout are still tracked in `TODO.md`.
 
 - 2026-10-01: compared Zed's background diff update and snapshot replacement
   in `crates/buffer_diff/src/buffer_diff.rs` at
@@ -72,6 +289,65 @@
   marker retention and stale-reply rejection. In `just dev` against the
   disposable Python fixture, markers remained visible after typing and Undo;
   the edit was not saved.
+
+- 2026-10-02: revisited Zed's versioned background diff update in
+  `crates/buffer_diff/src/buffer_diff.rs::update_diff`. AHEAD retained markers
+  across edits, but its 150 ms timer still sent Git metadata requests during
+  sustained typing because it started at the first edit. `CodePanel` now
+  cancels the pending task when the buffer revision or repository generation
+  changes and waits 150 ms after the latest change. The new GPUI scheduler
+  regression failed before the fix and passes after it; the existing
+  stale-reply test and all 177 app library tests pass. This reduces redundant
+  proxy diffs and whole-file blame requests, but native visual stability is
+  unverified while the Mac is locked. No Zed source was copied.
+
+- 2026-10-02: checked the commit handoff against Zed's Git diff/blame split in
+  `crates/editor/src/git.rs` and `crates/git/src/blame.rs`. AHEAD's pre-commit
+  CodeAnchor policy is its own layer: the GitCommit route used to choose author
+  `ahead` for any selected path with an agent anchor, even after a human had
+  replaced the anchored quote. Its cleanup already required the quote and
+  SHA-256 to match file content. The author decision now uses that same
+  predicate; a regression failed before the fix and passes after it. The full
+  proxy library suite passes (195 passed, one ignored). The synthetic test
+  proves commit metadata and anchor retention, not the rendered user-driven
+  gutter-to-commit journey. No Zed source was copied.
+
+- 2026-10-02: checked Zed's staged-commit flow in
+  `crates/git_ui/src/git_panel.rs::commit_changes` before fixing AHEAD's
+  separate CodeAnchor attribution. The dispatcher used the first matching
+  anchor's session ID, losing other source sessions. A real-repository
+  regression with two sessions and repeated anchors failed before the fix;
+  AHEAD now writes sorted, distinct `Ahead-Session` trailers while retaining
+  the human committer and staged-content attribution predicate. The focused
+  proxy test passes; a rendered user-driven commit remains unverified.
+
+- 2026-10-02: compared Zed's Git-command commit in
+  `crates/git/src/repository.rs::commit` with AHEAD's `git2` helper. AHEAD now
+  treats only an unborn HEAD as a root commit; an invalid HEAD object reports
+  an explicit error instead of being treated as parentless. A disposable-repo
+  regression failed before the fix and passes after it. Zed's path also runs
+  normal Git hooks and signing; AHEAD still bypasses both, so release parity
+  remains open in `TODO.md`. No Zed source was copied.
+
+- 2026-10-02: compared Zed's acknowledged commit lifecycle in
+  `crates/git_ui/src/git_panel.rs` (`commit_changes`, staged-change check,
+  pending task, draft retention and error toast) at
+  `418f89714891f9d8105a3e92e60b9a7a5084d232`. AHEAD's Source Control
+  button had no handler even though the proxy had a commit notification.
+  The panel now offers `Commit Staged`, sends an acknowledged proxy request,
+  disables duplicate submission and shows the returned error while preserving
+  the message. The proxy attributes the actual staged index snapshot, not
+  unstaged working-tree content; its regression covers agent edits, a human
+  rewrite, staged agent content followed by a human rewrite, and an empty
+  stage. A focused headless panel test covers missing message/service, and a
+  proxy-client test covers the request/result bridge. Native
+  click-through remains unverified while macOS is locked. No Zed source was
+  copied.
+  The commit status now sits above the action so long Git errors cannot push
+  the button out of a narrow Source Control panel; its 260-pixel GPUI layout
+  regression includes a long failure message. `Stage All` also moved off the
+  GPUI thread to an acknowledged proxy request, preserving Git's error text
+  for the panel; the disposable-repo dispatcher regression exercises it.
 
 - 2026-10-01: compared Source Control rows with Zed
   `crates/git_ui/src/git_panel.rs` at
@@ -474,6 +750,17 @@
   earlier startup failure remains unexplained despite passing this run.
   Root app linking is still disk-blocked, the dev watcher remains stopped,
   and these results do not establish native or authenticated ACP behavior.
+
+- 2026-10-01: revisited the native parent/child shutdown fixture without
+  changing its timeout. Its sandboxed run stopped at the local mock server's
+  loopback bind with `PermissionDenied`, not at shutdown. The same compiled
+  test passed with loopback access; 21 full `ahead-agent --lib` runs then passed
+  (124 tests, 2 opt-in tests ignored each time), ten at four test threads and
+  ten at sixteen. The earlier intermittent child-start failure did not
+  reproduce, so the cause remains open rather than being treated as fixed.
+  The current dirty root app also passed
+  `cargo check --locked --offline -p ahead -j 1`; this is compile evidence,
+  not a rendered app or authenticated-provider run.
 
 - 2026-10-01: followed up on debugger ownership using Zed's
   `crates/dap/src/transport.rs::StdioTransport`, its pending-request cleanup,
@@ -994,6 +1281,16 @@
   support. Extension execution, native navigation and remaining lifecycle
   gates stay in `TODO.md`. No Zed implementation was copied in this slice.
 
+  2026-10-02 follow-up: compared Zed's
+  `crates/grammars/src/{javascript,typescript,python}/config.toml` with
+  gpui-kit 0.6.6's linked Tree-sitter features. AHEAD now enables its
+  JavaScript, TypeScript, TSX and Python parsers in the normal build. The
+  existing file-switch regression verifies actual error-free parse trees and
+  multiple highlight spans for JavaScript/JSX, TypeScript/TSX, Python, Rust
+  and JSON; all 172 app library tests and the `ahead` binary check pass.
+  This uses gpui-kit's parsers, not copied Zed grammar code. Rendered color
+  verification and arbitrary installed-extension grammar loading remain open.
+
 - 2026-09-30: reviewed `crates/agent_servers/src/acp.rs::new_session` at
   `418f89714891f9d8105a3e92e60b9a7a5084d232`. Zed awaits the session-creation
   request's result. AHEAD's local `StartWork` and adapter-install-selection
@@ -1348,6 +1645,11 @@
   carried (adapted): format-inference family cases. AHEAD additions:
   session comment header, unknown-model fallback path, generation-guarded
   ghost flow with request-offset tracking.
+- 2026-10-02: AHEAD's FIM host-to-provider regressions now cover the
+  standard root-to-target `AGENTS.md` hierarchy for both the active file and
+  a relevant open buffer in another subtree, plus editor-only prediction
+  before any session exists. Both inspect actual loopback provider requests;
+  native typing, insertion and undo remain separate acceptance checks.
 - 2026-09-22: `ahead-extension-host/wit/since_v0.8.0/` records the Apache-2.0
   Zed extension WIT contract at pinned commit
   `418f89714891f9d8105a3e92e60b9a7a5084d232`. The AHEAD host is independent
@@ -1365,16 +1667,65 @@
   ignores `requested_uri`, and the v0.8.0 guest callback receives a worktree,
   not a scope URI. The per-scope dispatch in `crates/project/src/lsp_store.rs`
   is generic adapter behavior; extension-provided settings are scope-invariant.
-  AHEAD's remaining parity gap is reevaluating that guest callback and sending
-  `workspace/didChangeConfiguration` after settings changes, rather than keeping
-  only the startup snapshot. The regression and implementation gate are tracked
-  in `TODO.md`.
+  At that point AHEAD still needed to reevaluate that guest callback and send
+  `workspace/didChangeConfiguration` after settings changes. The live guest
+  verification gate remains in `TODO.md`.
+- 2026-10-01: rechecked Zed's
+  `crates/extension_host/src/wasm_host/wit/since_v0_8_0.rs::get_settings`
+  and `crates/project/src/lsp_store.rs::on_settings_changed`. AHEAD's
+  `ahead-extension-host/src/host.rs::get_settings` had returned `{}` for every
+  request. It now reads the requested server's `lsp` category from bounded,
+  symlink-safe user and project layers, using only ignored local config for
+  executable binary overrides. Following Zed's
+  `maintain_workspace_config`/`refresh_workspace_configurations` path, AHEAD's
+  workspace watcher now triggers an off-thread extension callback; the catalog
+  ignores stale results and updates the LSP host before sending
+  `workspace/didChangeConfiguration`. Focused extension-host tests and all 188
+  proxy library tests pass with local loopback permitted. At this stage a real
+  guest and rendered app remained unverified; the later installed-package
+  probe below closes the former, not the latter. User-global live watching
+  remains open in `TODO.md`.
+- 2026-10-01: a real-Wasm smoke in `ahead-extension-host/src/host.rs` copies an
+  installed Zed extension into a disposable project before calling the AHEAD
+  host. Locally installed Proto and HTML extensions declare API 0.7.0; both
+  initially failed under AHEAD's 0.8.0-only binding (different GitHub asset
+  and DAP TCP-host shapes). Following Zed's
+  `crates/extension_host/src/wasm_host/wit.rs`, AHEAD now dispatches API 0.6/0.7
+  through the Apache-2.0 `since_v0.6.0` WIT, copied exactly from pinned Zed,
+  and retains `since_v0.8.0` for API 0.8. The AHEAD host implementation is
+  independent; no Zed GPL host source was copied. Both installed-package
+  probes now pass offline after packaging each installed manifest/Wasm pair
+  and exercising AHEAD's installer, including changed workspace settings. Missing or
+  unsupported API versions fail at install/discovery. Proto's actual command
+  and initialization-options callbacks also pass with a disposable local
+  binary override, without fetching a GitHub release. Following Zed's
+  `crates/extension_host/src/wasm_host.rs` serialized extension-call loop,
+  AHEAD now retains one Wasm guest/store per extension and worktree and
+  serializes calls with a per-guest async lock. The installed-package probes
+  exercise separate Tokio runtimes and assert a single instantiation across
+  command and multiple configuration calls. Hot extension upgrades still
+  need targeted invalidation or proxy restart. Language-server startup and
+  live refresh in a native window remain unverified; keep the smoke on
+  disposable copies, not the user's Zed installation.
+- 2026-10-01: Zed's `crates/extension_host/src/headless_host.rs` loads each
+  extension independently and retains failures for reporting. AHEAD's
+  discovery had aborted the entire installed-adapter list on one malformed
+  manifest or unsupported API version. It now returns valid adapters alongside
+  per-package errors; the proxy reports each error through the existing
+  server-status route. Language detection also keeps valid definitions when
+  an unrelated package is malformed, without silently swallowing the error
+  if no definition matches. Regressions cover both cases, and the real
+  Proto/HTML offline probes still pass. Rendered
+  failure visibility remains to be checked in the native app.
 - 2026-09-23: search reference review at the pinned checkout. Zed's
   `crates/project/src/{search,project_search}.rs` separates path candidates,
   match detection and open-buffer range search, with bounded workers and
   ordered streaming results. `crates/search/src/project_search.rs` owns the
   query UI; `crates/agent/src/tools/grep_tool.rs` calls the same project search
-  and offers an include glob and 20-result pages. `crates/file_finder/` uses a
+  and offers an include glob and 20-result pages using an offset. AHEAD's
+  managed `file_search` instead exposes only a revision-bound cursor so a
+  changed worktree or unsaved buffer cannot silently shift later pages.
+  `crates/file_finder/` uses a
   separate ranked path picker. AHEAD's shared `ahead-core::search` matcher is
   independent code, not an imported Zed file. It now accepts compiled
   include/exclude globs for panel content search and an include glob for
@@ -1383,8 +1734,10 @@
   still scans candidate file contents serially and lacks Zed's incremental
   worktree index, candidate pipeline and full query controls. AHEAD's `Cmd+P`
   modal now consumes its shared path ranker and generation-tagged proxy
-  snapshot; rendered picker behavior remains unverified. See the search item
-  in `TODO.md`;
+  snapshot. A disposable native-window pass confirmed `Cmd+P`, filename
+  filtering and Enter opening a selected file; restart persistence and
+  large-worktree responsiveness remain unverified. See the search item in
+  `TODO.md`;
   do not describe the current matcher as Zed-equivalent.
 - 2026-09-29: pinned Zed `crates/project/src/project_search.rs` reads matches
   through its worktree/file abstraction. AHEAD's shared matcher now requires
@@ -1432,6 +1785,13 @@
   request path with retained Codex `core/src/client.rs` and `codex-api`.
   AHEAD removed the unused Guardian/classifier inference routes and
   `free_guardian` switch; managed requests now have one `/responses` route.
+- 2026-10-01: Zed's pinned
+  `crates/agent/src/agent.rs::NativeThreadEnvironment::create_subagent_thread`
+  creates a child from its parent and depth, without a reviewer-labeled source.
+  AHEAD removed its copied Guardian label checks and instead rejects all
+  unsupported feature-thread sources at creation and restore; arbitrary child
+  labels remain non-root metadata. The focused AHEAD-owned create/restore test
+  passes, but a running-app permission check remains open.
 - 2026-09-24: external ACP adapter review against pinned
   `crates/project/src/agent_server_store.rs` and
   `crates/paths/src/paths.rs`. AHEAD now puts the registry and Npx packages
@@ -1451,6 +1811,18 @@
   from full responses or agent updates. This follows Zed's session-config
   state boundary without importing its GPUI selector. Live UI verification
   and Pi provider access remain open in `TODO.md`.
+- 2026-10-02: extended the disposable Pi ACP smoke test through Zed's
+  `session/set_config_option` and `session/load` paths. The real installed
+  adapter advertised an alternate model, accepted it offline, and returned an
+  updated option. A fresh adapter process reopened the session after AHEAD
+  re-resolved the install and saved model default; the selected model was
+  advertised again. This verifies the ACP client exchange and empty-session
+  restore, not provider inference, conversation replay or GPUI rendering.
+- 2026-10-02: Zed's ACP `open_or_create_session` keeps the load RPC in an
+  asynchronous task. AHEAD's proxy already routes `AgentSessionPrepare` to a
+  background worker; a focused proxy regression now holds the session host
+  busy and confirms an editor RPC still returns before preparation can finish.
+  The running GPUI startup and option-update path remains unverified.
 - 2026-09-25: followed Zed's pinned
   `crates/project/src/project_search.rs` and
   `crates/language/src/file_content.rs` decode boundary for shared content
@@ -1564,6 +1936,17 @@ retained path-URI suggestions, and the repository-policy run stopped on 29
 existing `ahead-agent` errors. This is tracked separately in `TODO.md`, not
 counted as a passed lint gate.
 
+On 2026-10-02, rechecked Zed's
+`crates/project/src/debugger/session.rs::{continue_execution,step_over,on_step_response}`:
+Zed marks the thread as moving before the adapter responds and restores its
+stopped state on error. AHEAD's session state also owns the stopped frame, so
+it now admits only one Step/Continue request until a reply or new state event
+instead of clearing that frame optimistically. The new real-process admission
+regression and all 15 proxy DAP tests pass. The rebuilt root executable also
+passed `tests/dap-shutdown-smoke.mjs` in running, initializing and full-stderr
+modes. Rapid native shortcut presses and rendered error/retry remain unverified
+while macOS is locked.
+
 ## Targeted lint and rollout-import verification (2026-10-01)
 
 After the retained-feature cleanup, the focused agent/app/proxy Clippy gate
@@ -1592,3 +1975,689 @@ tools in AHEAD. Zed's pinned `crates/agent/src/thread.rs` (around line 4139)
 collects the turn's available tools into each direct `LanguageModelRequest`;
 AHEAD must either ship the retained host or make a deliberate model-mode
 decision before offering equivalent functionality for CodeModeOnly models.
+
+## Native Code Mode warning and restore check (2026-10-01)
+
+In a disposable copy of `tests/fixtures/editor-smoke/`, `just dev` bootstrapped
+`.ahead/` and opened a new managed session. Settings autosaved a credential-free
+OpenAI-compatible connection to unavailable loopback `127.0.0.1:9` with model
+`gpt-5.6-sol`. Sending a read-only prompt showed the missing Code Mode host
+warning in the panel's warning area, distinct from the transient Thinking and
+network-retry content. Cancelling the turn kept the warning visible. After
+stopping and restarting the native app with the same isolated user profile and
+workspace, the cancelled turn and warning both restored. The `just dev` watcher
+was stopped afterward.
+
+No model response, tool call, host worker or authenticated provider was
+exercised: the loopback endpoint was intentionally unavailable. The host
+bundle and provider-backed safety check remain open in `TODO.md`.
+
+## Hosted Apps file-upload removal (2026-10-01)
+
+Compared the retained MCP call path with Zed's direct JSON argument handoff in
+`../zed/crates/agent/src/tools/context_server_registry.rs`. AHEAD no longer
+registers `codex_apps`; the only consumer of OpenAI file-argument rewriting
+was guarded for that removed server. Deleted the core rewrite, upload-only
+client pool and API upload module, then removed `codex-mcp`'s hosted-only
+`fileParams` schema masking and unused `ToolInfo` field. No Zed code was copied
+and no user data was changed.
+
+The complete AHEAD agent library suite passed (114 active, 2 opt-in tests
+ignored). After dropping the upload module's unused direct `uuid` dependency
+and Tokio `fs` feature, the locked production `ahead-agent` check and app
+binary build passed again; the suite was not rerun for that manifest-only trim.
+The workspace formatting check passed after a formatting-only assertion change
+in `ahead-app/src/code_panel.rs`.
+The copied
+`codex-core --all-targets` test target still cannot compile because inherited
+test dependencies are absent; this is not evidence of an MCP regression or a
+replacement for live verification. The rendered stdio MCP tool-call and human
+approval journey remain open in `TODO.md`; no authenticated provider was used.
+
+## Managed stdio MCP approval roundtrip (2026-10-01)
+
+Compared Zed's third-party MCP authorization and JSON argument handoff in
+`../zed/crates/agent/src/tools/context_server_registry.rs` with AHEAD's
+managed turn path. An AHEAD-owned offline test now starts a disposable stdio
+MCP server and loopback model, discovers the tool through deferred search,
+and verifies the server receives exact JSON arguments only after human
+approval. It first exposed a hang: `NativeClient` answered
+`Op::UserInputAnswer` with the tool-call ID while the retained session stored
+the pending answer under the turn ID. Answering by turn ID unblocked one
+call, but the extended test reproduced a second failure with two parallel
+read-only calls in one turn: their pending answers overwrote each other. The
+runtime now keys pending input by call ID, matching the UI and model call,
+so each approval resolves only its own tool.
+
+`cargo test --locked -p ahead-agent --lib` passed: 115 tests, two opt-in tests ignored.
+Workspace formatting also passed. This is not a rendered GPUI or authenticated
+provider result; those approval journeys remain open in `TODO.md`.
+
+The retained runtime's stable tool-call elicitation feature is now enabled
+for AHEAD-managed sessions. `NativeClient` maps only its identifiable,
+empty-schema MCP tool approval forms into the existing chat question card;
+the card includes the JSON arguments. An explicit Allow or Cancel resolves
+that exact call. Other server elicitations still decline, and AHEAD continues
+to advertise no general form or URL elicitation capability. The disposable
+parallel stdio roundtrip passes for two independently approved calls and a
+denied resource operation; a unit test checks the form discriminator. This
+follows Zed's `../zed/crates/agent/src/thread.rs` per-tool human authorization
+path while retaining the pinned runtime's request and response semantics.
+It is not a rendered UI result: the desktop was locked during this pass.
+
+The app-side review queue now follows Zed's
+`../zed/crates/agent_ui/src/conversation_view.rs::Conversation` pattern:
+retain every pending request per session in arrival order and retire only the
+answered ID. Previously `ProxyClient` kept one request per session, so two
+parallel MCP calls could overwrite the first card even though the managed
+runtime held both approvals. The chat shows the next request and a pending
+count. `parallel_agent_input_requests_remain_queued_until_each_is_answered`
+now passes through the actual answer RPC, proving the second request remains
+after the first succeeds; the native card sequence is still unverified while
+macOS is locked.
+`rendered_parallel_mcp_approval_shows_first_request` additionally draws the
+headless GPUI chat, clicks Allow on the first card and verifies the second
+request has not been presented simultaneously. It does not replace the native
+window check or exercise an authenticated provider.
+
+The managed event pump now follows Zed's
+`../zed/crates/agent/src/thread.rs::run_authorization_loop` pattern of
+keeping authorization waits in owned tasks while the main event stream
+continues. Previously `NativeClient::consume_turn` awaited each human answer
+inline, so the app could not receive the second parallel MCP approval until
+the first was answered. The disposable two-call test now requires both
+requests before either answer: it timed out before the fix and passes
+afterward. Each turn also retires only its own unanswered host requests on
+exit, so an aborted parent/child does not leave a stale answer route or remove
+the other turn's pending requests. Its focused regression and all 124 active
+`ahead-agent` library tests pass (two opt-in tests ignored). This is offline
+host behavior, not a rendered GPUI or authenticated provider result. The
+locked offline `ahead` binary check passes.
+
+The host now assigns a unique AHEAD request ID to each pending approval,
+including child-thread requests displayed in the parent work session. This
+prevents separate runtime threads with the same model call ID from addressing
+one another's pending answer; the retained runtime still receives its
+original call and question IDs. The parallel roundtrip asserts distinct host
+request IDs and still passes. A concurrent parent/child native review remains
+unverified.
+
+Per-turn cleanup now emits a cancellation notification for each unanswered
+request that exits with that turn, following Zed's task-owned authorization
+lifetime in `../zed/crates/agent/src/thread.rs::run_authorization_loop`.
+The app removes only that card from its active-turn queue; a headless GPUI
+regression shows the next card and clears the previous choice. All 124 agent
+and 167 app library tests pass. This has not been checked in a native window.
+
+## MCP client identity and hosted-Apps startup trim (2026-10-01)
+
+Zed's `../zed/crates/context_server/src/context_server.rs` sends its editor
+identity in MCP `clientInfo`, and its
+`../zed/crates/agent/src/tools/context_server_registry.rs` uses the listed
+tool name and JSON arguments directly. AHEAD now sends `AHEAD` as its MCP
+client name/title and uses an `ahead-mcp-client` HTTP user agent. Removed the
+unreachable hosted-Apps callable-name/namespace normalization module and
+branch from `codex-mcp` startup; normal MCP discovery still strips untrusted
+connector metadata and preserves the server namespace. AHEAD cannot register
+`codex_apps` as a workspace server, so this does not retain an old-server
+compatibility path. The disposable stdio MCP regression checks the AHEAD
+client name and two independently approved tool calls; it passes. Remaining
+hosted-Apps paths elsewhere in the retained runtime are tracked in `TODO.md`.
+The locked offline AHEAD agent library suite passed 115 tests with two opt-in
+tests ignored; `cargo check --locked --offline -p ahead --bin ahead -j 1` and
+workspace formatting passed. The Mac was locked during this pass, so no
+rendered app behavior was verified.
+
+## Hosted MCP event and catalog branch removal (2026-10-01)
+
+Checked Zed's per-server context store and tool registry before removing the
+remaining host-owned Apps branch from `codex-mcp`. The hosted
+`events/list`/`events/stream` resource adapter had no AHEAD caller: its only
+core wrapper was uncalled, and its extension resource-client field was only
+written. Deleted those paths and the watcher that kept a hosted event server
+alive across runtime publication. AHEAD's normal MCP resource list/read entry
+points still use `McpRuntime` directly. Removed the hosted catalog policy
+exemption, larger item limit and cache bypass; all configured servers now
+follow the ordinary per-environment policy and tool-cache path. No Zed code
+was copied.
+
+The locked offline AHEAD agent suite passed 115 active tests (two opt-in tests
+ignored), including the disposable two-call stdio MCP approval roundtrip.
+`cargo check --locked --offline -p ahead --bin ahead -j 1` passed. Rendered
+resource/approval behavior remains unverified while the Mac is locked.
+
+## Lower-level hosted MCP stream removal (2026-10-01)
+
+Traced the remaining Plugin Runtime `events/stream` client against Zed's
+`crates/agent/src/tools/context_server_registry.rs`: Zed issues ordinary
+per-server `CallTool` requests, authorizes each call, and cancels through the
+tool event stream. No AHEAD production caller remained for the hosted event
+subscription. Deleted that request API, its notification-capture transport,
+the HTTP event-specific cancellation and header timeout, and the copied
+event-only tests. Standard streamable-HTTP SSE processing and `CallTool`
+handling were left intact. No Zed code was copied.
+
+`cargo check --locked --offline -p ahead --bin ahead -j 1` passed and
+`cargo test --locked --offline -p ahead-agent --lib` passed 115 active tests
+(two opt-in tests ignored). The copied `codex-rmcp-client` SSE-discovery test
+target does not compile because its retired `pretty_assertions` and
+`wiremock` dev-dependencies are absent, so that target gives no transport
+proof. HTTP MCP remains gated on AHEAD-owned server-auth UI and a live
+rendered journey.
+
+## MCP tool-list connector parser removal (2026-10-01)
+
+Compared the remaining tool-list handoff with Zed's
+`crates/agent/src/tools/context_server_registry.rs`: Zed registers the
+ordinary server-listed tool identity and authorizes the call per tool. AHEAD's
+`codex-mcp` already discarded connector fields from ordinary server tools,
+but `codex-rmcp-client` still ran a duplicate `tools/list` wrapper to parse
+those untrusted fields. Removed the wrapper and reused its existing SDK-backed
+`list_tools` result, retaining the ordinary metadata-stripping step. No Zed
+code was copied. `cargo check --locked --offline -p ahead --bin ahead -j 1`
+and `cargo test --locked --offline -p ahead-agent --lib` passed (115 active,
+two opt-in ignored). This is source/test evidence, not a rendered approval
+journey.
+
+## Hosted MCP approval-template removal (2026-10-01)
+
+Zed's `crates/agent/src/tools/context_server_registry.rs` authorizes the
+ordinary server/tool identity per call. The retained Codex core instead had
+a bundled consequential-question template table keyed exclusively by
+`codex_apps` connector IDs. AHEAD rejects that hosted server, and its
+ordinary tool registry never supplies those IDs, so the table and renderer
+were unreachable. Deleted the module and asset; kept the generic approval
+question and JSON argument display. Adjusted the copied approval test to
+describe ordinary server metadata rather than a hosted template. No Zed
+code was copied.
+
+The locked offline app check and AHEAD agent suite passed (115 active tests,
+two opt-in tests ignored), including its independently approved two-call
+stdio MCP roundtrip. The copied `codex-core` test target remains unbuildable
+from missing historical test-only dependencies; this does not establish a
+rendered approval journey. Remaining hosted metadata/DTO branches stay in
+`TODO.md`.
+
+## Hosted MCP request metadata removal (2026-10-01)
+
+Compared the retained core's `tools/call` envelope with Zed's direct
+per-server call in `crates/agent/src/tools/context_server_registry.rs`.
+Removed the unreachable `_codex_apps` request metadata payload and the
+hosted connector-ID exception in session approval keys. AHEAD still sends
+the ordinary call ID, turn metadata and eligible confirmation policies,
+and still requires the generic per-server approval path. Deleted the copied
+tests that asserted a hosted-only envelope; no Zed code was copied. The
+locked offline app check and AHEAD agent suite passed (115 active tests,
+two opt-in tests ignored), including the parallel stdio MCP approval
+roundtrip. Native rendered verification remains open.
+
+## MCP event identity pruning (2026-10-01)
+
+Kept Zed's ordinary server/tool authorization model as the reference and
+traced every `McpToolCallItem`/legacy-event constructor in AHEAD. Deleted
+hosted connector, link, app-action and plugin identity fields from those
+DTOs and projections. Kept tool `readOnlyHint` and MCP Apps
+`_meta.ui.resourceUri`/`_meta["ui/resourceUri"]` because the
+[MCP Apps extension](https://apps.extensions.modelcontextprotocol.io/api/documents/overview.html)
+defines the tool-UI link; removed the proprietary
+`openai/outputTemplate` fallback. AHEAD currently forwards the URI as
+metadata but does not render an MCP App, so no host support is claimed. No
+Zed code was copied.
+
+The locked offline app check passed. The copied `codex-protocol --lib` test
+target cannot compile without retired `pretty_assertions`/`tempfile`
+test-only dependencies; an AHEAD-owned managed-agent regression now checks
+begin/end event identity, UI URI, read-only hint and error propagation.
+The full AHEAD agent suite passed 116 active tests with two opt-in tests
+ignored. Native rendered verification remains open.
+
+## MCP approval and tool identity pruning (2026-10-01)
+
+Zed's `ContextServerTool::run` in
+`crates/agent/src/tools/context_server_registry.rs` authorizes a tool with
+`mcp:<server_id>:<tool_name>` before calling that server. AHEAD now removes
+hosted connector IDs/names/descriptions, account email and plugin ID from its
+managed MCP approval pipeline, lower tool catalogue, request metadata and
+metrics. Ordinary approval still names the server and tool, shows original
+arguments and optional tool title/description/annotations, and can remember
+an automatic-mode choice for the session. The retained model-facing tool
+name, schema, result and error semantics are unchanged for configured MCP
+servers. No Zed code was copied. A native rendered approval journey remains
+unverified; the disposable loopback MCP fixture covers the managed path. The
+locked offline app and formatting checks passed. The AHEAD agent suite passed
+(116 active tests, two ignored), then its focused approval roundtrip passed
+again after the header copy changed. The first sandboxed suite run could not
+bind local sockets; the approved loopback rerun passed.
+
+## MCP resource gate cleanup (2026-10-01)
+
+Zed keeps context servers under their configured server IDs in
+`crates/project/src/context_server_store.rs` and loads their tools and prompts
+through `crates/agent/src/tools/context_server_registry.rs`; there is no
+hosted-Apps resource access mode to mirror. AHEAD removed its inert
+`codex_apps`-only resource filter and the `orchestrator.mcp.enabled` config
+flag. Explicit resource reads and aggregate resource/template listings now
+use the same registered-server runtime path. The workspace-level
+`codex_apps` name reservation and executor-local HTTP MCP discovery branch
+were removed after the caller audit; the former hosted name is now only an
+ordinary server ID, consistent with Zed's ID-keyed server registry. No Zed
+code was copied. Native
+rendered verification remains open. A disposable managed stdio roundtrip now
+lists and reads a resource through the agent loop and passes; it is a
+legacy-version fixture, not a 2026-07-28 resource conformance test.
+
+The executor-local HTTP MCP discovery projection and its unused exec-server
+helper are removed. Managed AHEAD sessions still load the reviewed workspace
+stdio declarations; generic environment-config reading remains. Validation
+ran on Darwin arm64 (`aarch64-apple-darwin`): the 117-test AHEAD agent suite,
+the `codex-exec-server` and `codex-core` library checks, and the `ahead` binary
+check passed. No remote executor was selected by the native client, and no
+Docker/Wine or remote-host lane ran, so these results do not claim remote
+execution coverage.
+
+The model-callable resource handlers now pass through the retained per-server
+MCP review path before dispatch, following Zed's authorize-before-request
+ordering in `crates/agent/src/tools/context_server_registry.rs`. Aggregate
+listings review each configured server first; they no longer identify
+themselves as a `codex` server in turn events. The disposable mock-model test
+proves a denied list sends no request and then exercises approved resource,
+template and read requests. Resource approval is intentionally independent of
+server-owned MCP tool-name allowlists to avoid granting unrelated operations
+through a name collision. AHEAD now lets the human switch a reviewed,
+workspace-local server between per-call review and auto-approval of permitted
+tools and resources. The choice is tied to the current declaration fingerprint;
+named tool `deny` and `confirm` entries still override it. This follows Zed's
+per-server authorization order and tool-policy precedence in
+`crates/agent/src/tools/context_server_registry.rs` and
+`crates/agent/src/tool_permissions.rs`; no Zed code was copied. The AHEAD
+agent suite passes 117 active tests (two opt-in tests ignored). The disposable
+mock-model test now also switches the reviewed server to auto-approval for a
+second managed session and checks that a tool call and resource listing reach
+the stdio server without prompting. Native approval UI remains unverified.
+
+## Copied Apps configuration removal (2026-10-01)
+
+Compared Zed's project-owned `crates/project/src/context_server_store.rs` and
+`crates/agent/src/tools/context_server_registry.rs` with AHEAD's retained
+configuration. The Codex Apps `[apps]` config types, generated-schema field,
+managed requirement merge branch, and their copied fixtures had no production
+consumer, so they were removed. Ordinary `mcp_servers`, per-server approval
+overrides, and the managed MCP effect boundary remain. No Zed code was copied.
+The AHEAD agent path and config test target compile; a native rendered MCP
+roundtrip and a current-version resource conformance test remain open.
+
+## ACP editor bridge backpressure (2026-10-01)
+
+Zed's `crates/agent_servers/src/acp.rs::mcp_servers_for_project` remains the
+reference for passing project-owned MCP servers to external ACP sessions.
+AHEAD's stdio editor bridge now uses a 32-slot bounded standard-library event
+channel instead of an unbounded one; the reader blocks when the queue fills.
+No Zed code was copied. The local bridge now caps accepted socket workers at
+20, leaving four slots beyond the pending tool-call quota for cancellation and
+releasing a slot when a worker exits or fails to start. The backpressure,
+worker-slot and AHEAD agent library tests pass (121 active tests, two opt-in
+tests ignored) with loopback access. AHEAD's local bridge now adds total socket
+read deadlines and a 2 MiB response limit, with slow-drip and oversized-reply
+regressions. Zed does not use this AHEAD-specific editor socket bridge; its
+project-owned MCP server handoff remains the architectural reference. Native
+ACP, overload and cancellation races at the new limits remain open.
+
+## Display-bound windows and combinable search options (2026-10-01)
+
+Zed's `crates/workspace/src/workspace.rs` leaves `window_bounds` unset for a
+new workspace and lets GPUI choose display-aware defaults. AHEAD's fixed
+1600×1000 opening window put the new-thread wizard's final control outside the
+clickable region on the disposable native smoke display. AHEAD now uses
+`TitleBar::window_options()` without overriding the bounds. Rebuilt native
+verification of the new size and wizard completion is still pending.
+
+Zed's `crates/search/src/search.rs::SearchOptions::build_query` treats case,
+whole-word and regex as independent options; regex selects the query parser,
+while the other two refine its matching. AHEAD's panel toggles and shared
+matcher already use the same combinable semantics, so no exclusivity change
+is needed. The native disposable project confirmed a live-buffer Git rail
+click opens the hunk review card without turning that line into a breakpoint;
+the card still overlays code instead of expanding editor rows as Zed does.
+
+## Terminal reference-test recording (2026-10-01)
+
+Zed's `crates/terminal/src/alacritty.rs` passes `false` for Alacritty's
+`EventLoop::new` reference-test flag. AHEAD had passed `true`, which makes
+Alacritty write PTY output to `./alacritty.recording` relative to the app
+process, including during ordinary editor use. AHEAD now passes `false` too;
+no Zed code was copied. All 167 app library tests pass after the change, and
+a real PTY test run with a disposable working directory created no recording.
+The pre-existing modified repository recording is preserved for review.
+
+## Explorer ignore-state fallback (2026-10-01)
+
+Zed's `crates/project_panel/src/project_panel.rs` reads each worktree entry's
+`is_ignored` state. AHEAD still shells out to `git check-ignore` for its
+Explorer tree; outside a Git repository, its already-handled empty-result
+fallback printed repeated Git errors to the app's stderr. AHEAD now discards
+that expected subprocess stderr. The 167-test app suite passes without the
+earlier `fatal: not a git repository` noise. This is an AHEAD-only fix, not a
+port of Zed's worktree cache; shared ignore-state integration remains part of
+the broader search/Explorer parity work.
+
+## Managed privacy and slash-skill cleanup (2026-10-01)
+
+The retained agent runtime's config default still selected Statsig for metrics,
+even though AHEAD does not initialize its OTEL provider in the production path.
+The hard fork now defaults all exporters to `none`, and the native managed
+config overrides an explicit runtime-home request for log, trace, metrics, or
+prompt logging. A focused regression proves the retained loader reads those
+requests before checking AHEAD's override, and the full AHEAD agent suite
+passes (125 active tests, two opt-in tests ignored). The obsolete `/:name`
+skill alias was also removed; source-qualified collision names follow the
+Zed-inspired skill selection documented in `ahead-agent-standards.md`. These are
+AHEAD-only cleanups, not Zed code ports. Native-turn privacy verification is
+still pending because the Mac is locked.
+
+## Extension-gallery source and install boundary (2026-10-01)
+
+Compared pinned Zed
+`crates/extension_host/src/extension_host.rs::{fetch_extensions,install_latest_extension}`,
+`crates/extensions_ui/src/extensions_ui.rs::fetch_extensions`, and
+`crates/cloud_api_types/src/extension.rs` with AHEAD's URL/ID install form in
+`ahead-app/src/settings_panel.rs`. Zed's gallery requests its service's
+`/extensions` list with `max_schema_version=1` and a `provides` filter; the
+client installs a versioned archive through a download endpoint. A live
+read-only probe of the public endpoint returned language-server metadata with
+ID, version, Wasm API version, repository, and capabilities. AHEAD currently
+accepts only Zed API 0.6/0.7/0.8 language-server Wasm packages, so a gallery
+must not imply that all Zed marketplace categories work here.
+
+The [public source index](https://github.com/zed-industries/extensions/blob/main/extensions.toml)
+contains submodule paths and versions, not ready-to-install archives; Zed's
+[publishing guide](https://github.com/zed-industries/zed/blob/main/docs/src/extensions/publishing/publishing-guide.md)
+describes packaging after merge. Zed's published archives are served by its
+own API and object store. Direct third-party use of that API is not documented
+as supported; [Zed's terms](https://zed.dev/terms) restrict seeking access to
+non-public APIs. At that point no production registry integration was
+added pending the source/permission choice. The planned picker, offline
+installed state, compatibility filter and disposable-package proof remain in
+`TODO.md`; no Zed code was copied.
+
+On 2026-10-02, AHEAD has a searchable gallery preview with Wasm API-version
+filtering, offline installed-package visibility, and Install/Update/Retry states.
+The live metadata response contained 412 language-server entries, of which 307
+matched AHEAD's accepted Wasm API versions; this does not prove their servers
+start in AHEAD, and the UI now calls them candidates rather than compatible.
+It follows the pinned Zed gallery's list-then-versioned-download flow. A
+disposable loopback test installed a real HTML 0.7 extension archive, and a
+headless GPUI test checks catalog selection and the install request. This does
+not resolve distribution: the current gallery and download URLs still target
+Zed's service. The [public index](https://github.com/zed-industries/extensions/blob/main/extensions.toml)
+is a source list, not a package feed, while [Zed's extension overview](https://zed.dev/blog/zed-decoded-extensions)
+describes its own CI packaging and service upload. Before shipping live
+installation, obtain explicit service permission or publish an AHEAD-owned
+package feed from reviewed public extension sources; keep the compatible Wasm
+ABI, package checks and installed-package UI independent of the feed choice.
+No Zed source was copied for the gallery.
+
+On 2026-10-02, AHEAD added All/Installed/Not Installed filters to the existing
+Settings gallery, following the filter behavior in pinned Zed
+`crates/extensions_ui/src/extensions_ui.rs`. At that point this was a UI
+increment, not a dedicated Extensions page or a cleared distribution source. The proposed
+AHEAD-owned feed would build versioned packages from reviewed public extension
+repositories; Zed's public `extensions.toml` is only a source index.
+Zed's pinned `ExtensionsPage` keeps search, installed-state filters, remote
+results, and fetch errors in a dedicated workspace view; AHEAD now has a
+separate Extensions page in Settings navigation; the next pass moved it to a
+standalone center tab opened from the Command Palette and focused its search.
+The gallery's catalog/install state, rendering and regressions now belong to
+`ahead-app/src/extensions_panel.rs`, leaving Settings without a second gallery.
+Like Zed's `ExtensionsPage::new`, AHEAD now begins the catalog fetch on first
+open, while retaining locally installed entries if it cannot reach the feed;
+manual Refresh still forces a later request. The focused headless GPUI
+open/close test checks the loading transition and passes.
+Search now follows pinned Zed `ExtensionsPage::fetch_extensions_debounced`:
+nonempty queries wait 250 ms before sending `filter` to the catalog API, while
+clearing the query reloads immediately. A request revision discards stale
+responses, and the returned server matches are not re-filtered by a local
+substring check; matching offline-installed packages remain visible. The
+catalog URL encoding test and all 174 app library tests pass. The earlier
+focused GPUI open/close and focus test and app binary check passed, while a
+native navigation check remains blocked by the locked Mac. Its pinned
+`ExtensionStore` fetches metadata and
+downloads a selected version separately. AHEAD's install screen should keep
+that separation while using a feed it is authorized to distribute from.
+Zed's `ExtensionStore::upgrade_extensions` compares parsed semantic versions;
+AHEAD now does the same before presenting or sending an Update request. A stale
+catalog cannot offer a downgrade, and the row shows the installed version
+when it is newer than the catalog. The catalog parser rejects non-semantic
+remote versions. This is AHEAD code informed by Zed, not a source copy.
+
+## Retained terminal grant prune (2026-10-02)
+
+The retained runtime's terminal launch had a second, internal permission
+profile for a copied plugin-metrics write grant. AHEAD's sole production
+caller always passed `None`; only a copied test exercised the grant. The
+internal profile, its approval text, and the copied fixture are removed.
+Normal `additional_permissions` still flow through the same launch and
+stdin-review policy; `merge_permission_profiles(grants, None)` was exactly a
+clone of `grants`. The locked offline app check, repository format check, and
+131 AHEAD agent library tests pass (two ignored) with loopback access. The
+copied core test target remains outside this validation.
+
+## Agent composer Enter handling (2026-10-01)
+
+Zed's pinned `assets/keymaps/default-macos.json` binds `enter` to
+`agent::Chat` only in its thread editor when modifier-to-send is off; the
+editor's newline action remains separate. AHEAD's textarea instead emitted
+`PressEnter` and let the plain key event continue, so an unsent draft gained a
+newline even after the send handler ran. `ahead-app/src/session_panel.rs` now
+consumes plain Enter in its focused-composer interceptor while leaving
+Shift+Enter with the textarea. One rendered composer test and four adjacent
+slash-palette tests pass in the locked offline app suite. A native-app keyboard
+pass is still pending; no Zed code was copied.
+
+## Managed provider-layer safety (2026-10-02)
+
+Zed's `../zed/crates/agent/src/thread.rs::set_model` changes the selected
+model on an existing thread. AHEAD's retained managed runtime fixes the
+provider at thread spawn, so AHEAD instead replaces an idle harness when its
+connection changes and reloads the same durable Turso thread before the next
+turn. A two-endpoint local Responses regression checks the new endpoint and
+credential, model-visible prior reply, and persisted conversation. Active
+managed turns block the swap; the native Settings-to-next-turn journey remains
+to be verified.
+
+Compared pinned Zed `crates/settings/src/settings_store.rs`, which keeps user
+and local settings layers separate and tracks file errors, with AHEAD's
+provider-layer readers. AHEAD's managed runtime was the outlier: it followed
+paths directly and silently skipped malformed layers. It now uses the same
+bounded `ahead_core::config::read_ahead_config` path (no-follow on Unix) as the editor
+and proxy, and errors propagate instead of selecting an unintended fallback.
+That shared reader rejects credential-named fields anywhere in tracked
+`.ahead/config.toml`, plus URL userinfo and credential-named query parameters;
+ignored settings layers still accept credentials. The
+managed agent and FIM now inherit a private key only when the endpoint stays
+exactly the same; switching a tracked layer to another endpoint drops the key.
+The 35-test core suite, focused managed-layer/precedence tests, both endpoint
+switch regressions and two Settings/model-picker tests pass offline.
+Other disguised secret values and native-app error presentation remain open
+checks; no Zed code was copied.
+
+Zed's `crates/agent/src/agent.rs::run_skills_scan` treats an absent global
+skills directory as a normal first-run state and retries discovery later.
+In a disposable AHEAD project, an absent `AHEAD_USER_HOME` instead caused
+the shared native config build to fail before the project skill catalog
+loaded. `runtime_config_from_sources` now omits only that absent optional
+user settings root; other filesystem errors and dangling links still fail
+closed. Its regression and the full 145-test active agent library suite pass
+offline. A rebuilt native first-open check remains pending because macOS is
+locked; this is source/test evidence, not a rendered-app claim.
+
+The next AHEAD language-extension first-open gate is catalog responsiveness.
+`PluginCatalog::handle_did_open_text_document` calls `ensure_lsp_server`
+synchronously; an installed extension's command resolution uses a current-
+thread runtime. Before the child-wait change, it could reach a blocking npm
+`.output()` in `ahead-extension-host/src/host.rs`. Zed instead awaits
+`crates/extension_host/src/wasm_host/wit/since_v0_8_0.rs` through its async
+`crates/node_runtime/src/node_runtime.rs::npm_install_packages` path. AHEAD
+now bounds its permitted process and npm children with Tokio async output,
+a 120-second deadline and `kill_on_drop`; a hung-child regression and all 21
+active extension-host library tests pass. It still needs an off-catalog,
+cancellable acquisition with stale-result rejection and unsaved-document
+replay; the current synchronous route has not been shown responsive in a
+native first-open run.
+
+Normal managed-MCP declaration and opt-in reads now use that same shared
+reader instead of a second path/size/symlink implementation. The Unix
+approval transaction still uses its directory-handle reader to keep the
+reviewed declaration and private settings under one lock. That reader now
+calls the shared tracked-credential validator too; a focused test verifies
+both listing and direct approval reject a tracked secret. Four focused
+workspace-MCP tests and the approval/private-settings regression pass; the
+separate running-app MCP approval journey is still unverified. Managed
+provider settings now enter the retained config builder as in-memory session
+overrides, while its runtime-home user config layer is ignored; AHEAD no
+longer writes provider credentials to `.ahead/runtime/config.toml`. A focused
+regression proves an invalid stale runtime config cannot override the AHEAD
+model, endpoint or key, and all 131 active agent library tests pass with
+loopback access. The managed AHEAD host now explicitly skips retained managed
+file/MDM config, system and managed requirements, and user/project execution-
+policy rules, rather than letting those layers outrank its in-memory settings.
+The retained config suite passes 247 tests, including an invalid managed-file
+and macOS-preferences skip regression; AHEAD's own permission profile tests
+remain green. Unix default runtime-home creation still rejects symlinked
+parents, but the retained runtime addresses other state there by pathname;
+that residual race remains in `TODO.md`. The locked/offline `ahead --bin ahead` check and repository
+format check pass after this change. The Mac remained locked for the native
+GPUI pass.
+
+- 2026-10-02: compared the pinned Zed extension-host catalog/download flow in
+  `crates/extension_host/src/extension_host.rs` and gallery in
+  `crates/extensions_ui/src/extensions_ui.rs` with AHEAD's single Extensions
+  tab. AHEAD now forwards the selected package version and an optional archive
+  SHA-256 through its install RPC; the host rejects a mismatched manifest
+  version or digest before replacing an installed package. The extension-host
+  suite passed 17 tests (one opt-in test ignored), all seven filtered app
+  extension tests passed, the proxy checked, and the RPC suite passed 15 tests.
+  In a disposable native project, Cmd+Shift+X opened the tab, Load catalog
+  displayed 308 live candidates, and searching `HTML` narrowed the list to
+  two. No package was installed; a real catalog-selected install and an
+  AHEAD-owned publisher/feed remain open. `just dev` built the bundle but its
+  first launch exited with signal 6 after a macOS connection error; opening
+  the rebuilt bundle by path worked. No Zed source was copied.
+  A later elevated `just dev` run in another disposable project captured the
+  Extensions tab auto-populated with live Zed candidates after launch. It did
+  not install a package; the native UI tool listed AHEAD Dev but could not
+  attach to its window.
+
+## MCP form defaults and titled choices (2026-10-02)
+
+Zed initializes typed field state from schema defaults in
+`../zed/crates/agent_ui/src/conversation_view/elicitation.rs::ElicitationFormState::new`.
+AHEAD still renders generic chat questions, but now carries only defaults that
+pass its existing form response validator into that card and preselects them
+when a new request arrives. Invalid or unrepresentable defaults stay blank;
+an edited answer is not overwritten by a refresh of the same request. The
+focused form and headless GPUI card tests pass. Zed's `single_select_options`
+and `multi_select_options` keep a choice's submitted value separate from its
+display title and description. AHEAD's question DTO now does the same for
+titled MCP choices; the panel submits the value, and an opaque omission value
+keeps optional `Skip` distinct from a literal answer of `Skip`. Pure form,
+stdio MCP and headless GPUI regressions pass. A native `just dev` check in a
+disposable project did not reach a window because the watcher kept restarting
+during the build. At that point, dedicated typed controls and URL
+consent/navigation remained open in `TODO.md`; no Zed code was copied.
+
+## MCP URL elicitation review (2026-10-02)
+
+Zed's URL card in
+`../zed/crates/agent_ui/src/conversation_view/elicitation.rs` shows the
+requesting server, destination host, full URL, and separate Open, Decline and
+Cancel controls. AHEAD now projects retained managed-runtime URL elicitation
+events into a similarly explicit chat card. It accepts only bounded HTTPS
+URLs without embedded credentials, validates the pending request again before
+opening, and sends a URL decision without collecting website secrets in chat.
+The retained MCP client already has form/URL capability and 2026 MRTR tests;
+the AHEAD managed config now advertises both modes. Focused URL validation,
+managed-answer and headless GPUI click tests pass. A disposable stdio server
+roundtrip also passed for both form and URL modes: the URL trace received
+`accept` with empty content. The rebuilt native browser journey remains open
+in `TODO.md`; an elevated disposable `just dev` run initialized the project,
+but the UI tool could not attach to its window, so no URL-card click was
+observed. The headless test and local mock are not live UI evidence. No
+Zed code was copied.
+
+## Built-in language-server acquisition boundary (2026-10-02)
+
+Zed's `crates/project/src/lsp_store.rs::get_language_server_binary` can wait
+for worktree trust before resolving and starting a local language-server
+binary. Its BasedPyright and Vtsls adapters check existing binaries and use
+cached npm packages before downloading. AHEAD still launches its built-in
+Rust Analyzer, BasedPyright, and Vtsls commands from PATH, and it has no
+worktree-trust gate. When the BasedPyright or Vtsls executable is absent from
+PATH, AHEAD can now start a complete package from its own
+`cache/language-servers/` directory using system Node. It does not execute an
+opened project's `node_modules`. Managed acquisition still needs to populate
+that cache and restart through the dispatcher so current unsaved buffer
+snapshots are replayed. Project-local package execution needs a separate
+trust decision and UI. The exact executable-launch failure is visible in the
+Language Servers panel; package acquisition remains open in `TODO.md`. No Zed
+source was copied. The cached BasedPyright package was copied into an isolated
+disposable AHEAD profile and the freshly rebuilt native app showed its server
+as Ready. On a cache miss, AHEAD now runs npm on a background thread with
+install scripts disabled, checks the staged entrypoint, publishes the package
+under its own cache, and asks the dispatcher to replay the current open-buffer
+snapshots. A fake-npm install/failure test passes. The clean-profile native
+test used an offline fake npm to copy local Zed packages into the staging
+directory: both BasedPyright and Vtsls reached Ready after automatic restarts.
+That proved AHEAD's orchestration without a real registry download or
+package-integrity policy.
+A second fresh native profile on 2026-10-02 used separate empty user/global
+npm config files and the public registry. It downloaded BasedPyright 1.40.1
+and Vtsls 0.3.0 into AHEAD's cache; both reached Ready after automatic
+restart. Switching from Python to JavaScript left only Vtsls in the panel.
+Updates, a bundled Node/npm runtime, and package-integrity policy remain open.
+Following Zed's installed-version check, AHEAD now reads a bounded package
+manifest and requires the expected name, a nonempty version, and a regular
+entrypoint before using or publishing a cached built-in server. A per-package
+file lock serializes publication across editor windows; a concurrent fake-npm
+test passes. A malformed staged install preserves the previous valid cache in
+the focused regression. This rejects malformed caches, not a package that
+starts and then fails at runtime. The rebuilt disposable macOS app reused both
+real public-npm packages: BasedPyright and Vtsls rendered Ready after opening
+Python and JavaScript respectively (the latter via Quick Open).
+Zed runs npm through its async Node runtime. AHEAD's retained system-npm path
+now polls its child with a 120-second total deadline and signals cancellation
+on proxy shutdown, waiting briefly for the installer to stop. A fake-npm
+shutdown regression verifies that an active child exits before publication;
+the rebuilt disposable macOS app also quit with fake npm active, leaving no
+child process or cache entry. Windows still needs a live pass.
+The first run also exposed stale health rows after restart. Restart now clears
+old server statuses before replay, while the toolbar and panel distinguish a
+server still starting from one that failed. Focused proxy and app regressions
+pass. In the rebuilt disposable app, switching from Python to JavaScript left
+only Vtsls Ready in the panel and the toolbar also reported ready.
+Zed's `LanguageServerStatus` belongs to a real server id; AHEAD now likewise
+routes installed-extension discovery failures separately from language-server
+health. The panel shows them as an unboxed "Extension issues" list, and each
+discovery pass replaces the list so resolved failures clear. Focused proxy and
+app regressions passed. In a rebuilt macOS app with isolated data and project,
+one malformed extension appeared below a real BasedPyright Ready card; hiding
+that package and choosing Restart removed the warning while BasedPyright
+remained Ready. The older "Managed by ahead-proxy" row is absent from current
+source and did not recur. Git history traced it to a hard-coded workspace/proxy
+note in the previous `LanguageServersPanel`, rendered with the same card
+background as real servers despite carrying no server-health state. Its removal
+needs no special-case status filter.
+
+Zed's extension `worktree.which` calls use executable names; AHEAD's host now
+rejects path-shaped names and uses the shared executable-aware lookup rather
+than treating every regular PATH file as launchable. Zed's pinned
+`project/src/lsp_store.rs` waits for a trusted worktree before resolving and
+starting binaries, and `workspace/src/security_modal.rs` offers an explicit
+Restricted Mode choice. AHEAD now keeps a user-level per-workspace trust list
+outside the project; the Language Servers panel grants and revokes it. The
+catalog checks before invoking an extension or starting an npm install, and
+`LspClient::process` checks again before spawn. Two core store tests and a
+proxy untrusted-launch regression pass; proxy and app library checks pass.
+This is source/protocol evidence, not a rebuilt native trust journey. AHEAD's
+restricted coverage is still narrower than Zed's: project settings, MCP
+startup, other project-driven processes, and a first-open prompt remain open.
+Windows ACL/reparse safety and native Linux behavior are also unverified.

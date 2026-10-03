@@ -132,7 +132,7 @@ async fn run_non_blocking_request_user_input_case(answer: Option<(&str, String)>
 
     session
         .notify_user_input_response(
-            &request_event.turn_id,
+            &request_event.call_id,
             RequestUserInputResponse {
                 answers: answer
                     .iter()
@@ -244,7 +244,7 @@ async fn request_user_input_sets_blocking_from_turn_mode() {
 
     session
         .notify_user_input_response(
-            &request_event.turn_id,
+            &request_event.call_id,
             RequestUserInputResponse {
                 answers: HashMap::new(),
             },

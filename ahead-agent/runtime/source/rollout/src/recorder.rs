@@ -560,12 +560,32 @@ impl RolloutRecorder {
         max_records: usize,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
+        let reader = compression::open_rollout_line_reader(path).await?;
+        Self::read_rollout_items_with_limits(reader, max_bytes, max_records).await
+    }
+
+    /// Loads an exact, already-opened rollout without reopening its path.
+    pub async fn load_rollout_items_from_file_with_limits(
+        file: File,
+        path: &Path,
+        max_bytes: u64,
+        max_records: usize,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        trace!("Importing rollout from an open file at {path:?}");
+        let reader = compression::open_rollout_line_reader_from_file(file, path).await?;
+        Self::read_rollout_items_with_limits(reader, max_bytes, max_records).await
+    }
+
+    async fn read_rollout_items_with_limits(
+        mut reader: compression::RolloutLineReader,
+        max_bytes: u64,
+        max_records: usize,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
         let mut total_bytes = 0u64;
         let mut record_count = 0usize;
-        let mut reader = compression::open_rollout_line_reader(path).await?;
         let mut saw_non_empty_line = false;
         loop {
             let remaining_bytes = max_bytes.saturating_sub(total_bytes);

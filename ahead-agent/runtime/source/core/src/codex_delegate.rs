@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::session::ForkPersistence;
 use crate::session::GitEnrichmentPolicy;
 use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::SessionIo;
@@ -64,11 +63,6 @@ pub(crate) async fn run_codex_thread_interactive(
             "Codex delegates require approval policy `never`".to_string(),
         ));
     }
-    if subagent_source.kind() == crate::approval::UNSUPPORTED_GUARDIAN_SOURCE {
-        return Err(CodexErr::InvalidRequest(
-            "Automatic-review delegates are not supported by AHEAD".to_string(),
-        ));
-    }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
     config.model_provider.supports_websockets &= parent_session
         .services
@@ -101,7 +95,6 @@ pub(crate) async fn run_codex_thread_interactive(
         extensions: Arc::clone(&parent_session.services.extensions),
         conversation_history,
         requested_history_mode: None,
-        fork_persistence: ForkPersistence::Copied,
         session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
@@ -121,7 +114,6 @@ pub(crate) async fn run_codex_thread_interactive(
         reserved_thread_id: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         thread_store: Arc::clone(&parent_session.services.thread_store),
-        attestation_provider: parent_session.services.attestation_provider.clone(),
         external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,

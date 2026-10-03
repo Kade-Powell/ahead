@@ -56,6 +56,18 @@ const COMMANDS: &[Command] = &[
         action: ShellShortcut::Settings,
     },
     Command {
+        name: "Extensions",
+        keywords: "install language server lsp gallery",
+        shortcut: "⌘⇧X / Ctrl+Shift+X",
+        action: ShellShortcut::Extensions,
+    },
+    Command {
+        name: "AHEAD Guide",
+        keywords: "help documentation how to",
+        shortcut: "",
+        action: ShellShortcut::Help,
+    },
+    Command {
         name: "New Terminal",
         keywords: "shell pty",
         shortcut: "",
@@ -216,6 +228,33 @@ fn platform_shortcut(shortcut: &'static str) -> &'static str {
         mac
     } else {
         other
+    }
+}
+
+#[cfg(test)]
+mod guide_tests {
+    use super::COMMANDS;
+
+    #[test]
+    fn command_palette_actions_appear_in_the_user_guide() {
+        let guide = [
+            include_str!("../../docs/guide/start-here.md"),
+            include_str!("../../docs/guide/files-and-editing.md"),
+            include_str!("../../docs/guide/search-and-git.md"),
+            include_str!("../../docs/guide/terminal-and-debugging.md"),
+            include_str!("../../docs/guide/agent-sessions.md"),
+            include_str!("../../docs/guide/connections-and-settings.md"),
+            include_str!("../../docs/guide/voice-and-sharing.md"),
+            include_str!("../../docs/guide/shortcuts.md"),
+        ]
+        .join("\n");
+        for command in COMMANDS {
+            assert!(
+                guide.to_lowercase().contains(&command.name.to_lowercase()),
+                "Document Command Palette action: {}",
+                command.name
+            );
+        }
     }
 }
 
@@ -431,6 +470,10 @@ mod tests {
             ShellShortcut::DebugKey("f9", false)
         );
         assert_eq!(rank_commands("git")[0].action, ShellShortcut::SourceControl);
+        assert_eq!(
+            rank_commands("extensions")[0].action,
+            ShellShortcut::Extensions
+        );
         assert!(rank_commands("unlikely unknown action").is_empty());
     }
 

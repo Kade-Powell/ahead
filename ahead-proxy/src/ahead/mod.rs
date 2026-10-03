@@ -17,6 +17,7 @@ pub mod policy;
 pub mod prediction;
 mod recovery;
 pub mod scenarios;
+pub(crate) mod share;
 pub mod store;
 pub mod tracker;
 pub mod voice;

@@ -42,6 +42,43 @@ use crate::app::{FindReferences, GoToDefinition, GoToImplementation, SaveFile};
 use crate::proxy_client::{LspCompletion, ProxyClient};
 use ahead_rpc::source_control::{BlameHunk, DiffHunkKind, GitFileState};
 
+const SHARED_DRAFT_PREFIX: &str = ".ahead/shared-drafts";
+
+pub(crate) fn shared_draft_path(
+    session_id: &str,
+    file_path: &str,
+) -> Option<std::path::PathBuf> {
+    uuid::Uuid::parse_str(session_id).ok()?;
+    let path = std::path::Path::new(file_path);
+    if file_path.is_empty()
+        || file_path.contains('\\')
+        || !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(format!("{SHARED_DRAFT_PREFIX}/{session_id}/{file_path}").into())
+}
+
+pub(crate) fn shared_draft_file_path<'a>(
+    path: &'a std::path::Path,
+    session_id: &str,
+) -> Option<&'a std::path::Path> {
+    uuid::Uuid::parse_str(session_id).ok()?;
+    let prefix = std::path::Path::new(SHARED_DRAFT_PREFIX).join(session_id);
+    let file = path.strip_prefix(prefix).ok()?;
+    (!file.as_os_str().is_empty()
+        && file
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))))
+    .then_some(file)
+}
+
+pub(crate) fn is_shared_draft_path(path: &std::path::Path) -> bool {
+    path.starts_with(SHARED_DRAFT_PREFIX)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletionContext {
     generation: u64,
@@ -156,7 +193,7 @@ pub struct CodePanel {
     saved_request_id: u64,
     recovery_id: String,
     recovery_revision: u64,
-    recovery_key: Option<(u64, u64)>,
+    recovery_key: Option<(u64, u64, bool)>,
     recovery_reply: Option<(Instant, async_channel::Receiver<Result<bool, String>>)>,
     recovery_conflict: bool,
     saved_sha256: Option<String>,
@@ -175,6 +212,17 @@ pub struct CodePanel {
     pub diagnostics: Vec<DiagnosticItem>,
     pub proxy: Option<Arc<ProxyClient>>,
     diagnostic_task: Option<Task<()>>,
+    pub(crate) shared_session_id: Option<String>,
+    shared_revision: Option<u64>,
+    shared_committed_content: Option<String>,
+    shared_editable: bool,
+    shared_edit_task: Option<Task<()>>,
+    shared_poll_task: Option<Task<()>>,
+    shared_update_task: Option<Task<()>>,
+    shared_conflict: Option<ahead_rpc::ahead::SharedBufferSnapshot>,
+    shared_conflict_session_id: Option<String>,
+    shared_conflict_resolving: bool,
+    host_shared_recovery_pending: bool,
     pub workspace: String,
     pub hover_text: Option<String>,
     navigation_results: Option<NavigationResults>,
@@ -183,6 +231,7 @@ pub struct CodePanel {
     show_markdown_preview: bool,
     git_state: GitFileState,
     git_key: Option<GitStateKey>,
+    git_task_key: Option<GitStateKey>,
     git_task: Option<Task<()>>,
     hovered_breakpoint_line: Option<u32>,
     expanded_hunk_start: Option<u32>,
@@ -248,6 +297,13 @@ impl CodePanel {
                     if !this.loading {
                         this.interrupt_speech();
                         this.refresh_presentation_after_edit(cx);
+                        if let Some(session_panel) = &this.session_panel {
+                            session_panel
+                                .update(cx, |panel, cx| {
+                                    panel.stop_following_on_edit(cx);
+                                })
+                                .log_err();
+                        }
                     }
                     this.dirty_rev += 1;
                     // ponytail: same-length edits scan the rope; use edit-history dirtiness if large-file typing slows.
@@ -259,7 +315,13 @@ impl CodePanel {
                         this.request_generation.wrapping_add(1);
                     this.show_completions = false;
                     if !this.loading {
-                        if let Some(proxy) = this.proxy.as_ref() {
+                        if this.shared_session_id.is_some() {
+                            this.start_shared_edit_sync(cx);
+                        }
+                        if let Some(proxy) = this.proxy.as_ref()
+                            && this.shared_conflict.is_none()
+                            && this.shared_session_id.is_none()
+                        {
                             let text = this.editor.read(cx).value().to_string();
                             proxy.sync_editor_snapshot(
                                 this.proxy_path(),
@@ -363,6 +425,17 @@ impl CodePanel {
             diagnostics: Vec::new(),
             proxy: None,
             diagnostic_task: None,
+            shared_session_id: None,
+            shared_revision: None,
+            shared_committed_content: None,
+            shared_editable: false,
+            shared_edit_task: None,
+            shared_poll_task: None,
+            shared_update_task: None,
+            shared_conflict: None,
+            shared_conflict_session_id: None,
+            shared_conflict_resolving: false,
+            host_shared_recovery_pending: false,
             workspace: String::new(),
             hover_text: None,
             navigation_results: None,
@@ -371,6 +444,7 @@ impl CodePanel {
             show_markdown_preview: is_markdown_path(path),
             git_state: GitFileState::default(),
             git_key: None,
+            git_task_key: None,
             git_task: None,
             hovered_breakpoint_line: None,
             expanded_hunk_start: None,
@@ -386,10 +460,525 @@ impl CodePanel {
         }
     }
 
+    pub(crate) fn new_shared(
+        session_id: String,
+        snapshot: ahead_rpc::ahead::SharedBufferSnapshot,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut panel = Self::new("", window, cx);
+        panel.file_path = snapshot.path.clone();
+        panel.shared_session_id = Some(session_id);
+        panel.shared_revision = Some(snapshot.revision);
+        panel.shared_committed_content = Some(snapshot.content.clone());
+        panel.shared_editable = editable;
+        panel.loading = true;
+        panel.editor.update(cx, |editor, cx| {
+            editor.set_highlighter(editor_language(&snapshot.path), cx);
+            editor.set_value(snapshot.content.clone(), window, cx);
+            editor.set_disabled(!editable, cx);
+        });
+        panel.loading = false;
+        panel.saved_text = panel.editor.read(cx).text().clone();
+        panel.saved_sha256 = Some(format!(
+            "{:x}",
+            sha2::Sha256::digest(snapshot.content.as_bytes())
+        ));
+        panel.dirty = false;
+        panel.status = if editable {
+            "Shared file · live editing"
+        } else {
+            "Shared file · read only"
+        }
+        .into();
+        panel
+    }
+
+    pub(crate) fn restore_shared_draft(
+        &mut self,
+        snapshot: ahead_rpc::file::EditorRecoverySnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let session_id = self
+            .shared_session_id
+            .as_deref()
+            .ok_or("Not a shared file")?;
+        let draft_path = shared_draft_file_path(&snapshot.path, session_id)
+            .ok_or("Invalid shared draft path")?;
+        if draft_path.to_str() != Some(self.file_path.as_str()) {
+            return Err("Shared draft belongs to a different file".into());
+        }
+        if self.dirty {
+            return Err(
+                "Local edits are already open; the draft remains recoverable".into(),
+            );
+        }
+        let content = snapshot.contents.ok_or("Shared draft was cleared")?;
+        let host_content = self
+            .shared_committed_content
+            .clone()
+            .ok_or("Host file is unavailable")?;
+        let host_snapshot = ahead_rpc::ahead::SharedBufferSnapshot {
+            path: self.file_path.clone(),
+            revision: self.shared_revision.ok_or("Host revision is unavailable")?,
+            content: host_content,
+        };
+        self.recovery_id = snapshot.buffer_id;
+        self.recovery_revision = snapshot.revision;
+        self.recovery_key = None;
+        self.recovery_reply = None;
+        self.loading = true;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_value(content, window, cx);
+        });
+        self.loading = false;
+        self.dirty = self.editor.read(cx).text() != &self.saved_text;
+        if self.dirty {
+            self.shared_conflict = Some(host_snapshot);
+            self.shared_conflict_session_id = Some(session_id.to_string());
+            self.status = "Recovered shared draft · choose a version".into();
+        } else {
+            self.status = "Shared draft already matches host".into();
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn start_shared_poll(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_poll_task.is_some() {
+            return;
+        }
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.shared_session_id.clone())
+        else {
+            return;
+        };
+        let path = self.file_path.clone();
+        self.shared_poll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(750))
+                    .await;
+                let session_id_for_read = session_id.clone();
+                let path_for_read = path.clone();
+                let proxy = proxy.clone();
+                let result = cx
+                    .background_spawn(async move {
+                        proxy.read_shared_buffer(session_id_for_read, path_for_read)
+                    })
+                    .await;
+                let active = this.update_in(cx, |panel, window, cx| {
+                    if panel.shared_session_id.as_deref()
+                        != Some(session_id.as_str())
+                        || panel.file_path != path
+                    {
+                        return false;
+                    }
+                    match result {
+                        Ok(snapshot) => {
+                            panel.apply_shared_snapshot(snapshot, window, cx)
+                        }
+                        Err(error) => {
+                            panel.status = format!(
+                                "Shared file unavailable: {}",
+                                error.message
+                            )
+                            .into();
+                            cx.notify();
+                        }
+                    }
+                    true
+                });
+                if !matches!(active, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn start_shared_edit_sync(&mut self, cx: &mut Context<Self>) {
+        if !self.shared_editable
+            || self.shared_edit_task.is_some()
+            || self.shared_conflict.is_some()
+        {
+            return;
+        }
+        let (Some(proxy), Some(session_id)) =
+            (self.proxy.clone(), self.shared_session_id.clone())
+        else {
+            return;
+        };
+        let path = self.file_path.clone();
+        self.shared_edit_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let pending = this
+                    .update(cx, |panel, cx| {
+                        if !panel.shared_editable
+                            || panel.shared_session_id.as_deref()
+                                != Some(session_id.as_str())
+                            || panel.file_path != path
+                            || panel.shared_conflict.is_some()
+                        {
+                            panel.shared_edit_task = None;
+                            return None;
+                        }
+                        let content = panel.editor.read(cx).value().to_string();
+                        if panel.shared_committed_content.as_deref()
+                            == Some(content.as_str())
+                        {
+                            panel.shared_edit_task = None;
+                            return None;
+                        }
+                        panel.shared_revision.map(|revision| (revision, content))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((revision, content)) = pending else {
+                    break;
+                };
+                let submitted_content = content.clone();
+                let proxy = proxy.clone();
+                let session = session_id.clone();
+                let file = path.clone();
+                let result = cx
+                    .background_spawn(async move {
+                        proxy.replace_shared_buffer(session, file, revision, content)
+                    })
+                    .await;
+                let again = this
+                    .update(cx, |panel, cx| {
+                        if panel.shared_session_id.as_deref()
+                            != Some(session_id.as_str())
+                            || panel.file_path != path
+                        {
+                            panel.shared_edit_task = None;
+                            return false;
+                        }
+                        match result {
+                            Ok(edit) if edit.applied => {
+                                if panel.shared_conflict.as_ref().is_some_and(
+                                    |conflict| {
+                                        conflict.revision <= edit.snapshot.revision
+                                            && conflict.content
+                                                == edit.snapshot.content
+                                    },
+                                ) {
+                                    panel.shared_conflict = None;
+                                    panel.shared_conflict_session_id = None;
+                                }
+                                panel.shared_revision = Some(edit.snapshot.revision);
+                                panel.shared_committed_content =
+                                    Some(edit.snapshot.content.clone());
+                                panel.saved_text = Rope::from(edit.snapshot.content);
+                                panel.dirty = panel.editor.read(cx).text()
+                                    != &panel.saved_text;
+                                panel.recovery_key = None;
+                                if panel.shared_conflict.is_some() {
+                                    panel.shared_edit_task = None;
+                                    cx.notify();
+                                    return false;
+                                }
+                                panel.status = if panel.dirty {
+                                    "Syncing shared edits…"
+                                } else {
+                                    "Shared edits synced"
+                                }
+                                .into();
+                                if !panel.dirty {
+                                    panel.shared_edit_task = None;
+                                }
+                                cx.notify();
+                                panel.dirty
+                                    && panel.editor.read(cx).value()
+                                        != submitted_content
+                            }
+                            Ok(edit) => {
+                                panel.shared_conflict = Some(edit.snapshot);
+                                panel.shared_conflict_session_id =
+                                    Some(session_id.clone());
+                                panel.status =
+                                    "Shared edit conflict · choose a version".into();
+                                panel.shared_edit_task = None;
+                                cx.notify();
+                                false
+                            }
+                            Err(error) => {
+                                panel.status =
+                                    format!("Shared edit failed: {}", error.message)
+                                        .into();
+                                panel.shared_edit_task = None;
+                                cx.notify();
+                                false
+                            }
+                        }
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub(crate) fn stop_shared_poll(&mut self, cx: &mut Context<Self>) {
+        self.shared_poll_task = None;
+        self.shared_edit_task = None;
+        self.shared_editable = false;
+        self.dirty = self.editor.read(cx).text() != &self.saved_text;
+        self.editor
+            .update(cx, |editor, cx| editor.set_disabled(true, cx));
+        if self.shared_session_id.is_some() {
+            self.status = "Shared session left · read-only snapshot".into();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_shared_editable(
+        &mut self,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_session_id.is_none() || self.shared_editable == editable {
+            return;
+        }
+        self.dirty = self.editor.read(cx).text() != &self.saved_text;
+        self.shared_editable = editable;
+        if !editable {
+            self.shared_edit_task = None;
+            self.status = "Shared file · read only; local changes retained".into();
+        } else if self.status.as_ref().starts_with("Shared file · read only") {
+            self.status = "Shared file · live editing".into();
+        }
+        self.editor
+            .update(cx, |editor, cx| editor.set_disabled(!editable, cx));
+        if editable {
+            self.start_shared_edit_sync(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn current_line(&self, cx: &App) -> u32 {
+        self.cursor_position(cx).line
+    }
+
+    pub(crate) fn apply_shared_snapshot(
+        &mut self,
+        snapshot: ahead_rpc::ahead::SharedBufferSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_revision == Some(snapshot.revision) {
+            if self.shared_editable && self.dirty {
+                self.start_shared_edit_sync(cx);
+            }
+            return;
+        }
+        let current = self.editor.read(cx).value().to_string();
+        if self.shared_session_id.is_some()
+            && self.shared_committed_content.as_deref() != Some(current.as_str())
+            && current != snapshot.content
+        {
+            self.dirty = self.editor.read(cx).text() != &self.saved_text;
+            if self.shared_conflict.as_ref() != Some(&snapshot) {
+                self.shared_conflict = Some(snapshot);
+                self.shared_conflict_session_id = self.shared_session_id.clone();
+                self.status = "Shared edit conflict · choose a version".into();
+                cx.notify();
+            }
+            return;
+        }
+        self.shared_revision = Some(snapshot.revision);
+        self.shared_committed_content = Some(snapshot.content.clone());
+        self.loading = true;
+        if current != snapshot.content {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_value(snapshot.content.clone(), window, cx);
+            });
+        }
+        self.loading = false;
+        self.saved_text = self.editor.read(cx).text().clone();
+        self.saved_sha256 = Some(format!(
+            "{:x}",
+            sha2::Sha256::digest(snapshot.content.as_bytes())
+        ));
+        self.dirty = false;
+        self.shared_conflict = None;
+        self.shared_conflict_session_id = None;
+        self.status = if self.shared_editable {
+            "Shared file · live editing"
+        } else {
+            "Shared file · read only"
+        }
+        .into();
+        cx.notify();
+    }
+
+    fn apply_cached_host_shared_change(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_session_id.is_some()
+            || !self.is_text_available()
+            || self.file_path.is_empty()
+        {
+            return;
+        }
+        let Some(proxy) = self.proxy.as_ref() else {
+            return;
+        };
+        let Some((session_id, previous, snapshot)) =
+            proxy.shared_buffer_change_for_path(&self.workspace, &self.file_path)
+        else {
+            return;
+        };
+        self.host_shared_recovery_pending = true;
+        let local = self.editor.read(cx).value().to_string();
+        if local == snapshot.content || local == previous {
+            if local != snapshot.content {
+                self.loading = true;
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_value(snapshot.content.clone(), window, cx);
+                });
+                self.loading = false;
+            }
+            self.dirty = self.editor.read(cx).text() != &self.saved_text;
+            self.shared_conflict = None;
+            self.shared_conflict_session_id = None;
+            proxy.acknowledge_shared_buffer(&session_id, &snapshot);
+            self.status = "Applied collaborator edit".into();
+        } else {
+            self.shared_conflict = Some(snapshot);
+            self.shared_conflict_session_id = Some(session_id);
+            self.status =
+                "Shared edit conflict · choose latest or keep local".into();
+        }
+        cx.notify();
+    }
+
+    fn resolve_shared_conflict(
+        &mut self,
+        keep_local: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shared_conflict_resolving {
+            return;
+        }
+        let (Some(snapshot), Some(session_id), Some(proxy)) = (
+            self.shared_conflict.clone(),
+            self.shared_conflict_session_id.clone(),
+            self.proxy.clone(),
+        ) else {
+            return;
+        };
+        if self.shared_session_id.is_some() {
+            self.shared_edit_task = None;
+            self.shared_revision = Some(snapshot.revision);
+            self.shared_committed_content = Some(snapshot.content.clone());
+            self.saved_text = Rope::from(snapshot.content.clone());
+            self.shared_conflict = None;
+            self.shared_conflict_session_id = None;
+            if keep_local {
+                self.dirty = self.editor.read(cx).text() != &self.saved_text;
+                self.status = "Applying local version to host…".into();
+                self.start_shared_edit_sync(cx);
+            } else {
+                self.loading = true;
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_value(snapshot.content.clone(), window, cx);
+                });
+                self.loading = false;
+                self.dirty = false;
+                self.status = "Used latest host version".into();
+            }
+            cx.notify();
+            return;
+        }
+        if !keep_local {
+            self.loading = true;
+            self.editor.update(cx, |editor, cx| {
+                editor.set_value(snapshot.content.clone(), window, cx);
+            });
+            self.loading = false;
+            self.dirty = self.editor.read(cx).text() != &self.saved_text;
+            self.shared_conflict = None;
+            self.shared_conflict_session_id = None;
+            proxy.acknowledge_shared_buffer(&session_id, &snapshot);
+            self.status = "Used latest collaborator edit".into();
+            cx.notify();
+            return;
+        }
+        let local = self.editor.read(cx).value().to_string();
+        let submitted_local = local.clone();
+        let path = snapshot.path.clone();
+        let acknowledgement_session_id = session_id.clone();
+        self.shared_conflict_resolving = true;
+        self.status = "Applying local version…".into();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    proxy.replace_shared_buffer(
+                        session_id,
+                        path,
+                        snapshot.revision,
+                        local,
+                    )
+                })
+                .await;
+            this.update_in(cx, |panel, _, cx| {
+                panel.shared_conflict_resolving = false;
+                match result {
+                    Ok(edit) if edit.applied => {
+                        if panel.editor.read(cx).value() == submitted_local {
+                            if let Some(proxy) = &panel.proxy {
+                                proxy.acknowledge_shared_buffer(
+                                    &acknowledgement_session_id,
+                                    &edit.snapshot,
+                                );
+                            }
+                            panel.shared_conflict = None;
+                            panel.shared_conflict_session_id = None;
+                            panel.status = "Kept local version".into();
+                        } else {
+                            panel.shared_conflict = Some(edit.snapshot);
+                            panel.status =
+                                "Local text changed during resolution; choose again"
+                                    .into();
+                        }
+                    }
+                    Ok(edit) => {
+                        panel.shared_conflict = Some(edit.snapshot);
+                        panel.status =
+                            "Shared file changed again; choose a version".into();
+                    }
+                    Err(error) => {
+                        panel.status =
+                            format!("Shared conflict: {}", error.message).into()
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub fn with_proxy(
         mut self,
         proxy: Arc<ProxyClient>,
         workspace: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let receiver = proxy.subscribe_diagnostics();
@@ -406,15 +995,17 @@ impl CodePanel {
                 }
             }
         }));
-        self.proxy = Some(proxy);
+        self.proxy = Some(proxy.clone());
         self.workspace = workspace.to_string();
+        self.watch_shared_buffer_changes(&proxy, window, cx);
         self.set_inline_blame_enabled(
             crate::settings_panel::inline_blame_enabled(std::path::Path::new(
                 workspace,
             )),
             cx,
         );
-        if !self.file_path.is_empty()
+        if self.shared_session_id.is_none()
+            && !self.file_path.is_empty()
             && self.is_text_available()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -425,6 +1016,29 @@ impl CodePanel {
             proxy.refresh_anchors(&[self.proxy_path()]);
         }
         self
+    }
+
+    pub(crate) fn watch_shared_buffer_changes(
+        &mut self,
+        proxy: &Arc<ProxyClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = proxy.subscribe_shared_buffers();
+        self.shared_update_task =
+            Some(cx.spawn_in(window, async move |this, cx| {
+                while receiver.recv().await.is_ok() {
+                    if this
+                        .update_in(cx, |panel, window, cx| {
+                            panel.apply_cached_host_shared_change(window, cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        self.apply_cached_host_shared_change(window, cx);
     }
 
     pub(crate) fn set_inline_blame_enabled(
@@ -440,10 +1054,16 @@ impl CodePanel {
 
     pub fn release_buffer(&mut self) {
         if let Some(proxy) = self.proxy.take() {
-            proxy.close_editor_buffer(self.proxy_path());
+            if self.shared_session_id.is_none() {
+                proxy.close_editor_buffer(self.proxy_path());
+            }
         }
+        self.shared_poll_task = None;
+        self.shared_edit_task = None;
+        self.shared_update_task = None;
         self.diagnostic_task = None;
         self.git_task = None;
+        self.git_task_key = None;
         self.git_key = None;
         self.git_state = GitFileState::default();
         self.hovered_breakpoint_line = None;
@@ -522,16 +1142,20 @@ impl CodePanel {
         if self.recovery_revision == 0 && !self.dirty {
             return None;
         }
-        let key = (self.request_generation, self.saved_request_id);
+        let key = (self.request_generation, self.saved_request_id, self.dirty);
         if !force && self.recovery_key == Some(key) {
             return None;
         }
-        let Ok(path) =
-            std::path::Path::new(&self.file_path).strip_prefix(&self.workspace)
-        else {
-            self.status =
-                "Unsaved recovery unavailable for a file outside this workspace"
-                    .into();
+        let path = if let Some(session_id) = &self.shared_session_id {
+            shared_draft_path(session_id, &self.file_path)
+        } else {
+            std::path::Path::new(&self.file_path)
+                .strip_prefix(&self.workspace)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        };
+        let Some(path) = path else {
+            self.status = "Unsaved recovery unavailable for this file".into();
             cx.notify();
             return None;
         };
@@ -544,7 +1168,7 @@ impl CodePanel {
             proxy.write_editor_recovery(ahead_rpc::file::EditorRecoverySnapshot {
                 buffer_id: self.recovery_id.clone(),
                 revision: self.recovery_revision,
-                path: path.to_owned(),
+                path,
                 contents: (self.dirty && !discard)
                     .then(|| self.editor.read(cx).text().to_string()),
                 saved_sha256: self.saved_sha256.clone(),
@@ -710,27 +1334,14 @@ impl CodePanel {
         }
         let editor = self.editor.read(cx);
         let file_content = editor.value().to_string();
-        let display_position = |position: gpui_kit::base::input::Position| {
-            ahead_rpc::ahead::DisplayPosition {
-                line: position.line,
-                col: file_content
-                    .split('\n')
-                    .nth(position.line as usize)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(position.character as usize)
-                    .map(|character| character.len_utf16() as u32)
-                    .sum(),
-            }
-        };
         let position = editor.cursor_position();
         let selected_range = editor.selected_range();
         let selection = if selected_range.start != selected_range.end {
             let start = editor.text().offset_to_position(selected_range.start);
             let end = editor.text().offset_to_position(selected_range.end);
             Some(ahead_rpc::ahead::DisplayRange {
-                start: display_position(start),
-                end: display_position(end),
+                start: display_position_utf16(&file_content, start),
+                end: display_position_utf16(&file_content, end),
             })
         } else {
             None
@@ -741,7 +1352,7 @@ impl CodePanel {
                 .unwrap_or_else(|_| std::path::Path::new(&self.file_path))
                 .to_string_lossy()
                 .to_string(),
-            caret: display_position(position),
+            caret: display_position_utf16(&file_content, position),
             selection,
             file_content,
             visible_end: None,
@@ -977,15 +1588,30 @@ impl CodePanel {
             cx.notify();
             return;
         }
+        if self.shared_session_id.is_some() && self.recovery_revision > 0 {
+            drop(self.queue_recovery(true, true, cx));
+        }
+        let was_shared = self.shared_session_id.take().is_some();
+        self.shared_poll_task = None;
+        self.shared_edit_task = None;
+        self.shared_committed_content = None;
+        self.shared_editable = false;
+        self.shared_conflict = None;
+        self.shared_conflict_session_id = None;
+        self.shared_revision = None;
+        self.host_shared_recovery_pending = false;
         let disk_text = read_editor_file(path);
-        if !self.file_path.is_empty()
+        if !was_shared
+            && !self.file_path.is_empty()
             && self.is_text_available()
             && let Some(proxy) = &self.proxy
         {
             proxy.close_editor_buffer(self.proxy_path());
         }
         if self.file_path != path {
-            drop(self.queue_recovery(true, true, cx));
+            if !was_shared {
+                drop(self.queue_recovery(true, true, cx));
+            }
             self.recovery_id = uuid::Uuid::new_v4().to_string();
             self.recovery_revision = 0;
             self.recovery_key = None;
@@ -1029,6 +1655,7 @@ impl CodePanel {
         self.ghost_text = None;
         self.hover_text = None;
         self.git_task = None;
+        self.git_task_key = None;
         self.git_key = None;
         self.git_state = GitFileState::default();
         self.show_completions = false;
@@ -1046,6 +1673,7 @@ impl CodePanel {
             .as_ref()
             .map_or_else(|| format!("Opened {path}"), |error| error.to_string())
             .into();
+        self.apply_cached_host_shared_change(window, cx);
         cx.notify();
     }
 
@@ -1244,6 +1872,10 @@ impl CodePanel {
     }
 
     fn sync_proxy_diagnostics(&mut self, _cx: &App) {
+        if self.shared_session_id.is_some() {
+            self.diagnostics.clear();
+            return;
+        }
         let Some(proxy) = self.proxy.clone() else {
             return;
         };
@@ -1267,13 +1899,16 @@ impl CodePanel {
     }
 
     pub fn refresh_attribution(&mut self) {
+        if self.shared_session_id.is_some() {
+            return;
+        }
         if let Some(proxy) = self.proxy.as_ref() {
             proxy.refresh_anchors(&[self.proxy_path()]);
         }
     }
 
     fn current_git_key(&self) -> Option<GitStateKey> {
-        if self.file_path.is_empty() {
+        if self.file_path.is_empty() || self.shared_session_id.is_some() {
             return None;
         }
         Some(GitStateKey {
@@ -1287,18 +1922,24 @@ impl CodePanel {
         let Some(key) = self.current_git_key() else {
             return;
         };
+        if self.git_task_key.as_ref() == Some(&key) {
+            return;
+        }
         if self.git_key.as_ref() == Some(&key) {
+            self.git_task = None;
+            self.git_task_key = None;
             return;
         }
-        if self.git_task.is_some() {
-            return;
-        }
+        self.git_task = None;
+        self.git_task_key = Some(key.clone());
         self.git_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(150))
                 .await;
             let Ok(Some((key, receiver))) = this.update(cx, |this, cx| {
-                let key = this.current_git_key()?;
+                if this.current_git_key().as_ref() != Some(&key) {
+                    return None;
+                }
                 let receiver = this.proxy.as_ref()?.git_file_state(
                     key.path.clone(),
                     this.editor.read(cx).value().to_string(),
@@ -1327,6 +1968,7 @@ impl CodePanel {
         cx: &mut Context<Self>,
     ) {
         self.git_task = None;
+        self.git_task_key = None;
         if self.git_key.as_ref() != Some(&key)
             || self.current_git_key().as_ref() != Some(&key)
         {
@@ -1508,6 +2150,33 @@ impl CodePanel {
     }
 
     fn save_and_wait(&mut self, cx: &mut Context<Self>) -> Task<bool> {
+        if self.shared_session_id.is_some() {
+            self.dirty = self.editor.read(cx).text() != &self.saved_text;
+            if !self.shared_editable {
+                self.status = if self.dirty {
+                    "Local shared edits cannot sync; reconnect or copy them before closing"
+                } else {
+                    "Shared file is read-only"
+                }.into();
+                cx.notify();
+                return Task::ready(!self.dirty);
+            }
+            if self.shared_conflict.is_some() {
+                self.status =
+                    "Resolve the shared edit conflict before saving".into();
+                cx.notify();
+                return Task::ready(false);
+            }
+            self.start_shared_edit_sync(cx);
+            self.status = if self.dirty {
+                "Syncing shared edits…"
+            } else {
+                "Shared edits synced"
+            }
+            .into();
+            cx.notify();
+            return Task::ready(!self.dirty);
+        }
         if let Some(error) = &self.file_error {
             self.status = error.to_string().into();
             cx.notify();
@@ -1562,6 +2231,7 @@ impl CodePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<u64>> {
+        self.dirty = self.editor.read(cx).text() != &self.saved_text;
         let generation = self.request_generation;
         if !self.dirty {
             return Task::ready(Some(generation));
@@ -1589,7 +2259,49 @@ impl CodePanel {
                         return None;
                     }
                 }
-                Ok(1) => {}
+                Ok(1) => {
+                    let discard = this
+                        .read_with(cx, |panel, _| {
+                            (panel.host_shared_recovery_pending
+                                && panel.shared_session_id.is_none()
+                                && panel.request_generation == generation)
+                                .then(|| {
+                                    panel.proxy.as_ref().map(|proxy| {
+                                        (proxy.clone(), panel.proxy_path())
+                                    })
+                                })
+                                .flatten()
+                        })
+                        .ok()?;
+                    if let Some((proxy, path)) = discard {
+                        let requested_path = path.clone();
+                        let result = cx
+                            .background_spawn(async move {
+                                proxy.discard_shared_remote_recovery(path)
+                            })
+                            .await;
+                        if let Err(error) = result {
+                            this.update(cx, |panel, cx| {
+                                panel.status = format!(
+                                    "Could not discard shared edit: {}",
+                                    error.message
+                                )
+                                .into();
+                                cx.notify();
+                            })
+                            .log_err();
+                            return None;
+                        }
+                        this.update(cx, |panel, _| {
+                            if panel.request_generation == generation
+                                && panel.proxy_path() == requested_path
+                            {
+                                panel.host_shared_recovery_pending = false;
+                            }
+                        })
+                        .ok()?;
+                    }
+                }
                 _ => return None,
             }
             this.update(cx, |this, _| {
@@ -1619,6 +2331,7 @@ impl CodePanel {
                         sha2::Sha256::digest(text.to_string().as_bytes())
                     ));
                     self.recovery_conflict = false;
+                    self.host_shared_recovery_pending = false;
                     self.saved_text = text;
                     self.dirty = self.editor.read(cx).text() != &self.saved_text;
                     self.git_key = None;
@@ -2154,6 +2867,43 @@ fn unique_quote_range(
     Ok((start, start + quote.len()))
 }
 
+fn display_position_utf16(
+    text: &str,
+    position: gpui_kit::base::input::Position,
+) -> ahead_rpc::ahead::DisplayPosition {
+    ahead_rpc::ahead::DisplayPosition {
+        line: position.line,
+        col: text
+            .split('\n')
+            .nth(position.line as usize)
+            .unwrap_or_default()
+            .chars()
+            .take(position.character as usize)
+            .map(|character| character.len_utf16() as u32)
+            .sum(),
+    }
+}
+
+pub(crate) fn current_comment_range(
+    comment: &ahead_rpc::ahead::CodeComment,
+    text: &str,
+) -> Option<ahead_rpc::ahead::DisplayRange> {
+    use ahead_rpc::ahead::DisplayRange;
+    if format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+        == comment.source_sha256
+    {
+        return Some(comment.range);
+    }
+    let (start, end) = unique_quote_range(text, &comment.quote).ok()?;
+    let rope = Rope::from(text);
+    let start = rope.offset_to_position(start);
+    let end = rope.offset_to_position(end);
+    Some(DisplayRange {
+        start: display_position_utf16(text, start),
+        end: display_position_utf16(text, end),
+    })
+}
+
 fn location_byte_position(
     text: &str,
     line: usize,
@@ -2220,12 +2970,18 @@ impl Panel for CodePanel {
         let title = SharedString::from(file_name.to_string());
         let tab_label = h_flex()
             .min_w_0()
+            .flex_nowrap()
             .items_center()
             .gap_1()
             .when(self.is_preview, |this| this.italic())
             .child(div().min_w_0().truncate().child(title))
             .when(dirty, |this| {
-                this.child(div().text_color(cx.theme().warning).child("•"))
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(cx.theme().warning)
+                        .child("•"),
+                )
             });
         h_flex()
             .id(("code-tab", panel_id.as_u64()))
@@ -2414,15 +3170,22 @@ impl Render for CodePanel {
         let mut comment_starts = std::collections::HashMap::<u32, usize>::new();
         let mut comment_ranges = std::collections::HashSet::<u32>::new();
         let mut comment_ends = std::collections::HashSet::<u32>::new();
-        for comment in self.code_comments.iter().filter(|comment| {
-            comment.resolved_at.is_none() && comment.path == comment_path
-        }) {
-            let start = comment.range.start.line.saturating_add(1);
+        let located_comments: Vec<_> = self
+            .code_comments
+            .iter()
+            .filter(|comment| {
+                comment.resolved_at.is_none() && comment.path == comment_path
+            })
+            .filter_map(|comment| {
+                current_comment_range(comment, &editor_text)
+                    .map(|range| (comment, range))
+            })
+            .collect();
+        for (_, range) in &located_comments {
+            let start = range.start.line.saturating_add(1);
             *comment_starts.entry(start).or_default() += 1;
-            let end = comment.range.end.line.saturating_add(
-                if comment.range.end.col == 0
-                    && comment.range.end.line > comment.range.start.line
-                {
+            let end = range.end.line.saturating_add(
+                if range.end.col == 0 && range.end.line > range.start.line {
                     0
                 } else {
                     1
@@ -2435,15 +3198,10 @@ impl Render for CodePanel {
         }
         let selected_comment_target = self.selected_code_comment(cx);
         let visible_comments = self.comment_popover_line.map(|line| {
-            let comments = self
-                .code_comments
+            let comments = located_comments
                 .iter()
-                .filter(|comment| {
-                    comment.resolved_at.is_none()
-                        && comment.path == comment_path
-                        && comment.range.start.line.saturating_add(1) == line
-                })
-                .cloned()
+                .filter(|(_, range)| range.start.line.saturating_add(1) == line)
+                .map(|(comment, range)| ((*comment).clone(), *range))
                 .collect::<Vec<_>>();
             (line, comments)
         });
@@ -2646,6 +3404,46 @@ impl Render for CodePanel {
                             })
                     )
             )
+            .when_some(self.shared_conflict.clone(), |root, snapshot| root.child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(IconName::ShieldAlert)
+                    .child(div().flex_1().text_size(px(11.)).child(format!(
+                        "Collaborator revision {} differs from this editor. Choose a version.",
+                        snapshot.revision
+                    )))
+                    .child(Button::new("use_shared_latest")
+                        .label("Use latest")
+                        .tooltip("Discard local edits and use the collaborator version")
+                        .disabled(self.shared_conflict_resolving)
+                        .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                            this.resolve_shared_conflict(false, window, cx);
+                        })))
+                    .child(Button::new("keep_shared_local")
+                        .label("Keep mine")
+                        .tooltip("Overwrite the collaborator version with local edits")
+                        .disabled(self.shared_conflict_resolving || (self.shared_session_id.is_some() && !self.shared_editable))
+                        .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                            this.resolve_shared_conflict(true, window, cx);
+                        })))
+            ))
+            .when(self.shared_session_id.is_some() && self.dirty && self.shared_conflict.is_none()
+                && (!self.shared_editable || self.status.starts_with("Shared edit failed:")), |root| root.child(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(IconName::ShieldAlert)
+                    .child(div().text_size(px(11.)).child(self.status.clone()))
+            ))
             // Editor row: native gutter rail (diff + breakpoints) beside editor
             .when(!self.show_markdown_preview, |root| root.child(
                 h_flex()
@@ -3333,7 +4131,7 @@ impl Render for CodePanel {
                                                 }))
                                         )
                                 )
-                                .children(comments.into_iter().map(|comment| {
+                                .children(comments.into_iter().map(|(comment, current_range)| {
                                     let reference_comment = comment.clone();
                                     let resolve_id = comment.id.clone();
                                     let source_changed = format!("{:x}", sha2::Sha256::digest(editor_text.as_bytes())) != comment.source_sha256;
@@ -3342,7 +4140,7 @@ impl Render for CodePanel {
                                         .p_2()
                                         .border_l_2()
                                         .border_color(comment_accent)
-                                        .child(div().text_size(px(11.)).text_color(text_color).child(format!("{} · lines {}–{}", comment.actor_id, comment.range.start.line + 1, comment.range.end.line + 1)))
+                                        .child(div().text_size(px(11.)).text_color(text_color).child(format!("{} · lines {}–{}", comment.actor_id, current_range.start.line + 1, current_range.end.line + 1)))
                                         .child(div().min_w_0().truncate().text_size(px(11.)).text_color(cx.theme().muted_foreground).child(comment.path.clone()))
                                         .when(source_changed, |card| card.child(div().text_size(px(10.)).text_color(cx.theme().warning).child("Source changed since this comment")))
                                         .child(div().text_size(px(12.)).child(comment.body.clone()))
@@ -3587,15 +4385,561 @@ fn presentation_gutter_line(
 mod tests {
     use super::{
         CodePanel, agent_anchor_lines, blame_label, caret_byte_offset,
-        completion_edit, completion_prefix_range, definition_open_request,
-        editor_language, interpolate_insertion, is_markdown_path,
-        location_byte_position, presentation_gutter_line, rank_completions,
+        completion_edit, completion_prefix_range, current_comment_range,
+        definition_open_request, editor_language, interpolate_insertion,
+        is_markdown_path, is_shared_draft_path, location_byte_position,
+        presentation_gutter_line, rank_completions, shared_draft_file_path,
+        shared_draft_path,
     };
     use crate::proxy_client::LspCompletion;
     use crate::ross::{OpenColumn, OpenLocation};
     use ahead_rpc::plugin::PluginId;
     use gpui_kit::component::input::Undo;
     use gpui_kit::{Focusable, VisualContext};
+    use sha2::Digest;
+
+    #[test]
+    fn code_comment_moves_with_a_unique_quote_and_hides_ambiguous_ranges() {
+        use ahead_rpc::ahead::{CodeComment, DisplayPosition, DisplayRange};
+        let source = "fn selected() {}\n";
+        let comment = CodeComment {
+            id: "comment".into(),
+            session_id: "session".into(),
+            actor_id: "bob".into(),
+            path: "src/lib.rs".into(),
+            range: DisplayRange {
+                start: DisplayPosition { line: 0, col: 3 },
+                end: DisplayPosition { line: 0, col: 11 },
+            },
+            quote: "selected".into(),
+            source_sha256: format!("{:x}", sha2::Sha256::digest(source.as_bytes())),
+            body: "Review this".into(),
+            created_at: String::new(),
+            resolved_at: None,
+            resolved_by: None,
+        };
+        assert_eq!(current_comment_range(&comment, source), Some(comment.range));
+        assert_eq!(
+            current_comment_range(&comment, "// moved\nfn selected() {}\n")
+                .map(|range| range.start),
+            Some(DisplayPosition { line: 1, col: 3 })
+        );
+        assert_eq!(
+            current_comment_range(&comment, "// 😀 selected\n")
+                .map(|range| range.start),
+            Some(DisplayPosition { line: 0, col: 6 })
+        );
+        assert!(current_comment_range(&comment, "fn gone() {}\n").is_none());
+        assert!(
+            current_comment_range(&comment, "fn selected() {}\nfn selected() {}\n")
+                .is_none()
+        );
+    }
+
+    #[gpui_kit::test]
+    fn host_editor_applies_clean_shared_change_and_preserves_conflicting_local_text(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{AheadNotification, SharedBufferSnapshot};
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("shared.rs");
+        std::fs::write(&path, "old\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx).with_proxy(
+                proxy.clone(),
+                directory.path().to_str().expect("workspace"),
+                window,
+                cx,
+            )
+        });
+        proxy.route_ahead(AheadNotification::SharedBufferChanged {
+            session_id: "session".into(),
+            previous_content: "old\n".into(),
+            snapshot: SharedBufferSnapshot {
+                path: "shared.rs".into(),
+                revision: 2,
+                content: "guest\n".into(),
+            },
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value(), "guest\n");
+            assert!(panel.shared_conflict.is_none());
+            assert!(panel.host_shared_recovery_pending);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_value("host\n", window, cx);
+            });
+        });
+        proxy.route_ahead(AheadNotification::SharedBufferChanged {
+            session_id: "session".into(),
+            previous_content: "guest\n".into(),
+            snapshot: SharedBufferSnapshot {
+                path: "shared.rs".into(),
+                revision: 3,
+                content: "guest again\n".into(),
+            },
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            assert_eq!(panel.editor.read(cx).value(), "host\n");
+            assert_eq!(
+                panel
+                    .shared_conflict
+                    .as_ref()
+                    .map(|snapshot| snapshot.revision),
+                Some(3)
+            );
+            panel.resolve_shared_conflict(false, window, cx);
+            assert_eq!(panel.editor.read(cx).value(), "guest again\n");
+            assert!(panel.shared_conflict.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn guest_editor_records_unsynced_text_in_local_recovery(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{AheadRequest, SharedBufferSnapshot};
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        proxy.enable_editor_recovery();
+        let rpc = proxy.rpc_for_test();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                session_id.clone(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 1,
+                    content: "host\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+            .with_proxy(
+                proxy.clone(),
+                directory.path().to_str().expect("workspace"),
+                window,
+                cx,
+            )
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .editor
+                .update(cx, |editor, cx| editor.replace_all("guest\n", window, cx));
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert!(panel.dirty);
+            assert!(panel.queue_recovery(false, true, cx).is_some());
+        });
+        let snapshot = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Request(
+                    _,
+                    ProxyRequest::AheadRequest {
+                        request: AheadRequest::WriteEditorRecovery { snapshot },
+                    },
+                ) => Some(snapshot),
+                _ => None,
+            })
+            .expect("guest recovery request");
+        assert_eq!(
+            snapshot.path,
+            shared_draft_path(&session_id, "shared.rs").expect("draft path")
+        );
+        assert_eq!(snapshot.contents.as_deref(), Some("guest\n"));
+    }
+
+    #[gpui_kit::test]
+    fn guest_editor_restores_private_draft_and_detects_changed_host(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::SharedBufferSnapshot;
+        use ahead_rpc::file::EditorRecoverySnapshot;
+        cx.update(gpui_kit::component::init);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let path = shared_draft_path(&session_id, "shared.rs").expect("draft path");
+        assert!(shared_draft_path(&session_id, "../private.rs").is_none());
+        assert!(is_shared_draft_path(&path));
+        assert_eq!(
+            shared_draft_file_path(&path, &session_id)
+                .and_then(std::path::Path::to_str),
+            Some("shared.rs")
+        );
+        assert!(
+            shared_draft_file_path(&path, &uuid::Uuid::new_v4().to_string())
+                .is_none()
+        );
+        assert!(
+            shared_draft_file_path(
+                std::path::Path::new(&format!(
+                    ".ahead/shared-drafts/{session_id}/../private.rs"
+                )),
+                &session_id,
+            )
+            .is_none()
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                session_id.clone(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 2,
+                    content: "host changed\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .restore_shared_draft(
+                    EditorRecoverySnapshot {
+                        buffer_id: uuid::Uuid::new_v4().to_string(),
+                        revision: 1,
+                        path,
+                        contents: Some("unsynced local\n".into()),
+                        saved_sha256: Some(format!(
+                            "{:x}",
+                            sha2::Sha256::digest(b"original host\n")
+                        )),
+                    },
+                    window,
+                    cx,
+                )
+                .expect("restore draft");
+            assert_eq!(panel.editor.read(cx).value(), "unsynced local\n");
+            assert!(panel.dirty);
+            assert_eq!(
+                panel
+                    .shared_conflict
+                    .as_ref()
+                    .map(|snapshot| snapshot.revision),
+                Some(2)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn guest_editor_keeps_local_text_on_stale_revision(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::SharedBufferSnapshot;
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                "session".into(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 1,
+                    content: "base\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .editor
+                .update(cx, |editor, cx| editor.set_value("local\n", window, cx));
+            panel.apply_shared_snapshot(
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 2,
+                    content: "remote\n".into(),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(panel.editor.read(cx).value(), "local\n");
+            assert_eq!(
+                panel
+                    .shared_conflict
+                    .as_ref()
+                    .map(|snapshot| snapshot.revision),
+                Some(2)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn guest_editor_retains_unsynced_text_after_role_loss(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::SharedBufferSnapshot;
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                "session".into(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 1,
+                    content: "base\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .editor
+                .update(cx, |editor, cx| editor.set_value("unsynced\n", window, cx));
+            panel.set_shared_editable(false, cx);
+            panel.apply_shared_snapshot(
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 2,
+                    content: "remote\n".into(),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(panel.editor.read(cx).value(), "unsynced\n");
+            assert!(panel.dirty);
+            assert!(panel.shared_conflict.is_some());
+            assert!(!panel.shared_editable);
+            panel.set_shared_editable(true, cx);
+            assert_eq!(panel.editor.read(cx).value(), "unsynced\n");
+            assert!(panel.shared_conflict.is_some());
+            assert!(panel.status.contains("conflict"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn two_editor_windows_converge_after_a_guest_edit(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{
+            AheadNotification, AheadRequest, SharedBufferEditResult,
+            SharedBufferSnapshot,
+        };
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        cx.update(gpui_kit::component::init);
+        let host_workspace = tempfile::tempdir().expect("host workspace");
+        let guest_workspace = tempfile::tempdir().expect("guest workspace");
+        let host_path = host_workspace.path().join("shared.rs");
+        std::fs::write(&host_path, "original\n").expect("host file");
+        let host_proxy = crate::proxy_client::ProxyClient::new_for_test(
+            host_workspace.path().to_owned(),
+        );
+        let guest_proxy = crate::proxy_client::ProxyClient::new_for_test(
+            guest_workspace.path().to_owned(),
+        );
+        let (host_panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(host_path.to_str().expect("host path"), window, cx)
+                .with_proxy(
+                    host_proxy.clone(),
+                    host_workspace.path().to_str().expect("workspace"),
+                    window,
+                    cx,
+                )
+        });
+        let (guest_panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                "session".into(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 1,
+                    content: "original\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+            .with_proxy(
+                guest_proxy.clone(),
+                guest_workspace.path().to_str().expect("workspace"),
+                window,
+                cx,
+            )
+        });
+        let guest_rpc = guest_proxy.rpc_for_test();
+        let responder = std::thread::spawn(move || {
+            while let Ok(message) = guest_rpc
+                .rx()
+                .recv_timeout(std::time::Duration::from_secs(5))
+            {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::AheadRequest {
+                        request:
+                            AheadRequest::ReplaceSharedBuffer {
+                                session_id,
+                                path,
+                                expected_revision,
+                                content,
+                            },
+                    },
+                ) = message
+                {
+                    assert_eq!(session_id, "session");
+                    assert_eq!(path, "shared.rs");
+                    assert_eq!(expected_revision, 1);
+                    assert_eq!(content, "guest edit\n");
+                    let snapshot = SharedBufferSnapshot {
+                        path,
+                        revision: 2,
+                        content,
+                    };
+                    guest_rpc.handle_response(
+                        id,
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::to_value(SharedBufferEditResult {
+                                applied: true,
+                                snapshot: snapshot.clone(),
+                            })
+                            .expect("edit response"),
+                        }),
+                    );
+                    return (session_id, snapshot);
+                }
+            }
+            panic!("guest edit was not sent");
+        });
+        guest_panel.update_in(cx, |panel, window, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.replace_all("guest edit\n", window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        let (session_id, snapshot) =
+            responder.join().expect("shared edit responder");
+        host_proxy.route_ahead(AheadNotification::SharedBufferChanged {
+            session_id,
+            snapshot,
+            previous_content: "original\n".into(),
+        });
+        cx.run_until_parked();
+        host_panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value(), "guest edit\n");
+            assert!(panel.host_shared_recovery_pending);
+        });
+        guest_panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value(), "guest edit\n");
+            assert!(!panel.dirty);
+            assert_eq!(panel.shared_revision, Some(2));
+        });
+        assert_eq!(
+            std::fs::read_to_string(host_path).expect("host disk"),
+            "original\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn guest_editor_sends_revision_checked_live_edit(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{
+            AheadRequest, SharedBufferEditResult, SharedBufferSnapshot,
+        };
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                "session".into(),
+                SharedBufferSnapshot {
+                    path: "shared.rs".into(),
+                    revision: 1,
+                    content: "base\n".into(),
+                },
+                true,
+                window,
+                cx,
+            )
+            .with_proxy(
+                proxy.clone(),
+                directory.path().to_str().expect("workspace"),
+                window,
+                cx,
+            )
+        });
+        let responder = std::thread::spawn(move || {
+            while let Ok(message) =
+                rpc.rx().recv_timeout(std::time::Duration::from_secs(5))
+            {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::AheadRequest {
+                        request:
+                            AheadRequest::ReplaceSharedBuffer {
+                                session_id,
+                                path,
+                                expected_revision,
+                                content,
+                            },
+                    },
+                ) = message
+                {
+                    assert_eq!(
+                        (
+                            session_id.as_str(),
+                            path.as_str(),
+                            expected_revision,
+                            content.as_str()
+                        ),
+                        ("session", "shared.rs", 1, "edited\n")
+                    );
+                    rpc.handle_response(
+                        id,
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::to_value(SharedBufferEditResult {
+                                applied: true,
+                                snapshot: SharedBufferSnapshot {
+                                    path,
+                                    revision: 2,
+                                    content,
+                                },
+                            })
+                            .expect("response"),
+                        }),
+                    );
+                    return;
+                }
+            }
+            panic!("guest edit request was not sent");
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .editor
+                .update(cx, |editor, cx| editor.replace_all("edited\n", window, cx));
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        responder.join().expect("responder");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.shared_revision, Some(2));
+            assert!(!panel.dirty);
+            assert_eq!(panel.editor.read(cx).value(), "edited\n");
+        });
+    }
 
     #[test]
     fn file_open_accepts_utf8_and_preserves_read_failures() {
@@ -3656,6 +5000,7 @@ mod tests {
             CodePanel::new(binary.to_str().expect("path"), window, cx).with_proxy(
                 proxy.clone(),
                 directory.path().to_str().expect("workspace"),
+                window,
                 cx,
             )
         });
@@ -4032,12 +5377,27 @@ mod tests {
             std::fs::write(&path, source).expect("write source");
             let path = path.to_str().expect("source path");
             assert_eq!(editor_language(path), language);
-            if matches!(language, "rust" | "json") {
+            if language != "text" {
+                let registry =
+                    gpui_kit::component::highlighter::LanguageRegistry::singleton();
                 assert!(
-                    gpui_kit::component::highlighter::LanguageRegistry::singleton()
+                    registry
                         .language(language)
                         .expect("registered language")
                         .has_grammar()
+                );
+                let mut highlighter =
+                    gpui_kit::component::highlighter::SyntaxHighlighter::new(
+                        language,
+                    );
+                assert!(highlighter.update(None, &ropey::Rope::from(source), None));
+                let tree = highlighter.tree().expect("parsed syntax tree");
+                assert!(!tree.root_node().has_error(), "{name} did not parse");
+                let theme =
+                    gpui_kit::component::highlighter::HighlightTheme::default_dark();
+                assert!(
+                    highlighter.styles(&(0..source.len()), &*theme).len() > 1,
+                    "{name} has no syntax highlight captures"
                 );
             }
             panel.update_in(cx, |panel, window, cx| {
@@ -4146,6 +5506,83 @@ mod tests {
             !panel.update(cx, |panel, _| panel.suppress_completion_for_next_edit)
         );
         std::fs::remove_file(path).expect("remove test source");
+    }
+
+    #[gpui_kit::test]
+    async fn confirmed_discard_waits_for_shared_recovery_cleanup(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::ahead::AheadRequest;
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.rs");
+        std::fs::write(&path, "saved\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx).with_proxy(
+                proxy.clone(),
+                directory.path().to_str().expect("workspace"),
+                window,
+                cx,
+            )
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.host_shared_recovery_pending = true;
+            panel.editor.update(cx, |editor, cx| {
+                editor.replace_all("discard me\n", window, cx)
+            });
+        });
+        let expected_path = path.clone();
+        let responder = std::thread::spawn(move || {
+            let mut attempts = 0;
+            while let Ok(message) =
+                rpc.rx().recv_timeout(std::time::Duration::from_secs(5))
+            {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::AheadRequest {
+                        request: AheadRequest::DiscardSharedRemoteRecovery { path },
+                    },
+                ) = message
+                {
+                    assert_eq!(path, expected_path);
+                    attempts += 1;
+                    let result = if attempts == 1 {
+                        Err(ahead_rpc::RpcError {
+                            code: 0,
+                            message: "recovery store unavailable".into(),
+                        })
+                    } else {
+                        Ok(ProxyResponse::AheadResponse {
+                            response: serde_json::json!({ "discarded": true }),
+                        })
+                    };
+                    rpc.handle_response(id, result);
+                    if attempts == 2 {
+                        return;
+                    }
+                }
+            }
+            panic!("discard recovery requests were not sent");
+        });
+        let rejected =
+            panel.update_in(cx, |panel, window, cx| panel.prepare_close(window, cx));
+        cx.simulate_prompt_answer("Discard Changes");
+        assert!(rejected.await.is_none());
+        assert!(panel.update(cx, |panel, _| {
+            panel.status.contains("recovery store unavailable")
+        }));
+        let accepted =
+            panel.update_in(cx, |panel, window, cx| panel.prepare_close(window, cx));
+        cx.simulate_prompt_answer("Discard Changes");
+        assert!(accepted.await.is_some());
+        assert!(!panel.update(cx, |panel, _| panel.host_shared_recovery_pending));
+        responder.join().expect("discard responder");
+        assert_eq!(std::fs::read_to_string(path).expect("disk"), "saved\n");
     }
 
     #[gpui_kit::test]
@@ -4620,6 +6057,63 @@ mod tests {
     }
 
     #[gpui_kit::test(iterations = 10)]
+    fn git_metadata_waits_for_typing_to_settle(cx: &mut gpui_kit::TestAppContext) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "original\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy);
+            panel.workspace = directory.path().to_string_lossy().into_owned();
+            panel.refresh_git_metadata(cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let editor = panel.update(cx, |panel, _| panel.editor.clone());
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_all("latest\n", window, cx);
+        });
+        panel.update(cx, |panel, cx| panel.refresh_git_metadata(cx));
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(
+            !rpc.rx().try_iter().any(|message| matches!(
+                message,
+                ProxyRpc::Request(_, ProxyRequest::GitFileState { .. })
+            )),
+            "typing should postpone the Git request"
+        );
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        let request_content = rpc.rx().try_iter().find_map(|message| {
+            if let ProxyRpc::Request(_, ProxyRequest::GitFileState { content, .. }) =
+                message
+            {
+                Some(content)
+            } else {
+                None
+            }
+        });
+        assert_eq!(request_content.as_deref(), Some("latest\n"));
+    }
+
+    #[gpui_kit::test(iterations = 10)]
     fn git_metadata_coalesces_requests_and_rejects_stale_or_closed_replies(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -4811,9 +6305,7 @@ mod tests {
         let breakpoint = cx
             .debug_bounds("breakpoint-target-1")
             .expect("breakpoint target");
-        assert!(
-            breakpoint.origin.x >= change.origin.x + change.size.width
-        );
+        assert!(breakpoint.origin.x >= change.origin.x + change.size.width);
         cx.simulate_click(change.center(), Default::default());
         assert!(proxy.breakpoints_for(&path).is_empty());
         assert_eq!(

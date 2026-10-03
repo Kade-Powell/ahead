@@ -47,6 +47,45 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn opened_rollout_reader_keeps_the_original_plain_or_compressed_file() -> anyhow::Result<()> {
+    for compressed in [false, true] {
+        let home = TempDir::new()?;
+        let original_id = ThreadId::from_string(&Uuid::from_u128(31).to_string())?;
+        let replacement_id = ThreadId::from_string(&Uuid::from_u128(32).to_string())?;
+        let plain_path = rollout_path(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(31));
+        write_rollout(&plain_path, original_id, "original")?;
+        if compressed {
+            compress_now(&plain_path)?;
+        }
+        let file_path = if compressed {
+            compressed_rollout_path(&plain_path)
+        } else {
+            plain_path.clone()
+        };
+        let opened = fs::File::open(&file_path)?;
+        fs::remove_file(&file_path)?;
+        write_rollout(&plain_path, replacement_id, "replacement")?;
+        if compressed {
+            compress_now(&plain_path)?;
+        }
+
+        let (items, thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items_from_file_with_limits(
+                opened,
+                &file_path,
+                64 * 1024,
+                10,
+            )
+            .await?;
+        assert_eq!(thread_id, Some(original_id));
+        assert_eq!(items.len(), 2);
+        assert_eq!(parse_errors, 0);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn bounded_rollout_loader_limits_decompressed_compressed_data() -> anyhow::Result<()> {
     let home = TempDir::new()?;

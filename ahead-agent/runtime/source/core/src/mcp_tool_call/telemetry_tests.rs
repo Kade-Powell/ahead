@@ -16,19 +16,11 @@ fn metric_call_tool_result(
 #[test]
 fn mcp_call_metric_tags_include_server_name() {
     assert_eq!(
-        mcp_call_metric_tags(
-            "error",
-            "docs server",
-            "search docs",
-            Some("connector/docs"),
-            Some("Docs connector"),
-        ),
+        mcp_call_metric_tags("error", "docs server", "search docs"),
         vec![
             ("status", "error".to_string()),
             ("server", "docs_server".to_string()),
             ("tool", "search_docs".to_string()),
-            ("connector_id", "connector/docs".to_string()),
-            ("connector_name", "Docs_connector".to_string()),
         ],
     );
 }
@@ -79,32 +71,6 @@ fn mcp_call_metric_outcome_reports_server_tool_error_codes() {
             status: "error",
             error_type: Some(MCP_CALL_ERROR_TYPE_TOOL_RESULT),
             error_code: Some("arbitrary-user-value".to_string()),
-        }
-    );
-}
-
-#[test]
-fn mcp_call_metric_outcome_reads_auth_error_code_from_meta() {
-    let result = CallToolResult {
-        content: Vec::new(),
-        structured_content: None,
-        is_error: Some(true),
-        meta: Some(serde_json::json!({
-            MCP_TOOL_CODEX_APPS_META_KEY: {
-                "connector_auth_failure": {
-                    "is_auth_failure": true,
-                    "error_code": "UNAUTHORIZED",
-                },
-            },
-        })),
-    };
-
-    assert_eq!(
-        mcp_call_metric_outcome(&Ok(result)),
-        McpCallMetricOutcome {
-            status: "error",
-            error_type: Some(MCP_CALL_ERROR_TYPE_TOOL_RESULT),
-            error_code: Some("UNAUTHORIZED".to_string()),
         }
     );
 }

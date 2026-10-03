@@ -14,7 +14,6 @@ use crate::session::turn_context::TurnContext;
 pub(crate) use approval_request::ApprovalRequest;
 pub(crate) use approval_request::McpToolAnnotations;
 pub(crate) use approval_request::NetworkAccessTrigger;
-pub(crate) const UNSUPPORTED_GUARDIAN_SOURCE: &str = "guardian";
 const AHEAD_MAX_APPROVAL_ACTION_STRING_TOKENS: usize = 16_000;
 
 /// Captures approval policy and environments without retaining step-scoped MCP bindings or tools.

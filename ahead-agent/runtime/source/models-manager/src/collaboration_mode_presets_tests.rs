@@ -23,7 +23,7 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
 
     assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
 
-    let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
+    let known_mode_names = format_mode_names(&SUPPORTED_COLLABORATION_MODES);
     let expected_snippet = format!("Known mode names are {known_mode_names}.");
     assert!(default_instructions.contains(&expected_snippet));
 

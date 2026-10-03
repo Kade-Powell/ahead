@@ -65,9 +65,6 @@ async fn test_step(
             format!("{label} catalog"),
             Arc::new(JsonObject::default()),
         ),
-        openai_file_input_optional_fields: Default::default(),
-        connector_id: None,
-        connector_name: None,
     };
     let client = Arc::new(
         RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))

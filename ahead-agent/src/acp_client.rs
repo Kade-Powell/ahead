@@ -7,7 +7,7 @@
 //! - performs the `initialize` → `session/new|load` → `session/prompt`
 //!   handshake,
 //! - streams `session/update` notifications to the durable session and UI,
-//! - answers `session/request_permission` from the current Learn/Assist mode,
+//! - presents `session/request_permission` for human review in Assist mode,
 //! - cancels an in-flight turn with `session/cancel`.
 //!
 //! Wire format: newline-delimited JSON-RPC 2.0 on stdio. The reader thread
@@ -21,13 +21,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::File,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -50,6 +51,10 @@ use crate::editor_tools::{
 pub const ACP_PROTOCOL_VERSION: u32 = 1;
 
 const MAX_EDITOR_MCP_MESSAGE_BYTES: usize = 1_048_576;
+const MAX_EDITOR_MCP_RESPONSE_BYTES: usize = 2_097_152;
+const MAX_EDITOR_MCP_QUEUED_EVENTS: usize = 32;
+// Tool calls can fill their own quota; leave sockets for cancellation.
+const MAX_EDITOR_MCP_BRIDGE_WORKERS: usize = MAX_PENDING_STDIO_TOOL_CALLS + 4;
 
 const MCP_LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -208,6 +213,10 @@ pub enum HarnessEvent {
         is_blocking: bool,
         questions: Vec<HarnessUserInputQuestion>,
     },
+    UserInputCancelled {
+        acp_session_id: String,
+        request_id: String,
+    },
     BufferSnapshotsRequested {
         acp_session_id: String,
         request_id: String,
@@ -245,6 +254,7 @@ pub struct HarnessPlanEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessUserInputOption {
+    pub value: String,
     pub label: String,
     pub description: String,
 }
@@ -254,7 +264,9 @@ pub struct HarnessUserInputQuestion {
     pub id: String,
     pub header: String,
     pub question: String,
+    pub external_url: Option<String>,
     pub options: Vec<HarnessUserInputOption>,
+    pub default_answers: Vec<String>,
     pub allows_other: bool,
     pub is_secret: bool,
 }
@@ -278,6 +290,9 @@ struct ReaderState {
     pending: PendingMap,
     sink: HarnessSink,
     policy_modes: Arc<Mutex<HashMap<String, String>>>,
+    cancelled_sessions: Arc<Mutex<HashSet<String>>>,
+    active_prompt_sessions: Arc<Mutex<HashSet<String>>>,
+    pending_acp_permissions: PendingAcpPermissions,
     config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
     editor_mcp_state: Arc<Mutex<AcpEditorMcpState>>,
     pending_editor_buffer_snapshots: PendingEditorBufferSnapshots,
@@ -293,6 +308,7 @@ pub struct HarnessClientConfig {
     pub cwd: PathBuf,
     pub default_config_options: HashMap<String, AgentConfigOptionValue>,
     pub default_config_options_path: Option<PathBuf>,
+    pub(crate) generation_lease: Option<Arc<File>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -322,6 +338,8 @@ const MAX_CANCELLED_EDITOR_REQUESTS: usize = 128;
 const CANCELLED_EDITOR_REQUEST_TTL: Duration = Duration::from_secs(30);
 // Bound worker threads when an ACP peer issues many slow editor calls.
 const MAX_PENDING_STDIO_TOOL_CALLS: usize = 16;
+const MAX_PENDING_ACP_PERMISSIONS: usize = 16;
+const MAX_ACP_PERMISSION_OPTIONS: usize = 16;
 
 enum EditorMcpStdioEvent {
     InputLine(String),
@@ -347,6 +365,14 @@ type PendingEditorBufferSnapshots = Arc<
         >,
     >,
 >;
+
+struct PendingAcpPermission {
+    rpc_id: Value,
+    choices: Vec<(String, String)>,
+}
+
+type PendingAcpPermissions =
+    Arc<Mutex<HashMap<(String, String), PendingAcpPermission>>>;
 
 fn register_editor_request(
     editor_mcp_state: &Arc<Mutex<AcpEditorMcpState>>,
@@ -426,6 +452,7 @@ impl HarnessClientConfig {
             cwd,
             default_config_options: HashMap::new(),
             default_config_options_path: None,
+            generation_lease: None,
         }
     }
 
@@ -437,6 +464,7 @@ impl HarnessClientConfig {
             cwd,
             default_config_options: HashMap::new(),
             default_config_options_path: None,
+            generation_lease: None,
         }
     }
 }
@@ -445,6 +473,7 @@ impl HarnessClientConfig {
 /// mutation is behind a mutex and the reader runs on its own thread.
 pub struct HarnessClient {
     child: Mutex<Child>,
+    _generation_lease: Option<Arc<File>>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -453,6 +482,7 @@ pub struct HarnessClient {
     /// requests. This must stay separate from agent-advertised ACP modes,
     /// which may represent unrelated settings such as reasoning effort.
     policy_modes: Arc<Mutex<HashMap<String, String>>>,
+    pending_acp_permissions: PendingAcpPermissions,
     config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
     default_config_options: Mutex<HashMap<String, AgentConfigOptionValue>>,
     default_config_options_path: Option<PathBuf>,
@@ -469,8 +499,9 @@ pub struct HarnessClient {
     /// In-flight prompt request id per ACP session. Cancellation removes the
     /// correlated response waiter so the controller settles immediately.
     prompt_requests: Mutex<HashMap<String, u64>>,
+    active_prompt_sessions: Arc<Mutex<HashSet<String>>>,
     /// Covers cancellation that races before the prompt request is registered.
-    cancelled_sessions: Mutex<HashSet<String>>,
+    cancelled_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl HarnessClient {
@@ -553,15 +584,20 @@ impl HarnessClient {
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let policy_modes = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled_sessions = Arc::new(Mutex::new(HashSet::new()));
+        let active_prompt_sessions = Arc::new(Mutex::new(HashSet::new()));
+        let pending_acp_permissions = Arc::new(Mutex::new(HashMap::new()));
         let config_options = Arc::new(Mutex::new(HashMap::new()));
 
         let harness = Self {
             child: Mutex::new(child),
+            _generation_lease: config.generation_lease.clone(),
             stdin: stdin.clone(),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
             policy_modes: policy_modes.clone(),
+            pending_acp_permissions: pending_acp_permissions.clone(),
             config_options: config_options.clone(),
             default_config_options: Mutex::new(
                 config.default_config_options.clone(),
@@ -577,7 +613,8 @@ impl HarnessClient {
             agent_modes: Mutex::new(HashMap::new()),
             session_capabilities: Mutex::new(AcpSessionCapabilities::default()),
             prompt_requests: Mutex::new(HashMap::new()),
-            cancelled_sessions: Mutex::new(HashSet::new()),
+            active_prompt_sessions: active_prompt_sessions.clone(),
+            cancelled_sessions: cancelled_sessions.clone(),
         };
 
         Self::start_reader(
@@ -587,6 +624,9 @@ impl HarnessClient {
                 pending,
                 sink,
                 policy_modes,
+                cancelled_sessions,
+                active_prompt_sessions,
+                pending_acp_permissions,
                 config_options,
                 editor_mcp_state: harness.editor_mcp_state.clone(),
                 pending_editor_buffer_snapshots: harness
@@ -620,6 +660,17 @@ impl HarnessClient {
                     )));
                 }
             }
+            if let Ok(mut pending) = state.pending_acp_permissions.lock() {
+                let abandoned =
+                    pending.drain().map(|(key, _)| key).collect::<Vec<_>>();
+                drop(pending);
+                for (session_id, request_id) in abandoned {
+                    (state.sink)(HarnessEvent::UserInputCancelled {
+                        acp_session_id: session_id,
+                        request_id,
+                    });
+                }
+            }
         });
     }
 
@@ -629,6 +680,9 @@ impl HarnessClient {
             pending,
             sink,
             policy_modes,
+            cancelled_sessions,
+            active_prompt_sessions,
+            pending_acp_permissions,
             config_options,
             editor_mcp_state,
             pending_editor_buffer_snapshots,
@@ -894,35 +948,55 @@ impl HarnessClient {
                 }
             }
             Some("session/request_permission") => {
-                // Permission is governed by the current mode for this session.
+                let Some(id) = id else { return };
                 let session_id = msg
                     .get("params")
                     .and_then(|p| p.get("sessionId"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let mode = policy_modes
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&session_id).cloned())
-                    .unwrap_or_default();
-                let options = msg
-                    .get("params")
-                    .and_then(|p| p.get("options"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let response = Self::permission_response(&mode, &options);
-                if let Some(id) = id {
-                    if let Err(error) = write_json(
-                        stdin,
-                        &json!({ "jsonrpc": "2.0", "id": id, "result": response }),
-                    ) {
-                        tracing::warn!(
-                            %error,
-                            "failed to answer ACP permission request"
-                        );
+                let request_id = format!("acp_permission_{}", uuid::Uuid::new_v4());
+                let question = msg.get("params").and_then(|params| {
+                    Self::permission_question(params, &request_id)
+                });
+                let queued = (|| {
+                    let modes = policy_modes.lock().ok()?;
+                    let cancelled = cancelled_sessions.lock().ok()?;
+                    let active = active_prompt_sessions.lock().ok()?;
+                    let mut pending = pending_acp_permissions.lock().ok()?;
+                    let (choices, _) = question.as_ref()?;
+                    if !matches!(
+                        modes.get(&session_id).map(String::as_str),
+                        Some("agent" | "assist")
+                    ) || cancelled.contains(&session_id)
+                        || !active.contains(&session_id)
+                        || pending.len() >= MAX_PENDING_ACP_PERMISSIONS
+                    {
+                        return None;
                     }
+                    pending.insert(
+                        (session_id.clone(), request_id.clone()),
+                        PendingAcpPermission {
+                            rpc_id: id.clone(),
+                            choices: choices.clone(),
+                        },
+                    );
+                    Some(true)
+                })()
+                .unwrap_or(false);
+                if queued {
+                    if let Some((_, question)) = question {
+                        sink(HarnessEvent::UserInputRequested {
+                            acp_session_id: session_id,
+                            request_id,
+                            is_blocking: true,
+                            questions: vec![question],
+                        });
+                    }
+                } else if let Err(error) =
+                    write_json(stdin, &Self::cancelled_permission_response(id))
+                {
+                    tracing::warn!(%error, "failed to decline ACP permission request");
                 }
             }
             Some(other) => {
@@ -1099,29 +1173,81 @@ impl HarnessClient {
         }
     }
 
-    /// Unknown and read-only sessions decline. Assistance accepts the first
-    /// allow-style option; otherwise the request is cancelled.
-    fn permission_response(mode: &str, options: &[Value]) -> Value {
-        if !matches!(mode, "agent" | "assist") {
-            return json!({ "outcome": { "outcome": "cancelled" } });
+    fn cancelled_permission_response(id: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {
+            "outcome": { "outcome": "cancelled" }
+        } })
+    }
+
+    fn permission_question(
+        params: &Value,
+        request_id: &str,
+    ) -> Option<(Vec<(String, String)>, HarnessUserInputQuestion)> {
+        let options = params.get("options")?.as_array()?;
+        if options.is_empty() || options.len() > MAX_ACP_PERMISSION_OPTIONS {
+            return None;
         }
-        let allow = options.iter().find(|o| {
-            let kind = o.get("kind").and_then(Value::as_str).unwrap_or_default();
-            kind.starts_with("allow")
-        });
-        match allow {
-            Some(option) => {
-                let option_id =
-                    option.get("optionId").cloned().unwrap_or(Value::Null);
-                json!({
-                    "outcome": {
-                        "outcome": "selected",
-                        "optionId": option_id,
-                    }
-                })
+        let mut seen_ids = HashSet::new();
+        let mut choices = Vec::with_capacity(options.len());
+        let mut displayed = Vec::with_capacity(options.len());
+        for (index, option) in options.iter().enumerate() {
+            let option_id = option.get("optionId")?.as_str()?;
+            let name = option.get("name")?.as_str()?.trim();
+            let kind = option.get("kind")?.as_str()?;
+            let description = match kind {
+                "allow_once" => "Allow this request once",
+                "allow_always" => {
+                    "Allow and remember this choice in the external agent"
+                }
+                "reject_once" => "Reject this request once",
+                "reject_always" => {
+                    "Reject and remember this choice in the external agent"
+                }
+                _ => return None,
+            };
+            if option_id.trim().is_empty()
+                || option_id.len() > 200
+                || name.is_empty()
+                || !seen_ids.insert(option_id)
+            {
+                return None;
             }
-            None => json!({ "outcome": { "outcome": "cancelled" } }),
+            let label = format!(
+                "{} · {}",
+                name.chars().take(80).collect::<String>(),
+                index + 1
+            );
+            choices.push((label.clone(), option_id.to_string()));
+            displayed.push(HarnessUserInputOption {
+                value: label.clone(),
+                label,
+                description: description.to_string(),
+            });
         }
+        let tool_call = params.get("toolCall")?;
+        let title = tool_call
+            .get("title")
+            .and_then(Value::as_str)
+            .or_else(|| tool_call.get("toolCallId").and_then(Value::as_str))?;
+        let details = tool_call.to_string();
+        if title.is_empty() || title.chars().count() > 200 || details.len() > 2000 {
+            return None;
+        }
+        Some((
+            choices,
+            HarnessUserInputQuestion {
+                id: request_id.to_string(),
+                header: "External agent permission".to_string(),
+                question: format!(
+                    "Approve {title}? Tool details: {details}. External agents may perform other actions without asking AHEAD."
+                ),
+                external_url: None,
+                options: displayed,
+                default_answers: Vec::new(),
+                allows_other: false,
+                is_secret: false,
+            },
+        ))
     }
 
     fn write_line(&self, value: &Value) -> Result<()> {
@@ -1428,6 +1554,28 @@ impl HarnessClient {
         {
             return Err(anyhow!("ACP prompt cancelled before it started"));
         }
+        if !self
+            .active_prompt_sessions
+            .lock()
+            .map_err(|error| anyhow!("active ACP prompts lock: {error}"))?
+            .insert(acp_session_id.to_string())
+        {
+            bail!("ACP session already has an active prompt");
+        }
+        let result = self.prompt_active(acp_session_id, text);
+        self.active_prompt_sessions
+            .lock()
+            .map_err(|error| anyhow!("active ACP prompts lock: {error}"))?
+            .remove(acp_session_id);
+        self.cancel_acp_permissions(acp_session_id)?;
+        self.cancelled_sessions
+            .lock()
+            .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?
+            .remove(acp_session_id);
+        result
+    }
+
+    fn prompt_active(&self, acp_session_id: &str, text: &str) -> Result<String> {
         let (request_id, receiver) = self.send_request(
             "session/prompt",
             json!({
@@ -1443,7 +1591,7 @@ impl HarnessClient {
             .cancelled_sessions
             .lock()
             .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?
-            .remove(acp_session_id)
+            .contains(acp_session_id)
         {
             if let Some(sender) = self
                 .pending
@@ -1463,10 +1611,6 @@ impl HarnessClient {
             .lock()
             .map_err(|error| anyhow!("prompt request lock: {error}"))?
             .remove(acp_session_id);
-        self.cancelled_sessions
-            .lock()
-            .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?
-            .remove(acp_session_id);
         if result.is_err() {
             self.pending
                 .lock()
@@ -1481,12 +1625,111 @@ impl HarnessClient {
             .to_string())
     }
 
+    pub fn answer_user_input(
+        &self,
+        acp_session_id: &str,
+        request_id: &str,
+        answers: HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        let key = (acp_session_id.to_string(), request_id.to_string());
+        let (request, option_id, cancelled) = {
+            let modes = self
+                .policy_modes
+                .lock()
+                .map_err(|error| anyhow!("ACP policy mode lock: {error}"))?;
+            let cancelled_sessions = self
+                .cancelled_sessions
+                .lock()
+                .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?;
+            let active_sessions = self
+                .active_prompt_sessions
+                .lock()
+                .map_err(|error| anyhow!("active ACP prompts lock: {error}"))?;
+            let mut pending = self
+                .pending_acp_permissions
+                .lock()
+                .map_err(|error| anyhow!("ACP permission lock: {error}"))?;
+            let request = pending
+                .get(&key)
+                .context("ACP permission request is no longer pending")?;
+            let answer = answers
+                .get(request_id)
+                .filter(|answers| answers.len() == 1)
+                .and_then(|answers| answers.first())
+                .context("Select exactly one ACP permission option")?;
+            let option_id = request
+                .choices
+                .iter()
+                .find(|(label, _)| label == answer)
+                .map(|(_, option_id)| option_id.clone())
+                .context("ACP permission option is no longer available")?;
+            let cancelled = cancelled_sessions.contains(acp_session_id)
+                || !active_sessions.contains(acp_session_id)
+                || !matches!(
+                    modes.get(acp_session_id).map(String::as_str),
+                    Some("agent" | "assist")
+                );
+            let request = pending
+                .remove(&key)
+                .context("ACP permission request disappeared")?;
+            (request, option_id, cancelled)
+        };
+        let outcome = if cancelled {
+            json!({ "outcome": { "outcome": "cancelled" } })
+        } else {
+            json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+        };
+        self.write_line(&json!({
+            "jsonrpc": "2.0", "id": request.rpc_id, "result": outcome
+        }))?;
+        if cancelled {
+            (self.sink)(HarnessEvent::UserInputCancelled {
+                acp_session_id: acp_session_id.to_string(),
+                request_id: request_id.to_string(),
+            });
+            bail!("ACP turn was cancelled before permission was answered");
+        }
+        Ok(())
+    }
+
+    fn cancel_acp_permissions(&self, acp_session_id: &str) -> Result<()> {
+        let cancelled_permissions = {
+            let mut pending = self
+                .pending_acp_permissions
+                .lock()
+                .map_err(|error| anyhow!("ACP permission lock: {error}"))?;
+            let keys = pending
+                .keys()
+                .filter(|(session_id, _)| session_id == acp_session_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| {
+                    pending.remove(&key).map(|request| (key.1, request.rpc_id))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (request_id, rpc_id) in cancelled_permissions {
+            if let Err(error) =
+                self.write_line(&Self::cancelled_permission_response(rpc_id))
+            {
+                tracing::warn!(%error, "failed to cancel ACP permission request");
+            }
+            (self.sink)(HarnessEvent::UserInputCancelled {
+                acp_session_id: acp_session_id.to_string(),
+                request_id,
+            });
+        }
+        Ok(())
+    }
+
     /// Requests cancellation of the in-flight turn (ACP notification).
     pub fn cancel(&self, acp_session_id: &str) -> Result<()> {
         self.cancelled_sessions
             .lock()
             .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?
             .insert(acp_session_id.to_string());
+        self.cancel_acp_permissions(acp_session_id)?;
         let notify_result =
             self.notify("session/cancel", json!({ "sessionId": acp_session_id }));
         let request_id = self
@@ -1603,6 +1846,9 @@ impl HarnessClient {
     ) -> Result<()> {
         if let Ok(mut policy_modes) = self.policy_modes.lock() {
             policy_modes.insert(acp_session_id.to_string(), mode_id.to_string());
+        }
+        if !matches!(mode_id, "agent" | "assist") {
+            self.cancel_acp_permissions(acp_session_id)?;
         }
         let mode_is_advertised = self
             .agent_modes
@@ -1796,6 +2042,16 @@ impl HarnessClient {
         if let Ok(mut pending) = self.pending.lock() {
             for (_, sender) in pending.drain() {
                 drop(sender.send(Err("ACP agent shut down by AHEAD".into())));
+            }
+        }
+        if let Ok(mut pending) = self.pending_acp_permissions.lock() {
+            let abandoned = pending.drain().map(|(key, _)| key).collect::<Vec<_>>();
+            drop(pending);
+            for (acp_session_id, request_id) in abandoned {
+                (self.sink)(HarnessEvent::UserInputCancelled {
+                    acp_session_id,
+                    request_id,
+                });
             }
         }
         if let Ok(mut pending) = self.pending_editor_buffer_snapshots.lock() {
@@ -2149,26 +2405,41 @@ fn start_editor_mcp_listener(
     accepting: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
+        let active_workers = Arc::new(AtomicUsize::new(0));
         while accepting.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    let Some(worker_permit) =
+                        EditorMcpWorkerPermit::try_acquire(&active_workers)
+                    else {
+                        tracing::debug!(
+                            "AHEAD editor MCP bridge has too many active connections"
+                        );
+                        continue;
+                    };
                     let editor_mcp_state = editor_mcp_state.clone();
                     let pending_editor_buffer_snapshots =
                         pending_editor_buffer_snapshots.clone();
                     let pending_editor_presentations =
                         pending_editor_presentations.clone();
                     let sink = sink.clone();
-                    thread::spawn(move || {
-                        if let Err(error) = handle_editor_mcp_bridge_connection(
-                            stream,
-                            &editor_mcp_state,
-                            &pending_editor_buffer_snapshots,
-                            &pending_editor_presentations,
-                            &sink,
-                        ) {
-                            tracing::warn!(%error, "AHEAD editor MCP bridge request failed");
-                        }
-                    });
+                    if let Err(error) = thread::Builder::new()
+                        .name("ahead-editor-mcp-bridge".to_string())
+                        .spawn(move || {
+                            let _worker_permit = worker_permit;
+                            if let Err(error) = handle_editor_mcp_bridge_connection(
+                                stream,
+                                &editor_mcp_state,
+                                &pending_editor_buffer_snapshots,
+                                &pending_editor_presentations,
+                                &sink,
+                            ) {
+                                tracing::warn!(%error, "AHEAD editor MCP bridge request failed");
+                            }
+                        })
+                    {
+                        tracing::warn!(%error, "AHEAD editor MCP bridge worker could not start");
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
@@ -2182,6 +2453,25 @@ fn start_editor_mcp_listener(
     });
 }
 
+struct EditorMcpWorkerPermit(Arc<AtomicUsize>);
+
+impl EditorMcpWorkerPermit {
+    fn try_acquire(active_workers: &Arc<AtomicUsize>) -> Option<Self> {
+        active_workers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < MAX_EDITOR_MCP_BRIDGE_WORKERS).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self(active_workers.clone()))
+    }
+}
+
+impl Drop for EditorMcpWorkerPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn handle_editor_mcp_bridge_connection(
     mut stream: TcpStream,
     editor_mcp_state: &Arc<Mutex<AcpEditorMcpState>>,
@@ -2191,10 +2481,14 @@ fn handle_editor_mcp_bridge_connection(
 ) -> Result<()> {
     // macOS inherits the listener's nonblocking mode; this worker uses blocking IO.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut line = String::new();
-    let bytes =
-        read_editor_mcp_line(&mut BufReader::new(stream.try_clone()?), &mut line)?;
+    let bytes = read_editor_mcp_socket_line(
+        &mut stream,
+        &mut line,
+        MAX_EDITOR_MCP_MESSAGE_BYTES,
+        Instant::now() + Duration::from_secs(20),
+    )?;
     anyhow::ensure!(bytes > 0, "AHEAD editor MCP bridge request was empty");
     anyhow::ensure!(
         line.len() <= MAX_EDITOR_MCP_MESSAGE_BYTES,
@@ -2249,6 +2543,14 @@ fn handle_editor_mcp_bridge_connection(
         ),
     };
     let mut response = serde_json::to_vec(&json!({ "result": result }))?;
+    if response.len() > MAX_EDITOR_MCP_RESPONSE_BYTES {
+        response = serde_json::to_vec(&json!({
+            "result": editor_tool_result(
+                false,
+                "AHEAD editor MCP bridge response exceeds 2 MiB".to_string(),
+            )
+        }))?;
+    }
     response.push(b'\n');
     stream.write_all(&response)?;
     stream.flush()?;
@@ -2258,19 +2560,70 @@ fn handle_editor_mcp_bridge_connection(
 fn read_editor_mcp_line(
     reader: &mut impl BufRead,
     line: &mut String,
+    max_bytes: usize,
 ) -> std::io::Result<usize> {
-    reader
-        .take(MAX_EDITOR_MCP_MESSAGE_BYTES as u64 + 1)
-        .read_line(line)
+    reader.take(max_bytes as u64 + 1).read_line(line)
+}
+
+fn read_editor_mcp_socket_line(
+    stream: &mut TcpStream,
+    line: &mut String,
+    max_bytes: usize,
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    read_editor_mcp_line(
+        &mut BufReader::new(EditorMcpDeadlineReader { stream, deadline }),
+        line,
+        max_bytes,
+    )
+}
+
+struct EditorMcpDeadlineReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl Read for EditorMcpDeadlineReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "AHEAD editor MCP frame deadline exceeded",
+                    )
+                })?;
+            self.stream.set_read_timeout(Some(remaining))?;
+            match self.stream.read(buffer) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 fn read_editor_mcp_input(
     reader: &mut impl BufRead,
-    sender: mpsc::Sender<EditorMcpStdioEvent>,
+    sender: mpsc::SyncSender<EditorMcpStdioEvent>,
 ) {
     let mut line = String::new();
     loop {
-        let event = match read_editor_mcp_line(reader, &mut line) {
+        let event = match read_editor_mcp_line(
+            reader,
+            &mut line,
+            MAX_EDITOR_MCP_MESSAGE_BYTES,
+        ) {
             Ok(0) => EditorMcpStdioEvent::InputClosed,
             Ok(_) if line.len() > MAX_EDITOR_MCP_MESSAGE_BYTES => {
                 EditorMcpStdioEvent::InputTooLong
@@ -2297,7 +2650,8 @@ pub fn run_editor_mcp_stdio() -> Result<()> {
     let token = std::env::var("AHEAD_EDITOR_MCP_TOKEN")
         .context("AHEAD editor MCP bridge token is missing")?;
 
-    let (event_sender, event_receiver) = mpsc::channel();
+    let (event_sender, event_receiver) =
+        mpsc::sync_channel(MAX_EDITOR_MCP_QUEUED_EVENTS);
     let reader_sender = event_sender.clone();
     thread::Builder::new()
         .name("ahead-editor-mcp-stdin".to_string())
@@ -2323,7 +2677,7 @@ fn run_editor_mcp_stdio_loop(
     server_id: &str,
     token: &str,
     event_receiver: mpsc::Receiver<EditorMcpStdioEvent>,
-    event_sender: mpsc::Sender<EditorMcpStdioEvent>,
+    event_sender: mpsc::SyncSender<EditorMcpStdioEvent>,
     writer: &mut impl Write,
 ) -> Result<()> {
     let mut legacy_initialized = false;
@@ -2649,6 +3003,7 @@ fn forward_editor_tool_call(
 ) -> Result<Value> {
     let mut stream = TcpStream::connect(address)
         .context("could not connect to the AHEAD editor MCP bridge")?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut request = serde_json::to_vec(&json!({
         "serverId": server_id,
         "token": token,
@@ -2659,7 +3014,17 @@ fn forward_editor_tool_call(
     stream.write_all(&request)?;
     stream.flush()?;
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
+    let bytes = read_editor_mcp_socket_line(
+        &mut stream,
+        &mut response,
+        MAX_EDITOR_MCP_RESPONSE_BYTES,
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    anyhow::ensure!(bytes > 0, "AHEAD editor MCP bridge returned no response");
+    anyhow::ensure!(
+        response.len() <= MAX_EDITOR_MCP_RESPONSE_BYTES,
+        "AHEAD editor MCP bridge response exceeds 2 MiB"
+    );
     let response: Value = serde_json::from_str(&response)
         .context("invalid response from the AHEAD editor MCP bridge")?;
     response
@@ -2677,7 +3042,7 @@ fn forward_editor_tool_cancellation(
     let mut stream = TcpStream::connect(address).context(
         "could not connect to the AHEAD editor MCP bridge for cancellation",
     )?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut request = serde_json::to_vec(&json!({
         "serverId": server_id,
         "token": token,
@@ -2687,10 +3052,19 @@ fn forward_editor_tool_cancellation(
     stream.write_all(&request)?;
     stream.flush()?;
     let mut response = String::new();
-    let bytes = BufReader::new(stream).read_line(&mut response)?;
+    let bytes = read_editor_mcp_socket_line(
+        &mut stream,
+        &mut response,
+        MAX_EDITOR_MCP_RESPONSE_BYTES,
+        Instant::now() + Duration::from_secs(2),
+    )?;
     anyhow::ensure!(
         bytes > 0,
         "AHEAD editor MCP bridge did not confirm cancellation"
+    );
+    anyhow::ensure!(
+        response.len() <= MAX_EDITOR_MCP_RESPONSE_BYTES,
+        "AHEAD editor MCP bridge cancellation response exceeds 2 MiB"
     );
     let response: Value = serde_json::from_str(&response)
         .context("invalid response from the AHEAD editor MCP bridge cancellation")?;
@@ -2711,6 +3085,9 @@ impl Drop for HarnessClient {
                 && let Err(error) = child.kill()
             {
                 tracing::warn!(%error, "failed to stop ACP agent during drop");
+            }
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "failed to reap ACP agent during drop");
             }
         }
     }
@@ -3388,7 +3765,7 @@ mod tests {
         let mut input = vec![b' '; MAX_EDITOR_MCP_MESSAGE_BYTES - 3];
         input.extend_from_slice(b"{}\n");
         input.extend_from_slice("{\"message\":\"héllo\"}\n".as_bytes());
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(MAX_EDITOR_MCP_QUEUED_EVENTS);
         read_editor_mcp_input(&mut std::io::Cursor::new(input), sender);
         assert!(
             matches!(receiver.recv().expect("boundary-sized line"), EditorMcpStdioEvent::InputLine(line)
@@ -3409,7 +3786,8 @@ mod tests {
             let oversized = invalid.len() > MAX_EDITOR_MCP_MESSAGE_BYTES;
             invalid.extend_from_slice(b"\n{\"method\":\"tools/call\"}\n");
             let mut reader = std::io::Cursor::new(invalid);
-            let (sender, receiver) = mpsc::channel();
+            let (sender, receiver) =
+                mpsc::sync_channel(MAX_EDITOR_MCP_QUEUED_EVENTS);
             read_editor_mcp_input(&mut reader, sender);
             if oversized {
                 assert!(matches!(
@@ -3432,6 +3810,44 @@ mod tests {
                 "invalid input must not enqueue its trailing command"
             );
         }
+    }
+
+    #[test]
+    fn editor_mcp_reader_progresses_with_bounded_events() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            read_editor_mcp_input(
+                &mut std::io::Cursor::new(b"first\nsecond\n"),
+                sender,
+            );
+        });
+
+        for expected in ["first\n", "second\n"] {
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)),
+                Ok(EditorMcpStdioEvent::InputLine(line)) if line == expected
+            ));
+        }
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(EditorMcpStdioEvent::InputClosed)
+        ));
+        reader.join().expect("bounded MCP reader should finish");
+    }
+
+    #[test]
+    fn editor_mcp_bridge_worker_slots_are_released() {
+        assert!(MAX_EDITOR_MCP_BRIDGE_WORKERS > MAX_PENDING_STDIO_TOOL_CALLS);
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..MAX_EDITOR_MCP_BRIDGE_WORKERS)
+            .map(|_| {
+                EditorMcpWorkerPermit::try_acquire(&active_workers)
+                    .expect("bridge worker slot")
+            })
+            .collect();
+        assert!(EditorMcpWorkerPermit::try_acquire(&active_workers).is_none());
+        drop(permits);
+        assert!(EditorMcpWorkerPermit::try_acquire(&active_workers).is_some());
     }
 
     #[test]
@@ -3526,6 +3942,62 @@ mod tests {
     }
 
     #[test]
+    fn editor_mcp_socket_deadline_rejects_slow_drip_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bridge");
+        let address = listener.local_addr().expect("bridge address");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect bridge");
+            for _ in 0..8 {
+                stream.write_all(b"x").expect("write fragment");
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let (mut server, _) = listener.accept().expect("accept bridge");
+        let mut line = String::new();
+        let error = read_editor_mcp_socket_line(
+            &mut server,
+            &mut line,
+            MAX_EDITOR_MCP_MESSAGE_BYTES,
+            Instant::now() + Duration::from_millis(90),
+        )
+        .expect_err("drip-fed frame must hit its total deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        client.join().expect("drip client finished");
+    }
+
+    #[test]
+    fn editor_mcp_forwarder_rejects_oversized_response_before_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bridge");
+        let address = listener.local_addr().expect("bridge address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept bridge");
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().expect("clone socket"))
+                .read_line(&mut request)
+                .expect("read request");
+            if let Err(error) =
+                stream.write_all(&vec![b'x'; MAX_EDITOR_MCP_RESPONSE_BYTES + 1])
+            {
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                ));
+            }
+        });
+        let error = forward_editor_tool_call(
+            &address.to_string(),
+            "server",
+            "token",
+            "request",
+            json!({}),
+        )
+        .expect_err("oversized response must be rejected");
+        assert!(error.to_string().contains("exceeds 2 MiB"));
+        server.join().expect("bridge server finished");
+    }
+
+    #[test]
     fn stdio_mcp_loop_reads_cancellation_while_editor_tool_call_is_pending() {
         let workspace = tempfile::tempdir().expect("create workspace");
         std::fs::create_dir_all(workspace.path().join("src"))
@@ -3575,7 +4047,8 @@ mod tests {
             accepting.clone(),
         );
 
-        let (event_sender, event_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) =
+            mpsc::sync_channel(MAX_EDITOR_MCP_QUEUED_EVENTS);
         let loop_event_sender = event_sender.clone();
         let loop_address = address.clone();
         let loop_thread = thread::spawn(move || {
@@ -3715,20 +4188,241 @@ mod tests {
     }
 
     #[test]
-    fn learn_permission_is_declined_and_assist_selects_allow() {
-        let options = vec![
-            json!({ "optionId": "reject", "kind": "reject_once", "name": "Reject" }),
-            json!({ "optionId": "allow", "kind": "allow_once", "name": "Allow" }),
-        ];
-        let learn = HarnessClient::permission_response("read-only", &options);
-        assert_eq!(learn["outcome"]["outcome"], "cancelled");
+    fn acp_permission_requires_a_valid_human_choice() {
+        let params = json!({
+            "toolCall": { "toolCallId": "call-1", "title": "Edit a file" },
+            "options": [
+                { "optionId": "reject", "kind": "reject_once", "name": "Reject" },
+                { "optionId": "allow", "kind": "allow_once", "name": "Allow" }
+            ]
+        });
+        let (choices, question) =
+            HarnessClient::permission_question(&params, "acp_permission_test")
+                .expect("reviewable ACP permission");
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[1].1, "allow");
+        assert_eq!(question.id, "acp_permission_test");
+        assert!(!question.allows_other);
+        let mut spaced_id = params.clone();
+        spaced_id["options"][1]["optionId"] = json!(" allow ");
+        assert_eq!(
+            HarnessClient::permission_question(&spaced_id, "acp_permission_test")
+                .expect("advertised option id is preserved")
+                .0[1]
+                .1,
+            " allow "
+        );
+        assert!(
+            HarnessClient::permission_question(
+                &json!({ "toolCall": params["toolCall"], "options": [
+                { "optionId": "allow", "kind": "allow_once", "name": "Allow" },
+                { "optionId": "allow", "kind": "allow_always", "name": "Always" }
+            ] }),
+                "acp_permission_test"
+            )
+            .is_none()
+        );
+    }
 
-        let assist = HarnessClient::permission_response("agent", &options);
-        assert_eq!(assist["outcome"]["outcome"], "selected");
-        assert_eq!(assist["outcome"]["optionId"], "allow");
-
-        let unknown = HarnessClient::permission_response("", &options);
-        assert_eq!(unknown["outcome"]["outcome"], "cancelled");
+    #[cfg(unix)]
+    #[test]
+    fn acp_permission_waits_for_review_and_cancels_with_the_turn() {
+        for action in ["allow", "cancel", "read_only", "late_cancel", "early_end"] {
+            let mut config = HarnessClientConfig::new("sh", std::env::temp_dir());
+            config
+                .env
+                .insert("AHEAD_PERMISSION_CASE".to_string(), action.to_string());
+            config.args = vec![
+                "-c".into(),
+                r#"
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"PROMPT_SEEN"}}}}'
+if [ "$AHEAD_PERMISSION_CASE" = late_cancel ]; then
+  IFS= read -r line || exit 1
+fi
+printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"edit-1","title":"Edit source","rawInput":{"path":"src/main.rs"}},"options":[{"optionId":"reject","name":"Reject","kind":"reject_once"},{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}'
+if [ "$AHEAD_PERMISSION_CASE" = early_end ]; then
+  printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+fi
+IFS= read -r line || exit 1
+case "$AHEAD_PERMISSION_CASE:$line" in
+  allow:*'"optionId":"allow"'*) result=PASS ;;
+  cancel:*'"outcome":"cancelled"'*) result=PASS ;;
+  read_only:*'"outcome":"cancelled"'*) result=PASS ;;
+  late_cancel:*'"outcome":"cancelled"'*) result=PASS ;;
+  early_end:*'"outcome":"cancelled"'*) result=PASS ;;
+  *) result=FAIL ;;
+esac
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"s1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"$result\"}}}}"
+if [ "$AHEAD_PERMISSION_CASE" != early_end ]; then
+  printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+fi
+"#
+                .into(),
+            ];
+            let (event_tx, event_rx) = mpsc::channel();
+            let client = Arc::new(
+                HarnessClient::spawn_without_editor_mcp(
+                    &config,
+                    Arc::new(move |event| {
+                        event_tx.send(event).expect("capture ACP event");
+                    }),
+                )
+                .expect("spawn ACP permission fixture"),
+            );
+            client.initialize().expect("initialize ACP fixture");
+            let session_id = client
+                .new_session(&config.cwd, "agent", None, None)
+                .expect("create ACP session");
+            let (prompt_tx, prompt_rx) = mpsc::channel();
+            let prompt_client = client.clone();
+            let prompt_session_id = session_id.clone();
+            let prompt = thread::spawn(move || {
+                prompt_tx
+                    .send(prompt_client.prompt(&prompt_session_id, "edit"))
+                    .expect("report ACP prompt outcome");
+            });
+            loop {
+                let event = event_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("ACP peer received prompt");
+                if let HarnessEvent::AgentDelta { text, .. } = event {
+                    assert_eq!(text, "PROMPT_SEEN");
+                    break;
+                }
+            }
+            if action == "late_cancel" {
+                client.cancel(&session_id).expect("cancel ACP turn");
+            } else {
+                let (request_id, allow_label) = loop {
+                    let event = event_rx
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("ACP permission request event");
+                    if let HarnessEvent::UserInputRequested {
+                        request_id,
+                        questions,
+                        ..
+                    } = event
+                    {
+                        let label = questions[0].options[1].label.clone();
+                        break (request_id, label);
+                    }
+                };
+                if action == "early_end" {
+                    loop {
+                        let event = event_rx
+                            .recv_timeout(Duration::from_secs(3))
+                            .expect("ended turn cancels pending ACP review");
+                        if let HarnessEvent::UserInputCancelled {
+                            request_id: cancelled_id,
+                            ..
+                        } = event
+                        {
+                            assert_eq!(cancelled_id, request_id);
+                            break;
+                        }
+                    }
+                    assert!(
+                        client
+                            .answer_user_input(
+                                &session_id,
+                                &request_id,
+                                HashMap::from([(
+                                    request_id.clone(),
+                                    vec![allow_label]
+                                )]),
+                            )
+                            .is_err()
+                    );
+                } else if action == "cancel" {
+                    assert!(
+                        prompt_rx.recv_timeout(Duration::from_millis(50)).is_err()
+                    );
+                    client.cancel(&session_id).expect("cancel ACP turn");
+                    assert!(
+                        client
+                            .answer_user_input(
+                                &session_id,
+                                &request_id,
+                                HashMap::from([(
+                                    request_id.clone(),
+                                    vec![allow_label]
+                                )]),
+                            )
+                            .is_err()
+                    );
+                } else if action == "read_only" {
+                    assert!(
+                        prompt_rx.recv_timeout(Duration::from_millis(50)).is_err()
+                    );
+                    client
+                        .set_session_mode(&session_id, "read-only")
+                        .expect("switch ACP session to read-only");
+                    assert!(
+                        client
+                            .answer_user_input(
+                                &session_id,
+                                &request_id,
+                                HashMap::from([(
+                                    request_id.clone(),
+                                    vec![allow_label]
+                                )]),
+                            )
+                            .is_err()
+                    );
+                } else {
+                    assert!(
+                        prompt_rx.recv_timeout(Duration::from_millis(50)).is_err()
+                    );
+                    assert!(
+                        client
+                            .answer_user_input(
+                                &session_id,
+                                &request_id,
+                                HashMap::from([(
+                                    request_id.clone(),
+                                    vec!["invalid".into()]
+                                )]),
+                            )
+                            .is_err()
+                    );
+                    client
+                        .answer_user_input(
+                            &session_id,
+                            &request_id,
+                            HashMap::from([(request_id.clone(), vec![allow_label])]),
+                        )
+                        .expect("approve advertised ACP option");
+                }
+            }
+            let passed = loop {
+                let event = event_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("ACP permission response observed by fixture");
+                assert!(
+                    action != "late_cancel"
+                        || !matches!(event, HarnessEvent::UserInputRequested { .. }),
+                    "a cancelled ACP turn must not queue a late permission request"
+                );
+                if let HarnessEvent::AgentDelta { text, .. } = event {
+                    break text == "PASS";
+                }
+            };
+            assert!(passed, "ACP fixture received the wrong permission outcome");
+            let prompt_result = prompt_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("ACP prompt settled");
+            assert_eq!(
+                prompt_result.is_err(),
+                matches!(action, "cancel" | "late_cancel")
+            );
+            prompt.join().expect("ACP prompt worker");
+            client.shutdown();
+        }
     }
 
     #[test]

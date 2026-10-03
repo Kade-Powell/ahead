@@ -1,21 +1,16 @@
 use crate::agent::AgentControl;
-use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
-use crate::rollout::truncation;
-use crate::session::ForkPersistence;
 use crate::session::GitEnrichmentPolicy;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::SessionIo;
 use crate::session::SessionSpawnArgs;
 use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
-use crate::tasks::InterruptedTurnHistoryMarker;
-use crate::tasks::interrupted_turn_history_marker;
 use ahead_agent_skills::HostSkillsService;
 use ahead_model_auth::AuthManager;
 #[cfg(test)]
@@ -37,7 +32,6 @@ use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
-use codex_history::RolloutItem;
 use codex_model_provider::create_model_provider;
 #[cfg(test)]
 use codex_model_provider_info::ModelProviderInfo;
@@ -50,7 +44,6 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -61,16 +54,12 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
-use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 #[cfg(test)]
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::MoveThreadToSectionParams;
-use codex_thread_store::PreparedFork;
-use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
 use codex_thread_store::StoredModelContext;
 use codex_thread_store::StoredThread;
@@ -96,20 +85,10 @@ use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
 
-fn reject_unsupported_guardian_source(
-    session_source: &SessionSource,
-    thread_source: Option<&ThreadSource>,
-) -> CodexResult<()> {
-    let is_unsupported_guardian = matches!(
-        session_source,
-        SessionSource::SubAgent(SubAgentSource::Other(source))
-            if source == crate::approval::UNSUPPORTED_GUARDIAN_SOURCE
-    ) || thread_source
-        .is_some_and(|source| source.as_str() == "guardian_review");
-
-    if is_unsupported_guardian {
+fn reject_unsupported_thread_source(thread_source: Option<&ThreadSource>) -> CodexResult<()> {
+    if matches!(thread_source, Some(ThreadSource::Feature(_))) {
         return Err(CodexErr::InvalidRequest(
-            "Automatic-review sources are not supported by AHEAD".to_string(),
+            "Feature thread sources are not supported by AHEAD".to_string(),
         ));
     }
 
@@ -185,51 +164,6 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
-// TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
-// core can represent sampling boundaries directly instead of relying on
-// whichever items happened to be persisted mid-turn.
-//
-// Two likely future variants:
-// - `TruncateToLastSamplingBoundary` for callers that want a coherent fork from
-//   the last stable model boundary without synthesizing an interrupt.
-// - `WaitUntilNextSamplingBoundary` (or similar) for callers that prefer to
-//   fork after the next sampling boundary rather than interrupting immediately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkSnapshot {
-    /// Fork a committed prefix ending strictly before the nth user message.
-    ///
-    /// When `n` is within range, this cuts before that 0-based user-message
-    /// boundary. When `n` is out of range and the source thread is currently
-    /// mid-turn, this instead cuts before the active turn's opening boundary
-    /// so the fork drops the unfinished turn suffix. When `n` is out of range
-    /// and the source thread is already at a turn boundary, this returns the
-    /// full committed history unchanged.
-    TruncateBeforeNthUserMessage(usize),
-
-    /// Fork the current persisted history as if the source thread had been
-    /// interrupted now.
-    ///
-    /// If the persisted snapshot ends mid-turn, this appends the same
-    /// `<turn_aborted>` marker produced by a real interrupt. If the snapshot is
-    /// already at a turn boundary, this returns the current persisted history
-    /// unchanged.
-    Interrupted,
-}
-
-struct ForkHistory {
-    snapshot: ForkSnapshot,
-    initial_history: InitialHistory,
-    persistence: ForkPersistence,
-}
-
-/// Preserve legacy `fork_thread(usize, ...)` callsites by mapping them to the
-/// existing truncate-before-nth-user-message snapshot mode.
-impl From<usize> for ForkSnapshot {
-    fn from(value: usize) -> Self {
-        Self::TruncateBeforeNthUserMessage(value)
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
@@ -294,7 +228,6 @@ struct ThreadSpawnRequest {
     agent_control: AgentControl,
     parent_thread_id: Option<ThreadId>,
     forked_from_thread_id: Option<ThreadId>,
-    fork_persistence: ForkPersistence,
     inherited_environments: Option<TurnEnvironmentSnapshot>,
     inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     user_shell_override: Option<crate::shell::Shell>,
@@ -312,7 +245,6 @@ impl ThreadSpawnRequest {
             agent_control,
             parent_thread_id: None,
             forked_from_thread_id: None,
-            fork_persistence: ForkPersistence::Copied,
             inherited_environments: None,
             inherited_exec_policy: None,
             user_shell_override: None,
@@ -380,7 +312,6 @@ pub(crate) struct ThreadManagerState {
     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
     thread_store: Arc<dyn ThreadStore>,
     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
-    attestation_provider: Option<Arc<dyn AttestationProvider>>,
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     session_source: SessionSource,
     installation_id: String,
@@ -414,10 +345,7 @@ impl ThreadManager {
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Arc<dyn AgentGraphStore>,
     ) -> CodexResult<Self> {
-        let auth_manager =
-            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true)
-                .await
-                .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let auth_manager = AuthManager::shared_empty();
         let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
             config.codex_self_exe.clone(),
             config.codex_linux_sandbox_exe.clone(),
@@ -444,7 +372,6 @@ impl ThreadManager {
             thread_store,
             Some(agent_graph_store),
             installation_id,
-            /*attestation_provider*/ None,
             /*external_time_provider*/ None,
         ))
     }
@@ -462,7 +389,6 @@ impl ThreadManager {
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
         installation_id: String,
-        attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
         let codex_home = config.codex_home.clone();
@@ -495,7 +421,6 @@ impl ThreadManager {
                 user_instructions_provider,
                 thread_store,
                 agent_graph_store,
-                attestation_provider,
                 external_time_provider,
                 auth_manager,
                 session_source,
@@ -631,7 +556,6 @@ impl ThreadManager {
                 ),
                 thread_store,
                 agent_graph_store: None,
-                attestation_provider: None,
                 external_time_provider: None,
                 auth_manager,
                 session_source: SessionSource::Exec,
@@ -944,10 +868,7 @@ impl ThreadManager {
                     "failed to read persisted AHEAD thread {thread_id}: {err}"
                 )),
             })?;
-        reject_unsupported_guardian_source(
-            &stored_thread.source,
-            stored_thread.thread_source.as_ref(),
-        )?;
+        reject_unsupported_thread_source(stored_thread.thread_source.as_ref())?;
         let history_items = if stored_thread.history_mode == ThreadHistoryMode::Paginated {
             self.state
                 .load_latest_model_context(LoadThreadHistoryParams {
@@ -1122,62 +1043,6 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(request)).await
     }
 
-    // TODO(jif) merge with fork_agent
-    /// Spawn a subagent by forking persisted history from `forked_from_thread_id`.
-    pub async fn spawn_subagent(
-        &self,
-        forked_from_thread_id: ThreadId,
-        mut options: StartThreadOptions,
-    ) -> CodexResult<NewThread> {
-        let fork_source = self.get_thread(forked_from_thread_id).await?;
-        // Persist queued rollout updates before reading the fork snapshot.
-        fork_source.ensure_rollout_materialized().await;
-        fork_source.flush_rollout().await?;
-        let stored_thread = fork_source
-            .read_thread(
-                /*include_archived*/ true, /*include_history*/ true,
-            )
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!(
-                    "failed to read subagent fork source {forked_from_thread_id}: {err}"
-                ))
-            })?;
-        let history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
-        let inherited_multi_agent_version = fork_source
-            .multi_agent_version()
-            .unwrap_or(MultiAgentVersion::V1);
-        options.initial_history = fork_history_from_snapshot(
-            ForkSnapshot::Interrupted,
-            history,
-            InterruptedTurnHistoryMarker::from_config_and_version(
-                &options.config,
-                inherited_multi_agent_version,
-            ),
-        );
-        self.start_thread_inner(options, Some(forked_from_thread_id))
-            .await
-    }
-
-    pub async fn resume_thread_from_rollout(
-        &self,
-        config: Config,
-        rollout_path: PathBuf,
-        auth_manager: Arc<AuthManager>,
-        parent_trace: Option<W3cTraceContext>,
-        client_mcp_extensions: ClientMcpExtensions,
-    ) -> CodexResult<NewThread> {
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        Box::pin(self.resume_thread_with_history(
-            config,
-            initial_history,
-            auth_manager,
-            parent_trace,
-            client_mcp_extensions,
-        ))
-        .await
-    }
-
     /// Reloads a recorded Multi-Agent V2 child through its currently loaded immediate parent.
     ///
     /// The child keeps the existing parent-controlled reload semantics. Callers cannot supply
@@ -1287,32 +1152,6 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(request)).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn resume_thread_from_rollout_with_user_shell_override_for_tests(
-        &self,
-        config: Config,
-        rollout_path: PathBuf,
-        auth_manager: Arc<AuthManager>,
-        user_shell_override: crate::shell::Shell,
-        client_mcp_extensions: ClientMcpExtensions,
-    ) -> CodexResult<NewThread> {
-        let agent_control = self.agent_control_for_config(&config);
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        let (session_source, thread_source) = initial_history
-            .get_resumed_session_sources()
-            .unwrap_or_else(|| (self.state.session_source.clone(), None));
-        let options = StartThreadOptions {
-            initial_history,
-            session_source: Some(session_source),
-            thread_source,
-            client_mcp_extensions,
-            ..StartThreadOptions::new(config)
-        };
-        let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
-        request.user_shell_override = Some(user_shell_override);
-        Box::pin(self.state.spawn_thread(request)).await
-    }
-
     /// Removes the thread from the manager's internal map, though the thread is stored
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
@@ -1389,170 +1228,6 @@ impl ThreadManager {
             .timed_out
             .sort_by_key(std::string::ToString::to_string);
         report
-    }
-
-    /// Fork an existing thread by snapshotting rollout history according to
-    /// `snapshot` and starting a new thread with identical configuration
-    /// (unless overridden by the caller's `config`). The new thread will have
-    /// a fresh id.
-    pub async fn fork_thread<S>(
-        &self,
-        snapshot: S,
-        config: Config,
-        path: PathBuf,
-        thread_source: Option<ThreadSource>,
-        parent_trace: Option<W3cTraceContext>,
-    ) -> CodexResult<NewThread>
-    where
-        S: Into<ForkSnapshot>,
-    {
-        let snapshot = snapshot.into();
-        let history = self.initial_history_from_rollout_path(path).await?;
-        self.fork_thread_from_history(
-            snapshot,
-            config,
-            history,
-            thread_source,
-            parent_trace,
-            ClientMcpExtensions::default(),
-            /*reserved_thread_id*/ None,
-        )
-        .await
-    }
-
-    async fn initial_history_from_rollout_path(
-        &self,
-        rollout_path: PathBuf,
-    ) -> CodexResult<InitialHistory> {
-        let requested_rollout_path = rollout_path.clone();
-        let stored_thread = self
-            .state
-            .thread_store
-            .read_thread_by_rollout_path(ReadThreadByRolloutPathParams {
-                rollout_path,
-                include_archived: true,
-                include_history: true,
-            })
-            .await
-            .map_err(thread_store_rollout_read_error)?;
-        stored_thread_to_initial_history(stored_thread, Some(requested_rollout_path))
-    }
-
-    /// Fork an existing thread from already-loaded store history.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fork_thread_from_history<S>(
-        &self,
-        snapshot: S,
-        config: Config,
-        history: InitialHistory,
-        thread_source: Option<ThreadSource>,
-        parent_trace: Option<W3cTraceContext>,
-        client_mcp_extensions: ClientMcpExtensions,
-        reserved_thread_id: Option<ThreadId>,
-    ) -> CodexResult<NewThread>
-    where
-        S: Into<ForkSnapshot>,
-    {
-        self.fork_thread_with_initial_history(
-            config,
-            ForkHistory {
-                snapshot: snapshot.into(),
-                initial_history: history,
-                persistence: ForkPersistence::Copied,
-            },
-            thread_source,
-            parent_trace,
-            client_mcp_extensions,
-            reserved_thread_id,
-        )
-        .await
-    }
-
-    /// Fork prepared reference-backed history using the same snapshot semantics as copied forks.
-    pub async fn fork_prepared_thread(
-        &self,
-        config: Config,
-        prepared: PreparedFork,
-        thread_source: Option<ThreadSource>,
-        parent_trace: Option<W3cTraceContext>,
-        client_mcp_extensions: ClientMcpExtensions,
-        reserved_thread_id: Option<ThreadId>,
-    ) -> CodexResult<NewThread> {
-        let history = InitialHistory::Resumed(ResumedHistory {
-            conversation_id: prepared.source_thread_id,
-            history: Arc::clone(&prepared.model_context),
-            rollout_path: None,
-        });
-        let fork_persistence = ForkPersistence::Referenced {
-            history_base: prepared.history_base,
-            inherited_item_count: prepared.model_context.len(),
-        };
-        let result = self
-            .fork_thread_with_initial_history(
-                config,
-                ForkHistory {
-                    snapshot: ForkSnapshot::Interrupted,
-                    initial_history: history,
-                    persistence: fork_persistence,
-                },
-                thread_source,
-                parent_trace,
-                client_mcp_extensions,
-                reserved_thread_id,
-            )
-            .await;
-        drop(prepared);
-        result
-    }
-
-    async fn fork_thread_with_initial_history(
-        &self,
-        config: Config,
-        fork_history: ForkHistory,
-        thread_source: Option<ThreadSource>,
-        parent_trace: Option<W3cTraceContext>,
-        client_mcp_extensions: ClientMcpExtensions,
-        reserved_thread_id: Option<ThreadId>,
-    ) -> CodexResult<NewThread> {
-        let ForkHistory {
-            snapshot,
-            initial_history: history,
-            persistence: fork_persistence,
-        } = fork_history;
-        // `forked_from_id()` describes this history's existing lineage. When
-        // forking a resumed thread, the child copies the resumed thread itself.
-        let source_thread_id = match &history {
-            InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
-            InitialHistory::Forked(_) => history.forked_from_id(),
-            InitialHistory::New | InitialHistory::Cleared => None,
-        };
-        let multi_agent_version = self
-            .state
-            .effective_multi_agent_version_for_spawn(
-                &history,
-                /*session_source*/ None,
-                /*parent_thread_id*/ None,
-                source_thread_id,
-                &config,
-            )
-            .await;
-        let interrupted_marker =
-            InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
-        let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
-        let agent_control = self.agent_control_for_config(&config);
-        let options = StartThreadOptions {
-            initial_history: history,
-            thread_source,
-            parent_trace,
-            client_mcp_extensions,
-            reserved_thread_id,
-            ..StartThreadOptions::new(config)
-        };
-        let mut request =
-            ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
-        request.forked_from_thread_id = source_thread_id;
-        request.fork_persistence = fork_persistence;
-        Box::pin(self.state.spawn_thread(request)).await
     }
 
     pub(crate) fn agent_control(&self) -> AgentControl {
@@ -1959,42 +1634,6 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread(request)).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn fork_thread_with_source(
-        &self,
-        config: Config,
-        initial_history: InitialHistory,
-        history_mode: Option<ThreadHistoryMode>,
-        agent_control: AgentControl,
-        session_source: SessionSource,
-        thread_source: Option<ThreadSource>,
-        parent_thread_id: Option<ThreadId>,
-        forked_from_thread_id: Option<ThreadId>,
-        inherited_environments: Option<TurnEnvironmentSnapshot>,
-        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
-        environments: Option<Vec<TurnEnvironmentSelection>>,
-        thread_extension_init: ExtensionDataInit,
-    ) -> CodexResult<NewThread> {
-        let client_mcp_extensions = self.client_mcp_extensions_for_child(parent_thread_id).await;
-        let options = StartThreadOptions {
-            initial_history,
-            history_mode,
-            session_source: Some(session_source),
-            thread_source,
-            environments,
-            thread_extension_init,
-            client_mcp_extensions,
-            ..StartThreadOptions::new(config)
-        };
-        let mut request =
-            ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
-        request.parent_thread_id = parent_thread_id;
-        request.forked_from_thread_id = forked_from_thread_id;
-        request.inherited_environments = inherited_environments;
-        request.inherited_exec_policy = inherited_exec_policy;
-        Box::pin(self.spawn_thread(request)).await
-    }
-
     async fn client_mcp_extensions_for_child(
         &self,
         parent_thread_id: Option<ThreadId>,
@@ -2016,7 +1655,6 @@ impl ThreadManagerState {
             agent_control,
             parent_thread_id,
             forked_from_thread_id,
-            fork_persistence,
             inherited_environments,
             inherited_exec_policy,
             user_shell_override,
@@ -2037,7 +1675,7 @@ impl ThreadManagerState {
             reserved_thread_id,
         } = options;
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
-        reject_unsupported_guardian_source(&session_source, thread_source.as_ref())?;
+        reject_unsupported_thread_source(thread_source.as_ref())?;
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
@@ -2121,7 +1759,6 @@ impl ThreadManagerState {
             extensions,
             conversation_history: initial_history,
             requested_history_mode: history_mode,
-            fork_persistence,
             session_source,
             forked_from_thread_id,
             parent_thread_id,
@@ -2141,7 +1778,6 @@ impl ThreadManagerState {
             reserved_thread_id,
             analytics_events_client: self.analytics_events_client.clone(),
             thread_store: Arc::clone(&self.thread_store),
-            attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
@@ -2149,17 +1785,6 @@ impl ThreadManagerState {
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         })
         .await?;
-        // Enable Full Access form input only after session startup so a required MCP server cannot
-        // block startup while waiting for form input.
-        if session
-            .services
-            .client_mcp_extensions
-            .contains(OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID)
-            && matches!(thread_source.as_ref(), Some(ThreadSource::User))
-            && !tracked_session_source.is_non_root_agent()
-        {
-            session.services.mcp_runtime.enable_full_access_form_input();
-        }
         let new_thread = self
             .finalize_thread_spawn(session, io, tracked_session_source)
             .await?;
@@ -2270,14 +1895,6 @@ fn stored_thread_to_initial_history(
     }))
 }
 
-fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {
-    match err {
-        ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
-        ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
-        err => CodexErr::Fatal(format!("failed to read thread by rollout path: {err}")),
-    }
-}
-
 fn thread_store_metadata_update_error(thread_id: ThreadId, err: ThreadStoreError) -> CodexErr {
     match err {
         ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
@@ -2288,177 +1905,6 @@ fn thread_store_metadata_update_error(thread_id: ThreadId, err: ThreadStoreError
         err => CodexErr::Fatal(format!(
             "failed to update thread metadata {thread_id}: {err}"
         )),
-    }
-}
-
-/// Return a fork snapshot cut strictly before the nth user message (0-based).
-///
-/// Out-of-range values keep the full committed history at a turn boundary, but
-/// when the source thread is currently mid-turn they fall back to cutting
-/// before the active turn's opening boundary so the fork omits the unfinished
-/// suffix entirely.
-fn truncate_before_nth_user_message(
-    history: InitialHistory,
-    n: usize,
-    snapshot_state: &SnapshotTurnState,
-) -> InitialHistory {
-    let mut items = match history {
-        InitialHistory::New | InitialHistory::Cleared => Vec::new(),
-        InitialHistory::Resumed(resumed) => Arc::unwrap_or_clone(resumed.history),
-        InitialHistory::Forked(items) => items,
-    };
-    let user_positions = truncation::user_message_positions_in_rollout(&items);
-    let rolled = if snapshot_state.ends_mid_turn && n >= user_positions.len() {
-        if let Some(cut_idx) = snapshot_state
-            .active_turn_start_index
-            .or_else(|| user_positions.last().copied())
-        {
-            items.truncate(cut_idx);
-            items
-        } else {
-            items
-        }
-    } else {
-        truncation::truncate_rollout_before_nth_user_message_from_start(items, n)
-    };
-
-    if rolled.is_empty() {
-        InitialHistory::New
-    } else {
-        InitialHistory::Forked(rolled)
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct SnapshotTurnState {
-    ends_mid_turn: bool,
-    active_turn_id: Option<String>,
-    active_turn_started_at: Option<i64>,
-    active_turn_start_index: Option<usize>,
-}
-
-fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
-    let rollout_items = history.get_rollout_items();
-    if let Some(active_turn) = truncation::active_explicit_rollout_turn(rollout_items) {
-        if active_turn.status != truncation::RolloutTurnStatus::InProgress {
-            return SnapshotTurnState {
-                ends_mid_turn: false,
-                active_turn_id: None,
-                active_turn_started_at: None,
-                active_turn_start_index: None,
-            };
-        }
-
-        return SnapshotTurnState {
-            ends_mid_turn: true,
-            active_turn_id: Some(active_turn.id),
-            active_turn_started_at: active_turn.started_at,
-            active_turn_start_index: Some(active_turn.start_index),
-        };
-    }
-
-    let Some(last_user_position) = truncation::user_message_positions_in_rollout(rollout_items)
-        .last()
-        .copied()
-    else {
-        return SnapshotTurnState {
-            ends_mid_turn: false,
-            active_turn_id: None,
-            active_turn_started_at: None,
-            active_turn_start_index: None,
-        };
-    };
-
-    // Synthetic fork/resume histories can contain user/assistant response items
-    // without explicit turn lifecycle events. If the persisted snapshot has no
-    // terminating boundary after its last user message, treat it as mid-turn.
-    SnapshotTurnState {
-        ends_mid_turn: !rollout_items[last_user_position + 1..].iter().any(|item| {
-            matches!(
-                item,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
-            )
-        }),
-        active_turn_id: None,
-        active_turn_started_at: None,
-        active_turn_start_index: None,
-    }
-}
-
-fn fork_history_from_snapshot(
-    snapshot: ForkSnapshot,
-    history: InitialHistory,
-    interrupted_marker: InterruptedTurnHistoryMarker,
-) -> InitialHistory {
-    let snapshot_state = snapshot_turn_state(&history);
-    match snapshot {
-        ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
-            truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
-        }
-        ForkSnapshot::Interrupted => {
-            let history = match history {
-                InitialHistory::New => InitialHistory::New,
-                InitialHistory::Cleared => InitialHistory::Cleared,
-                InitialHistory::Forked(history) => InitialHistory::Forked(history),
-                InitialHistory::Resumed(resumed) => {
-                    InitialHistory::Forked(Arc::unwrap_or_clone(resumed.history))
-                }
-            };
-            if snapshot_state.ends_mid_turn {
-                append_interrupted_boundary(
-                    history,
-                    snapshot_state.active_turn_id,
-                    snapshot_state.active_turn_started_at,
-                    interrupted_marker,
-                )
-            } else {
-                history
-            }
-        }
-    }
-}
-
-/// Append the same persisted interrupt boundary used by the live interrupt path
-/// to an existing fork snapshot after the source thread has been confirmed to
-/// be mid-turn.
-fn append_interrupted_boundary(
-    history: InitialHistory,
-    turn_id: Option<String>,
-    started_at: Option<i64>,
-    interrupted_marker: InterruptedTurnHistoryMarker,
-) -> InitialHistory {
-    let aborted_event = RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-        turn_id,
-        reason: TurnAbortReason::Interrupted,
-        started_at,
-        completed_at: None,
-        duration_ms: None,
-    }));
-
-    match history {
-        InitialHistory::New | InitialHistory::Cleared => {
-            let mut history = Vec::new();
-            if let Some(marker) = interrupted_turn_history_marker(interrupted_marker) {
-                history.push(RolloutItem::ResponseItem(marker.into()));
-            }
-            history.push(aborted_event);
-            InitialHistory::Forked(history)
-        }
-        InitialHistory::Forked(mut history) => {
-            if let Some(marker) = interrupted_turn_history_marker(interrupted_marker) {
-                history.push(RolloutItem::ResponseItem(marker.into()));
-            }
-            history.push(aborted_event);
-            InitialHistory::Forked(history)
-        }
-        InitialHistory::Resumed(resumed) => {
-            let mut history = Arc::unwrap_or_clone(resumed.history);
-            if let Some(marker) = interrupted_turn_history_marker(interrupted_marker) {
-                history.push(RolloutItem::ResponseItem(marker.into()));
-            }
-            history.push(aborted_event);
-            InitialHistory::Forked(history)
-        }
     }
 }
 

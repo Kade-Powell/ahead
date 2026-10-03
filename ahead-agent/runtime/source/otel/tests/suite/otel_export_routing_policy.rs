@@ -1,5 +1,4 @@
 use codex_api::AgentIdentityTelemetry;
-use codex_otel::AuthEnvTelemetryMetadata;
 use codex_otel::OtelProvider;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
@@ -83,17 +82,6 @@ fn find_span_event_by_name_attr<'a>(
                 .is_some_and(|value| value == event_name)
         })
         .expect("span event should exist")
-}
-
-fn auth_env_metadata() -> AuthEnvTelemetryMetadata {
-    AuthEnvTelemetryMetadata {
-        openai_api_key_env_present: true,
-        codex_api_key_env_present: false,
-        codex_api_key_env_enabled: true,
-        provider_env_key_name: Some("configured".to_string()),
-        provider_env_key_present: Some(true),
-        refresh_token_url_override_present: true,
-    }
 }
 
 #[test]
@@ -625,8 +613,7 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
             /*log_user_prompts*/ true,
             "tty".to_string(),
             SessionSource::Cli,
-        )
-        .with_auth_env(auth_env_metadata());
+        );
         let root_span = tracing::info_span!("root");
         let _root_guard = root_span.enter();
         manager.conversation_starts(
@@ -668,20 +655,19 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
     let logs = log_exporter.get_emitted_logs().expect("log export");
     let conversation_log = find_log_by_event_name(&logs, "codex.conversation_starts");
     let conversation_log_attrs = log_attributes(&conversation_log.record);
-    assert_eq!(
-        conversation_log_attrs
-            .get("auth.env_openai_api_key_present")
-            .map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        conversation_log_attrs
-            .get("auth.env_provider_key_name")
-            .map(String::as_str),
-        Some("configured")
+    assert!(
+        !conversation_log_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     let request_log = find_log_by_event_name(&logs, "codex.api_request");
     let request_log_attrs = log_attributes(&request_log.record);
+    assert!(
+        !request_log_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_")),
+        "credential environment metadata must not be exported"
+    );
     assert_eq!(
         request_log_attrs
             .get("auth.header_attached")
@@ -721,18 +707,6 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
         Some("missing_authorization_header")
     );
     assert_eq!(
-        request_log_attrs
-            .get("auth.env_codex_api_key_enabled")
-            .map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        request_log_attrs
-            .get("auth.env_refresh_token_url_override_present")
-            .map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
         request_log_attrs.get("auth.agent_id").map(String::as_str),
         Some("agent-runtime-otel")
     );
@@ -745,11 +719,10 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
     let conversation_trace_event =
         find_span_event_by_name_attr(&spans[0].events.events, "codex.conversation_starts");
     let conversation_trace_attrs = span_event_attributes(conversation_trace_event);
-    assert_eq!(
-        conversation_trace_attrs
-            .get("auth.env_provider_key_present")
-            .map(String::as_str),
-        Some("true")
+    assert!(
+        !conversation_trace_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     let request_trace_event =
         find_span_event_by_name_attr(&spans[0].events.events, "codex.api_request");
@@ -776,11 +749,10 @@ fn otel_export_routing_policy_routes_api_request_auth_observability() {
         request_trace_attrs.get("endpoint").map(String::as_str),
         Some("/responses")
     );
-    assert_eq!(
-        request_trace_attrs
-            .get("auth.env_openai_api_key_present")
-            .map(String::as_str),
-        Some("true")
+    assert!(
+        !request_trace_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     assert_eq!(
         request_trace_attrs.get("auth.agent_id").map(String::as_str),
@@ -830,8 +802,7 @@ fn otel_export_routing_policy_routes_websocket_connect_auth_observability() {
             /*log_user_prompts*/ true,
             "tty".to_string(),
             SessionSource::Cli,
-        )
-        .with_auth_env(auth_env_metadata());
+        );
         let root_span = tracing::info_span!("root");
         let _root_guard = root_span.enter();
         let agent_identity_telemetry = AgentIdentityTelemetry {
@@ -889,11 +860,10 @@ fn otel_export_routing_policy_routes_websocket_connect_auth_observability() {
             .map(String::as_str),
         Some("false")
     );
-    assert_eq!(
-        connect_log_attrs
-            .get("auth.env_provider_key_name")
-            .map(String::as_str),
-        Some("configured")
+    assert!(
+        !connect_log_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     assert_eq!(
         connect_log_attrs.get("auth.agent_id").map(String::as_str),
@@ -914,11 +884,10 @@ fn otel_export_routing_policy_routes_websocket_connect_auth_observability() {
             .map(String::as_str),
         Some("reload")
     );
-    assert_eq!(
-        connect_trace_attrs
-            .get("auth.env_refresh_token_url_override_present")
-            .map(String::as_str),
-        Some("true")
+    assert!(
+        !connect_trace_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     assert_eq!(
         connect_trace_attrs.get("auth.agent_id").map(String::as_str),
@@ -968,8 +937,7 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
             /*log_user_prompts*/ true,
             "tty".to_string(),
             SessionSource::Cli,
-        )
-        .with_auth_env(auth_env_metadata());
+        );
         let root_span = tracing::info_span!("root");
         let _root_guard = root_span.enter();
         let agent_identity_telemetry = AgentIdentityTelemetry {
@@ -1000,11 +968,10 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
         request_log_attrs.get("error.message").map(String::as_str),
         Some("stream error")
     );
-    assert_eq!(
-        request_log_attrs
-            .get("auth.env_openai_api_key_present")
-            .map(String::as_str),
-        Some("true")
+    assert!(
+        !request_log_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     assert_eq!(
         request_log_attrs.get("auth.agent_id").map(String::as_str),
@@ -1025,11 +992,10 @@ fn otel_export_routing_policy_routes_websocket_request_transport_observability()
             .map(String::as_str),
         Some("true")
     );
-    assert_eq!(
-        request_trace_attrs
-            .get("auth.env_provider_key_present")
-            .map(String::as_str),
-        Some("true")
+    assert!(
+        !request_trace_attrs
+            .keys()
+            .any(|key| key.starts_with("auth.env_"))
     );
     assert_eq!(
         request_trace_attrs.get("auth.agent_id").map(String::as_str),

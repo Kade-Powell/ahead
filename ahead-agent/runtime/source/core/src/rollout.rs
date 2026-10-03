@@ -51,7 +51,3 @@ pub(crate) mod recorder {
 }
 
 pub(crate) use crate::session_rollout_init_error::map_session_init_error;
-
-pub(crate) mod truncation {
-    pub(crate) use crate::thread_rollout_truncation::*;
-}

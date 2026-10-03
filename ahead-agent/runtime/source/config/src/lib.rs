@@ -1,4 +1,3 @@
-mod auth_policy;
 mod browser_computer_use_requirements;
 mod browser_use;
 mod cloud_config_bundle;
@@ -32,12 +31,10 @@ mod state;
 mod strict_config;
 pub mod test_support;
 mod thread_config;
-mod tui_keymap;
 pub mod types;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
-pub use auth_policy::ManagedAuthPolicy;
 pub use browser_computer_use_requirements::AllowDenyRequirementToml;
 pub use browser_computer_use_requirements::BrowserUseAccessApprovalLifetimeToml;
 pub use browser_computer_use_requirements::BrowserUseOriginPolicyToml;
@@ -78,10 +75,6 @@ pub use config_layer_source::ConfigLayer;
 pub use config_layer_source::ConfigLayerMetadata;
 pub use config_layer_source::ConfigLayerSource;
 pub use config_layer_source::format_config_layer_source;
-pub use config_requirements::AppRequirementToml;
-pub use config_requirements::AppToolRequirementToml;
-pub use config_requirements::AppToolsRequirementsToml;
-pub use config_requirements::AppsRequirementsToml;
 pub use config_requirements::AutoReviewRequirementsToml;
 pub use config_requirements::ConfigRequirements;
 pub use config_requirements::ConfigRequirementsToml;

@@ -11,21 +11,25 @@ impl Directory {
         BaseDirs::new().map(|d| PathBuf::from(d.home_dir()))
     }
 
-    #[cfg(not(feature = "portable"))]
     fn project_dirs() -> Option<ProjectDirs> {
-        ProjectDirs::from("io", "ahead", NAME)
+        if let Some(path) = std::env::var_os("AHEAD_DATA_HOME") {
+            return Self::project_dirs_from_data_home(PathBuf::from(path));
+        }
+        #[cfg(not(feature = "portable"))]
+        return ProjectDirs::from("io", "ahead", NAME);
+        #[cfg(feature = "portable")]
+        return std::env::current_exe()
+            .ok()?
+            .parent()
+            .and_then(|parent| ProjectDirs::from_path(parent.join("ahead-data")));
     }
 
-    /// Return path adjacent to ahead executable when built as portable
-    #[cfg(feature = "portable")]
-    fn project_dirs() -> Option<ProjectDirs> {
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(parent) = current_exe.parent() {
-                return ProjectDirs::from_path(parent.join("ahead-data"));
-            }
-            unreachable!("Couldn't obtain current process parent path");
+    fn project_dirs_from_data_home(path: PathBuf) -> Option<ProjectDirs> {
+        if !path.is_absolute() {
+            tracing::error!(path = %path.display(), "AHEAD_DATA_HOME must be absolute");
+            return None;
         }
-        unreachable!("Couldn't obtain current process path");
+        ProjectDirs::from_path(path)
     }
 
     // Get path of local data directory
@@ -188,5 +192,24 @@ impl Directory {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Directory;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_data_home_keeps_config_and_plugins_together() {
+        let root = std::env::temp_dir().join("ahead-disposable-data-home");
+        let dirs = Directory::project_dirs_from_data_home(root.clone())
+            .expect("absolute path");
+        assert_eq!(dirs.data_local_dir(), root);
+        assert_eq!(dirs.config_dir(), root);
+        assert!(
+            Directory::project_dirs_from_data_home(PathBuf::from("relative"))
+                .is_none()
+        );
     }
 }

@@ -1,12 +1,16 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    fs::OpenOptions,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use ahead_extension_host::{
@@ -19,8 +23,10 @@ use ahead_rpc::{
     dap_types::{self, DapId, DapServer, RunDebugConfig, SetBreakpointsResponse},
     delta::AheadDelta,
     plugin::PluginId,
+    proxy::{ProxyNotification, ProxyRpcHandler},
     style::LineStyle,
 };
+use fs4::fs_std::FileExt;
 use lsp_types::{
     Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentDiagnosticParams, DocumentDiagnosticReport,
@@ -43,21 +49,210 @@ use super::{
 pub struct PluginCatalog {
     workspace: Option<PathBuf>,
     plugin_rpc: PluginCatalogRpcHandler,
+    proxy_rpc: Option<ProxyRpcHandler>,
+    installing_servers: Arc<Mutex<HashSet<&'static str>>>,
+    cancel_installs: Arc<AtomicBool>,
     plugins: HashMap<PluginId, PluginServerRpcHandler>,
     daps: HashMap<DapId, DapRpcHandler>,
     open_files: HashMap<PathBuf, OpenDocument>,
     diagnostics:
         HashMap<url::Url, HashMap<(PluginId, DiagnosticSource), Vec<Diagnostic>>>,
-    extension_host: Option<ExtensionHost>,
+    extension_host: Option<Arc<ExtensionHost>>,
     language_extensions: Vec<LanguageServerExtension>,
+    extension_servers: HashMap<PluginId, LanguageServerExtension>,
+    configuration_generation: u64,
     /// Running servers by language id.
     lsp_servers: HashMap<String, PluginId>,
 }
 
+#[derive(Clone, Copy)]
 struct BuiltinLanguageServer {
     command: &'static str,
     languages: &'static [&'static str],
     args: &'static [&'static str],
+}
+
+impl BuiltinLanguageServer {
+    fn npm_package(&self) -> Option<(&'static str, &'static str, &'static str)> {
+        match self.command {
+            "basedpyright-langserver" => {
+                Some(("basedpyright", "basedpyright", "langserver.index.js"))
+            }
+            "vtsls" => Some(("vtsls", "@vtsls/language-server", "bin/vtsls.js")),
+            _ => None,
+        }
+    }
+
+    fn cached_npm_command(
+        &self,
+        cache: &Path,
+        node: &Path,
+    ) -> Option<LanguageServerCommand> {
+        let (directory, package_name, entrypoint) = self.npm_package()?;
+        let package = cache
+            .join("language-servers")
+            .join(directory)
+            .join("node_modules")
+            .join(package_name);
+        let script = valid_npm_entrypoint(&package, package_name, entrypoint)?;
+        Some(LanguageServerCommand {
+            command: node.to_str()?.into(),
+            args: vec![script.to_str()?.into(), "--stdio".into()],
+            env: Vec::new(),
+            initialization_options: None,
+            workspace_configuration: None,
+        })
+    }
+}
+
+fn valid_npm_entrypoint(
+    package: &Path,
+    expected_name: &str,
+    entrypoint: &str,
+) -> Option<PathBuf> {
+    let script = package.join(entrypoint);
+    let manifest = package.join("package.json");
+    if !std::fs::symlink_metadata(&script).ok()?.is_file()
+        || !std::fs::symlink_metadata(&manifest).ok()?.is_file()
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(manifest)
+        .ok()?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    (manifest.get("name")?.as_str()? == expected_name
+        && !manifest.get("version")?.as_str()?.is_empty())
+    .then_some(script)
+}
+
+fn install_builtin_npm_package(
+    cache: &Path,
+    npm: &Path,
+    builtin: BuiltinLanguageServer,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<()> {
+    let (directory, package, entrypoint) = builtin
+        .npm_package()
+        .ok_or_else(|| anyhow::anyhow!("{} has no npm package", builtin.command))?;
+    let root = cache.join("language-servers");
+    std::fs::create_dir_all(&root)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let lock = options.open(root.join(format!(".{directory}.lock")))?;
+    anyhow::ensure!(lock.metadata()?.is_file(), "invalid {package} cache lock");
+    loop {
+        anyhow::ensure!(
+            !cancelled.load(Ordering::Relaxed),
+            "npm install of {package} was cancelled"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "npm install of {package} timed out waiting for its cache lock"
+        );
+        if FileExt::try_lock_exclusive(&lock)? {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{directory}-install-"))
+        .tempdir_in(&root)?;
+    anyhow::ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "npm install of {package} was cancelled"
+    );
+    let mut child = Command::new(npm)
+        .args(["install", "--prefix"])
+        .arg(staging.path())
+        .arg(format!("{package}@latest"))
+        .args([
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--no-package-lock",
+            "--save-exact",
+            "--fetch-retries=2",
+            "--fetch-timeout=10000",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if cancelled.load(Ordering::Relaxed) => {
+                break Err(anyhow::anyhow!(
+                    "npm install of {package} was cancelled"
+                ));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                break Err(anyhow::anyhow!(
+                    "npm install of {package} timed out after 120 seconds"
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => break Err(error.into()),
+        }
+    };
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            if let Err(kill_error) = child.kill() {
+                tracing::warn!(?kill_error, package, "stopping npm install");
+            }
+            if let Err(wait_error) = child.wait() {
+                tracing::warn!(?wait_error, package, "reaping npm install");
+            }
+            return Err(error);
+        }
+    };
+    anyhow::ensure!(
+        status.success(),
+        "npm could not install {package} ({})",
+        status
+    );
+    anyhow::ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "npm install of {package} was cancelled"
+    );
+    let installed = staging.path().join("node_modules").join(package);
+    anyhow::ensure!(
+        valid_npm_entrypoint(&installed, package, entrypoint).is_some(),
+        "npm finished without a valid {package} language-server package"
+    );
+    let destination = root.join(directory);
+    let backup = root.join(format!(".{directory}-backup-{}", uuid::Uuid::new_v4()));
+    let replaced = destination.exists();
+    if replaced {
+        std::fs::rename(&destination, &backup)?;
+    }
+    if let Err(error) = std::fs::rename(staging.path(), &destination) {
+        if replaced {
+            std::fs::rename(&backup, &destination)?;
+        }
+        return Err(error.into());
+    }
+    if replaced {
+        if let Err(error) = std::fs::remove_dir_all(&backup) {
+            tracing::warn!(?error, path = %backup.display(), "removing replaced language-server cache");
+        }
+    }
+    Ok(())
 }
 
 fn builtin_language_server(language_id: &str) -> Option<BuiltinLanguageServer> {
@@ -109,6 +304,27 @@ struct OpenDocument {
     generation: Arc<AtomicU64>,
 }
 
+fn report_extension_discovery_errors(
+    plugin_rpc: &PluginCatalogRpcHandler,
+    errors: Vec<(PathBuf, anyhow::Error)>,
+) {
+    let issues = errors
+        .into_iter()
+        .map(|(directory, error)| {
+            tracing::error!(path = %directory.display(), ?error, "loading language extension");
+            ahead_rpc::core::LanguageExtensionIssue {
+                name: directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                message: format!("{error:#}"),
+            }
+        })
+        .collect();
+    plugin_rpc.core_rpc.language_extension_issues(issues);
+}
+
 impl PluginCatalog {
     pub fn new(
         workspace: Option<PathBuf>,
@@ -117,18 +333,28 @@ impl PluginCatalog {
         let language_extensions =
             ahead_core::directory::Directory::plugins_directory()
                 .and_then(|root| match discover_language_server_extensions(&root) {
-                    Ok(extensions) => Some(extensions),
+                    Ok(discovery) => {
+                        report_extension_discovery_errors(
+                            &plugin_rpc,
+                            discovery.errors,
+                        );
+                        Some(discovery.extensions)
+                    }
                     Err(error) => {
                         tracing::error!(
                             ?error,
                             "discovering installed language extensions"
+                        );
+                        report_extension_discovery_errors(
+                            &plugin_rpc,
+                            vec![(root, error)],
                         );
                         None
                     }
                 })
                 .unwrap_or_default();
         let extension_host = match ExtensionHost::new() {
-            Ok(host) => Some(host),
+            Ok(host) => Some(Arc::new(host)),
             Err(error) => {
                 tracing::error!(?error, "creating language extension host");
                 None
@@ -137,14 +363,24 @@ impl PluginCatalog {
         Self {
             workspace,
             plugin_rpc,
+            proxy_rpc: None,
+            installing_servers: Arc::new(Mutex::new(HashSet::new())),
+            cancel_installs: Arc::new(AtomicBool::new(false)),
             plugins: HashMap::new(),
             daps: HashMap::new(),
             open_files: HashMap::new(),
             diagnostics: HashMap::new(),
             extension_host,
             language_extensions,
+            extension_servers: HashMap::new(),
+            configuration_generation: 0,
             lsp_servers: HashMap::new(),
         }
+    }
+
+    pub fn with_proxy_rpc(mut self, proxy_rpc: ProxyRpcHandler) -> Self {
+        self.proxy_rpc = Some(proxy_rpc);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -239,7 +475,7 @@ impl PluginCatalog {
 
         // Otherwise send it to all plugins
         let method = method.into();
-        for (_, plugin) in self.plugins.iter() {
+        for plugin in self.plugins.values() {
             plugin.server_notification(
                 method.clone(),
                 params.clone(),
@@ -431,69 +667,99 @@ impl PluginCatalog {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
+        match ahead_core::workspace_trust::is_trusted(&workspace) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.report_language_server_error(
+                    language_id,
+                    &anyhow::Error::from(error),
+                );
+                return;
+            }
+        }
         if !self
             .language_extensions
             .iter()
             .any(|extension| extension.supports_language(language_id))
-            && let Some(root) = ahead_core::directory::Directory::plugins_directory()
         {
-            match discover_language_server_extensions(&root) {
-                Ok(extensions) => self.language_extensions = extensions,
-                Err(error) => {
-                    self.report_language_server_error(language_id, &error);
-                    return;
-                }
+            if let Err(error) = self.reload_language_extensions() {
+                self.report_language_server_error(language_id, &error);
+                return;
             }
         }
         let extension = self
             .language_extensions
             .iter()
-            .find(|extension| extension.supports_language(language_id));
-        let (server, server_id, mut languages) = if let Some(extension) = extension {
-            let result = (|| -> anyhow::Result<LanguageServerCommand> {
-                let host = self.extension_host.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("Language extension host is unavailable")
-                })?;
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(host.language_server_command_for_extension(
-                    extension,
-                    WorktreeContext {
-                        root: workspace.clone(),
-                    },
-                ))
-            })();
-            match result {
-                Ok(server) => (
-                    server,
-                    extension.server_id.clone(),
-                    extension.language_ids(),
-                ),
-                Err(error) => {
-                    self.report_language_server_error(language_id, &error);
+            .find(|extension| extension.supports_language(language_id))
+            .cloned();
+        let (server, server_id, mut languages) =
+            if let Some(extension) = extension.as_ref() {
+                let result = (|| -> anyhow::Result<LanguageServerCommand> {
+                    let host = self.extension_host.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Language extension host is unavailable")
+                    })?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(host.language_server_command_for_extension(
+                        extension,
+                        WorktreeContext {
+                            root: workspace.clone(),
+                        },
+                    ))
+                })();
+                match result {
+                    Ok(server) => (
+                        server,
+                        extension.server_id.clone(),
+                        extension.language_ids(),
+                    ),
+                    Err(error) => {
+                        self.report_language_server_error(language_id, &error);
+                        return;
+                    }
+                }
+            } else if let Some(builtin) = builtin_language_server(language_id) {
+                // ponytail: use system Node for cached packages until AHEAD
+                // provisions its own runtime alongside managed server downloads.
+                let has_user_binary = which::which(builtin.command).is_ok();
+                let cached_command = if !has_user_binary {
+                    ahead_core::directory::Directory::cache_directory().and_then(
+                        |cache| {
+                            which::which("node").ok().and_then(|node| {
+                                builtin.cached_npm_command(&cache, &node)
+                            })
+                        },
+                    )
+                } else {
+                    None
+                };
+                if !has_user_binary
+                    && cached_command.is_none()
+                    && builtin.npm_package().is_some()
+                {
+                    self.start_builtin_install(builtin);
                     return;
                 }
-            }
-        } else if let Some(builtin) = builtin_language_server(language_id) {
-            (
-                LanguageServerCommand {
-                    command: builtin.command.into(),
-                    args: builtin.args.iter().map(|arg| (*arg).into()).collect(),
-                    env: Vec::new(),
-                    initialization_options: None,
-                    workspace_configuration: None,
-                },
-                builtin.command.to_string(),
-                builtin
-                    .languages
-                    .iter()
-                    .map(|language| (*language).into())
-                    .collect(),
-            )
-        } else {
-            return;
-        };
+                (
+                    cached_command.unwrap_or_else(|| LanguageServerCommand {
+                        command: builtin.command.into(),
+                        args: builtin.args.iter().map(|arg| (*arg).into()).collect(),
+                        env: Vec::new(),
+                        initialization_options: None,
+                        workspace_configuration: None,
+                    }),
+                    builtin.command.to_string(),
+                    builtin
+                        .languages
+                        .iter()
+                        .map(|language| (*language).into())
+                        .collect(),
+                )
+            } else {
+                return;
+            };
         if !languages.iter().any(|language| language == language_id) {
             languages.push(language_id.to_string());
         }
@@ -538,19 +804,102 @@ impl PluginCatalog {
         match result {
             Ok((plugin_id, handler)) => {
                 self.plugins.insert(plugin_id, handler);
+                if let Some(extension) = extension {
+                    self.extension_servers.insert(plugin_id, extension);
+                }
                 for language in languages {
                     self.lsp_servers.insert(language, plugin_id);
                 }
             }
             Err(error) => {
-                self.report_language_server_error(
-                    &server_id,
-                    &anyhow::anyhow!(
-                        "{error:#}. Install {server_id} on PATH or install a matching Zed language extension in Settings, then restart language servers."
-                    ),
-                );
+                self.report_language_server_error(&server_id, &error);
             }
         }
+    }
+
+    fn start_builtin_install(&self, builtin: BuiltinLanguageServer) {
+        let prerequisites = (|| -> anyhow::Result<_> {
+            let proxy_rpc = self.proxy_rpc.clone().ok_or_else(|| {
+                anyhow::anyhow!("managed server installer is unavailable")
+            })?;
+            let cache = ahead_core::directory::Directory::cache_directory()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("AHEAD cache directory is unavailable")
+                })?;
+            which::which("node").map_err(|_| {
+                anyhow::anyhow!("Node.js is required for {}", builtin.command)
+            })?;
+            let npm = which::which("npm").map_err(|_| {
+                anyhow::anyhow!("npm is required to install {}", builtin.command)
+            })?;
+            Ok((proxy_rpc, cache, npm))
+        })();
+        let (proxy_rpc, cache, npm) = match prerequisites {
+            Ok(prerequisites) => prerequisites,
+            Err(error) => {
+                self.report_language_server_error(builtin.command, &error);
+                return;
+            }
+        };
+        if !self.installing_servers.lock().insert(builtin.command) {
+            return;
+        }
+        let mut status =
+            ahead_rpc::core::ServerStatusParams::starting(builtin.command.into());
+        status.message = Some("Installing from npm into AHEAD's cache…".into());
+        self.plugin_rpc.core_rpc.server_status(status);
+        let core_rpc = self.plugin_rpc.core_rpc.clone();
+        let installing = self.installing_servers.clone();
+        let cancelled = self.cancel_installs.clone();
+        thread::spawn(move || {
+            let result =
+                install_builtin_npm_package(&cache, &npm, builtin, &cancelled);
+            installing.lock().remove(builtin.command);
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            match result {
+                Ok(()) => proxy_rpc
+                    .notification(ProxyNotification::RestartLanguageServers {}),
+                Err(error) => {
+                    tracing::error!(
+                        server = builtin.command,
+                        ?error,
+                        "installing language server"
+                    );
+                    core_rpc.server_status(
+                        ahead_rpc::core::ServerStatusParams::failed(
+                            builtin.command.into(),
+                            format!("{error:#}"),
+                        ),
+                    );
+                }
+            }
+        });
+    }
+
+    fn reload_language_extensions(&mut self) -> anyhow::Result<()> {
+        let Some(root) = ahead_core::directory::Directory::plugins_directory()
+        else {
+            self.plugin_rpc
+                .core_rpc
+                .language_extension_issues(Vec::new());
+            self.language_extensions.clear();
+            return Ok(());
+        };
+        let discovery = match discover_language_server_extensions(&root) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                report_extension_discovery_errors(
+                    &self.plugin_rpc,
+                    vec![(root, anyhow::anyhow!("{error:#}"))],
+                );
+                return Err(error);
+            }
+        };
+        report_extension_discovery_errors(&self.plugin_rpc, discovery.errors);
+        self.language_extensions = discovery.extensions;
+        Ok(())
     }
 
     fn report_language_server_error(
@@ -567,6 +916,48 @@ impl PluginCatalog {
         );
     }
 
+    fn refresh_workspace_configurations(&mut self) {
+        let (Some(workspace), Some(host)) =
+            (self.workspace.as_ref(), self.extension_host.as_ref())
+        else {
+            return;
+        };
+        self.configuration_generation =
+            self.configuration_generation.wrapping_add(1);
+        let generation = self.configuration_generation;
+        for (plugin_id, extension) in &self.extension_servers {
+            if !self.plugins.contains_key(plugin_id) {
+                continue;
+            }
+            let host = host.clone();
+            let workspace = workspace.clone();
+            let extension = extension.clone();
+            let plugin_id = *plugin_id;
+            let catalog_rpc = self.plugin_rpc.clone();
+            thread::spawn(move || {
+                let result = (|| -> anyhow::Result<Option<Value>> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(host.workspace_configuration_for_extension(
+                        &extension,
+                        WorktreeContext { root: workspace },
+                    ))
+                })()
+                .map_err(|error| format!("{error:#}"));
+                if let Err(error) = catalog_rpc.catalog_notification(
+                    PluginCatalogNotification::WorkspaceConfigurationResolved {
+                        plugin_id,
+                        generation,
+                        result,
+                    },
+                ) {
+                    tracing::error!(?error, "reporting language-server settings");
+                }
+            });
+        }
+    }
+
     pub fn handle_did_save_text_document(
         &mut self,
         language_id: String,
@@ -574,7 +965,7 @@ impl PluginCatalog {
         text_document: TextDocumentIdentifier,
         text: Rope,
     ) {
-        for (_, plugin) in self.plugins.iter() {
+        for plugin in self.plugins.values() {
             plugin.handle_rpc(PluginServerRpc::DidSaveTextDocument {
                 language_id: language_id.clone(),
                 path: path.clone(),
@@ -598,7 +989,7 @@ impl PluginCatalog {
             open_document.generation.fetch_add(1, Ordering::Relaxed);
         }
         let change = Arc::new(Mutex::new((None, None)));
-        for (_, plugin) in self.plugins.iter() {
+        for plugin in self.plugins.values() {
             plugin.handle_rpc(PluginServerRpc::DidChangeTextDocument {
                 language_id: language_id.clone(),
                 document: document.clone(),
@@ -732,18 +1123,58 @@ impl PluginCatalog {
     pub fn handle_notification(&mut self, notification: PluginCatalogNotification) {
         use PluginCatalogNotification::*;
         match notification {
+            RefreshWorkspaceConfigurations => {
+                self.refresh_workspace_configurations();
+            }
+            WorkspaceConfigurationResolved {
+                plugin_id,
+                generation,
+                result,
+            } => {
+                if generation != self.configuration_generation {
+                    return;
+                }
+                let (Some(server), Some(extension)) = (
+                    self.plugins.get(&plugin_id),
+                    self.extension_servers.get(&plugin_id),
+                ) else {
+                    return;
+                };
+                match result {
+                    Ok(configuration) => {
+                        server.update_workspace_configuration(configuration)
+                    }
+                    Err(message) => {
+                        tracing::error!(server = %extension.server_id, %message, "refreshing language-server settings");
+                        self.plugin_rpc.core_rpc.show_message(
+                            "Language server settings".into(),
+                            lsp_types::ShowMessageParams {
+                                typ: lsp_types::MessageType::ERROR,
+                                message: format!(
+                                    "{}: {message}",
+                                    extension.server_id
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
             RestartLanguageServers { documents } => {
+                self.plugin_rpc.core_rpc.clear_language_server_statuses();
+                let installing = self
+                    .installing_servers
+                    .lock()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for name in installing {
+                    let mut status =
+                        ahead_rpc::core::ServerStatusParams::starting(name.into());
+                    status.message =
+                        Some("Installing from npm into AHEAD's cache…".into());
+                    self.plugin_rpc.core_rpc.server_status(status);
+                }
                 for plugin in self.plugins.values() {
-                    self.plugin_rpc.core_rpc.server_status(
-                        ahead_rpc::core::ServerStatusParams::starting(
-                            plugin
-                                .server_id
-                                .name
-                                .strip_prefix("lsp-")
-                                .unwrap_or(&plugin.server_id.name)
-                                .to_owned(),
-                        ),
-                    );
                     plugin.shutdown();
                 }
                 for plugin in self.plugins.values() {
@@ -754,6 +1185,21 @@ impl PluginCatalog {
                 }
                 for plugin_id in self.plugins.keys().copied().collect::<Vec<_>>() {
                     self.remove_language_server(plugin_id);
+                }
+                if let Err(error) = self.reload_language_extensions() {
+                    tracing::error!(
+                        ?error,
+                        "reloading installed language extensions"
+                    );
+                    self.plugin_rpc.core_rpc.show_message(
+                        "Language extensions".into(),
+                        lsp_types::ShowMessageParams {
+                            typ: lsp_types::MessageType::ERROR,
+                            message: format!(
+                                "Could not reload language extensions: {error:#}"
+                            ),
+                        },
+                    );
                 }
                 for document in documents {
                     self.handle_did_open_text_document(document);
@@ -893,7 +1339,19 @@ impl PluginCatalog {
                 }
             }
             Shutdown => {
-                for (_, plugin) in self.plugins.iter() {
+                self.cancel_installs.store(true, Ordering::Relaxed);
+                let install_deadline = Instant::now() + Duration::from_secs(1);
+                while !self.installing_servers.lock().is_empty()
+                    && Instant::now() < install_deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if !self.installing_servers.lock().is_empty() {
+                    tracing::warn!(
+                        "npm installs did not stop before shutdown deadline"
+                    );
+                }
+                for plugin in self.plugins.values() {
                     plugin.shutdown();
                 }
                 for dap in self.daps.values() {
@@ -921,6 +1379,7 @@ impl PluginCatalog {
 
     fn remove_language_server(&mut self, plugin_id: PluginId) {
         self.plugins.remove(&plugin_id);
+        self.extension_servers.remove(&plugin_id);
         self.lsp_servers.retain(|_, id| *id != plugin_id);
         self.diagnostics.retain(|uri, sources| {
             let before = sources.len();
@@ -954,12 +1413,353 @@ fn full_document_diagnostics(
 mod document_diagnostic_tests {
     use super::*;
 
+    fn discard_initial_extension_issues(core: &ahead_rpc::core::CoreRpcHandler) {
+        use ahead_rpc::core::{CoreNotification, CoreRpc};
+
+        if let Ok(message) = core.rx().try_recv() {
+            assert!(matches!(
+                message,
+                CoreRpc::Notification(notification)
+                    if matches!(&*notification, CoreNotification::LanguageExtensionIssues { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn extension_discovery_errors_are_not_server_statuses() {
+        use ahead_rpc::core::{CoreNotification, CoreRpc, CoreRpcHandler};
+
+        let core = CoreRpcHandler::new();
+        let rpc = PluginCatalogRpcHandler::new(core.clone());
+        report_extension_discovery_errors(
+            &rpc,
+            vec![(
+                PathBuf::from("broken-extension"),
+                anyhow::anyhow!("bad manifest"),
+            )],
+        );
+        let CoreRpc::Notification(notification) =
+            core.rx().try_recv().expect("issue")
+        else {
+            panic!("expected notification");
+        };
+        let CoreNotification::LanguageExtensionIssues { issues } = *notification
+        else {
+            panic!("extension issue must not be a language-server status");
+        };
+        assert_eq!(issues[0].name, "broken-extension");
+        assert!(issues[0].message.contains("bad manifest"));
+        assert!(core.rx().try_recv().is_err());
+
+        report_extension_discovery_errors(&rpc, Vec::new());
+        assert!(matches!(
+            core.rx().try_recv(),
+            Ok(CoreRpc::Notification(notification))
+                if matches!(&*notification, CoreNotification::LanguageExtensionIssues { issues } if issues.is_empty())
+        ));
+    }
+
+    #[test]
+    fn restart_clears_old_language_server_statuses() {
+        use ahead_rpc::core::{CoreNotification, CoreRpc, CoreRpcHandler};
+
+        let core = CoreRpcHandler::new();
+        let rpc = PluginCatalogRpcHandler::new(core.clone());
+        let mut catalog = PluginCatalog::new(None, rpc);
+        catalog.handle_notification(
+            PluginCatalogNotification::RestartLanguageServers {
+                documents: Vec::new(),
+            },
+        );
+        assert!(core.rx().try_iter().any(|event| matches!(
+            event,
+            CoreRpc::Notification(notification)
+                if matches!(&*notification, CoreNotification::LanguageServerStatusesCleared)
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_npm_install_publishes_only_a_complete_cached_package()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cache = tempfile::tempdir()?;
+        let npm = cache.path().join("fake-npm");
+        std::fs::write(
+            &npm,
+            r#"#!/bin/sh
+mkdir -p "$3/node_modules/basedpyright"
+printf '{"name":"basedpyright","version":"1.0.0"}' > "$3/node_modules/basedpyright/package.json"
+: > "$3/node_modules/basedpyright/langserver.index.js"
+"#,
+        )?;
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o700))?;
+        let builtin = builtin_language_server("python").expect("Python server");
+        let cancelled = AtomicBool::new(false);
+        install_builtin_npm_package(cache.path(), &npm, builtin, &cancelled)?;
+        let cached =
+            builtin.cached_npm_command(cache.path(), Path::new("/usr/bin/node"));
+        assert!(cached.is_some());
+
+        std::fs::write(
+            &npm,
+            r#"#!/bin/sh
+mkdir -p "$3/node_modules/basedpyright"
+printf '{}' > "$3/node_modules/basedpyright/package.json"
+: > "$3/node_modules/basedpyright/langserver.index.js"
+"#,
+        )?;
+        assert!(
+            install_builtin_npm_package(cache.path(), &npm, builtin, &cancelled)
+                .is_err()
+        );
+        assert!(
+            builtin
+                .cached_npm_command(cache.path(), Path::new("/usr/bin/node"))
+                .is_some()
+        );
+
+        std::fs::write(&npm, "#!/bin/sh\nexit 7\n")?;
+        assert!(
+            install_builtin_npm_package(cache.path(), &npm, builtin, &cancelled)
+                .is_err()
+        );
+        assert!(
+            builtin
+                .cached_npm_command(cache.path(), Path::new("/usr/bin/node"))
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_builtin_npm_installs_serialize_cache_publication()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let cache = tempfile::tempdir()?;
+        let npm = cache.path().join("fake-npm");
+        std::fs::write(
+            &npm,
+            r#"#!/bin/sh
+mkdir "$3/../busy" || exit 27
+sleep 1
+mkdir -p "$3/node_modules/basedpyright"
+printf '{"name":"basedpyright","version":"1.0.0"}' > "$3/node_modules/basedpyright/package.json"
+: > "$3/node_modules/basedpyright/langserver.index.js"
+rmdir "$3/../busy"
+"#,
+        )?;
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o700))?;
+        let start = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let cache = cache.path().to_path_buf();
+                let npm = npm.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    install_builtin_npm_package(
+                        &cache,
+                        &npm,
+                        builtin_language_server("python").expect("Python server"),
+                        &AtomicBool::new(false),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("installer thread")?;
+        }
+        assert!(
+            builtin_language_server("python")
+                .expect("Python server")
+                .cached_npm_command(cache.path(), Path::new("/usr/bin/node"))
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_an_active_builtin_npm_install() -> anyhow::Result<()> {
+        use ahead_rpc::core::CoreRpcHandler;
+        use std::os::unix::fs::PermissionsExt;
+
+        let cache = tempfile::tempdir()?;
+        let npm = cache.path().join("fake-npm");
+        std::fs::write(&npm, "#!/bin/sh\n: > \"$3/../started\"\nexec sleep 10\n")?;
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o700))?;
+        let builtin = builtin_language_server("python").expect("Python server");
+        let mut catalog = PluginCatalog::new(
+            None,
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
+        );
+        let cancelled = catalog.cancel_installs.clone();
+        let installing = catalog.installing_servers.clone();
+        installing.lock().insert(builtin.command);
+        let cache_path = cache.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            let result =
+                install_builtin_npm_package(&cache_path, &npm, builtin, &cancelled);
+            installing.lock().remove(builtin.command);
+            result
+        });
+        let started = cache.path().join("language-servers/started");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let was_running = started.exists();
+        let shutdown_started = Instant::now();
+        catalog.handle_notification(PluginCatalogNotification::Shutdown);
+        let result = worker.join().expect("installer thread");
+        assert!(was_running, "fake npm did not start");
+        assert!(format!("{result:?}").contains("cancelled"));
+        assert!(shutdown_started.elapsed() < Duration::from_secs(5));
+        assert!(!cache.path().join("language-servers/basedpyright").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_servers_use_only_complete_app_cached_packages() -> anyhow::Result<()>
+    {
+        let cache = tempfile::tempdir()?;
+        let node = Path::new("/usr/bin/node");
+        for (language, package_name, script) in [
+            ("python", "basedpyright", "langserver.index.js"),
+            ("typescript", "@vtsls/language-server", "bin/vtsls.js"),
+        ] {
+            let builtin =
+                builtin_language_server(language).expect("built-in server");
+            assert!(builtin.cached_npm_command(cache.path(), node).is_none());
+            let package = cache
+                .path()
+                .join("language-servers")
+                .join(if language == "python" {
+                    "basedpyright"
+                } else {
+                    "vtsls"
+                })
+                .join("node_modules")
+                .join(package_name);
+            std::fs::create_dir_all(&package)?;
+            std::fs::write(package.join("package.json"), "{}")?;
+            assert!(builtin.cached_npm_command(cache.path(), node).is_none());
+            let script = package.join(script);
+            std::fs::create_dir_all(script.parent().expect("script directory"))?;
+            std::fs::write(&script, "")?;
+            assert!(builtin.cached_npm_command(cache.path(), node).is_none());
+            std::fs::write(
+                package.join("package.json"),
+                format!(r#"{{"name":"{package_name}","version":"1.0.0"}}"#),
+            )?;
+            let command = builtin
+                .cached_npm_command(cache.path(), node)
+                .expect("complete cached package");
+            assert_eq!(command.command, node.to_string_lossy().into_owned());
+            assert_eq!(
+                command.args,
+                vec![script.to_string_lossy().into_owned(), "--stdio".into()]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "set AHEAD_ZED_EXTENSION_SOURCE to an installed HTML extension and put its server on PATH"]
+    fn installed_zed_html_extension_starts_a_real_server() -> anyhow::Result<()> {
+        use ahead_rpc::core::{CoreNotification, CoreRpc, CoreRpcHandler};
+        use anyhow::{Context as _, bail};
+
+        let source = PathBuf::from(std::env::var("AHEAD_ZED_EXTENSION_SOURCE")?);
+        let project = tempfile::tempdir()?;
+        let extension_root = project.path().join("extensions");
+        let installed = extension_root.join("html");
+        std::fs::create_dir_all(&installed)?;
+        for name in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(source.join(name), installed.join(name))?;
+        }
+        let language_directory = installed.join("languages/html");
+        std::fs::create_dir_all(&language_directory)?;
+        std::fs::copy(
+            source.join("languages/html/config.toml"),
+            language_directory.join("config.toml"),
+        )?;
+        let extension = discover_language_server_extensions(&extension_root)?
+            .extensions
+            .into_iter()
+            .find(|extension| extension.server_id == "vscode-html-language-server")
+            .context("installed HTML extension has no language server")?;
+        let workspace = project.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let file = workspace.join("index.html");
+        std::fs::write(&file, "<di")?;
+        let language = ahead_extension_host::language_id_for_path(
+            &extension_root,
+            &file,
+            Some("<di"),
+        )?
+        .context("installed extension did not detect HTML")?;
+        assert_eq!(language, "HTML");
+        let core = CoreRpcHandler::new();
+        let rpc = PluginCatalogRpcHandler::new(core.clone());
+        let mut catalog = PluginCatalog::new(Some(workspace), rpc.clone());
+        catalog.language_extensions = vec![extension];
+        catalog.handle_did_open_text_document(TextDocumentItem::new(
+            url::Url::from_file_path(&file)
+                .map_err(|_| anyhow::anyhow!("invalid HTML file path"))?,
+            language,
+            1,
+            "<di".into(),
+        ));
+        if !catalog.lsp_servers.contains_key("HTML") {
+            bail!("installed HTML extension did not launch its language server");
+        }
+        let loop_rpc = rpc.clone();
+        let loop_thread = std::thread::spawn(move || {
+            loop_rpc.mainloop(&mut catalog);
+        });
+        let outcome = (|| -> anyhow::Result<()> {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let timeout =
+                    deadline.saturating_duration_since(std::time::Instant::now());
+                let CoreRpc::Notification(notification) =
+                    core.rx().recv_timeout(timeout)?
+                else {
+                    continue;
+                };
+                if let CoreNotification::ServerStatus { params } = &*notification
+                    && params.server_name.as_deref()
+                        == Some("vscode-html-language-server")
+                {
+                    if params.is_ok() {
+                        return Ok(());
+                    }
+                    if let Some(message) = &params.message {
+                        bail!("installed HTML server failed: {message}");
+                    }
+                }
+            }
+        })();
+        rpc.shutdown();
+        loop_thread.join().expect("catalog loop");
+        outcome
+    }
+
     #[test]
     fn completion_without_a_running_server_finishes_with_an_empty_list() {
         use ahead_rpc::core::{CoreNotification, CoreRpc, CoreRpcHandler};
         let core = CoreRpcHandler::new();
         let rpc = PluginCatalogRpcHandler::new(core.clone());
         let mut catalog = PluginCatalog::new(None, rpc.clone());
+        discard_initial_extension_issues(&core);
         let path = std::env::temp_dir().join("ahead-completion-test.ts");
         rpc.completion(3, &path, String::new(), lsp_types::Position::default());
         rpc.shutdown();
@@ -987,6 +1787,7 @@ mod document_diagnostic_tests {
         let core_rpc = CoreRpcHandler::new();
         let mut catalog =
             PluginCatalog::new(None, PluginCatalogRpcHandler::new(core_rpc.clone()));
+        discard_initial_extension_issues(&core_rpc);
         let uri = url::Url::parse("file:///fixture/main.ts").expect("URI");
         let path = uri.to_file_path().expect("path");
         let generation = Arc::new(AtomicU64::new(7));
@@ -1030,6 +1831,7 @@ mod document_diagnostic_tests {
         let core_rpc = CoreRpcHandler::new();
         let mut catalog =
             PluginCatalog::new(None, PluginCatalogRpcHandler::new(core_rpc.clone()));
+        discard_initial_extension_issues(&core_rpc);
         let uri = url::Url::parse("file:///fixture/main.rs").expect("file URL");
         for id in [PluginId(1), PluginId(2)] {
             let (sender, _) = crossbeam_channel::unbounded();

@@ -2,7 +2,6 @@ mod file_update;
 mod invocation;
 mod parser;
 mod seek_sequence;
-mod standalone_executable;
 mod streaming_parser;
 mod text_file;
 
@@ -41,18 +40,8 @@ pub use invocation::maybe_parse_apply_patch_verified;
 pub use invocation::maybe_parse_apply_patch_verified_with_mode;
 pub use invocation::verify_apply_patch_args;
 pub use invocation::verify_apply_patch_args_with_mode;
-pub use standalone_executable::main;
 
 use crate::invocation::ExtractHeredocError;
-
-/// Special argv[1] flag used when the Codex executable self-invokes to run the
-/// internal `apply_patch` path.
-///
-/// Although this constant lives in `codex-apply-patch` (to avoid forcing
-/// `codex-arg0` to depend on `codex-core`), it remains part of the "codex core"
-/// process-invocation contract for the standalone `apply_patch` command
-/// surface.
-pub const CODEX_CORE_APPLY_PATCH_ARG1: &str = "--codex-run-as-apply-patch";
 
 /// Internal environment variable used to carry the selected update mode
 /// through the arg0-dispatched standalone executable.
@@ -83,15 +72,6 @@ impl Default for ApplyPatchOptions {
             update_file_mode: ApplyPatchFileUpdateMode::default(),
             follow_symlinks: true,
         }
-    }
-}
-
-/// Reads the update mode selected for an arg0-dispatched `apply_patch` process.
-#[doc(hidden)]
-pub fn apply_patch_file_update_mode_from_env() -> ApplyPatchFileUpdateMode {
-    match std::env::var(CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR).as_deref() {
-        Ok("1") => ApplyPatchFileUpdateMode::PreserveLineEndings,
-        _ => ApplyPatchFileUpdateMode::NormalizeToLf,
     }
 }
 

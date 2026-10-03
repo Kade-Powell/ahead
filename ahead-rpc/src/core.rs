@@ -79,6 +79,10 @@ pub enum CoreNotification {
     ServerStatus {
         params: ServerStatusParams,
     },
+    LanguageExtensionIssues {
+        issues: Vec<LanguageExtensionIssue>,
+    },
+    LanguageServerStatusesCleared,
     WorkDoneProgress {
         progress: ProgressParams,
     },
@@ -312,6 +316,14 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::ServerStatus { params });
     }
 
+    pub fn language_extension_issues(&self, issues: Vec<LanguageExtensionIssue>) {
+        self.notification(CoreNotification::LanguageExtensionIssues { issues });
+    }
+
+    pub fn clear_language_server_statuses(&self) {
+        self.notification(CoreNotification::LanguageServerStatusesCleared);
+    }
+
     pub fn work_done_progress(&self, progress: ProgressParams) {
         self.notification(CoreNotification::WorkDoneProgress { progress });
     }
@@ -421,6 +433,12 @@ pub struct ServerStatusParams {
     health: String,
     quiescent: bool,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LanguageExtensionIssue {
+    pub name: String,
+    pub message: String,
 }
 
 impl ServerStatusParams {

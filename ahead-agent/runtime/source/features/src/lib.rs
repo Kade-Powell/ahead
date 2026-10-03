@@ -103,8 +103,6 @@ pub enum Feature {
     ExecutedToolCallMetadata,
     /// Enable JavaScript code mode backed by the standalone host process.
     CodeMode,
-    /// Removed compatibility flag for the configurable code-mode exec yield timeout.
-    CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
     /// Establish the code-mode host connection during session startup.
@@ -123,8 +121,6 @@ pub enum Feature {
     /// on either `unified_exec` or `shell_zsh_fork` because those features have
     /// separate rollout and enterprise controls.
     UnifiedExecZshFork,
-    /// Removed compatibility flag. Transcript scrollback reflow on terminal resize is always on.
-    TerminalResizeReflow,
     /// Add terminal-specific visualization guidance to TUI developer instructions.
     TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
@@ -177,18 +173,10 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
-    /// Removed compatibility flag retained as a no-op.
-    MultiAgentMode,
-    /// Removed compatibility flag for the deleted agent-job tools.
-    SpawnCsv,
     /// Enable MCP apps.
     EnableMcpApps,
     /// Enable MCP protocol version 2026-07-28 support.
     Mcp20260728,
-    /// Removed compatibility flag retained as a no-op now that tool_search is always enabled.
-    ToolSearch,
-    /// Removed compatibility flag. MCP tools are always deferred when tool_search is available.
-    ToolSearchAlwaysDeferMcpTools,
     /// Describe deferred tool namespaces in the model-visible world state.
     DeferredToolWorldState,
     /// Expose MCP model-visible namespaces without the legacy `mcp__` prefix.
@@ -231,8 +219,6 @@ pub enum Feature {
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
     ComputerUse,
-    /// Removed compatibility flag retained as a no-op.
-    ExternalMigration,
     /// Enable extension-backed image generation.
     ImageGeneration,
     /// Omit inline image and audio content from app-server item notifications.
@@ -241,22 +227,14 @@ pub enum Feature {
     ImageResizeNotice,
     /// Apply one shared pixel and token budget to every image, regardless of legacy detail hints.
     UnifiedImageBudget,
-    /// Removed compatibility flag for always-on centralized image preparation.
-    ResizeAllImages,
-    /// Removed compatibility flag for always-on response item IDs.
-    ItemIds,
     /// Request sequential cutoff reasoning summary delivery.
     ConcurrentReasoningSummaries,
     /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
     SkillSearch,
-    /// Removed compatibility flag for deleted skill env var dependency prompting.
-    SkillEnvVarDependencyPrompt,
     /// Enable the unified mention popup used by default in the TUI.
     MentionsV2,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
-    /// Removed compatibility flag for model-enabled async user messaging.
-    SendAsyncMessage,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
     /// Add current context-window metadata to model-visible context.
@@ -287,58 +265,14 @@ pub enum Feature {
     CompactionImageBudget,
     /// Retain client-authored developer messages across compacted context windows.
     RetainClientDeveloperMessages,
-    /// Use Agent Identity for ChatGPT-authenticated sessions.
-    UseAgentIdentity,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
 
     // Removed
-    /// Removed compatibility flag retained as a no-op so old configs can
-    /// still parse `undo`.
-    GhostCommit,
-    /// Removed compatibility flag for the deleted JavaScript REPL feature.
-    JsRepl,
-    /// Removed compatibility flag for the deleted JavaScript REPL tool-only mode.
-    JsReplToolsOnly,
-    /// Legacy search-tool feature flag kept for backward compatibility.
-    SearchTool,
-    /// Removed legacy Linux bubblewrap opt-in flag retained as a no-op so old
-    /// wrappers and config can still parse it.
-    UseLinuxSandboxBwrap,
-    /// Allow the model to request approval and propose exec rules.
-    RequestRule,
     /// Enable Windows sandbox (restricted token) on Windows.
     WindowsSandbox,
     /// Use the elevated Windows sandbox pipeline (setup + runner).
     WindowsSandboxElevated,
-    /// Legacy remote models flag kept for backward compatibility.
-    RemoteModels,
-    /// Removed legacy git commit attribution guidance flag.
-    CodexGitCommit,
-    /// Removed compatibility flag for the deleted apply_patch fallback feature.
-    ApplyPatchFreeform,
-    /// Removed compatibility flag for the deleted unavailable-tool placeholder backfill.
-    UnavailableDummyTools,
-    /// Steer feature flag - when enabled, Enter submits immediately instead of queuing.
-    /// Kept for config backward compatibility; behavior is always steer-enabled.
-    Steer,
-    /// Enable collaboration modes (Plan, Default).
-    /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
-    CollaborationModes,
-    /// Removed compatibility flag for the deleted remote control feature.
-    RemoteControl,
-    /// Removed compatibility flag retained as a no-op so old wrappers can
-    /// still pass `--enable image_detail_original`.
-    ImageDetailOriginal,
-    /// Removed compatibility flag. The TUI now always uses the app-server implementation.
-    TuiAppServer,
-    /// Removed compatibility flag retained as a no-op now that workspace owner
-    /// usage nudges are always enabled.
-    WorkspaceOwnerUsageNudge,
-    /// Legacy rollout flag for Responses API WebSocket transport experiments.
-    ResponsesWebsockets,
-    /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
-    ResponsesWebsocketsV2,
 }
 
 impl Feature {
@@ -496,43 +430,6 @@ impl Features {
                         Feature::WebSearchCached,
                     );
                 }
-                "tui_app_server" => {
-                    continue;
-                }
-                "undo" => {
-                    continue;
-                }
-                "js_repl" => {
-                    continue;
-                }
-                "js_repl_tools_only" => {
-                    continue;
-                }
-                "remote_control" => {
-                    continue;
-                }
-                "apply_patch_freeform" => {
-                    continue;
-                }
-                "tool_search" | "tool_search_always_defer_mcp_tools" => {
-                    continue;
-                }
-                "image_detail_original" | "resize_all_images" | "item_ids" => {
-                    continue;
-                }
-                "plugins"
-                | "recommended_plugins"
-                | "remote_plugin"
-                | "plugin_sharing"
-                | "plugin_hooks" => {
-                    continue;
-                }
-                "skill_env_var_dependency_prompt" => {
-                    continue;
-                }
-                "terminal_resize_reflow" => {
-                    continue;
-                }
                 "use_legacy_landlock" => {
                     self.record_legacy_usage_force(
                         "features.use_legacy_landlock",
@@ -543,9 +440,6 @@ impl Features {
             }
             match feature_for_key(k) {
                 Some(feat) => {
-                    if matches!(feat, Feature::TuiAppServer) {
-                        continue;
-                    }
                     if *v {
                         self.enable(feat);
                     } else {
@@ -783,12 +677,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     },
     // Stable features.
     FeatureSpec {
-        id: Feature::GhostCommit,
-        key: "undo",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ShellTool,
         key: "shell_tool",
         stage: Stage::Stable,
@@ -861,12 +749,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::JsRepl,
-        key: "js_repl",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ContentItemKinds,
         key: "content_item_kinds",
         stage: Stage::Stable,
@@ -882,12 +764,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::CodeMode,
         key: "code_mode",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::CodeModeBufferedExec,
-        key: "code_mode_buffered_exec",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -915,18 +791,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::JsReplToolsOnly,
-        key: "js_repl_tools_only",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::TerminalResizeReflow,
-        key: "terminal_resize_reflow",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::WebSearchRequest,
         key: "web_search_request",
         stage: Stage::Deprecated,
@@ -942,18 +806,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::StandaloneWebSearch,
         key: "standalone_web_search",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::SearchTool,
-        key: "search_tool",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::CodexGitCommit,
-        key: "codex_git_commit",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -978,12 +830,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::Chronicle,
         key: "chronicle",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ApplyPatchFreeform,
-        key: "apply_patch_freeform",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1023,21 +869,9 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::UseLinuxSandboxBwrap,
-        key: "use_linux_sandbox_bwrap",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::UseLegacyLandlock,
         key: "use_legacy_landlock",
         stage: Stage::Deprecated,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::RequestRule,
-        key: "request_rule",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1049,12 +883,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WindowsSandboxElevated,
         key: "elevated_windows_sandbox",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::RemoteModels,
-        key: "remote_models",
         stage: Stage::Removed,
         default_enabled: false,
     },
@@ -1099,18 +927,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::MultiAgentMode,
-        key: "multi_agent_mode",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::SpawnCsv,
-        key: "enable_fanout",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::EnableMcpApps,
         key: "enable_mcp_apps",
         stage: Stage::UnderDevelopment,
@@ -1123,18 +939,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::ToolSearch,
-        key: "tool_search",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ToolSearchAlwaysDeferMcpTools,
-        key: "tool_search_always_defer_mcp_tools",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::DeferredToolWorldState,
         key: "deferred_tool_world_state",
         stage: Stage::UnderDevelopment,
@@ -1144,12 +948,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::NonPrefixedMcpToolNames,
         key: "non_prefixed_mcp_tool_names",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::UnavailableDummyTools,
-        key: "unavailable_dummy_tools",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1213,12 +1011,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::ExternalMigration,
-        key: "external_migration",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ImageGeneration,
         key: "image_generation",
         stage: Stage::Stable,
@@ -1243,18 +1035,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::ResizeAllImages,
-        key: "resize_all_images",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::ItemIds,
-        key: "item_ids",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::ConcurrentReasoningSummaries,
         key: "concurrent_reasoning_summaries",
         stage: Stage::UnderDevelopment,
@@ -1267,33 +1047,15 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::SkillEnvVarDependencyPrompt,
-        key: "skill_env_var_dependency_prompt",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::MentionsV2,
         key: "mentions_v2",
         stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::Steer,
-        key: "steer",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::DefaultModeRequestUserInput,
         key: "default_mode_request_user_input",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::SendAsyncMessage,
-        key: "send_async_message",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1325,12 +1087,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "current_time_reminder",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::CollaborationModes,
-        key: "collaboration_modes",
-        stage: Stage::Removed,
-        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ToolCallMcpElicitation,
@@ -1375,24 +1131,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::RemoteControl,
-        key: "remote_control",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ImageDetailOriginal,
-        key: "image_detail_original",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::TuiAppServer,
-        key: "tui_app_server",
-        stage: Stage::Removed,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::PreventIdleSleep,
         key: "prevent_idle_sleep",
         stage: if cfg!(any(
@@ -1411,24 +1149,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::WorkspaceOwnerUsageNudge,
-        key: "workspace_owner_usage_nudge",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ResponsesWebsockets,
-        key: "responses_websockets",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::ResponsesWebsocketsV2,
-        key: "responses_websockets_v2",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::RemoteCompactionV2,
         key: "remote_compaction_v2",
         stage: Stage::Stable,
@@ -1443,12 +1163,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RetainClientDeveloperMessages,
         key: "retain_client_developer_messages",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::UseAgentIdentity,
-        key: "use_agent_identity",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

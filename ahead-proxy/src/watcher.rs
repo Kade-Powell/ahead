@@ -227,12 +227,10 @@ impl Watchee {
                     false
                 }
             }
-            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
-                if event.paths.len() == 1 {
-                    self.applies_to_path(&event.paths[0])
-                } else {
-                    false
-                }
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
+                if event.paths.len() == 1 =>
+            {
+                self.applies_to_path(&event.paths[0])
             }
             _ => false,
         }

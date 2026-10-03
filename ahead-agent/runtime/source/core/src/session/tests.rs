@@ -41,7 +41,6 @@ use codex_config::types::WindowsSandboxModeToml;
 use core_test_support::test_codex::TurnInputRequest as ExternalTurnInputRequest;
 
 use ahead_model_auth::CodexAuth;
-use ahead_model_auth::auth::AgentIdentityAuthPolicy;
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
 use codex_http_client::ClientRouteClass;
@@ -708,7 +707,6 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         .expect("test thread id should be valid");
     crate::client::ModelClient::new(
         /*auth_manager*/ None,
-        AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         ModelProviderInfo::create_openai_provider(/* base_url */ /*base_url*/ None),
         codex_protocol::protocol::SessionSource::Exec,
@@ -719,7 +717,6 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
-        /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
     .new_session()
@@ -1633,46 +1630,12 @@ async fn get_base_instructions_no_user_content() {
 }
 
 #[tokio::test]
-async fn reload_user_config_layer_updates_effective_apps_config() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
-    std::fs::write(
-        &config_toml_path,
-        "[apps.calendar]\nenabled = false\ndestructive_enabled = false\n",
-    )
-    .expect("write user config");
-
-    session.reload_user_config_layer().await;
-
-    let config = session.get_config().await;
-    let apps_toml = config
-        .config_layer_stack
-        .effective_config()
-        .as_table()
-        .and_then(|table| table.get("apps"))
-        .cloned()
-        .expect("apps table");
-    let apps = codex_config::types::AppsConfigToml::deserialize(apps_toml)
-        .expect("deserialize apps config");
-    let app = apps
-        .apps
-        .get("calendar")
-        .expect("calendar app config exists");
-
-    assert!(!app.enabled);
-    assert_eq!(app.destructive_enabled, Some(false));
-}
-
-#[tokio::test]
 async fn reload_user_config_layer_keeps_previous_config_for_malformed_shell_policy() {
     let (session, _turn_context) = make_session_and_context().await;
     let codex_home = session.codex_home().await;
     std::fs::create_dir_all(&codex_home).expect("create codex home");
     let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
-    std::fs::write(&config_toml_path, "[apps.calendar]\nenabled = false\n")
-        .expect("write valid user config");
+    std::fs::write(&config_toml_path, "model = \"gpt-5\"\n").expect("write valid user config");
     session.reload_user_config_layer().await;
     let previous_config = session
         .get_config()
@@ -1684,8 +1647,7 @@ async fn reload_user_config_layer_keeps_previous_config_for_malformed_shell_poli
     std::fs::write(
         &config_toml_path,
         r#"
-[apps.calendar]
-enabled = true
+model = "gpt-5"
 
 [shell_environment_policy]
 exclude = ["SECRET_*", 17]
@@ -1923,43 +1885,14 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
 async fn refresh_runtime_config_updates_runtime_refreshable_fields_and_keeps_session_static_settings()
  {
     let (session, _turn_context) = make_session_and_context().await;
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[apps.calendar]
-enabled = false
-destructive_enabled = false
-"#,
-    )
-    .expect("write user config");
-
     let original = session.get_config().await;
     let mut next_config = load_latest_config_for_session(&session).await;
     next_config.model = Some("gpt-5.4".to_string());
-    next_config.notify = Some(vec!["echo".to_string()]);
 
     session.refresh_runtime_config(next_config).await;
 
     let config = session.get_config().await;
-    let apps_toml = config
-        .config_layer_stack
-        .effective_config()
-        .as_table()
-        .and_then(|table| table.get("apps"))
-        .cloned()
-        .expect("apps table");
-    let apps = codex_config::types::AppsConfigToml::deserialize(apps_toml)
-        .expect("deserialize apps config");
-    let app = apps
-        .apps
-        .get("calendar")
-        .expect("calendar app config exists");
-
-    assert!(!app.enabled);
-    assert_eq!(app.destructive_enabled, Some(false));
     assert_eq!(config.model, original.model);
-    assert_eq!(config.notify, original.notify);
 }
 
 #[tokio::test]
@@ -3178,15 +3111,6 @@ async fn config_change_contributor_observes_effective_config_changes() {
         .await
         .expect("update settings");
 
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[apps.calendar]
-enabled = false
-"#,
-    )
-    .expect("write user config");
     let next_config = load_latest_config_for_session(&session).await;
     session.refresh_runtime_config(next_config).await;
 
@@ -3393,112 +3317,6 @@ async fn session_configured_reports_permission_profile_for_external_sandbox() ->
         test.session_configured.permission_profile, expected_permission_profile,
         "ExternalSandbox is represented explicitly instead of as a lossy root-write profile"
     );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<()> {
-    let server = start_mock_server().await;
-    mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let first_forked_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
-
-    let mut builder = test_codex().with_config(|config| {
-        config.update_plan_enabled = true;
-        config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(AskForApproval::OnRequest);
-    });
-    let initial = builder.build(&server).await?;
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
-
-    initial
-        .codex
-        .start_or_steer_turn(ExternalTurnInputRequest::user_input(vec![
-            UserInput::Text {
-                text: "fork seed".into(),
-                text_elements: Vec::new(),
-            },
-        ]))
-        .await?;
-    wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    // Forking reads the persisted rollout JSONL, so force the completed source turn to disk
-    // before snapshotting from it.
-    initial.codex.ensure_rollout_materialized().await;
-    initial
-        .codex
-        .flush_rollout()
-        .await
-        .expect("source rollout should flush before fork");
-
-    let mut fork_config = initial.config.clone();
-    fork_config.permissions.approval_policy =
-        codex_config::Constrained::allow_any(AskForApproval::UnlessTrusted);
-    let forked = initial
-        .thread_manager
-        .fork_thread(
-            usize::MAX,
-            fork_config.clone(),
-            rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-        )
-        .await?;
-
-    let collaboration_mode = CollaborationMode {
-        mode: ModeKind::Plan,
-        settings: Settings {
-            model: forked.session_configured.model.clone(),
-            reasoning_effort: None,
-            developer_instructions: Some("Fork turn collaboration instructions.".to_string()),
-        },
-    };
-    forked
-        .thread
-        .start_or_steer_turn(
-            ExternalTurnInputRequest::user_input(vec![UserInput::Text {
-                text: "after fork".into(),
-                text_elements: Vec::new(),
-            }])
-            .with_thread_settings(ThreadSettingsOverrides {
-                approval_policy: Some(AskForApproval::Never),
-                collaboration_mode: Some(collaboration_mode),
-                ..Default::default()
-            }),
-        )
-        .await?;
-    wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = first_forked_request.single_request();
-    let snapshot = context_snapshot::format_labeled_requests_snapshot(
-        "First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.",
-        &[("First Forked Turn Request", &request)],
-        &ContextSnapshotOptions::default()
-            .render_mode(ContextSnapshotRenderMode::KindWithTextPrefix { max_chars: 96 })
-            .strip_capability_instructions()
-            .strip_agents_md_user_context(),
-    );
-
-    let mut settings = insta::Settings::clone_current();
-    settings.set_snapshot_path("snapshots");
-    settings.set_prepend_module_to_snapshot(false);
-    settings.bind(|| {
-        insta::assert_snapshot!(
-            "codex_core__codex_tests__fork_startup_context_then_first_turn_diff",
-            snapshot
-        );
-    });
-
     Ok(())
 }
 
@@ -5925,7 +5743,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         tx_event,
         agent_status_tx,
         InitialHistory::New,
-        ForkPersistence::Copied,
         SessionSource::Exec,
         skills_service,
         mcp_manager,
@@ -5940,7 +5757,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         /*analytics_events_client*/ None,
         Arc::new(codex_thread_store::InMemoryThreadStore::default()),
         codex_rollout_trace::ThreadTraceContext::disabled(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
@@ -6084,10 +5900,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         .enabled(Feature::ExecutedToolCallMetadata)
         .then(|| Arc::new(crate::state::ExecutedToolCallRecorder::default()));
     let (hooks, async_hook_results) = Hooks::new(
-        HooksConfig {
-            legacy_notify_argv: config.notify.clone(),
-            ..HooksConfig::default()
-        },
+        HooksConfig::default(),
         thread_id,
         Arc::new(CoreHookMcpExecutor {
             runtime: Arc::clone(&mcp_runtime),
@@ -6137,11 +5950,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_approval: Arc::clone(&network_approval),
         live_thread: None,
         thread_store: Arc::new(codex_thread_store::InMemoryThreadStore::default()),
-        attestation_provider: None,
         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
-            AgentIdentityAuthPolicy::JwtOnly,
             thread_id,
             session_configuration.provider.info().clone(),
             session_configuration.session_source.clone(),
@@ -6155,7 +5966,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
-            /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
         executed_tool_calls: executed_tool_calls.clone(),
@@ -6191,7 +6001,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         input_queue: super::input_queue::InputQueue::new(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
-        fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -6337,7 +6146,6 @@ async fn make_session_with_config_and_rx(
         tx_event,
         agent_status_tx,
         InitialHistory::New,
-        ForkPersistence::Copied,
         SessionSource::Exec,
         skills_service,
         mcp_manager,
@@ -6352,7 +6160,6 @@ async fn make_session_with_config_and_rx(
         /*analytics_events_client*/ None,
         Arc::new(codex_thread_store::InMemoryThreadStore::default()),
         codex_rollout_trace::ThreadTraceContext::disabled(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
@@ -6453,7 +6260,6 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         tx_event,
         agent_status_tx,
         initial_history,
-        ForkPersistence::Copied,
         session_source,
         skills_service,
         mcp_manager,
@@ -6468,7 +6274,6 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*analytics_events_client*/ None,
         Arc::new(codex_thread_store::InMemoryThreadStore::default()),
         codex_rollout_trace::ThreadTraceContext::disabled(),
-        /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
@@ -8165,10 +7970,7 @@ where
         .enabled(Feature::ExecutedToolCallMetadata)
         .then(|| Arc::new(crate::state::ExecutedToolCallRecorder::default()));
     let (hooks, async_hook_results) = Hooks::new(
-        HooksConfig {
-            legacy_notify_argv: config.notify.clone(),
-            ..HooksConfig::default()
-        },
+        HooksConfig::default(),
         thread_id,
         Arc::new(CoreHookMcpExecutor {
             runtime: Arc::clone(&mcp_runtime),
@@ -8218,11 +8020,9 @@ where
         network_approval: Arc::clone(&network_approval),
         live_thread: None,
         thread_store: Arc::new(codex_thread_store::InMemoryThreadStore::default()),
-        attestation_provider: None,
         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
-            AgentIdentityAuthPolicy::JwtOnly,
             thread_id,
             session_configuration.provider.info().clone(),
             session_configuration.session_source.clone(),
@@ -8236,7 +8036,6 @@ where
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
-            /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
         executed_tool_calls: executed_tool_calls.clone(),
@@ -8272,7 +8071,6 @@ where
         input_queue: super::input_queue::InputQueue::new(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
-        fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     });

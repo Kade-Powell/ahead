@@ -22,20 +22,21 @@ use crossbeam_channel::{Receiver, Sender};
 use dyn_clone::DynClone;
 use jsonrpc_lite::{Id, JsonRpc, Params};
 use lsp_types::{
-    CancelParams, CodeActionProviderCapability, DidChangeTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentSelector, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeResult,
-    LogMessageParams, MessageType, OneOf, Position, ProgressParams,
-    PublishDiagnosticsParams, Range, Registration, RegistrationParams,
-    SemanticTokens, SemanticTokensLegend, SemanticTokensServerCapabilities,
-    ServerCapabilities, ShowMessageParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentSaveRegistrationOptions,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
+    CancelParams, CodeActionProviderCapability, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidSaveTextDocumentParams, DocumentSelector,
+    FoldingRangeProviderCapability, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeResult, LogMessageParams,
+    MessageType, OneOf, Position, ProgressParams, PublishDiagnosticsParams, Range,
+    Registration, RegistrationParams, SemanticTokens, SemanticTokensLegend,
+    SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentSaveRegistrationOptions, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncSaveOptions,
     VersionedTextDocumentIdentifier,
     notification::{
-        Cancel, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
-        DidSaveTextDocument, Initialized, LogMessage, Notification, Progress,
-        PublishDiagnostics, ShowMessage,
+        Cancel, DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument,
+        DidOpenTextDocument, DidSaveTextDocument, Initialized, LogMessage,
+        Notification, Progress, PublishDiagnostics, ShowMessage,
     },
     request::{
         CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
@@ -102,6 +103,7 @@ impl<Resp, Error, F: Send + FnOnce(Result<Resp, Error>)> RpcCallback<Resp, Error
 pub enum PluginHandlerNotification {
     Initialize,
     InitializeResult(InitializeResult),
+    WorkspaceConfiguration(Option<Value>),
     Shutdown,
 }
 
@@ -407,6 +409,14 @@ impl PluginServerRpcHandler {
             }
         } else {
             self.send_server_notification(&method, params);
+        }
+    }
+
+    pub fn update_workspace_configuration(&self, configuration: Option<Value>) {
+        if let Err(error) = self.rpc_tx.send(PluginServerRpc::Handler(
+            PluginHandlerNotification::WorkspaceConfiguration(configuration),
+        )) {
+            tracing::error!(?error, "updating language-server configuration");
         }
     }
 
@@ -1025,6 +1035,8 @@ pub struct PluginHostHandler {
     pub server_capabilities: ServerCapabilities,
     server_registrations: ServerRegistrations,
     workspace_configuration: Option<Value>,
+    initialized: bool,
+    pending_workspace_configuration: bool,
 }
 
 impl PluginHostHandler {
@@ -1056,14 +1068,50 @@ impl PluginHostHandler {
             server_capabilities: ServerCapabilities::default(),
             server_registrations: ServerRegistrations::default(),
             workspace_configuration,
+            initialized: false,
+            pending_workspace_configuration: false,
         }
     }
 
     pub(super) fn initialized(&mut self, result: InitializeResult) {
         self.server_capabilities = result.capabilities;
+        self.initialized = true;
+        if std::mem::take(&mut self.pending_workspace_configuration) {
+            self.notify_workspace_configuration();
+        }
         self.catalog_rpc.language_server_status(
             self.server_rpc.plugin_id,
             ServerStatusParams::ready(self.server_display_name.clone()),
+        );
+    }
+
+    pub(super) fn update_workspace_configuration(
+        &mut self,
+        configuration: Option<Value>,
+    ) {
+        if self.workspace_configuration == configuration {
+            return;
+        }
+        self.workspace_configuration = configuration.clone();
+        if self.initialized {
+            self.notify_workspace_configuration();
+        } else {
+            self.pending_workspace_configuration = true;
+        }
+    }
+
+    fn notify_workspace_configuration(&self) {
+        self.server_rpc.server_notification(
+            DidChangeConfiguration::METHOD,
+            DidChangeConfigurationParams {
+                settings: self
+                    .workspace_configuration
+                    .clone()
+                    .unwrap_or(Value::Null),
+            },
+            None,
+            None,
+            false,
         );
     }
 
@@ -1777,6 +1825,65 @@ mod save_capability_tests {
 mod workspace_configuration_tests {
     use super::workspace_configuration_response;
     use serde_json::json;
+
+    #[test]
+    fn changed_configuration_updates_requests_and_notifies_after_initialize() {
+        use super::{PluginHostHandler, PluginServerRpcHandler};
+        use ahead_rpc::{core::CoreRpcHandler, plugin::ServerId};
+        use lsp_types::notification::{DidChangeConfiguration, Notification};
+
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = super::PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test-lsp".into(),
+        };
+        let (io_tx, io_rx) = crossbeam_channel::unbounded();
+        let server_rpc = PluginServerRpcHandler::new(server_id.clone(), None, io_tx);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let first = json!({ "test": { "value": 1 } });
+        host.update_workspace_configuration(Some(first.clone()));
+        assert_eq!(
+            workspace_configuration_response(
+                host.workspace_configuration.as_ref(),
+                &json!({ "items": [{}] }),
+            ),
+            json!([first])
+        );
+        assert!(io_rx.try_recv().is_err());
+
+        host.initialized(
+            serde_json::from_value(json!({ "capabilities": {} }))
+                .expect("initialize result"),
+        );
+        let changed = io_rx
+            .recv()
+            .expect("configuration notification")
+            .expect("frame");
+        assert_eq!(changed.get_method(), Some(DidChangeConfiguration::METHOD));
+        assert_eq!(
+            serde_json::to_value(changed.get_params()).expect("params")["settings"],
+            json!({ "test": { "value": 1 } })
+        );
+        host.update_workspace_configuration(Some(first));
+        assert!(io_rx.try_recv().is_err());
+        host.update_workspace_configuration(None);
+        let cleared = io_rx.recv().expect("configuration clear").expect("frame");
+        assert_eq!(
+            serde_json::to_value(cleared.get_params()).expect("params")["settings"],
+            serde_json::Value::Null
+        );
+    }
 
     #[test]
     fn client_advertises_workspace_configuration_support() {

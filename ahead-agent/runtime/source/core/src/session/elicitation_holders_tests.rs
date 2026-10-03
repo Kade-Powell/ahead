@@ -189,9 +189,7 @@ async fn request_user_input_holds_an_elicitation_until_response() {
     let response = RequestUserInputResponse {
         answers: HashMap::new(),
     };
-    session
-        .notify_user_input_response(&turn_context.sub_id, response)
-        .await;
+    session.notify_user_input_response("call-1", response).await;
 
     request.await.expect("request user input task");
     wait_until_released(&mut pause_state).await;

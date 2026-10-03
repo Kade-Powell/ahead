@@ -24,11 +24,8 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderValue;
 
-use crate::auth::ProviderAuthScope;
-use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
-use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 
 pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
@@ -174,11 +171,6 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         DEFAULT_MEMORY_CONSOLIDATION_PREFERRED_MODEL
     }
 
-    /// Returns whether requests made through this provider should include attestation.
-    fn supports_attestation(&self) -> bool {
-        false
-    }
-
     /// Returns the provider-scoped auth manager, when this provider uses one.
     ///
     /// TODO(celia-oai): Make auth manager access internal to this crate so callers
@@ -250,21 +242,6 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         })
     }
 
-    /// Returns request credentials, optionally scoped to a Codex session task.
-    fn api_auth_for_scope(
-        &self,
-        scope: ProviderAuthScope,
-    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedProviderAuth>> {
-        Box::pin(async move {
-            if !provider_uses_first_party_auth_path(self.info()) {
-                return self.api_auth().await.map(ResolvedProviderAuth::new);
-            }
-            let auth = self.auth().await;
-            resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), self.info(), scope)
-                .await
-        })
-    }
-
     /// Creates the model manager implementation appropriate for this provider.
     fn models_manager(
         &self,
@@ -306,14 +283,6 @@ pub type ModelProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 
 /// Shared runtime model provider handle.
 pub type SharedModelProvider = Arc<dyn ModelProvider>;
-
-fn provider_uses_first_party_auth_path(provider: &ModelProviderInfo) -> bool {
-    provider.requires_openai_auth
-        && provider.env_key.is_none()
-        && provider.experimental_bearer_token.is_none()
-        && provider.auth.is_none()
-        && provider.aws.is_none()
-}
 
 /// Creates the default runtime model provider for configured provider metadata.
 pub fn create_model_provider(
@@ -375,13 +344,6 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
-    }
-
-    fn supports_attestation(&self) -> bool {
-        self.auth_manager
-            .as_ref()
-            .and_then(|auth_manager| auth_manager.auth_cached())
-            .is_some_and(|auth| auth.is_chatgpt_auth())
     }
 
     fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
@@ -511,7 +473,6 @@ impl ModelProvider for ConfiguredModelProvider {
 mod tests {
     use std::num::NonZeroU64;
 
-    use ahead_model_auth::auth::AgentIdentityAuthPolicy;
     use ahead_model_auth::auth::BedrockApiKeyAuth;
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
@@ -537,7 +498,6 @@ mod tests {
     use wiremock::matchers::path;
 
     use super::*;
-    use crate::auth::AgentIdentitySessionFallback;
     use crate::shared_state::process_shared_state;
 
     fn provider_info_with_command_auth() -> ModelProviderInfo {
@@ -616,22 +576,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_auth_ignores_scope_for_non_openai_provider() {
+    async fn non_openai_provider_has_no_auth_headers() {
         let provider = create_model_provider(
             create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses),
             /*auth_manager*/ None,
         );
 
-        let auth = provider
-            .api_auth_for_scope(ProviderAuthScope {
-                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
-                session_source: SessionSource::Cli,
-                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
-            })
-            .await
-            .expect("auth should resolve");
+        let auth = provider.api_auth().await.expect("auth should resolve");
 
-        assert!(auth.auth.to_auth_headers().is_empty());
+        assert!(auth.to_auth_headers().is_empty());
     }
 
     #[test]

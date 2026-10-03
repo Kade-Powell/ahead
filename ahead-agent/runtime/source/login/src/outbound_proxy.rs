@@ -2,8 +2,7 @@ use codex_http_client::HttpClientFactory;
 
 /// Auth-layer adapter around client-owned proxy policy.
 ///
-/// `AuthConfig` carries this value while endpoint resolution and platform details remain in the
-/// client layer.
+/// Provider auth reuses the client's HTTP policy; it does not choose an endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRouteConfig {
     http_client_factory: HttpClientFactory,

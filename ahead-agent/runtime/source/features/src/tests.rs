@@ -174,26 +174,6 @@ disable_in_process_fallback = true
 }
 
 #[test]
-fn from_sources_ignores_removed_terminal_resize_reflow_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "terminal_resize_reflow".to_string(),
-        false,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-    assert_eq!(features.enabled(Feature::TerminalResizeReflow), true);
-}
-
-#[test]
 fn image_generation_toggle_controls_extension_backed_generation() {
     let mut entries = BTreeMap::new();
     entries.insert("image_generation".to_string(), false);
@@ -248,17 +228,6 @@ fn use_legacy_landlock_config_records_deprecation_notice() {
 }
 
 #[test]
-fn remote_control_config_is_ignored() {
-    let mut entries = BTreeMap::new();
-    entries.insert("remote_control".to_string(), true);
-
-    let mut features = Features::with_defaults();
-    features.apply_map(&entries);
-
-    assert_eq!(features.enabled(Feature::RemoteControl), false);
-}
-
-#[test]
 fn from_sources_applies_base_profile_and_overrides() {
     let base_features = FeaturesToml::default();
 
@@ -285,159 +254,7 @@ fn from_sources_applies_base_profile_and_overrides() {
 
     assert_eq!(features.enabled(Feature::CodeModeOnly), true);
     assert_eq!(features.enabled(Feature::CodeMode), true);
-    assert_eq!(features.enabled(Feature::ApplyPatchFreeform), false);
     assert_eq!(features.enabled(Feature::WebSearchRequest), false);
-}
-
-#[test]
-fn from_sources_ignores_removed_image_detail_original_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "image_detail_original".to_string(),
-        true,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_resize_all_images_feature_key() {
-    let features_toml =
-        FeaturesToml::from(BTreeMap::from([("resize_all_images".to_string(), false)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_item_ids_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([("item_ids".to_string(), false)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-    assert_eq!(features.enabled(Feature::ItemIds), true);
-}
-
-#[test]
-fn from_sources_ignores_removed_undo_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([("undo".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_js_repl_feature_keys() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([
-        ("js_repl".to_string(), true),
-        ("js_repl_tools_only".to_string(), true),
-    ]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_apply_patch_freeform_feature_key() {
-    let features_toml =
-        FeaturesToml::from(BTreeMap::from([("apply_patch_freeform".to_string(), true)]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
-}
-
-#[test]
-fn from_sources_ignores_removed_plugin_feature_keys() {
-    for key in [
-        "plugins",
-        "recommended_plugins",
-        "remote_plugin",
-        "plugin_sharing",
-        "plugin_hooks",
-    ] {
-        let features_toml = FeaturesToml::from(BTreeMap::from([(key.to_string(), true)]));
-        let features = Features::from_sources(
-            FeatureConfigSource {
-                features: Some(&features_toml),
-                ..Default::default()
-            },
-            FeatureConfigSource::default(),
-            FeatureOverrides::default(),
-        );
-
-        assert_eq!(
-            features,
-            Features::with_defaults(),
-            "{key} must stay disabled"
-        );
-    }
-}
-
-#[test]
-fn from_sources_ignores_removed_tool_search_always_defer_mcp_tools_feature_key() {
-    let features_toml = FeaturesToml::from(BTreeMap::from([(
-        "tool_search_always_defer_mcp_tools".to_string(),
-        false,
-    )]));
-
-    let features = Features::from_sources(
-        FeatureConfigSource {
-            features: Some(&features_toml),
-            ..Default::default()
-        },
-        FeatureConfigSource::default(),
-        FeatureOverrides::default(),
-    );
-
-    assert_eq!(features, Features::with_defaults());
 }
 
 #[test]

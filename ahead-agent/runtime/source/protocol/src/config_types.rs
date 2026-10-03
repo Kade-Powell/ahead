@@ -498,14 +498,6 @@ impl ServiceTier {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum ForcedLoginMethod {
-    Chatgpt,
-    Api,
-}
-
 const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS: u64 = 300_000;
 
@@ -589,29 +581,7 @@ pub enum TrustLevel {
     Untrusted,
 }
 
-/// Controls whether the TUI uses the terminal's alternate screen buffer.
-///
-/// - `auto` (default): Use alternate screen mode.
-/// - `always`: Always use alternate screen mode.
-/// - `never`: Never use alternate screen mode. Runs in inline mode, preserving scrollback.
-///
-/// The CLI flag `--no-alt-screen` can override this setting at runtime.
-#[derive(
-    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum AltScreenMode {
-    /// Use alternate screen mode.
-    #[default]
-    Auto,
-    /// Always use alternate screen mode.
-    Always,
-    /// Never use alternate screen (inline mode only).
-    Never,
-}
-
-/// Initial collaboration mode to use when the TUI starts.
+/// Collaboration mode used by the managed agent.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema, TS, Default,
 )]
@@ -628,7 +598,7 @@ pub enum ModeKind {
     Default,
 }
 
-pub const TUI_VISIBLE_COLLABORATION_MODES: [ModeKind; 2] = [ModeKind::Default, ModeKind::Plan];
+pub const SUPPORTED_COLLABORATION_MODES: [ModeKind; 2] = [ModeKind::Default, ModeKind::Plan];
 
 impl ModeKind {
     pub const fn display_name(self) -> &'static str {
@@ -636,10 +606,6 @@ impl ModeKind {
             Self::Plan => "Plan",
             Self::Default => "Default",
         }
-    }
-
-    pub const fn is_tui_visible(self) -> bool {
-        matches!(self, Self::Plan | Self::Default)
     }
 
     pub const fn allows_request_user_input(self) -> bool {
@@ -827,13 +793,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_visible_collaboration_modes_match_mode_kind_visibility() {
+    fn supported_collaboration_modes_include_default_and_plan() {
         let expected = [ModeKind::Default, ModeKind::Plan];
-        assert_eq!(expected, TUI_VISIBLE_COLLABORATION_MODES);
-
-        for mode in TUI_VISIBLE_COLLABORATION_MODES {
-            assert!(mode.is_tui_visible());
-        }
+        assert_eq!(expected, SUPPORTED_COLLABORATION_MODES);
     }
 
     #[test]

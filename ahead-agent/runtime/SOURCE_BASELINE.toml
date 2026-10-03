@@ -1,0 +1,11 @@
+# Historical import point for the hard-forked native runtime. This does not
+# describe the current source tree, which AHEAD has modified and trimmed.
+upstream_repository = "https://github.com/openai/codex"
+upstream_tag = "rust-v0.152.0"
+upstream_commit = "316795b3cf2a45e90d121d9f46499d4658b2645c"
+upstream_subtree = "codex-rs"
+ahead_import_commit = "7c07b2f88aceedb4ed187a5fafa145044660d07a"
+ahead_original_path = "third-party/codex/codex-rs"
+ahead_current_path = "ahead-agent/runtime/source"
+upstream_license = "LICENSE"
+upstream_notice = "NOTICE"

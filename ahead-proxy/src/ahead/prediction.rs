@@ -62,8 +62,8 @@ impl PredictionProviderConfig {
     /// Loads the active endpoint from the AHEAD provider catalog.
     ///
     /// Each `[[ai.connections]]` entry is kept as a separate endpoint. Later
-    /// config layers override matching provider IDs while retaining a key from
-    /// an earlier private settings layer when the override omits it.
+    /// config layers override matching provider IDs. A key from an earlier
+    /// private layer is retained only when the endpoint stays identical.
     pub fn from_workspace(workspace: Option<&Path>) -> Result<Self> {
         let mut configs = Vec::new();
         if let Ok(home) = std::env::var("HOME") {
@@ -229,7 +229,10 @@ fn merge_prediction_provider(
     mut provider: PredictionProviderConfig,
 ) {
     if let Some((_, previous_private, previous)) = providers.get(&id) {
-        if provider.api_key.is_none() && (*previous_private || private) {
+        if provider.api_key.is_none()
+            && (*previous_private || private)
+            && provider.base_url == previous.base_url
+        {
             provider.api_key = previous.api_key.clone();
         }
     }
@@ -357,6 +360,7 @@ impl PredictionEngine {
         }
 
         let prompt = Self::assemble_context(work, request, open_buffers)?;
+        let (_, suffix) = prediction_excerpt(request);
         let endpoint = completion_endpoint(&provider.base_url)?;
         let endpoint_url = reqwest::Url::parse(&endpoint)
             .context("invalid prediction completion URL")?;
@@ -374,7 +378,7 @@ impl PredictionEngine {
         let body = json!({
             "model": provider.model,
             "prompt": prompt,
-            "suffix": request.suffix,
+            "suffix": suffix,
             "max_tokens": 128,
             "temperature": 0.2,
             "stream": false
@@ -681,8 +685,10 @@ pub fn clean_fim_completion(response: &str) -> String {
 /// Token-count guess (bytes/3, erring low), mirroring Zed's
 /// `cursor_excerpt::guess_token_count`.
 pub fn guess_token_count(bytes: usize) -> usize {
-    bytes / 3
+    bytes / BYTES_PER_TOKEN_GUESS
 }
+
+const BYTES_PER_TOKEN_GUESS: usize = 3;
 
 /// Total excerpt budget in tokens, mirroring Zed's
 /// `CURSOR_EXCERPT_TOKEN_BUDGET`.
@@ -707,7 +713,10 @@ pub fn cursor_excerpt_bounds(
     cursor: usize,
     budget_tokens: usize,
 ) -> (usize, usize) {
-    let cursor = cursor.min(text.len());
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let line_starts = line_start_offsets(text);
     if line_starts.is_empty() {
         return (0, 0);
@@ -716,8 +725,11 @@ pub fn cursor_excerpt_bounds(
         .iter()
         .rposition(|&start| start <= cursor)
         .unwrap_or(0);
-    let mut budget =
-        budget_tokens.saturating_sub(line_token_count(text, cursor_row));
+    let mut budget = budget_tokens.saturating_sub(line_token_count(
+        &line_starts,
+        text.len(),
+        cursor_row,
+    ));
     let mut start_row = cursor_row;
     let mut end_row = cursor_row;
     loop {
@@ -727,7 +739,7 @@ pub fn cursor_excerpt_bounds(
             break;
         }
         if can_down {
-            let cost = line_token_count(text, end_row + 1);
+            let cost = line_token_count(&line_starts, text.len(), end_row + 1);
             if cost <= budget {
                 end_row += 1;
                 budget = budget.saturating_sub(cost);
@@ -736,7 +748,7 @@ pub fn cursor_excerpt_bounds(
             }
         }
         if can_up && budget > 0 {
-            let cost = line_token_count(text, start_row - 1);
+            let cost = line_token_count(&line_starts, text.len(), start_row - 1);
             if cost <= budget {
                 start_row -= 1;
                 budget = budget.saturating_sub(cost);
@@ -746,11 +758,23 @@ pub fn cursor_excerpt_bounds(
         }
     }
     let start = line_starts[start_row];
-    let end = line_starts
-        .get(end_row + 1)
-        .copied()
-        .unwrap_or_else(|| text.len());
-    (start, end)
+    let end = line_starts.get(end_row + 1).copied().unwrap_or(text.len());
+    let max_bytes = budget_tokens.saturating_mul(BYTES_PER_TOKEN_GUESS);
+    if end - start <= max_bytes {
+        return (start, end);
+    }
+
+    // A single minified line can exceed the entire linewise budget.
+    let mut clipped_start = cursor.saturating_sub(max_bytes / 2).max(start);
+    let mut clipped_end = clipped_start.saturating_add(max_bytes).min(end);
+    clipped_start = clipped_end.saturating_sub(max_bytes).max(start);
+    while !text.is_char_boundary(clipped_start) {
+        clipped_start += 1;
+    }
+    while !text.is_char_boundary(clipped_end) {
+        clipped_end -= 1;
+    }
+    (clipped_start, clipped_end)
 }
 
 fn line_start_offsets(text: &str) -> Vec<usize> {
@@ -763,12 +787,11 @@ fn line_start_offsets(text: &str) -> Vec<usize> {
     starts
 }
 
-fn line_token_count(text: &str, row: usize) -> usize {
-    let starts = line_start_offsets(text);
+fn line_token_count(starts: &[usize], text_len: usize, row: usize) -> usize {
     let Some(&start) = starts.get(row) else {
         return 1;
     };
-    let end = starts.get(row + 1).copied().unwrap_or_else(|| text.len());
+    let end = starts.get(row + 1).copied().unwrap_or(text_len);
     guess_token_count(end.saturating_sub(start)).max(1)
 }
 
@@ -944,6 +967,45 @@ mod tests {
     }
 
     #[test]
+    fn generic_prediction_sends_only_the_bounded_utf8_suffix() {
+        let (address, server) = spawn_stub(r#"{"choices":[{"text":"ok"}]}"#);
+        let work = PredictionWorkContext {
+            work_kind: WorkKind::ProductChange,
+            mode: AssistanceMode::Assist,
+            phase_title: "Implement".to_string(),
+            primary_issue: None,
+            active_invariants: Vec::new(),
+        };
+        let suffix = "é".repeat(40_000);
+        let request = PredictionRequest {
+            request_id: "bounded-suffix".to_string(),
+            session_id: String::new(),
+            path: "src/main.rs".to_string(),
+            cursor: DisplayPosition { line: 0, col: 11 },
+            prefix: "fn main() {".to_string(),
+            suffix: suffix.clone(),
+            work_context: String::new(),
+        };
+        let provider = PredictionProviderConfig {
+            provider: "openai-compatible".to_string(),
+            base_url: format!("http://{address}/v1"),
+            api_key: None,
+            model: "unknown-fim-format".to_string(),
+        };
+
+        let result = PredictionEngine::predict(&work, &request, &[], &provider)
+            .expect("bounded generic prediction");
+        let body: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        let sent_suffix = body["suffix"].as_str().unwrap();
+        let prompt = body["prompt"].as_str().unwrap();
+
+        assert_eq!(result.replacement, "ok");
+        assert!(sent_suffix.len() <= MAX_EXCERPT_TOKENS * BYTES_PER_TOKEN_GUESS);
+        assert!(sent_suffix.len() < suffix.len());
+        assert!(prompt.ends_with(&format!("Suffix:\n{sent_suffix}\n")));
+    }
+
+    #[test]
     fn fim_provider_request_includes_project_instructions_session_and_open_buffers()
     {
         let (address, server) =
@@ -1001,6 +1063,7 @@ mod tests {
         let workspace = temporary.path();
         std::fs::create_dir_all(workspace.join(".ahead"))?;
         std::fs::create_dir_all(workspace.join("src"))?;
+        std::fs::create_dir_all(workspace.join("docs"))?;
         std::fs::write(
             workspace.join("AGENTS.md"),
             "Workspace instruction: preserve public retry semantics.",
@@ -1008,6 +1071,10 @@ mod tests {
         std::fs::write(
             workspace.join("src/AGENTS.md"),
             "Nested instruction: keep retry delays bounded.",
+        )?;
+        std::fs::write(
+            workspace.join("docs/AGENTS.md"),
+            "Docs instruction: use stable public examples.",
         )?;
 
         let (address, server) =
@@ -1071,10 +1138,16 @@ mod tests {
             crate::ahead::store::SessionStore::open(&database_path)?,
         );
         host.set_workspace(workspace.to_path_buf());
-        let open_buffers = [OpenBufferContext {
-            path: "src/client.rs".to_string(),
-            relevant_excerpt: "pub struct UnsavedRequest;".to_string(),
-        }];
+        let open_buffers = [
+            OpenBufferContext {
+                path: "src/client.rs".to_string(),
+                relevant_excerpt: "pub struct UnsavedRequest;".to_string(),
+            },
+            OpenBufferContext {
+                path: "docs/guide.md".to_string(),
+                relevant_excerpt: "Retry examples in progress.".to_string(),
+            },
+        ];
         let result = host.request_prediction(
             PredictionRequest {
                 request_id: "host-fim-1".to_string(),
@@ -1101,6 +1174,7 @@ mod tests {
             "Product Change · Questions & Outline",
             "Workspace instruction: preserve public retry semantics.",
             "Nested instruction: keep retry delays bounded.",
+            "Docs instruction: use stable public examples.",
             "Add bounded exponential backoff",
             "Preserve retry idempotency.",
             "Do not retry a committed response.",
@@ -1108,6 +1182,8 @@ mod tests {
             "Caller context: preserve the existing request identity.",
             "Relevant open buffer: src/client.rs",
             "pub struct UnsavedRequest;",
+            "Relevant open buffer: docs/guide.md",
+            "Retry examples in progress.",
             "pub fn retry",
         ] {
             assert!(
@@ -1115,6 +1191,60 @@ mod tests {
                 "provider prompt omitted: {expected}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn editor_only_fim_request_includes_agents_hierarchy() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path();
+        std::fs::create_dir_all(workspace.join(".ahead"))?;
+        std::fs::create_dir_all(workspace.join("src"))?;
+        std::fs::write(workspace.join("AGENTS.md"), "Root FIM instruction.")?;
+        std::fs::write(workspace.join("src/AGENTS.md"), "Nested FIM instruction.")?;
+
+        let (address, server) =
+            spawn_stub(r#"{"choices":[{"text":"completed()"}]}"#);
+        let connection_name = format!("ahead-fim-test-{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            format!(
+                r#"
+                [ai]
+                active_connection = "{connection_name}"
+
+                [[ai.connections]]
+                name = "{connection_name}"
+                provider_id = "{connection_name}"
+                provider = "openai-compatible"
+                base_url = "http://{address}/v1"
+                model = "qwen2.5-coder:7b"
+                "#
+            ),
+        )?;
+
+        let host = crate::ahead::host::AheadSessionHost::in_memory()?;
+        host.set_workspace(workspace.to_path_buf());
+        let result = host.request_prediction(
+            PredictionRequest {
+                request_id: "editor-only-fim".to_string(),
+                session_id: String::new(),
+                path: "src/main.rs".to_string(),
+                cursor: DisplayPosition { line: 0, col: 7 },
+                prefix: "fn main".to_string(),
+                suffix: "() {}".to_string(),
+                work_context: String::new(),
+            },
+            &[],
+        )?;
+        let body: Value =
+            serde_json::from_str(&server.join().expect("provider stub thread"))?;
+        let prompt = body["prompt"].as_str().context("FIM prompt")?;
+
+        assert_eq!(result.replacement, "completed()");
+        assert!(prompt.contains("Root FIM instruction."));
+        assert!(prompt.contains("Nested FIM instruction."));
+        assert!(prompt.contains("<|fim_prefix|>fn main"));
         Ok(())
     }
 
@@ -1256,6 +1386,18 @@ mod tests {
         assert!(end - start < text.len());
         assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
         assert!(start == 0 || text[..start].ends_with('\n'));
+    }
+
+    #[test]
+    fn cursor_excerpt_caps_oversized_utf8_lines() {
+        let text = "é".repeat(40_000);
+        let cursor = text.len() / 2;
+        let (start, end) = cursor_excerpt_bounds(&text, cursor, 10);
+
+        assert!(text.is_char_boundary(start));
+        assert!(text.is_char_boundary(end));
+        assert!(start <= cursor && cursor <= end);
+        assert!(end - start <= 10 * BYTES_PER_TOKEN_GUESS);
     }
 
     #[test]
@@ -1455,6 +1597,40 @@ mod tests {
         assert_eq!(provider.model, "reasoning");
         assert_eq!(provider.api_key.as_deref(), Some("secret"));
         std::fs::remove_dir_all(workspace).expect("cleanup");
+    }
+
+    #[test]
+    fn prediction_key_is_not_inherited_by_a_different_endpoint() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[ai]\nactive_connection = 'Shared'\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared-secret-boundary'\nbase_url = 'https://safe.example/v1'\nmodel = 'safe'\napi_key = 'private-token'\n",
+        )
+        .expect("private settings");
+        let shared = ahead.join("config.toml");
+        std::fs::write(
+            &shared,
+            "[ai]\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared-secret-boundary'\nbase_url = 'https://safe.example/v1'\nmodel = 'shared'\n",
+        )
+        .expect("same-endpoint override");
+        let provider =
+            PredictionProviderConfig::from_workspace(Some(workspace.path()))
+                .expect("same-endpoint provider");
+        assert_eq!(provider.api_key.as_deref(), Some("private-token"));
+        assert_eq!(provider.model, "shared");
+
+        std::fs::write(
+            &shared,
+            "[ai]\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared-secret-boundary'\nbase_url = 'https://other.example/v1'\nmodel = 'other'\n",
+        )
+        .expect("different-endpoint override");
+        let provider =
+            PredictionProviderConfig::from_workspace(Some(workspace.path()))
+                .expect("different-endpoint provider");
+        assert_eq!(provider.base_url, "https://other.example/v1");
+        assert_eq!(provider.api_key, None);
     }
 
     #[cfg(unix)]

@@ -10,13 +10,13 @@ use codex_rollout::{
 use codex_thread_store::{
     AppendThreadItemsParams, ArchiveThreadParams, CreateThreadParams,
     DeleteThreadParams, InMemoryThreadStore, ListThreadsParams,
-    LoadThreadHistoryParams, PersistContext, ReadThreadByRolloutPathParams,
-    ReadThreadParams, ResumeThreadParams, SortDirection, StoredModelContext,
-    StoredThread, StoredThreadHistory, ThreadMetadataPatch, ThreadPage,
-    ThreadRelationFilter, ThreadSortKey, ThreadStore, ThreadStoreError,
-    ThreadStoreFuture, ThreadStoreResult, UpdateThreadMetadataParams,
-    canonical_session_meta_line,
+    LoadThreadHistoryParams, PersistContext, ReadThreadParams, ResumeThreadParams,
+    SortDirection, StoredModelContext, StoredThread, StoredThreadHistory,
+    ThreadMetadataPatch, ThreadPage, ThreadRelationFilter, ThreadSortKey,
+    ThreadStore, ThreadStoreError, ThreadStoreFuture, ThreadStoreResult,
+    UpdateThreadMetadataParams, canonical_session_meta_line,
 };
+use parking_lot::Mutex;
 
 use crate::{HarnessStore, NativeThreadHeader};
 use crate::{
@@ -39,6 +39,7 @@ pub(crate) struct TursoThreadStore {
     inner: InMemoryThreadStore,
     store: Arc<dyn HarnessStore>,
     hydrated: tokio::sync::Mutex<HydrationState>,
+    persistence_errors: Mutex<HashMap<String, String>>,
 }
 
 impl TursoThreadStore {
@@ -47,7 +48,19 @@ impl TursoThreadStore {
             inner: InMemoryThreadStore::default(),
             store,
             hydrated: tokio::sync::Mutex::new(HydrationState::default()),
+            persistence_errors: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn persistence_error(&self, thread_id: &str) -> Option<String> {
+        self.persistence_errors.lock().get(thread_id).cloned()
+    }
+
+    fn record_persistence_error(&self, thread_id: &str, error: &ThreadStoreError) {
+        self.persistence_errors
+            .lock()
+            .entry(thread_id.to_string())
+            .or_insert_with(|| error.to_string());
     }
 
     async fn ensure_header(&self, thread_id: ThreadId) -> ThreadStoreResult<bool> {
@@ -96,6 +109,8 @@ impl TursoThreadStore {
             ThreadId::from_string(&header.thread_id).map_err(store_error)?;
         let archived = header.archived;
         let archived_at = header.archived_at;
+        let created_at = header.created_at;
+        let updated_at = header.updated_at;
         if archived != archived_at.is_some() {
             return Err(store_error(
                 "native thread archive flag and timestamp disagree",
@@ -127,6 +142,19 @@ impl TursoThreadStore {
                 .update_thread_metadata(UpdateThreadMetadataParams {
                     thread_id,
                     patch,
+                    include_archived: true,
+                })
+                .await?;
+        }
+        if created_at.is_some() || updated_at.is_some() {
+            store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id,
+                    patch: ThreadMetadataPatch {
+                        created_at,
+                        updated_at,
+                        ..ThreadMetadataPatch::default()
+                    },
                     include_archived: true,
                 })
                 .await?;
@@ -165,8 +193,10 @@ fn store_error(error: impl std::fmt::Display) -> ThreadStoreError {
 fn indexed_header_page_request(
     params: &ListThreadsParams,
 ) -> Option<NativeThreadHeaderPageRequest> {
-    // ponytail: project/section and recency filters still need indexed summaries.
-    if params.section.is_some() || params.project_id.is_some() {
+    // ponytail: assigned project/section and recency filters still need indexed summaries.
+    if params.section.as_ref().is_some_and(Option::is_some)
+        || params.project_id.as_ref().is_some_and(Option::is_some)
+    {
         return None;
     }
 
@@ -288,27 +318,41 @@ impl ThreadStore for TursoThreadStore {
         params: AppendThreadItemsParams,
     ) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.ensure_header(params.thread_id).await?;
-            let thread = self
-                .inner
-                .read_thread(ReadThreadParams {
-                    thread_id: params.thread_id,
-                    include_archived: false,
-                    include_history: false,
-                })
-                .await?;
-            let persisted = persisted_rollout_items(
-                params.items.as_slice(),
-                thread.history_mode,
-            );
-            let values = serde_json::to_value(&persisted).map_err(store_error)?;
-            let values = values.as_array().cloned().ok_or_else(|| {
-                store_error("serialized rollout items were not an array")
-            })?;
-            self.store
-                .append_native_thread_items(&params.thread_id.to_string(), values)
-                .map_err(store_error)?;
-            self.inner.append_items(params).await
+            let thread_id = params.thread_id.to_string();
+            if let Some(error) = self.persistence_error(&thread_id) {
+                return Err(store_error(format!(
+                    "native thread history is already unsafe to extend: {error}"
+                )));
+            }
+            let result: ThreadStoreResult<()> = async {
+                self.ensure_header(params.thread_id).await?;
+                let thread = self
+                    .inner
+                    .read_thread(ReadThreadParams {
+                        thread_id: params.thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await?;
+                let persisted = persisted_rollout_items(
+                    params.items.as_slice(),
+                    thread.history_mode,
+                );
+                let values =
+                    serde_json::to_value(&persisted).map_err(store_error)?;
+                let values = values.as_array().cloned().ok_or_else(|| {
+                    store_error("serialized rollout items were not an array")
+                })?;
+                self.store
+                    .append_native_thread_items(&thread_id, values)
+                    .map_err(store_error)?;
+                self.inner.append_items(params).await
+            }
+            .await;
+            if let Err(error) = &result {
+                self.record_persistence_error(&thread_id, error);
+            }
+            result
         })
     }
 
@@ -435,17 +479,6 @@ impl ThreadStore for TursoThreadStore {
             }
             self.hydrate(params.thread_id).await?;
             self.inner.read_thread(params).await
-        })
-    }
-
-    fn read_thread_by_rollout_path(
-        &self,
-        _params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
-        Box::pin(async {
-            Err(ThreadStoreError::Unsupported {
-                operation: "read_thread_by_rollout_path",
-            })
         })
     }
 
@@ -668,6 +701,12 @@ impl ThreadStore for TursoThreadStore {
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
         Box::pin(async move {
+            let thread_id = params.thread_id.to_string();
+            if let Some(error) = self.persistence_error(&thread_id) {
+                return Err(store_error(format!(
+                    "native thread history is already unsafe to extend: {error}"
+                )));
+            }
             self.ensure_header(params.thread_id).await?;
             if params.patch.project_id.is_some() {
                 return Err(ThreadStoreError::Unsupported {
@@ -682,9 +721,13 @@ impl ThreadStore for TursoThreadStore {
                 })
                 .await?;
             let patch = serde_json::to_value(&params.patch).map_err(store_error)?;
-            self.store
-                .append_native_thread_metadata(&params.thread_id.to_string(), patch)
-                .map_err(store_error)?;
+            if let Err(error) =
+                self.store.append_native_thread_metadata(&thread_id, patch)
+            {
+                let error = store_error(error);
+                self.record_persistence_error(&thread_id, &error);
+                return Err(error);
+            }
             self.inner.update_thread_metadata(params).await
         })
     }
@@ -769,15 +812,16 @@ mod indexed_listing_tests {
             allowed_sources: vec![codex_protocol::protocol::SessionSource::Cli],
             model_providers: Some(vec!["openai".to_string()]),
             cwd_filters: Some(vec![PathBuf::from("/workspace")]),
-            section: None,
-            project_id: None,
+            section: Some(None),
+            project_id: Some(None),
             archived: false,
             search_term: Some("needle".to_string()),
             relation_filter: None,
         };
 
-        let request = indexed_header_page_request(&params)
-            .expect("simple creation filters should use indexed keyset paging");
+        let request = indexed_header_page_request(&params).expect(
+            "unsectioned, unassigned threads should use indexed keyset paging",
+        );
         assert_eq!(request.allowed_sources, vec![serde_json::json!("cli")]);
         assert_eq!(request.model_providers, vec!["openai"]);
         assert_eq!(request.cwd_filters, Some(vec![PathBuf::from("/workspace")]));

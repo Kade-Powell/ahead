@@ -1,12 +1,10 @@
 mod config_rules;
 mod engine;
 pub(crate) mod events;
-mod legacy_notify;
 mod mcp;
 mod output_spill;
 mod registry;
 mod schema;
-mod types;
 
 use codex_protocol::protocol::HookEventName;
 
@@ -73,7 +71,6 @@ pub use events::stop::StopOutcome;
 pub use events::stop::StopRequest;
 pub use events::user_prompt_submit::UserPromptSubmitOutcome;
 pub use events::user_prompt_submit::UserPromptSubmitRequest;
-pub use legacy_notify::legacy_notify_json;
 pub use mcp::HookMcpCall;
 pub use mcp::HookMcpExecutor;
 pub use registry::HookListOutcome;
@@ -81,12 +78,6 @@ pub use registry::Hooks;
 pub use registry::HooksConfig;
 pub use registry::list_hooks;
 pub use schema::write_schema_fixtures;
-pub use types::Hook;
-pub use types::HookEvent;
-pub use types::HookEventAfterAgent;
-pub use types::HookPayload;
-pub use types::HookResponse;
-pub use types::HookResult;
 
 /// Returns the hook event label used in persisted hook-state keys.
 pub fn hook_event_key_label(event_name: HookEventName) -> &'static str {

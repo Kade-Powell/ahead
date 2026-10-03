@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_utils_home_dir::find_codex_home;
+use codex_utils_home_dir::find_ahead_home;
 
 const OAUTH_LOCK_DIR: &str = "mcp-oauth-locks";
 const STORE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -84,22 +84,22 @@ impl OAuthStoreLock {
         mode: OAuthStoreLockMode,
     ) -> Result<Self, OAuthStoreLockFailure> {
         // This lock intentionally follows the existing local File/Secrets credential-store
-        // authority. Those stores are CODEX_HOME-backed today: if CODEX_HOME is unset they use
-        // the default home (`~/.codex`), and if an embedder has no local home/filesystem authority
+        // authority. Those stores are AHEAD_HOME-backed today: if AHEAD_HOME is unset they use
+        // the default home (`~/.ahead`), and if an embedder has no local home/filesystem authority
         // those stores already cannot operate. A future provider-backed credential store should
         // provide its own matching lock authority instead of using this local path.
-        let codex_home = find_codex_home()
-            .map_err(|source| OAuthStoreLockFailure::CodexHome { store, source })?;
-        Self::acquire_in_with_mode(&codex_home, store, acquire_timeout, mode)
+        let ahead_home = find_ahead_home()
+            .map_err(|source| OAuthStoreLockFailure::AheadHome { store, source })?;
+        Self::acquire_in_with_mode(&ahead_home, store, acquire_timeout, mode)
     }
 
     fn acquire_in_with_mode(
-        codex_home: &Path,
+        ahead_home: &Path,
         store: OAuthStore,
         acquire_timeout: Duration,
         mode: OAuthStoreLockMode,
     ) -> Result<Self, OAuthStoreLockFailure> {
-        let path = oauth_store_lock_path(codex_home, store);
+        let path = oauth_store_lock_path(ahead_home, store);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OAuthStoreLockFailure::CreateDir {
                 store,
@@ -165,8 +165,8 @@ impl OAuthStoreLock {
 /// newer credential in File while a stale Secrets entry remains preferred.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum OAuthStoreLockFailure {
-    #[error("failed to resolve CODEX_HOME for MCP OAuth {store} aggregate-store lock")]
-    CodexHome {
+    #[error("failed to resolve AHEAD_HOME for MCP OAuth {store} aggregate-store lock")]
+    AheadHome {
         store: OAuthStore,
         #[source]
         source: io::Error,
@@ -203,8 +203,8 @@ pub(super) enum OAuthStoreLockFailure {
     },
 }
 
-fn oauth_store_lock_path(codex_home: &Path, store: OAuthStore) -> PathBuf {
-    codex_home.join(OAUTH_LOCK_DIR).join(store.lock_filename())
+fn oauth_store_lock_path(ahead_home: &Path, store: OAuthStore) -> PathBuf {
+    ahead_home.join(OAUTH_LOCK_DIR).join(store.lock_filename())
 }
 
 #[cfg(test)]

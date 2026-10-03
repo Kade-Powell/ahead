@@ -5,7 +5,6 @@ use serde::Serialize;
 
 use crate::config_toml::ToolsToml;
 use crate::types::Personality;
-use crate::types::SessionPickerViewMode;
 use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_protocol::config_types::ReasoningSummary;
@@ -37,7 +36,6 @@ pub struct ConfigProfile {
     /// Optional path to a JSON model catalog (applied on startup only).
     pub model_catalog_json: Option<AbsolutePathBuf>,
     pub personality: Option<Personality>,
-    pub chatgpt_base_url: Option<String>,
     /// Optional path to a file containing model instructions.
     pub model_instructions_file: Option<AbsolutePathBuf>,
     /// Deprecated: ignored.
@@ -52,9 +50,6 @@ pub struct ConfigProfile {
     pub include_environment_context: Option<bool>,
     pub tools: Option<ToolsToml>,
     pub web_search: Option<WebSearchMode>,
-    /// TUI settings scoped to this profile.
-    #[serde(default)]
-    pub tui: Option<ProfileTui>,
     #[serde(default)]
     pub windows: Option<WindowsToml>,
     /// Optional feature toggles scoped to this profile.
@@ -63,14 +58,4 @@ pub struct ConfigProfile {
     #[schemars(schema_with = "crate::schema::features_schema")]
     pub features: Option<FeaturesToml>,
     pub oss_provider: Option<String>,
-}
-
-/// TUI settings supported inside a named profile.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-pub struct ProfileTui {
-    /// Preferred layout for resume/fork session picker results.
-    #[serde(default)]
-    pub session_picker_view: Option<SessionPickerViewMode>,
 }

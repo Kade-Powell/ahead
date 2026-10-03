@@ -15,6 +15,7 @@ ahead-voice = { path = "../ahead-voice" }
 ahead-viewmodel = { path = "../ahead-viewmodel" }
 ahead-rpc = { workspace = true }
 ahead-core = { workspace = true }
+ahead-extension-host = { path = "../ahead-extension-host" }
 alacritty_terminal = { workspace = true }
 chrono = { workspace = true }
 gpui-kit = { workspace = true }
@@ -29,6 +30,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 lsp-types = { workspace = true }
 serde = { workspace = true }
+semver = "1.0.28"
 sha2 = { workspace = true }
 nucleo-matcher = { workspace = true }
 
@@ -41,4 +43,6 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 
 [dev-dependencies]
+ahead-proxy = { path = "../ahead-proxy", features = ["test-support"] }
 gpui-kit = { workspace = true, features = ["test-support"] }
+ropey = { workspace = true }

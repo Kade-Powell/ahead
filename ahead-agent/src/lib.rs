@@ -24,6 +24,7 @@ pub mod acp_client;
 pub mod adapters;
 pub mod editor_tools;
 mod instructions;
+mod mcp_form;
 pub mod native_client;
 mod runtime_support;
 pub mod session;

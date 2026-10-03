@@ -20,6 +20,8 @@ Normative open standards and registries:
 - [MCP stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
 - [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
 - [MCP server discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)
+- [MCP resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
+- [MCP elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation)
 
 Non-normative implementation references (not compatibility requirements):
 
@@ -29,6 +31,7 @@ Non-normative implementation references (not compatibility requirements):
 - [Pinned Zed ACP registry store](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/project/src/agent_registry_store.rs), [registry UI](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent_ui/src/agent_registry_ui.rs), and [installed-agent store](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/project/src/agent_server_store.rs)
 - [Pinned Zed ACP config-option UI](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent_ui/src/config_options.rs) and [ACP connection](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent_servers/src/acp.rs)
 - [Pinned Zed context-server settings](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/project/src/project_settings.rs) and [server lifecycle](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/project/src/context_server_store.rs)
+- [Pinned Zed elicitation form/card](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent_ui/src/conversation_view/elicitation.rs)
 - [Pinned Zed HTTP transport](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/context_server/src/transport/http.rs) and [MCP OAuth implementation](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/context_server/src/oauth.rs)
 - [Pinned Zed agent command/tool registration](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/agent.rs) and [in-process context-server registry](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/tools/context_server_registry.rs)
 - [Pinned Zed thread store](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/thread_store.rs) and [thread database model](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/db.rs)
@@ -47,9 +50,17 @@ Non-normative implementation references (not compatibility requirements):
 - **ACP** is the external-agent boundary. AHEAD speaks the Agent Client
   Protocol over the adapter's transport and renders the lifecycle it actually
   receives. External ACP processes own their own file, shell and permission
-  behavior; ACP is not AHEAD's managed authorization boundary. The install
-  catalog is deliberately limited to Pi, Codex and Claude Code, selected from
-  the ACP registry rather than exposing arbitrary registry entries. Install
+  behavior; ACP is not AHEAD's managed authorization boundary. For requests
+  it actually receives, AHEAD uses ACP v1's
+  [`session/request_permission`](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission)
+  when an adapter sends one: Assist queues the advertised choices for human
+  review, while Learn, unknown modes and cancelled turns answer `cancelled`.
+  Changing to Learn or ending the turn also cancels pending choices. AHEAD
+  never silently picks an `allow_*` option. Agents may still execute effects
+  without requesting permission, so this is a client interaction, not sandbox
+  enforcement. The install catalog is deliberately limited to Pi, Codex and
+  Claude Code. Entries come from the ACP registry, but AHEAD does not expose
+  arbitrary registry agents. Install
   selection is stored under the user-local `.ahead` directory; the supported
   package is resolved lazily on first launch, with a pinned package fallback
   when the registry is unavailable. This follows Zed's
@@ -111,6 +122,31 @@ Non-normative implementation references (not compatibility requirements):
   opted-in server process; do not claim CodeAnchor attribution for its writes.
   MCP servers are not installed from a Codex marketplace and must not widen
   AHEAD policy.
+  The managed agent presents supported flat MCP form elicitations as a
+  server-labelled, blocking chat card. The user reviews typed answers before
+  sending them and can explicitly decline or cancel. AHEAD validates the
+  restricted schema and submitted values at the agent boundary; unsupported
+  shapes fail closed. The current form UI uses the chat composer for free-text
+  fields and choice buttons for selections. It does not collect secrets:
+  per the MCP standard, a server must use URL mode for credentials or payment
+  details. The managed client now advertises both `form` and `url` modes.
+  URL requests show the server name, destination host and full HTTPS URL;
+  Open, Decline and Cancel are explicit actions, and the editor never asks for
+  website credentials in chat. Unsafe or malformed URLs fail closed. This is
+  the retained runtime's server-requested elicitation path, separate from the
+  editor's 2026 tools-only MCP bridge. Disposable stdio-server integration
+  tests confirm that typed form answers and explicit URL consent reach the
+  server and the managed turn resumes. A rebuilt native
+  disposable-project run also verified exact-declaration approval, tool-call
+  approval, the form card, typed answer delivery, explicit decline and cancel,
+  and turn completion with a local mock model. The stdio-server trace received
+  `accept` with typed content, then separate `decline` and `cancel` results.
+  The URL card and explicit browser consent pass a headless GPUI test, but URL
+  mode remains unverified in the running native UI and with a non-test MCP
+  server. The retained MCP client has 2026-07-28 MRTR URL tests; AHEAD's
+  managed agent and editor have not been verified end to end on that path.
+  Zed's dedicated `ElicitationCard` and field validation are the reference
+  for remaining typed field controls and URL review polish.
 - **Agent Skills** use the portable `SKILL.md` package shape: a directory with
   `SKILL.md`, optional `references/`, and optional audited `scripts/`. AHEAD
   requires the standard `name` and `description` frontmatter, enforces the
@@ -150,8 +186,8 @@ Non-normative implementation references (not compatibility requirements):
   carries only a source enum, never an absolute path. When names collide, the
   composer uses source-qualified slash names for collisions: user
   `/user:name`, project `/project:name`, system `/system:name`, and admin
-  `/admin:name`; unique names stay `/name`. `/:name` remains accepted as a
-  legacy alias for user-scoped invocations. This adapts Zed's scoped
+  `/admin:name`; unique names stay `/name`. There is no legacy `/:name`
+  alias. This adapts Zed's scoped
   disambiguation pattern; the exact spelling is AHEAD behavior, not part of the
 Agent Skills format. The native runtime resolves the source against the current
 model-enabled skill snapshot and reads the selected `SKILL.md` on demand.
@@ -203,6 +239,50 @@ per-command sandbox network contract; Zed's
 and
 [`macos_seatbelt.rs`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/sandbox/src/macos_seatbelt.rs)
 are the implementation references for that boundary.
+
+The managed AHEAD config ignores the retained runtime-home `config.toml`,
+injects AHEAD provider settings as in-memory session overrides, forces log,
+trace and metrics exporters to `none`, and disables user-prompt telemetry.
+It also skips retained managed config file/MDM layers, system and managed
+requirements, and user/project execution-policy rules; AHEAD's own per-turn
+permission profiles and scoped effect checks still govern the built-in agent.
+The retained config default also uses no metrics exporter.
+The packaged runtime defaults now retain only instruction-context controls.
+The unused Codex `history.jsonl` persistence and URI file-opener settings and
+their schema/runtime fields are removed; they never governed AHEAD's Turso
+thread store or GPUI file navigation. The packaged layer no longer injects a
+Codex credential-store mode or ChatGPT endpoint. The unused CLI credential-store
+and ChatGPT endpoint config paths, including managed-requirements projections,
+are removed. The unused Codex product-feedback config path is removed too;
+this is distinct from model-facing tool feedback. The copied CLI startup-update
+and TUI paste-burst switches are gone; any replacement would be editor-owned.
+Strict config and requirements-layer parsing reject the retired keys. The
+selected AHEAD provider supplies its endpoint directly; MCP OAuth
+storage is separate and remains live. Retained model-auth and MCP OAuth callers
+still need separate reachability audits before deletion.
+The unused Codex login-method and ChatGPT-workspace restrictions are removed
+from config and managed requirements. Strict config and requirements-layer
+parsing reject those retired keys; AHEAD provider selection owns model access.
+The unused Codex auth bootstrap trait and config helper are gone; the native
+thread manager starts with an empty auth manager and uses the AHEAD-selected
+provider credential for model requests. A disposable mock-provider turn now
+asserts the actual HTTP `Authorization` header, beyond the config-layer test.
+The retired `use_agent_identity` toggle and its ignored request-scope wrapper
+are removed; requests use the selected provider's bearer/header auth directly.
+The retained keyring-backend switch
+still serves MCP OAuth and is not evidence of a Codex login path.
+That retained OAuth implementation now resolves `AHEAD_HOME` (default
+`~/.ahead`), uses AHEAD-named keyring services, and falls back to
+`mcp_oauth_credentials.json` there; it does not read `CODEX_HOME` or
+`~/.codex` credentials. This is storage isolation for a retained protocol
+path, not evidence that Streamable HTTP MCP is enabled in AHEAD's editor.
+The retained core config fallback, exec-server config reader and Windows
+sandbox launch paths likewise resolve AHEAD home. The managed host passes its
+project-specific `.ahead/runtime` home explicitly to core configuration;
+other retained helpers use `AHEAD_HOME` or the user-level `~/.ahead` default.
+The Windows path change still needs a native Windows launch test.
+This is a hard-fork privacy boundary; the Codex OTEL types remain temporarily
+because trace context and session timing still use them internally.
 
 ## Composer slash catalog
 
@@ -276,6 +356,19 @@ replace conversation status or ACP/session state. A Settings completion forces
 a read even with unchanged timestamps; watcher-only checks skip unchanged
 files. Superseded results are not applied. Native verification remains in
 `TODO.md`.
+
+The retained managed runtime constructs its model provider when a thread is
+created or resumed. AHEAD refreshes the selected model for each turn, but an
+existing thread cannot safely swap its provider object in place. Before a
+managed prompt, AHEAD rebuilds the effective connection and compares a
+process-local SHA-256 fingerprint of its provider ID and full provider
+definition with the loaded snapshot. When an idle session's endpoint,
+credential, or provider changes, the controller initializes a fresh managed
+harness and resumes the same durable thread before the next turn. A direct
+stale-client prompt still fails closed, and an active managed turn blocks the
+swap until it finishes. The fingerprint and credentials are not written to
+session storage. A local two-endpoint regression verifies the new connection
+and model-visible history; native Settings-to-turn verification remains open.
 
 Provider reads in Settings, the model picker and FIM now share
 an AHEAD-core reader that accepts only regular files under a real `.ahead`
@@ -406,14 +499,23 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    the host limits each note to 8 KiB and rejects an append that would exceed
    the 32 KiB document limit. It appends only to the standard memory file,
    rejects symlinked AHEAD roots, memory directories and files before writing,
+   reads the opened file through the same 32 KiB bound used for review,
    deduplicates retries by conversation-message id and refreshes the local index
-   after the write.
+   after the write. On Unix, the host opens `.ahead/memories` relative to an
+   opened canonical workspace or user-home directory with no-follow directory
+   and file flags. Reads, appends, reviewed replacement temp creation/rename,
+   and index refresh use the resulting directory handle, so swapping the
+   parent path for a symlink cannot redirect them. Appends reject hard-linked
+   files. Non-Unix operations still use checked paths; equivalent resistance
+   to a concurrent directory swap is not yet verified there.
 
    A native smoke check in a disposable project on 2026-09-29 confirmed
    project-memory search, relative-path result labeling, excerpt attachment,
    chip removal, and search refresh after editing `MEMORY.md` outside the
-   running app. It did not send a model turn or verify user-scope memory,
-   append, or reviewed replacement in the rendered UI.
+   running app. A 2026-10-01 follow-up in an isolated `AHEAD_USER_HOME` rendered
+   a synthetic user-memory hit labeled `~/.ahead/memories/MEMORY.md:3`. Neither
+   check sent a model turn. User-scope excerpt attachment, append, and reviewed
+   replacement remain unverified in the rendered UI.
 
    The Markdown record is the human-readable authority. `.ahead/session.db`
    is the sole durable store for AHEAD sessions, visible conversation, managed
@@ -423,6 +525,8 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    contracts in the same Turso/libSQL database. Native spawned-agent parent/
    child edges and their open/closed status live in `agent_spawn_edges` there
    too; the runtime thread and graph adapters open no other durable database.
+   Binding a work session to a harness thread updates the binding and native
+   thread link in one transaction; a failed link rolls both back before retry.
    `harness_runtime_state` restores the latest plan, tool cards, token usage
    and advertised commands in the chat panel; it deliberately excludes
    ephemeral reasoning and pending user-input payloads.
@@ -451,10 +555,25 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    non-empty records. Malformed or unsupported records (including removed
    Guardian assessment events) reject the whole import; symlinked, out-of-root,
    cross-workspace or active-and-archived ambiguous sources are rejected
-   without changing the source. Turso inserts the thread header and ordered
+   without changing the source. On Unix, the importer opens every path component
+   without following symlinks and parses the pinned file descriptor, so a
+   pathname replacement cannot redirect the read. Windows still uses a
+   path-based open and needs equivalent reparse-point/race verification before
+   this is a cross-platform guarantee. Turso inserts the thread header and ordered
    replay records in one
    idempotent transaction. The source remains in place, and resumed history is
    read from Turso only; there is no live JSONL fallback or schema migration.
+   Copied rollout-path resume/fork helpers and `ThreadStore` path lookup are
+   removed; durable threads are addressed by ID or already-loaded history.
+   The unused reference-backed prepared-fork store contract and session branch
+   are removed; AHEAD's child agents start with an explicit task handoff rather
+   than inheriting a parent rollout prefix.
+   The unused `ForkSnapshot`/`fork_thread_from_history` API and its copied
+   snapshot tests are removed. The disabled core V1 `fork_context` and V2
+   `fork_turns` options, their agent-control history-copy branch, copied
+   fork-only tests, and now-unused rollout-truncation module are removed.
+   Both core multi-agent feature tiers remain disabled in AHEAD; its managed
+   child tool uses an explicit task message and fresh history.
    Focused integration tests are tracked in `TODO.md` until run in the shared
    Cargo loop.
    Before choosing resume-time dynamic tools, `NativeClient` reads the
@@ -481,11 +600,18 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    replay rows. Full replay history hydrates when a thread is resumed or read,
    rather than during listing. This follows Zed's metadata-first list/detail split while
    retaining the Codex thread-creation and metadata-patch shapes for model-loop
-   fidelity. Created/updated keyset listing pushes archive, source, provider,
+   fidelity. Native header, metadata-patch and replay-page reads cast stored
+   text to bytes before UTF-8 validation, so malformed history returns an
+   error instead of triggering libSQL's TEXT-decoder panic; a damaged-row
+   regression covers the full, paged and listing paths. A corrupt replay does
+   not remove its work session from the separate metadata-only sidebar list.
+   Created/updated keyset
+   listing pushes archive, source, provider,
    workspace, relation and title/preview search filters into Turso before its
    page limit; source, provider and workspace use the latest metadata patch,
-   falling back to creation data. Recency, section and project listing still
-   load all headers pending indexed summary data. Archive timestamps belong
+   falling back to creation data. Unsectioned/unassigned-project filters also
+   take this path; assigned section/project and recency ordering still load
+   all headers pending indexed summary data. Archive timestamps belong
    to the current schema; startup does not backfill old rows. The shared Turso store
    supports calls from the native Tokio workers; a file-backed integration test
    covers native thread reopen plus chat append/status writes from a Tokio
@@ -496,15 +622,27 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    well. `ProjectSortKey` stays because the normal-build project-list params
    still name it. The storage-neutral `ThreadStore` and `LiveThread` contracts
    remain for the retained core loop; AHEAD injects `TursoThreadStore` as its
-   only durable managed-session backend. The typed `Internal::Guardian` and
-   `ThreadSource::GuardianReview` variants are removed, and their old
-   serialized labels fail parsing. Direct `Feature("guardian_review")` and
-   `SubAgentSource::Other("guardian")` values are still rejected at
-   create/resume/delegate boundaries; these are fail-closed input guards, not
-   history compatibility. The
+   only durable managed-session backend. If an ordered replay append or its
+   metadata patch fails,
+   that adapter latches the first error and rejects further writes for the
+   loaded thread. At the next native event, the host requests an interrupt
+   and fails the turn without waiting for the model to finish. It refuses
+   another prompt, compaction or resumed child turn until restart;
+   users must review any tool effects before retrying from durable history.
+   A stalled local-provider test covers prompt interruption and retry refusal.
+   The turn controller sends the resulting harness error to the open chat and
+   persists it with the failed message; its chat-state regression covers the
+   streamed error.
+   An effect already dispatched before the host observes the write failure
+   cannot be assumed cancelled; rendered-chat and tool-effect confirmation
+   remain open in `TODO.md`. The typed `Internal::Guardian` and
+   `ThreadSource::GuardianReview` variants are removed. The thread manager
+   rejects every unsupported `ThreadSource::Feature` on create and resume;
+   arbitrary subagent labels remain non-root metadata and cannot select an
+   automatic reviewer. The
    unreachable Guardian-specific session setup, policy, world-state, remote
    MCP discovery, tool routing and prompt-schema branches have been removed;
-   only fail-closed entry checks and legacy history/source handling remain.
+   generic fail-closed source checks and legacy history/source handling remain.
    See `TODO.md` for the remaining marker removal.
    Shell-snapshot cleanup resolves
    rollout files directly. The copied SQLite agent-graph adapter and its DB
@@ -601,6 +739,9 @@ Managed-session anchors are pre-commit attribution. The Turso `anchors` table
 drives the AHEAD gutter until a commit lands; after the host verifies that the
 quoted, hashed text is present in committed content, it removes that anchor and
 Git blame becomes authoritative. The schema does not retain a commit marker.
+The commit author is `ahead` only for matching staged agent anchors, while the
+human remains committer; one `Ahead-Session` trailer is written for each
+distinct source session, in stable order.
 Old anchor schemas are unsupported; startup does not drop or convert their
 rows. External ACP edits do not receive managed CodeAnchors.
 
@@ -612,7 +753,9 @@ keeps lightweight sidebar metadata (identity, title, created/updated time,
 agent and workspace paths) apart from the conversation body, and sorts by
 recent activity. AHEAD's `SessionStore::list_sessions` likewise projects
 sidebar metadata without loading each `SessionView`; the app loads detail on
-selection. `TursoThreadStore::list_threads` reads header and metadata-patch
+selection. Its task-parent projection now groups task links once before joining
+sessions, avoiding two unindexed task scans per sidebar row without changing
+existing database schemas. `TursoThreadStore::list_threads` reads header and metadata-patch
 rows without replay history. Metadata-only reads stay header-only; legacy
 resume/full-history callers hydrate the complete replay. Paginated resume uses
 reverse keyset pages over `(thread_id, ordinal)` and Codex's `ModelContextScan`
@@ -731,6 +874,11 @@ configuration filename, directory, or settings shape. Zed's pinned
 that format is editor-specific. AHEAD's proposed settings are AHEAD-owned and
 map to MCP's standard transports. They do not promise compatibility with Zed's
 configuration or auto-start behavior.
+The copied Codex Apps `[apps]` config, schema and managed requirement branch
+have been removed: they had no production consumer in AHEAD. Ordinary
+`mcp_servers` settings and per-server tool approvals remain the managed-agent
+path. Zed's `ContextServerStore` and `ContextServerRegistry` are the reference
+for keeping server identity and tool registration with the editor's project.
 
 The current MCP specification is `2026-07-28`; that modern protocol removes the
 `initialize` handshake and requires per-request version metadata plus
@@ -761,8 +909,14 @@ protocol versions; see the [MCP SDK's 2026-07-28 compatibility guidance](https:/
 Stdin and local socket request reads consume at most 1 MiB plus one byte per
 frame; that extra byte detects an oversized frame without waiting for newline
 or EOF. Stdin stops after oversized or invalid UTF-8 input. This host limit is
-not an MCP protocol requirement and does not bound the event queue, socket
-worker count or responses; those limits remain in `TODO.md`.
+not an MCP protocol requirement. The stdio event queue is bounded to 32 events
+with reader backpressure, and the local bridge admits at most 20 socket
+workers, reserving four slots beyond the 16 pending tool calls for cancellation
+traffic. Socket reads have whole-frame deadlines (20 seconds for requests,
+30 seconds for tool results, two seconds for cancellations); responses are
+limited to 2 MiB. Oversized server replies become tool errors, and oversized
+or slow-dripped inbound bridge frames fail before parsing. End-to-end overload
+and native ACP verification remain open in `TODO.md`.
 The optional ACP `mcp/message` route remains experimental and is not part of the
 interoperability baseline. This wire subset is not a complete MCP
 implementation. Host tests cover cancellation of editor presentations and
@@ -812,7 +966,9 @@ path is separate from this AHEAD-owned editor bridge.
   non-Unix approval fallback remains path-based and needs an equivalent
   boundary before claiming cross-platform symlink-race safety.
   The Settings panel lists the tracked declaration, its fingerprint and local
-  approval state, and can enable or revoke it after review. Approval is
+  approval state, and can enable or revoke it after review. Once enabled, the
+  server can stay on per-call review or auto-approve permitted tool and
+  resource calls. Approval is
   checked again against the current declaration by the proxy and applies to
   new managed sessions; disabling it does not stop an already running server.
   The rendered approval journey has not yet been verified.
@@ -837,21 +993,31 @@ enabled_servers = ["docs"]
 [mcp.approved_declarations]
 docs = "sha256:<current declaration fingerprint>"
 
-# Optional workspace-local choices; unspecified tools still prompt every call.
+# Optional: auto-approve permitted calls for this reviewed server.
+# Omit this table to review every call.
+[mcp.server_permissions]
+docs = "allow"
+
+# Optional named-tool exceptions to the server policy.
 [mcp.tool_permissions.docs]
-search = "allow"
 delete = "deny"
+publish = "confirm"
 ```
 
-- AHEAD forces the effective server default and every per-tool approval mode
-  from tracked declarations to `prompt`. The ignored, workspace-local
-  `[mcp.tool_permissions.<server>]` table may set named tools to `allow`
-  (skip review), `deny` (do not expose the tool), or `confirm` (review each
-  call). Unlisted tools still prompt every call. These are tool-name choices,
-  not argument patterns or a sandbox around the MCP server; opting in starts
+- AHEAD ignores approval modes in tracked declarations. The ignored,
+  workspace-local `[mcp.server_permissions]` table accepts `allow` for
+  server-wide auto-approval of permitted tool and resource calls or `confirm`
+  for per-call review; an absent entry also means per-call review. The
+  `[mcp.tool_permissions.<server>]` table may override named tools with
+  `allow` (skip review), `deny` (do not expose the tool), or `confirm` (review
+  each call). Unlisted tools inherit the server choice. A turn that enters
+  strict review still prompts. The server choice applies only to the reviewed
+  declaration. Reapproving a changed declaration clears it; disabling the
+  server removes it. Named overrides use tool names, not argument patterns,
+  and neither policy sandboxes the MCP server. Opting in starts
   the server with the user's OS permissions. Managed Assist sessions apply
-  these choices; Learn/read-only
-  sessions remove MCP servers. The external ACP adapter does not receive these
+  these choices; Learn/read-only sessions remove MCP servers. The external ACP
+  adapter does not receive these
   user-configured servers because AHEAD cannot enforce its review policy over
   an agent-owned process. Zed's
   `../zed/crates/agent/src/thread.rs::authorize_third_party_tool` and
@@ -871,10 +1037,10 @@ requirements, analytics, MCP policy or runtime state. Reading old session JSON
 is not a compatibility promise. The model-specific required-review constraint
 is removed; managed `auto_review.ignore_rules` remains because it removes
 executable prefix allow-rules for selected models. Guardian session-source
-variants are removed; their old serialized labels fail parsing. Direct
-`guardian_review` feature and `guardian` subagent inputs remain rejection-only
-boundary guards, not supported session formats. Current AHEAD restore and
-permissions must stay tested.
+variants are removed. Unsupported feature-thread sources are rejected at
+creation and restore, while arbitrary subagent labels cannot become root
+turns or select an automatic reviewer. Current AHEAD restore and permissions
+must stay tested.
 Legacy `persist=always` metadata is reduced to approval of that call, and the
 copied runtime no longer writes approval rules into Codex user or project
 config.
@@ -1016,6 +1182,14 @@ plugin hooks and selected-plugin MCP contributions are removed from the native
 turn path. The copied plugin manager, marketplace, remote, store and sync
 implementation and old core-plugin facade are deleted. Command attribution and
 local tool records now live in the AHEAD-owned `ahead-tool-records` crate.
+Managed sessions also disable the retained Codex hook feature; AHEAD has no
+hook-install or trust flow. The legacy `notify` command and its turn-completion
+runner are removed, so a Codex-style config cannot spawn a notifier. This does
+not affect user-configured MCP servers, skills or Git commit hooks.
+Retained TUI config writers, reader/keymap and projected runtime fields are
+gone: AHEAD has no Codex terminal UI, and editor settings belong to its GPUI
+shell. The active default/plan collaboration modes remain part of the managed
+agent behavior, not terminal configuration.
 The write-only connector-selection cache and app-ID collection from prompts
 and skill bodies are also removed, along with the final core-plugin mention
 module. MCP readiness reads explicit `mcp://` targets through the shared
@@ -1029,9 +1203,71 @@ Inert plugin-measurement and artifact-operation telemetry, the sidecar's
 analytics facts, additional-permission merge and shell environment hooks are
 removed; this does not alter the user's requested command permissions or
 sandbox policy.
-The retained core still compiles hosted-Apps tool formatting, approval metadata
-and file-upload rewriting that need removal; none is a compatibility
-requirement. AHEAD rejects `codex_apps` as a workspace server name.
+The retained core uses ordinary MCP server/tool identity for approvals,
+matching Zed's `mcp:<server_id>:<tool_name>` authorization key. Hosted
+connector/account/plugin approval metadata, connector-derived tool identity
+and connector telemetry are removed. The copied `codex_apps` name reservation
+and executor-local HTTP MCP discovery branch are removed: it has ordinary MCP
+server-ID semantics now, with no hosted connector behavior. Managed sessions
+still load only reviewed workspace stdio declarations. The hosted-only MCP
+resource filter and `orchestrator.mcp.enabled` switch are removed. Configured servers
+use the ordinary MCP runtime for resource listing and reading. The
+disposable managed stdio fixture now exercises `resources/list` and
+`resources/read` through a mock-model turn. That fixture uses the negotiated
+legacy protocol; the modern 2026-07-28 resource result envelope and cache
+fields still need a separate probe before claiming current-version coverage.
+Model-invoked resource listing, template listing and reading use the MCP
+human-review path before dispatch, once per actual configured server, unless
+the reviewed server has the workspace-local `allow` choice and the turn is not
+in strict review. Aggregate listings wait for every required review before
+contacting any server and filter
+execution to that approved set. The disposable fixture proves a denied list
+never contacts the server, then exercises approved list, template and read
+calls. Resource operations use only the server-wide choice, never
+`[mcp.tool_permissions]` names, avoiding a collision with real MCP tools.
+The Settings panel exposes the server choice after declaration approval. The
+disposable mock-model fixture also starts a second managed session under the
+server-wide `allow` choice and proves its tool and resource calls reach the
+stdio server without a per-call review request. Native approval-card and
+cancellation behavior remain unverified. Server
+opt-in alone is not per-resource-call authorization.
+The unreachable consequential tool approval-template module and its
+`codex_apps`-only bundled JSON asset are removed. Ordinary approvals still
+show server/tool identity, original arguments, optional title/description
+and the session-remember choice; no connector-specific copy is selected.
+The hosted `_codex_apps` request metadata envelope and its connector-ID
+session-approval exception are removed. Ordinary MCP requests keep their
+call/turn metadata and generic per-server approval keys.
+MCP call items and legacy events no longer carry hosted connector, link,
+app-action or plugin identity. They retain `readOnlyHint` and the MCP Apps
+tool UI resource URI from `_meta.ui.resourceUri` (preferred) or the older
+`_meta["ui/resourceUri"]`, following the
+[MCP Apps tool-UI linkage](https://apps.extensions.modelcontextprotocol.io/api/documents/overview.html).
+The proprietary `openai/outputTemplate` fallback is removed. This is
+metadata preservation, not an MCP Apps renderer or host-capability claim.
+The unreachable hosted-Apps tool-name normalizer and startup branch in
+`codex-mcp` are removed. Ordinary MCP tools keep their server namespace and
+listed tool name, with untrusted connector metadata stripped. The client
+uses the SDK-backed `list_tools` result directly; the duplicate helper that
+parsed connector IDs from server-supplied metadata is removed. The client
+announces `AHEAD` in MCP `clientInfo` and uses an AHEAD HTTP user agent, as
+Zed announces its own editor identity when initializing context servers.
+The unused hosted `events/list`/`events/stream` resource adapter, its
+write-only extension injection and hosted-server publication watcher are
+removed. Standard MCP resource operations still use `McpRuntime` through
+`CodexThread`; the hosted-only catalog policy exemption and cache bypass are
+also removed, so configured servers follow the same permission and caching
+rules. The unreachable Plugin Runtime `events/stream` request and
+notification transport are removed from the lower-level MCP client too,
+including its HTTP-only cancellation/timeout branch. Standard HTTP SSE
+responses still use the normal streamable-HTTP path; AHEAD's owned agent
+suite covers stdio MCP, while copied HTTP transport tests require retired
+test-only dependencies and are not release evidence.
+The hosted-only OpenAI file-upload rewrite and upload client pool are now
+removed from the core, along with the API upload module and `codex-mcp`'s
+`fileParams` schema masking. Ordinary MCP calls pass their JSON arguments to
+the exact prepared client. This follows Zed's direct MCP call path in
+`crates/agent/src/tools/context_server_registry.rs`; no Zed code was copied.
 Automatic hosted-server registration
 and its endpoint/config factory are removed, along with the product headers,
 connector-token environment lookup and MCP-only originator plumbing.
@@ -1068,8 +1304,8 @@ exposure now uses the published server catalog and model-visibility metadata;
 approval uses the prepared call's per-server policy. The hosted-widget resource
 reader, event observer and widget provenance checkpoints are also removed from
 runtime state, compaction and serialization. Standard MCP resource reads and
-AHEAD's Turso session replay remain. The remaining hosted-Apps metadata,
-file handling and event registration are tracked in `TODO.md`.
+AHEAD's Turso session replay remain. The remaining hosted-Apps metadata
+and event registration are tracked in `TODO.md`.
 There is no backward-compatibility requirement for retired Codex features or
 settings, and pruning their source does not authorize deleting user data.
 For new managed Assist sessions, AHEAD projects only explicitly approved
@@ -1091,10 +1327,19 @@ keys instead of whitelisting them. AHEAD also removed the copied feature-alias
 registry and the top-level `experimental_use_unified_exec_tool` setting.
 `[features]` and managed requirements use canonical keys; strict validation
 rejects retired aliases instead of silently mapping them to active behavior.
+The copied no-op removed-stage feature entries and special-case ignore branches
+are gone too; strict config rejects their old keys. The three remaining
+removed-stage flags (`unified_exec_zsh_fork`, `experimental_windows_sandbox`,
+`elevated_windows_sandbox`) still have runtime readers and cannot be deleted
+as no-ops.
 The copied managed
 network proxy, MITM, SOCKS, DNS, certificate and credential-broker engine is
 deleted. A small fail-closed compatibility surface remains only for serialized
 sandbox/exec-server records and copied call sites; attempts to start it error.
+The copied `x-oai-attestation` provider hook is also removed. Managed AHEAD
+never supplied a provider, so no request used that header; this removes the
+OpenAI-only extension point without changing Responses transport or native
+tool contracts.
 
 Keep both copied `Collab`/v1 and `MultiAgentV2` disabled. AHEAD's native
 `spawn_agent` dynamic tool follows Zed's
@@ -1104,6 +1349,8 @@ by creating or resuming a distinct child thread; Zed's
 persists parent/depth in `SubagentContext`, with round-trip and recursive
 deletion tests in
 [`db.rs`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/db.rs).
+The copied `ThreadManager::spawn_subagent` path that forked full parent
+history is removed; only AHEAD's explicit child-task handoff remains.
 
 AHEAD advertises `spawn_agent` only to root sessions; child depth is capped at
 one. Child turns inherit the parent's workspace, model/provider, mode and
@@ -1148,15 +1395,18 @@ boundary in `../zed/crates/agent/src/tool_permissions.rs`; a model requirement
 does not switch AHEAD to a second model reviewer. External ACP authorization
 remains adapter-owned and is labeled as such.
 
-MCP server elicitation has no AHEAD review UI yet. `native_client.rs` declines
-`EventMsg::ElicitationRequest`; it does not display server-requested forms or
-URLs. Managed config keeps the existing empty elicitation capability and does
-not advertise URL support. Zed's user-event handoff
-(`../zed/crates/agent/src/agent.rs`, `ThreadEvent::Elicitation`) is the reference
-for implementing that UI, not evidence that AHEAD has it. MCP client
-auto-accept/decline behavior and strict-request rejection remain. Tool-call
-authorization is separate: managed MCP calls use AHEAD chat questions, whose
-rendered end-to-end verification is still open.
+`native_client.rs` handles AHEAD's tool-approval form and bounded
+server-requested forms and HTTPS URL elicitations through chat cards.
+The copied `openai/form` and `openai/elicitation/create` handlers and protocol
+modes are removed; the unused `openai/standard-form-input` client flag and its
+approval-policy bypass are removed too. Standard MCP `elicitation/create`
+remains. Managed config advertises `{form: {}, url: {}}`; unsupported requests
+are declined. Zed's user-event handoff
+(`../zed/crates/agent/src/agent.rs`, `ThreadEvent::Elicitation`) and URL card
+(`../zed/crates/agent_ui/src/conversation_view/elicitation.rs`) are the UI
+references. The AHEAD URL review card has a headless GPUI regression, but its
+native server-to-browser journey remains to be verified. Tool-call
+authorization remains a separate human-review path.
 AHEAD does not emit Codex `approvals_reviewer` response metadata.
 
 The Guardian transcript/context crate, second pre-compaction history copy,
@@ -1198,8 +1448,9 @@ by the retained approval serialization path is now the generic
 formatters now live under AHEAD's `core/src/approval` module. Strict legacy
 review remains fail-closed. Serialized `GuardianAssessment*` event types and
 rollout-preservation tests are removed. Typed Guardian session-source variants
-are also removed; generic `guardian` strings remain blocked at runtime
-boundaries rather than being supported as a session format. The legacy
+are also removed; all feature-thread sources are rejected at creation and
+restore, while arbitrary subagent labels remain non-root metadata rather
+than selecting a reviewer. The legacy
 `guardian_approval` feature key and `auto_review` feature requirements are
 unknown, have no effect, and are covered by strict-config and managed-requirement
 regressions. Model-specific automatic-review selection is absent from native
@@ -1223,6 +1474,13 @@ still compiles `codex-keyring-store` and `codex-secrets` for that protocol path,
 but AHEAD's current workspace configuration rejects HTTP and does not invoke
 this auth flow. This transport/auth boundary is tracked in `TODO.md`; Zed's HTTP
 transport and OAuth code are references, not proof that AHEAD supports them.
+Zed's `ContextServerStore` owns `AuthRequired`/`Authenticating` status and
+persists `OAuthSession` through the editor's credentials provider. Before
+enabling HTTP MCP in AHEAD, the editor needs its own equivalent lifecycle and
+credential UI, not just the retained protocol client.
+The copied auth-environment collector has been removed: model-list and session
+telemetry no longer export whether credential environment variables are set.
+Provider request authentication and actionable auth-error reporting remain.
 
 The copied Codex memory generation/tool pipeline is not present in the hard
 fork. AHEAD reuses its useful instruction and citation shapes, but keeps memory

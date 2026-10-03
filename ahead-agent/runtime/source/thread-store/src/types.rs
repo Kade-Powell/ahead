@@ -217,25 +217,6 @@ pub struct StoredModelContext {
 }
 
 /// Requested boundary for inheriting a paginated thread's history.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ForkBoundary {
-    /// Inherit the source thread's latest durable state.
-    Latest,
-    /// Inherit history through the newest visible occurrence of this turn.
-    ThroughTurn(String),
-    /// Inherit history preceding the original visible occurrence of this turn.
-    BeforeTurn(String),
-}
-
-/// Parameters for freezing the source history used to initialize a fork.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrepareForkParams {
-    /// Immediate source thread whose metadata and approval settings are inherited.
-    pub thread_id: ThreadId,
-    /// Requested inclusive or exclusive fork boundary.
-    pub boundary: ForkBoundary,
-}
-
 /// Parameters for reverting a paginated thread's durable history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevertThreadParams {
@@ -245,52 +226,11 @@ pub struct RevertThreadParams {
     pub before_turn_id: String,
 }
 
-/// Frozen source history and model context for a reference-backed fork.
-#[derive(Debug)]
-pub struct PreparedFork {
-    /// Immediate source thread, even when the normalized history base names an ancestor.
-    pub source_thread_id: ThreadId,
-    /// Frozen physical rollout prefix inherited by the child.
-    pub history_base: Option<HistoryPosition>,
-    /// Bounded model context selected by the requested fork boundary.
-    pub model_context: Arc<Vec<RolloutItem>>,
-    /// Blocks source deletion until the child's history reference is durable.
-    _source_reservation: Box<dyn std::fmt::Debug + Send>,
-}
-
-impl PreparedFork {
-    /// Creates a frozen fork snapshot while retaining a backend-owned source reservation.
-    pub fn new(
-        source_thread_id: ThreadId,
-        history_base: Option<HistoryPosition>,
-        model_context: Arc<Vec<RolloutItem>>,
-        source_reservation: impl std::fmt::Debug + Send + 'static,
-    ) -> Self {
-        Self {
-            source_thread_id,
-            history_base,
-            model_context,
-            _source_reservation: Box::new(source_reservation),
-        }
-    }
-}
-
 /// Parameters for reading a thread summary and optionally its replay history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadThreadParams {
     /// Thread id to read.
     pub thread_id: ThreadId,
-    /// Whether archived threads are eligible.
-    pub include_archived: bool,
-    /// Whether persisted rollout items should be included in the response.
-    pub include_history: bool,
-}
-
-/// Parameters for reading a local rollout-backed thread by path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadThreadByRolloutPathParams {
-    /// Local rollout JSONL path to read.
-    pub rollout_path: PathBuf,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
     /// Whether persisted rollout items should be included in the response.

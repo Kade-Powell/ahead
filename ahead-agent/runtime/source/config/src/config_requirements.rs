@@ -1,4 +1,3 @@
-use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
@@ -18,7 +17,6 @@ use super::requirements_exec_policy::RequirementsExecPolicyToml;
 use crate::Constrained;
 use crate::ConstraintError;
 use crate::InAppBrowserRequirementsToml;
-use crate::ManagedAuthPolicy;
 use crate::ManagedHooksRequirementsToml;
 use crate::McpServerRequirement;
 use crate::RequirementsExecPolicy;
@@ -26,10 +24,7 @@ use crate::browser_computer_use_requirements::BrowserUseRequirementsToml;
 use crate::browser_computer_use_requirements::ComputerUseRequirementsToml;
 use crate::config_toml::ConfigToml;
 use crate::mcp_requirements::validate_mcp_server_requirement;
-use crate::mcp_types::AppToolApproval;
 use crate::permissions_toml::PermissionProfileToml;
-use crate::types::AuthCredentialsStoreMode;
-use crate::types::FeedbackConfigToml;
 use crate::types::WindowsSandboxModeToml;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,15 +147,9 @@ impl<T> std::ops::DerefMut for ConstrainedWithSource<T> {
 /// normalization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigRequirements {
-    pub allowed_login_methods: Option<Sourced<Vec<ForcedLoginMethod>>>,
-    pub allowed_chatgpt_workspaces: Option<Sourced<Vec<String>>>,
-    pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
-    pub chatgpt_base_url: Option<Sourced<String>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
-    pub check_for_update_on_startup: Option<Sourced<bool>>,
     pub allow_login_shell: Option<Sourced<bool>>,
-    pub feedback: Option<Sourced<FeedbackConfigToml>>,
     pub approval_policy: ConstrainedWithSource<AskForApproval>,
     pub permission_profile: ConstrainedWithSource<PermissionProfile>,
     pub windows_sandbox_mode: ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
@@ -186,15 +175,9 @@ pub struct ConfigRequirements {
 impl Default for ConfigRequirements {
     fn default() -> Self {
         Self {
-            allowed_login_methods: None,
-            allowed_chatgpt_workspaces: None,
-            cli_auth_credentials_store: None,
-            chatgpt_base_url: None,
             log_dir: None,
             model_catalog_json: None,
-            check_for_update_on_startup: None,
             allow_login_shell: None,
-            feedback: None,
             approval_policy: ConstrainedWithSource::new(
                 Constrained::allow_any_from_default(),
                 /*source*/ None,
@@ -232,24 +215,6 @@ impl Default for ConfigRequirements {
 }
 
 impl ConfigRequirements {
-    pub fn managed_auth_policy(&self) -> ManagedAuthPolicy {
-        ManagedAuthPolicy {
-            allowed_login_methods: self
-                .allowed_login_methods
-                .as_ref()
-                .map(|allowed| allowed.value.clone()),
-            allowed_chatgpt_workspaces: self.allowed_chatgpt_workspaces.as_ref().map(|allowed| {
-                allowed
-                    .value
-                    .iter()
-                    .map(|workspace| workspace.trim())
-                    .filter(|workspace| !workspace.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }),
-        }
-    }
-
     pub fn exec_policy_source(&self) -> Option<&RequirementSource> {
         self.exec_policy.as_ref().map(|policy| &policy.source)
     }
@@ -740,100 +705,12 @@ impl FeatureRequirementsToml {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppToolRequirementToml {
-    pub approval_mode: Option<AppToolApproval>,
-}
-
-impl AppToolRequirementToml {
-    pub fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
-    }
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppToolsRequirementsToml {
-    #[serde(default, flatten)]
-    pub tools: BTreeMap<String, AppToolRequirementToml>,
-}
-
-impl AppToolsRequirementsToml {
-    pub fn is_empty(&self) -> bool {
-        self.tools.values().all(AppToolRequirementToml::is_empty)
-    }
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppRequirementToml {
-    pub enabled: Option<bool>,
-    pub tools: Option<AppToolsRequirementsToml>,
-}
-
-impl AppRequirementToml {
-    pub fn is_empty(&self) -> bool {
-        self.enabled.is_none()
-            && self
-                .tools
-                .as_ref()
-                .is_none_or(AppToolsRequirementsToml::is_empty)
-    }
-}
-
-#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct AppsRequirementsToml {
-    #[serde(default, flatten)]
-    pub apps: BTreeMap<String, AppRequirementToml>,
-}
-
-impl AppsRequirementsToml {
-    pub fn is_empty(&self) -> bool {
-        self.apps.values().all(AppRequirementToml::is_empty)
-    }
-}
-
-/// Merge app requirements from a lower-precedence source into an existing higher-precedence set.
-/// This lets managed sources (for example Cloud/MDM) enforce setting disablement across layers,
-/// while exact tool approval settings keep the higher-precedence value when present.
-pub(crate) fn merge_app_requirements_descending(
-    base: &mut AppsRequirementsToml,
-    incoming: AppsRequirementsToml,
-) {
-    for (app_id, incoming_requirement) in incoming.apps {
-        let base_requirement = base.apps.entry(app_id).or_default();
-        let higher_precedence = base_requirement.enabled;
-        let lower_precedence = incoming_requirement.enabled;
-        base_requirement.enabled =
-            if higher_precedence == Some(false) || lower_precedence == Some(false) {
-                Some(false)
-            } else {
-                higher_precedence.or(lower_precedence)
-            };
-
-        let Some(incoming_tools) = incoming_requirement.tools else {
-            continue;
-        };
-        let base_tools = base_requirement.tools.get_or_insert_with(Default::default);
-        for (tool_name, incoming_tool) in incoming_tools.tools {
-            let base_tool = base_tools.tools.entry(tool_name).or_default();
-            if base_tool.approval_mode.is_none() {
-                base_tool.approval_mode = incoming_tool.approval_mode;
-            }
-        }
-    }
-}
-
 /// Base config deserialized from system `requirements.toml` or MDM.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
-    pub allowed_login_methods: Option<Vec<ForcedLoginMethod>>,
-    pub allowed_chatgpt_workspaces: Option<Vec<String>>,
-    pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
-    pub chatgpt_base_url: Option<String>,
     pub log_dir: Option<AbsolutePathBuf>,
     pub model_catalog_json: Option<AbsolutePathBuf>,
-    pub check_for_update_on_startup: Option<bool>,
     pub allow_login_shell: Option<bool>,
-    pub feedback: Option<FeedbackConfigToml>,
     pub allowed_approval_policies: Option<Vec<AskForApproval>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxModeRequirement>>,
     pub allowed_permission_profiles: Option<BTreeMap<String, bool>>,
@@ -852,7 +729,6 @@ pub struct ConfigRequirementsToml {
     pub feature_requirements: Option<FeatureRequirementsToml>,
     pub hooks: Option<ManagedHooksRequirementsToml>,
     pub mcp_servers: Option<BTreeMap<String, McpServerRequirement>>,
-    pub apps: Option<AppsRequirementsToml>,
     pub rules: Option<RequirementsExecPolicyToml>,
     pub enforce_residency: Option<ResidencyRequirement>,
     #[serde(rename = "experimental_network")]
@@ -924,15 +800,9 @@ impl<T> std::ops::Deref for Sourced<T> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
-    pub allowed_login_methods: Option<Sourced<Vec<ForcedLoginMethod>>>,
-    pub allowed_chatgpt_workspaces: Option<Sourced<Vec<String>>>,
-    pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
-    pub chatgpt_base_url: Option<Sourced<String>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
-    pub check_for_update_on_startup: Option<Sourced<bool>>,
     pub allow_login_shell: Option<Sourced<bool>>,
-    pub feedback: Option<Sourced<FeedbackConfigToml>>,
     pub allowed_approval_policies: Option<Sourced<Vec<AskForApproval>>>,
     pub allowed_sandbox_modes: Option<Sourced<Vec<SandboxModeRequirement>>>,
     pub allowed_permission_profiles: Option<Sourced<BTreeMap<String, bool>>>,
@@ -949,7 +819,6 @@ pub struct ConfigRequirementsWithSources {
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub hooks: Option<Sourced<ManagedHooksRequirementsToml>>,
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
-    pub apps: Option<Sourced<AppsRequirementsToml>>,
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
     pub network: Option<Sourced<NetworkRequirementsToml>>,
@@ -978,15 +847,9 @@ impl ConfigRequirementsWithSources {
         // Destructure without `..` so adding fields to `ConfigRequirementsToml`
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
-            allowed_login_methods: _,
-            allowed_chatgpt_workspaces: _,
-            cli_auth_credentials_store: _,
-            chatgpt_base_url: _,
             log_dir: _,
             model_catalog_json: _,
-            check_for_update_on_startup: _,
             allow_login_shell: _,
-            feedback: _,
             allowed_approval_policies: _,
             allowed_sandbox_modes: _,
             allowed_permission_profiles: _,
@@ -1004,7 +867,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements: _,
             hooks: _,
             mcp_servers: _,
-            apps: _,
             rules: _,
             enforce_residency: _,
             network: _,
@@ -1020,15 +882,9 @@ impl ConfigRequirementsWithSources {
             other,
             source,
             {
-                allowed_login_methods,
-                allowed_chatgpt_workspaces,
-                cli_auth_credentials_store,
-                chatgpt_base_url,
                 log_dir,
                 model_catalog_json,
-                check_for_update_on_startup,
                 allow_login_shell,
-                feedback,
                 allowed_approval_policies,
                 allowed_sandbox_modes,
                 allowed_permission_profiles,
@@ -1054,27 +910,13 @@ impl ConfigRequirementsWithSources {
                 additional_developer_instructions,
             }
         );
-
-        if let Some(incoming_apps) = other.apps.take() {
-            if let Some(existing_apps) = self.apps.as_mut() {
-                merge_app_requirements_descending(&mut existing_apps.value, incoming_apps);
-            } else {
-                self.apps = Some(Sourced::new(incoming_apps, source));
-            }
-        }
     }
 
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
-            allowed_login_methods,
-            allowed_chatgpt_workspaces,
-            cli_auth_credentials_store,
-            chatgpt_base_url,
             log_dir,
             model_catalog_json,
-            check_for_update_on_startup,
             allow_login_shell,
-            feedback,
             allowed_approval_policies,
             allowed_sandbox_modes,
             allowed_permission_profiles,
@@ -1091,7 +933,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements,
             hooks,
             mcp_servers,
-            apps,
             rules,
             enforce_residency,
             network,
@@ -1101,15 +942,9 @@ impl ConfigRequirementsWithSources {
             additional_developer_instructions,
         } = self;
         ConfigRequirementsToml {
-            allowed_login_methods: allowed_login_methods.map(|sourced| sourced.value),
-            allowed_chatgpt_workspaces: allowed_chatgpt_workspaces.map(|sourced| sourced.value),
-            cli_auth_credentials_store: cli_auth_credentials_store.map(|sourced| sourced.value),
-            chatgpt_base_url: chatgpt_base_url.map(|sourced| sourced.value),
             log_dir: log_dir.map(|sourced| sourced.value),
             model_catalog_json: model_catalog_json.map(|sourced| sourced.value),
-            check_for_update_on_startup: check_for_update_on_startup.map(|sourced| sourced.value),
             allow_login_shell: allow_login_shell.map(|sourced| sourced.value),
-            feedback: feedback.map(|sourced| sourced.value),
             allowed_approval_policies: allowed_approval_policies.map(|sourced| sourced.value),
             allowed_sandbox_modes: allowed_sandbox_modes.map(|sourced| sourced.value),
             allowed_permission_profiles: allowed_permission_profiles.map(|sourced| sourced.value),
@@ -1128,7 +963,6 @@ impl ConfigRequirementsWithSources {
             feature_requirements: feature_requirements.map(|sourced| sourced.value),
             hooks: hooks.map(|sourced| sourced.value),
             mcp_servers: mcp_servers.map(|sourced| sourced.value),
-            apps: apps.map(|sourced| sourced.value),
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
             network: network.map(|sourced| sourced.value),
@@ -1205,18 +1039,9 @@ impl ConfigRequirementsToml {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.allowed_login_methods.is_none()
-            && self.allowed_chatgpt_workspaces.is_none()
-            && self.cli_auth_credentials_store.is_none()
-            && self.chatgpt_base_url.is_none()
-            && self.log_dir.is_none()
+        self.log_dir.is_none()
             && self.model_catalog_json.is_none()
-            && self.check_for_update_on_startup.is_none()
             && self.allow_login_shell.is_none()
-            && self
-                .feedback
-                .as_ref()
-                .is_none_or(|feedback| feedback == &FeedbackConfigToml::default())
             && self.allowed_approval_policies.is_none()
             && self.allowed_sandbox_modes.is_none()
             && self.allowed_permission_profiles.is_none()
@@ -1252,10 +1077,6 @@ impl ConfigRequirementsToml {
                 .as_ref()
                 .is_none_or(ManagedHooksRequirementsToml::is_empty)
             && self.mcp_servers.is_none()
-            && self
-                .apps
-                .as_ref()
-                .is_none_or(AppsRequirementsToml::is_empty)
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
@@ -1282,16 +1103,10 @@ impl ConfigRequirementsToml {
             };
         }
 
-        apply_exact!(cli_auth_credentials_store);
-        apply_exact!(chatgpt_base_url);
         apply_exact!(log_dir);
         apply_exact!(model_catalog_json);
-        apply_exact!(check_for_update_on_startup);
         apply_exact!(allow_login_shell);
 
-        if let Some(enabled) = self.feedback.as_ref().and_then(|feedback| feedback.enabled) {
-            config.feedback.get_or_insert_default().enabled = Some(enabled);
-        }
         if let Some(sandbox_private_desktop) = self
             .windows
             .as_ref()
@@ -1306,7 +1121,7 @@ impl ConfigRequirementsToml {
 
     /// Returns the exact managed field affected by editing `segments`.
     pub fn exact_requirement_for_config_path(&self, segments: &[String]) -> Option<&'static str> {
-        let managed_fields: [(bool, &[&str], &'static str); 8] = [
+        let managed_fields: [(bool, &[&str], &'static str); 4] = [
             (self.log_dir.is_some(), &["log_dir"], "log_dir"),
             (
                 self.model_catalog_json.is_some(),
@@ -1314,22 +1129,9 @@ impl ConfigRequirementsToml {
                 "model_catalog_json",
             ),
             (
-                self.check_for_update_on_startup.is_some(),
-                &["check_for_update_on_startup"],
-                "check_for_update_on_startup",
-            ),
-            (
                 self.allow_login_shell.is_some(),
                 &["allow_login_shell"],
                 "allow_login_shell",
-            ),
-            (
-                self.feedback
-                    .as_ref()
-                    .and_then(|feedback| feedback.enabled)
-                    .is_some(),
-                &["feedback", "enabled"],
-                "feedback.enabled",
             ),
             (
                 self.windows
@@ -1338,16 +1140,6 @@ impl ConfigRequirementsToml {
                     .is_some(),
                 &["windows", "sandbox_private_desktop"],
                 "windows.sandbox_private_desktop",
-            ),
-            (
-                self.cli_auth_credentials_store.is_some(),
-                &["cli_auth_credentials_store"],
-                "cli_auth_credentials_store",
-            ),
-            (
-                self.chatgpt_base_url.is_some(),
-                &["chatgpt_base_url"],
-                "chatgpt_base_url",
             ),
         ];
 
@@ -1390,15 +1182,9 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // config loading and requirements API projection. Managed new-thread
         // defaults also remain there because they are initialization values.
         let ConfigRequirementsWithSources {
-            allowed_login_methods,
-            allowed_chatgpt_workspaces,
-            cli_auth_credentials_store,
-            chatgpt_base_url,
             log_dir,
             model_catalog_json,
-            check_for_update_on_startup,
             allow_login_shell,
-            feedback,
             allowed_approval_policies,
             allowed_sandbox_modes,
             allowed_permission_profiles: _,
@@ -1415,7 +1201,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             feature_requirements,
             hooks,
             mcp_servers,
-            apps: _apps,
             rules,
             enforce_residency,
             network,
@@ -1675,15 +1460,9 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             Sourced::new(FilesystemConstraints::from(value), source)
         });
         Ok(ConfigRequirements {
-            allowed_login_methods,
-            allowed_chatgpt_workspaces,
-            cli_auth_credentials_store,
-            chatgpt_base_url,
             log_dir,
             model_catalog_json,
-            check_for_update_on_startup,
             allow_login_shell,
-            feedback,
             approval_policy,
             permission_profile,
             windows_sandbox_mode,
@@ -1766,15 +1545,9 @@ mod tests {
         let managed_path = AbsolutePathBuf::try_from(std::env::temp_dir().join("managed"))
             .expect("managed path should be absolute");
         let requirements = ConfigRequirementsToml {
-            cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Ephemeral),
-            chatgpt_base_url: Some("https://managed.example/backend-api/".to_string()),
             log_dir: Some(managed_path.clone()),
             model_catalog_json: Some(managed_path),
-            check_for_update_on_startup: Some(false),
             allow_login_shell: Some(false),
-            feedback: Some(FeedbackConfigToml {
-                enabled: Some(false),
-            }),
             windows: Some(WindowsRequirementsToml {
                 sandbox_private_desktop: Some(false),
                 ..Default::default()
@@ -1782,30 +1555,18 @@ mod tests {
             ..Default::default()
         };
         let cases: &[(&[&str], Option<&str>)] = &[
-            (
-                &["cli_auth_credentials_store"],
-                Some("cli_auth_credentials_store"),
-            ),
-            (&["chatgpt_base_url"], Some("chatgpt_base_url")),
             (&["log_dir"], Some("log_dir")),
             (&["model_catalog_json"], Some("model_catalog_json")),
-            (
-                &["check_for_update_on_startup"],
-                Some("check_for_update_on_startup"),
-            ),
             (&["allow_login_shell"], Some("allow_login_shell")),
-            (&["feedback", "enabled"], Some("feedback.enabled")),
             (
                 &["windows", "sandbox_private_desktop"],
                 Some("windows.sandbox_private_desktop"),
             ),
             (&[], Some("log_dir")),
-            (&["feedback"], Some("feedback.enabled")),
             (
                 &["windows", "sandbox_private_desktop", "value"],
                 Some("windows.sandbox_private_desktop"),
             ),
-            (&["feedback", "other"], None),
             (&["windows", "sandbox"], None),
         ];
 
@@ -1840,15 +1601,9 @@ mod tests {
 
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
-            allowed_login_methods,
-            allowed_chatgpt_workspaces,
-            cli_auth_credentials_store,
-            chatgpt_base_url,
             log_dir,
             model_catalog_json,
-            check_for_update_on_startup,
             allow_login_shell,
-            feedback,
             allowed_approval_policies,
             allowed_sandbox_modes,
             allowed_permission_profiles,
@@ -1866,7 +1621,6 @@ mod tests {
             feature_requirements,
             hooks,
             mcp_servers,
-            apps,
             rules,
             enforce_residency,
             network,
@@ -1876,22 +1630,11 @@ mod tests {
             additional_developer_instructions,
         } = toml;
         ConfigRequirementsWithSources {
-            allowed_login_methods: allowed_login_methods
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            allowed_chatgpt_workspaces: allowed_chatgpt_workspaces
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            cli_auth_credentials_store: cli_auth_credentials_store
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            chatgpt_base_url: chatgpt_base_url
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             log_dir: log_dir.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             model_catalog_json: model_catalog_json
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            check_for_update_on_startup: check_for_update_on_startup
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allow_login_shell: allow_login_shell
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            feedback: feedback.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_approval_policies: allowed_approval_policies
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_sandbox_modes: allowed_sandbox_modes
@@ -1919,7 +1662,6 @@ mod tests {
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             hooks: hooks.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             mcp_servers: mcp_servers.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            apps: apps.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             rules: rules.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             enforce_residency: enforce_residency
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2342,9 +2084,6 @@ mod tests {
         let model_catalog_json =
             AbsolutePathBuf::try_from(std::env::temp_dir().join("managed-models.json"))
                 .expect("managed model catalog path should be absolute");
-        let feedback = FeedbackConfigToml {
-            enabled: Some(false),
-        };
         let windows = WindowsRequirementsToml {
             allowed_sandbox_implementations: None,
             sandbox_private_desktop: Some(true),
@@ -2356,15 +2095,9 @@ mod tests {
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
         let other = ConfigRequirementsToml {
-            allowed_login_methods: Some(vec![ForcedLoginMethod::Chatgpt]),
-            allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
-            cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Keyring),
-            chatgpt_base_url: Some("https://managed.example/backend-api/".to_string()),
             log_dir: Some(log_dir.clone()),
             model_catalog_json: Some(model_catalog_json.clone()),
-            check_for_update_on_startup: Some(false),
             allow_login_shell: Some(false),
-            feedback: Some(feedback.clone()),
             allowed_approval_policies: Some(allowed_approval_policies.clone()),
             allowed_sandbox_modes: Some(allowed_sandbox_modes.clone()),
             allowed_permission_profiles: Some(BTreeMap::from([("managed".to_string(), true)])),
@@ -2382,7 +2115,6 @@ mod tests {
             feature_requirements: Some(feature_requirements.clone()),
             hooks: None,
             mcp_servers: None,
-            apps: None,
             rules: None,
             enforce_residency: Some(enforce_residency),
             network: None,
@@ -2397,30 +2129,9 @@ mod tests {
         assert_eq!(
             target,
             ConfigRequirementsWithSources {
-                allowed_login_methods: Some(Sourced::new(
-                    vec![ForcedLoginMethod::Chatgpt],
-                    source.clone(),
-                )),
-                allowed_chatgpt_workspaces: Some(Sourced::new(
-                    vec!["managed-workspace".to_string()],
-                    source.clone(),
-                )),
-                cli_auth_credentials_store: Some(Sourced::new(
-                    AuthCredentialsStoreMode::Keyring,
-                    source.clone(),
-                )),
-                chatgpt_base_url: Some(Sourced::new(
-                    "https://managed.example/backend-api/".to_string(),
-                    source.clone(),
-                )),
                 log_dir: Some(Sourced::new(log_dir, source.clone())),
                 model_catalog_json: Some(Sourced::new(model_catalog_json, source.clone())),
-                check_for_update_on_startup: Some(Sourced::new(
-                    /*value*/ false,
-                    source.clone(),
-                )),
                 allow_login_shell: Some(Sourced::new(/*value*/ false, source.clone())),
-                feedback: Some(Sourced::new(feedback, source.clone())),
                 allowed_approval_policies: Some(Sourced::new(
                     allowed_approval_policies,
                     source.clone()
@@ -2458,7 +2169,6 @@ mod tests {
                 )),
                 hooks: None,
                 mcp_servers: None,
-                apps: None,
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
@@ -2509,7 +2219,6 @@ mod tests {
                 feature_requirements: None,
                 hooks: None,
                 mcp_servers: None,
-                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -2564,7 +2273,6 @@ mod tests {
                 feature_requirements: None,
                 hooks: None,
                 mcp_servers: None,
-                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -2639,280 +2347,6 @@ mod tests {
             ))
         );
         Ok(())
-    }
-
-    #[test]
-    fn deserialize_apps_requirements() -> Result<()> {
-        let toml_str = r#"
-            [apps.connector_123123]
-            enabled = false
-        "#;
-        let requirements: ConfigRequirementsToml = from_str(toml_str)?;
-
-        assert_eq!(
-            requirements.apps,
-            Some(AppsRequirementsToml {
-                apps: BTreeMap::from([(
-                    "connector_123123".to_string(),
-                    AppRequirementToml {
-                        enabled: Some(false),
-                        tools: None,
-                    },
-                )]),
-            })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn deserialize_apps_tool_requirements() -> Result<()> {
-        let toml_str = r#"
-            [apps.connector_123123.tools."calendar/list_events"]
-            approval_mode = "approve"
-        "#;
-        let requirements: ConfigRequirementsToml = from_str(toml_str)?;
-
-        assert_eq!(
-            requirements.apps,
-            Some(AppsRequirementsToml {
-                apps: BTreeMap::from([(
-                    "connector_123123".to_string(),
-                    AppRequirementToml {
-                        enabled: None,
-                        tools: Some(AppToolsRequirementsToml {
-                            tools: BTreeMap::from([(
-                                "calendar/list_events".to_string(),
-                                AppToolRequirementToml {
-                                    approval_mode: Some(AppToolApproval::Approve),
-                                },
-                            )]),
-                        }),
-                    },
-                )]),
-            })
-        );
-        Ok(())
-    }
-
-    fn apps_requirements(entries: &[(&str, Option<bool>)]) -> AppsRequirementsToml {
-        AppsRequirementsToml {
-            apps: entries
-                .iter()
-                .map(|(app_id, enabled)| {
-                    (
-                        (*app_id).to_string(),
-                        AppRequirementToml {
-                            enabled: *enabled,
-                            tools: None,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    fn app_tool_requirements(
-        app_id: &str,
-        tool_name: &str,
-        approval_mode: AppToolApproval,
-    ) -> AppsRequirementsToml {
-        AppsRequirementsToml {
-            apps: BTreeMap::from([(
-                app_id.to_string(),
-                AppRequirementToml {
-                    enabled: None,
-                    tools: Some(AppToolsRequirementsToml {
-                        tools: BTreeMap::from([(
-                            tool_name.to_string(),
-                            AppToolRequirementToml {
-                                approval_mode: Some(approval_mode),
-                            },
-                        )]),
-                    }),
-                },
-            )]),
-        }
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_unions_distinct_apps() {
-        let mut merged = apps_requirements(&[("connector_high", Some(false))]);
-        let lower = apps_requirements(&[("connector_low", Some(true))]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[
-                ("connector_high", Some(false)),
-                ("connector_low", Some(true))
-            ]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_prefers_false_from_lower_precedence() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
-        let lower = apps_requirements(&[("connector_123123", Some(false))]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(false))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_keeps_higher_true_when_lower_is_unset() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(true))]);
-        let lower = apps_requirements(&[("connector_123123", None)]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(true))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_uses_lower_value_when_higher_missing() {
-        let mut merged = apps_requirements(&[]);
-        let lower = apps_requirements(&[("connector_123123", Some(true))]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(true))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_preserves_higher_false_when_lower_missing_app() {
-        let mut merged = apps_requirements(&[("connector_123123", Some(false))]);
-        let lower = apps_requirements(&[]);
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            apps_requirements(&[("connector_123123", Some(false))]),
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_preserves_higher_tool_approval_mode() {
-        let mut merged = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Approve,
-        );
-        let lower = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Prompt,
-        );
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            app_tool_requirements(
-                "connector_123123",
-                "calendar/list_events",
-                AppToolApproval::Approve,
-            )
-        );
-    }
-
-    #[test]
-    fn merge_app_requirements_descending_uses_lower_tool_approval_when_higher_missing() {
-        let mut merged = apps_requirements(&[("connector_123123", None)]);
-        let lower = app_tool_requirements(
-            "connector_123123",
-            "calendar/list_events",
-            AppToolApproval::Approve,
-        );
-
-        merge_app_requirements_descending(&mut merged, lower);
-
-        assert_eq!(
-            merged,
-            app_tool_requirements(
-                "connector_123123",
-                "calendar/list_events",
-                AppToolApproval::Approve,
-            )
-        );
-    }
-
-    #[test]
-    fn merge_unset_fields_merges_apps_across_sources_with_enabled_evaluation() {
-        let higher_source = RequirementSource::LegacyManagedConfigTomlFromMdm;
-        let lower_source = RequirementSource::MdmManagedPreferences {
-            domain: "com.openai.codex".to_string(),
-            key: "requirements_toml_base64".to_string(),
-        };
-        let mut target = ConfigRequirementsWithSources::default();
-
-        target.merge_unset_fields(
-            higher_source.clone(),
-            ConfigRequirementsToml {
-                apps: Some(apps_requirements(&[
-                    ("connector_high", Some(true)),
-                    ("connector_shared", Some(true)),
-                ])),
-                ..Default::default()
-            },
-        );
-        target.merge_unset_fields(
-            lower_source,
-            ConfigRequirementsToml {
-                apps: Some(apps_requirements(&[
-                    ("connector_low", Some(false)),
-                    ("connector_shared", Some(false)),
-                ])),
-                ..Default::default()
-            },
-        );
-
-        let apps = target.apps.expect("apps should be present");
-        assert_eq!(
-            apps.value,
-            apps_requirements(&[
-                ("connector_high", Some(true)),
-                ("connector_low", Some(false)),
-                ("connector_shared", Some(false)),
-            ])
-        );
-        assert_eq!(apps.source, higher_source);
-    }
-
-    #[test]
-    fn merge_unset_fields_apps_empty_higher_source_does_not_block_lower_disables() {
-        let mut target = ConfigRequirementsWithSources::default();
-
-        target.merge_unset_fields(
-            RequirementSource::LegacyManagedConfigTomlFromMdm,
-            ConfigRequirementsToml {
-                apps: Some(apps_requirements(&[])),
-                ..Default::default()
-            },
-        );
-        target.merge_unset_fields(
-            RequirementSource::LegacyManagedConfigTomlFromMdm,
-            ConfigRequirementsToml {
-                apps: Some(apps_requirements(&[("connector_123123", Some(false))])),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            target.apps.map(|apps| apps.value),
-            Some(apps_requirements(&[("connector_123123", Some(false))])),
-        );
     }
 
     #[test]
@@ -3483,7 +2917,7 @@ mod tests {
     fn deserialize_feature_requirements() -> Result<()> {
         let toml_str = r#"
             [features]
-            apps = false
+            collaboration_modes = false
             personality = true
         "#;
         let config: ConfigRequirementsToml = from_str(toml_str)?;
@@ -3494,7 +2928,7 @@ mod tests {
             Some(Sourced::new(
                 FeatureRequirementsToml {
                     entries: BTreeMap::from([
-                        ("apps".to_string(), false),
+                        ("collaboration_modes".to_string(), false),
                         ("personality".to_string(), true),
                     ]),
                 },

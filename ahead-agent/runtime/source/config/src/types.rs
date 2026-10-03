@@ -12,7 +12,6 @@ pub use crate::mcp_types::McpServerToolConfig;
 pub use crate::mcp_types::McpServerTransportConfig;
 pub use crate::mcp_types::RawMcpServerConfig;
 pub use crate::shell_environment_policy::ShellEnvironmentPolicyToml;
-pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
 pub use codex_protocol::config_types::ServiceTier;
@@ -20,27 +19,10 @@ pub use codex_protocol::config_types::WebSearchMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fmt;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
-
-pub use crate::tui_keymap::KeybindingSpec;
-pub use crate::tui_keymap::KeybindingsSpec;
-pub use crate::tui_keymap::MAX_FUNCTION_KEY;
-pub use crate::tui_keymap::TuiAgentsKeymap;
-pub use crate::tui_keymap::TuiApprovalKeymap;
-pub use crate::tui_keymap::TuiChatKeymap;
-pub use crate::tui_keymap::TuiComposerKeymap;
-pub use crate::tui_keymap::TuiEditorKeymap;
-pub use crate::tui_keymap::TuiGlobalKeymap;
-pub use crate::tui_keymap::TuiKeymap;
-pub use crate::tui_keymap::TuiListKeymap;
-pub use crate::tui_keymap::TuiPagerKeymap;
-pub use crate::tui_keymap::TuiVimNormalKeymap;
-pub use crate::tui_keymap::TuiVimOperatorKeymap;
-pub use crate::tui_keymap::TuiVimSearchKeymap;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;
@@ -53,68 +35,6 @@ const MIN_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION: usize = 1;
 const MAX_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION: usize = 4096;
 const MIN_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 1;
 const MAX_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 128;
-
-const fn default_enabled() -> bool {
-    true
-}
-
-/// Preferred layout for the resume/fork session picker.
-#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum SessionPickerViewMode {
-    Comfortable,
-    #[default]
-    Dense,
-}
-
-impl SessionPickerViewMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Comfortable => "comfortable",
-            Self::Dense => "dense",
-        }
-    }
-}
-
-impl fmt::Display for SessionPickerViewMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Working directory to use when resuming or forking a session.
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResumeCwdMode {
-    /// Use the directory where Codex was launched.
-    Current,
-    /// Use the latest working directory recorded in the selected session.
-    Session,
-}
-
-impl ResumeCwdMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::Session => "session",
-        }
-    }
-}
-
-/// Determine where Codex should store CLI auth credentials.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthCredentialsStoreMode {
-    #[default]
-    /// Persist credentials in CODEX_HOME/auth.json.
-    File,
-    /// Persist credentials in the keyring. Fail if unavailable.
-    Keyring,
-    /// Use keyring when available; otherwise, fall back to a file in CODEX_HOME.
-    Auto,
-    /// Store credentials in memory only for the current process.
-    Ephemeral,
-}
 
 /// Determine where Codex should store and read MCP credentials.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -167,55 +87,6 @@ pub struct WindowsToml {
     /// Defaults to `true`. Set to `false` to launch the final sandboxed child
     /// process on `Winsta0\\Default` instead of a private desktop.
     pub sandbox_private_desktop: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, JsonSchema)]
-pub enum UriBasedFileOpener {
-    #[serde(rename = "vscode")]
-    VsCode,
-
-    #[serde(rename = "vscode-insiders")]
-    VsCodeInsiders,
-
-    #[serde(rename = "windsurf")]
-    Windsurf,
-
-    #[serde(rename = "cursor")]
-    Cursor,
-
-    /// Option to disable the URI-based file opener.
-    #[serde(rename = "none")]
-    None,
-}
-
-/// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[serde(default)]
-#[schemars(deny_unknown_fields)]
-pub struct History {
-    /// If true, history entries will not be written to disk.
-    pub persistence: HistoryPersistence,
-
-    /// If set, the maximum size of the history file in bytes. The oldest entries
-    /// are dropped once the file exceeds this limit.
-    pub max_bytes: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Default, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum HistoryPersistence {
-    /// Save all history entries to disk.
-    #[default]
-    SaveAll,
-    /// Do not write history to disk.
-    None,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct FeedbackConfigToml {
-    /// When `false`, disables the feedback flow across Codex product surfaces.
-    pub enabled: Option<bool>,
 }
 
 /// Memories settings loaded from config.toml.
@@ -334,97 +205,6 @@ impl From<MemoriesToml> for MemoriesConfig {
     }
 }
 
-/// Default settings that apply to all apps.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct AppsDefaultConfig {
-    /// When `false`, apps are disabled unless overridden by per-app settings.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Whether tools with `destructive_hint = true` are allowed by default.
-    #[serde(
-        default = "default_enabled",
-        skip_serializing_if = "std::clone::Clone::clone"
-    )]
-    pub destructive_enabled: bool,
-
-    /// Whether tools with `open_world_hint = true` are allowed by default.
-    #[serde(
-        default = "default_enabled",
-        skip_serializing_if = "std::clone::Clone::clone"
-    )]
-    pub open_world_enabled: bool,
-
-    /// Approval mode for tools unless overridden by per-app or per-tool settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tools_approval_mode: Option<AppToolApproval>,
-}
-
-/// Per-tool settings for a single app tool.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct AppToolConfig {
-    /// Whether this tool is enabled. `Some(true)` explicitly allows this tool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    /// Approval mode for this tool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_mode: Option<AppToolApproval>,
-}
-
-/// Tool settings for a single app.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct AppToolsConfig {
-    /// Per-tool overrides keyed by tool name (for example `repos/list`).
-    #[serde(default, flatten)]
-    pub tools: HashMap<String, AppToolConfig>,
-}
-
-/// Config values for a single app/connector.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct AppConfig {
-    /// When `false`, Codex does not surface this app.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Whether tools with `destructive_hint = true` are allowed for this app.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destructive_enabled: Option<bool>,
-
-    /// Whether tools with `open_world_hint = true` are allowed for this app.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_world_enabled: Option<bool>,
-
-    /// Approval mode for tools in this app unless a tool override exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tools_approval_mode: Option<AppToolApproval>,
-
-    /// Whether tools are enabled by default for this app.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tools_enabled: Option<bool>,
-
-    /// Per-tool settings for this app.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<AppToolsConfig>,
-}
-
-/// App/connector settings loaded from `config.toml`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct AppsConfigToml {
-    /// Default settings for all apps.
-    #[serde(default, rename = "_default", skip_serializing_if = "Option::is_none")]
-    pub default: Option<AppsDefaultConfig>,
-
-    /// Per-app settings keyed by app ID (for example `[apps.google_drive]`).
-    #[serde(default, flatten)]
-    pub apps: HashMap<String, AppConfig>,
-}
-
 // ===== OTEL configuration =====
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
@@ -519,209 +299,11 @@ impl Default for OtelConfig {
             environment: DEFAULT_OTEL_ENVIRONMENT.to_owned(),
             exporter: OtelExporterKind::None,
             trace_exporter: OtelExporterKind::None,
-            metrics_exporter: OtelExporterKind::Statsig,
+            metrics_exporter: OtelExporterKind::None,
             span_attributes: BTreeMap::new(),
             tracestate: BTreeMap::new(),
         }
     }
-}
-
-#[derive(Serialize, Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum Notifications {
-    Enabled(bool),
-    Custom(Vec<String>),
-}
-
-impl Default for Notifications {
-    fn default() -> Self {
-        Self::Enabled(true)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum NotificationMethod {
-    #[default]
-    Auto,
-    Osc9,
-    Bel,
-}
-
-impl fmt::Display for NotificationMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NotificationMethod::Auto => write!(f, "auto"),
-            NotificationMethod::Osc9 => write!(f, "osc9"),
-            NotificationMethod::Bel => write!(f, "bel"),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum NotificationCondition {
-    /// Emit TUI notifications only while the terminal is unfocused.
-    #[default]
-    Unfocused,
-    /// Emit TUI notifications regardless of terminal focus.
-    Always,
-}
-
-impl fmt::Display for NotificationCondition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NotificationCondition::Unfocused => write!(f, "unfocused"),
-            NotificationCondition::Always => write!(f, "always"),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum TuiPetAnchor {
-    /// Anchor the pet to the bottom of the current TUI composer viewport.
-    #[default]
-    Composer,
-    /// Anchor the pet to the physical bottom of the terminal screen.
-    ScreenBottom,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct TuiNotificationSettings {
-    /// Enable desktop notifications from the TUI.
-    /// Defaults to `true`.
-    #[serde(default, rename = "notifications")]
-    pub notifications: Notifications,
-
-    /// Notification method to use for terminal notifications.
-    /// Defaults to `auto`.
-    #[serde(default, rename = "notification_method")]
-    pub method: NotificationMethod,
-
-    /// Controls whether TUI notifications are delivered only when the terminal is unfocused or
-    /// regardless of focus. Defaults to `unfocused`.
-    #[serde(default, rename = "notification_condition")]
-    pub condition: NotificationCondition,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct ModelAvailabilityNuxConfig {
-    /// Number of times a startup availability NUX has been shown per model slug.
-    #[serde(default, flatten)]
-    pub shown_count: HashMap<String, u32>,
-}
-
-/// Fallback resize-reflow row cap when Codex cannot identify a terminal-specific scrollback size.
-pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
-
-/// Collection of settings that are specific to the TUI.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct Tui {
-    #[serde(default, flatten)]
-    pub notification_settings: TuiNotificationSettings,
-
-    /// Enable animations (welcome screen, shimmer effects, spinners).
-    /// Defaults to `true`.
-    #[serde(default = "default_true")]
-    pub animations: bool,
-
-    /// Show startup tooltips in the TUI welcome screen.
-    /// Defaults to `true`.
-    #[serde(default = "default_true")]
-    pub show_tooltips: bool,
-
-    /// Start the composer in Vim mode (`Normal`) by default.
-    /// Defaults to `false`.
-    #[serde(default)]
-    pub vim_mode_default: bool,
-
-    /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
-    /// Defaults to `false`.
-    #[serde(default)]
-    pub raw_output_mode: bool,
-
-    /// Controls whether the TUI uses the terminal's alternate screen buffer.
-    ///
-    /// - `auto` (default): Use alternate screen.
-    /// - `always`: Always use alternate screen.
-    /// - `never`: Never use alternate screen (inline mode only, preserves scrollback).
-    #[serde(default)]
-    pub alternate_screen: AltScreenMode,
-
-    /// Ordered list of status line item identifiers.
-    ///
-    /// When set, the TUI renders the selected items as the status line.
-    /// When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.
-    #[serde(default)]
-    pub status_line: Option<Vec<String>>,
-
-    /// Color status line items with colors derived from the active syntax theme.
-    /// Defaults to `true`.
-    #[serde(default = "default_true")]
-    pub status_line_use_colors: bool,
-
-    /// Ordered list of terminal title item identifiers.
-    ///
-    /// When set, the TUI renders the selected items into the terminal window/tab title.
-    /// When unset, the TUI defaults to: `activity` and `project`.
-    /// The `activity` item spins while working and shows an action-required
-    /// message when blocked on the user.
-    #[serde(default)]
-    pub terminal_title: Option<Vec<String>>,
-
-    /// Syntax highlighting theme name (kebab-case).
-    ///
-    /// When set, overrides automatic light/dark theme detection.
-    /// Use `/theme` in the TUI or see `$CODEX_HOME/themes` for custom themes.
-    #[serde(default)]
-    pub theme: Option<String>,
-
-    /// Pet id to preselect in the terminal pet picker.
-    ///
-    /// Custom pet ids resolve against CODEX_HOME/pets/<pet-id>/pet.json.
-    #[serde(default)]
-    pub pet: Option<String>,
-
-    /// Where the terminal pet should anchor vertically.
-    ///
-    /// Defaults to `composer`, which follows the current TUI composer viewport.
-    #[serde(default)]
-    pub pet_anchor: TuiPetAnchor,
-
-    /// Preferred layout for resume/fork session picker results.
-    #[serde(default)]
-    pub session_picker_view: Option<SessionPickerViewMode>,
-
-    /// Working directory to use when resuming or forking a session.
-    /// When unset, prompt if the current and session directories differ.
-    #[serde(default)]
-    pub resume_cwd: Option<ResumeCwdMode>,
-
-    /// Keybinding overrides for the TUI.
-    ///
-    /// This supports rebinding selected actions globally and by context.
-    /// Context bindings take precedence over `global` bindings.
-    #[serde(default)]
-    pub keymap: TuiKeymap,
-
-    /// Startup tooltip availability NUX state persisted by the TUI.
-    #[serde(default)]
-    pub model_availability_nux: ModelAvailabilityNuxConfig,
-
-    /// Trim terminal resize-reflow replay to the most recent rendered terminal rows when the
-    /// transcript exceeds this cap. Omit to use Codex's terminal-specific default. Set to `0` to
-    /// keep all rendered rows.
-    #[serde(default)]
-    #[schemars(range(min = 0))]
-    pub terminal_resize_reflow_max_rows: Option<usize>,
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 /// Settings for notices we display to users via the tui and app-server clients

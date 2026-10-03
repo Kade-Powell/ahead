@@ -14,7 +14,6 @@ use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
-use crate::attestation::AttestationProvider;
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
@@ -46,7 +45,6 @@ use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
 use ahead_model_auth::AuthManager;
 use ahead_model_auth::CodexAuth;
-use ahead_model_auth::auth_env_telemetry::collect_auth_env_telemetry;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
@@ -71,7 +69,6 @@ use codex_features::unstable_features_warning_event;
 use codex_history::RolloutItem;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
-use codex_mcp::McpResourceClient;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpRuntimeInput;
@@ -114,7 +111,6 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
-use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -191,7 +187,7 @@ use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
-use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
+use crate::context_manager::is_user_turn_boundary;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
 use codex_model_provider::create_model_provider;
@@ -375,15 +371,6 @@ pub(crate) enum GitEnrichmentPolicy {
     Skip,
 }
 
-/// Controls which fork history belongs in the newly created thread's own rollout.
-pub(crate) enum ForkPersistence {
-    Copied,
-    Referenced {
-        history_base: Option<HistoryPosition>,
-        inherited_item_count: usize,
-    },
-}
-
 pub(crate) struct SessionSpawnArgs {
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
@@ -398,7 +385,6 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
-    pub(crate) fork_persistence: ForkPersistence,
     pub(crate) session_source: SessionSource,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -422,7 +408,6 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) reserved_thread_id: Option<ThreadId>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
-    pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
@@ -500,7 +485,6 @@ impl Session {
             extensions,
             conversation_history,
             requested_history_mode,
-            fork_persistence,
             session_source,
             forked_from_thread_id,
             parent_thread_id,
@@ -520,7 +504,6 @@ impl Session {
             reserved_thread_id,
             analytics_events_client,
             thread_store,
-            attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
             git_enrichment_policy,
@@ -705,7 +688,6 @@ impl Session {
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
-            fork_persistence,
             session_source_clone,
             skills_service,
             mcp_manager.clone(),
@@ -720,7 +702,6 @@ impl Session {
             analytics_events_client,
             thread_store,
             parent_rollout_thread_trace,
-            attestation_provider,
             external_time_provider,
             multi_agent_version,
             git_enrichment_policy,
@@ -1284,7 +1265,11 @@ impl Session {
                 ),
             )
         };
-        let has_prior_user_turns = initial_history_has_prior_user_turns(&conversation_history);
+        let has_prior_user_turns = conversation_history.scan_rollout_items(|item| match item {
+            RolloutItem::ResponseItem(item) => is_user_turn_boundary(item),
+            RolloutItem::InterAgentCommunication(_) => true,
+            _ => false,
+        });
         {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
@@ -1360,27 +1345,15 @@ impl Session {
 
                 let thread_settings_applied =
                     RolloutItem::EventMsg(thread_settings::applied_event(self).await);
-                match &self.fork_persistence {
-                    ForkPersistence::Referenced {
-                        inherited_item_count,
-                        ..
-                    } => {
-                        // Ancestor records remain behind history_base; only effective child
-                        // settings and boundaries synthesized by snapshot processing are local.
-                        rollout_items.drain(..*inherited_item_count);
-                        rollout_items.insert(0, thread_settings_applied);
-                    }
-                    ForkPersistence::Copied if is_paginated_subagent => {
-                        // Paginated subagents already persist inherited context when their live
-                        // thread is created.
-                        rollout_items.clear();
-                        rollout_items.push(thread_settings_applied);
-                    }
-                    ForkPersistence::Copied => {
-                        // Keep the copied prefix and effective child settings in one append so a
-                        // cold resume cannot observe inherited settings as the latest value.
-                        rollout_items.push(thread_settings_applied);
-                    }
+                if is_paginated_subagent {
+                    // Paginated subagents already persist inherited context when their live
+                    // thread is created.
+                    rollout_items.clear();
+                    rollout_items.push(thread_settings_applied);
+                } else {
+                    // Keep the copied prefix and effective child settings in one append so a
+                    // cold resume cannot observe inherited settings as the latest value.
+                    rollout_items.push(thread_settings_applied);
                 }
                 self.persist_rollout_items(&rollout_items).await;
 
@@ -1810,7 +1783,7 @@ impl Session {
 
     pub(crate) async fn reload_user_config_layer(&self) {
         // Refresh layer-backed runtime state for an existing session, including enabled plugin,
-        // skill, and hook state. Derived config fields such as feature gates and legacy notify
+        // skill, and hook state. Derived config fields such as feature gates
         // settings remain session-static.
         //
         // Prefer `refresh_runtime_config()` when the host can already provide a materialized
@@ -2619,21 +2592,19 @@ impl Session {
         args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
         let _elicitation = self.services.elicitations.register();
-        let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
-        let event_id = sub_id.clone();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_user_input(sub_id, tx_response)
+                    ts.insert_pending_user_input(call_id.clone(), tx_response)
                 }
                 None => None,
             }
         };
         if prev_entry.is_some() {
-            warn!("Overwriting existing pending user input for sub_id: {event_id}");
+            warn!("Overwriting existing pending user input for call_id: {call_id}");
         }
 
         let event = EventMsg::RequestUserInput(RequestUserInputEvent {
@@ -2656,7 +2627,7 @@ impl Session {
     )]
     pub async fn notify_user_input_response(
         &self,
-        sub_id: &str,
+        call_id: &str,
         response: RequestUserInputResponse,
     ) {
         let entry = {
@@ -2664,7 +2635,7 @@ impl Session {
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.remove_pending_user_input(sub_id)
+                    ts.remove_pending_user_input(call_id)
                 }
                 None => None,
             }
@@ -2674,7 +2645,7 @@ impl Session {
                 tx_response.send(response).ok();
             }
             None => {
-                warn!("No pending user input found for sub_id: {sub_id}");
+                warn!("No pending user input found for call_id: {call_id}");
             }
         }
     }
@@ -4197,7 +4168,6 @@ fn build_hooks_config(config: &Config, environment: Option<&TurnEnvironment>) ->
         })
         .unwrap_or_default();
     HooksConfig {
-        legacy_notify_argv: config.notify.clone(),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
         config_layer_stack: Some(config.config_layer_stack.clone()),

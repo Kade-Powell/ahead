@@ -46,7 +46,6 @@ use crate::runtime::McpRuntimeInput;
 use crate::runtime::McpStartupPolicy;
 use crate::server::EffectiveMcpServer;
 
-pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 
@@ -160,12 +159,7 @@ impl McpConfig {
             .filter(|(_, server)| server.enabled())
             .filter_map(|(server_name, _)| {
                 let server = self.mcp_server_catalog.server(server_name)?;
-                let permission_profile = if server
-                    .source()
-                    .is_host_owned_apps(server_name, server.config())
-                {
-                    &self.permission_profile
-                } else if let Some(permission_profile) =
+                let permission_profile = if let Some(permission_profile) =
                     environment_profiles.get(&server.config().environment_id)
                 {
                     permission_profile

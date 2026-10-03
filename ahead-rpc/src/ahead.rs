@@ -309,6 +309,15 @@ pub struct McpServerDeclaration {
     pub fingerprint: String,
     pub enabled: bool,
     pub approved: bool,
+    pub auto_approve_all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpServerApprovalAction {
+    ApproveAndEnable,
+    Disable,
+    AutoApproveAll,
+    ReviewEachCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +406,103 @@ pub struct SessionView {
     pub learning_arc: Option<LearningArc>,
     pub workflow: WorkflowState,
     pub participants: Vec<SessionParticipantRecord>,
+}
+
+/// Resolve exact GitHub handles in a message against this session's people.
+/// An unresolved `@` and the editor's `@currentFile` context stay agent text.
+pub fn mentioned_participants(
+    content: &str,
+    participants: &[SessionParticipantRecord],
+    sender_id: &str,
+) -> Vec<Id> {
+    let mut recipients = Vec::new();
+    for (index, character) in content.char_indices() {
+        if character != '@'
+            || content[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| {
+                    previous.is_alphanumeric() || previous == '_'
+                })
+        {
+            continue;
+        }
+        let handle: String = content[index + 1..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || *character == '-'
+            })
+            .collect();
+        if handle.is_empty() || handle.eq_ignore_ascii_case("currentFile") {
+            continue;
+        }
+        let suffix = &content[index + 1 + handle.len()..];
+        if matches!(suffix.chars().next(), Some('_' | '@'))
+            || matches!(suffix.chars().next(), Some('.' | '/'))
+                && suffix[1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        for record in participants {
+            if let Participant::Human { id, .. } = &record.participant {
+                if !id.eq_ignore_ascii_case(sender_id)
+                    && id.eq_ignore_ascii_case(&handle)
+                    && !recipients
+                        .iter()
+                        .any(|recipient: &String| recipient.eq_ignore_ascii_case(id))
+                {
+                    recipients.push(id.clone());
+                }
+            }
+        }
+    }
+    recipients
+}
+
+#[cfg(test)]
+#[test]
+fn mentions_route_only_exact_other_session_members() {
+    let participants = [
+        SessionParticipantRecord {
+            participant: Participant::Human {
+                id: "alice".into(),
+                subject: String::new(),
+                display_name: "Alice".into(),
+            },
+            role: SessionRole::Owner,
+        },
+        SessionParticipantRecord {
+            participant: Participant::Human {
+                id: "bob".into(),
+                subject: String::new(),
+                display_name: "Bob".into(),
+            },
+            role: SessionRole::Editor,
+        },
+    ];
+    assert_eq!(
+        mentioned_participants(
+            "@BoB, @bob @alice @currentFile @unknown x@bob @bob@example.com @bob.rs",
+            &participants,
+            "alice"
+        ),
+        ["bob"]
+    );
+    assert!(
+        mentioned_participants("@currentFile @unknown", &participants, "alice")
+            .is_empty()
+    );
+    assert!(
+        mentioned_participants(
+            "@bob@example.com @bob.rs @bob_file",
+            &participants,
+            "alice"
+        )
+        .is_empty()
+    );
 }
 
 /// Sidebar metadata; full session detail is loaded with `GetSession`.
@@ -879,12 +985,21 @@ pub struct ConversationMessage {
     pub session_id: Id,
     pub turn_id: Id,
     pub sequence: i64,
-    /// `human` or `agent`.
+    /// `human`, `agent`, or `human_to:<comma-separated participant IDs>`.
+    /// ponytail: role stores the audience until richer delivery needs a schema migration.
     pub role: String,
     pub actor_id: Id,
     pub content: String,
     pub status: String,
     pub created_at: Timestamp,
+}
+
+impl ConversationMessage {
+    pub fn human_recipient_ids(&self) -> Option<Vec<&str>> {
+        self.role
+            .strip_prefix("human_to:")
+            .map(|recipients| recipients.split(',').collect())
+    }
 }
 
 /// Stable keyset cursor into one session's visible conversation.
@@ -899,6 +1014,48 @@ pub struct ConversationMessageCursor {
 pub struct ConversationMessagePage {
     pub messages: Vec<ConversationMessage>,
     pub has_older: bool,
+}
+
+/// Direct connection details shown only while the owner shares an active session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSessionOffer {
+    pub session_id: Id,
+    pub address: String,
+    /// Base64 DER certificate pinned by joining clients for this share.
+    pub certificate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedBufferSnapshot {
+    pub path: RepoPath,
+    pub revision: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedBufferEditResult {
+    pub applied: bool,
+    pub snapshot: SharedBufferSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPresence {
+    pub actor_id: Id,
+    pub path: Option<RepoPath>,
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSessionUpdate {
+    pub view: SessionView,
+    pub messages: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub code_comments: Vec<CodeComment>,
+    #[serde(default)]
+    pub terminal_output: String,
+    #[serde(default)]
+    pub presence: Vec<SharedPresence>,
+    pub actor_id: Id,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1063,8 +1220,25 @@ pub struct AgentRuntimeState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentUserInputOption {
+    pub value: String,
     pub label: String,
     pub description: String,
+}
+
+/// Reserved answer key for a managed MCP elicitation's explicit action.
+pub const MCP_FORM_ACTION_KEY: &str = "__ahead_mcp_action";
+pub const MCP_FORM_SKIP_VALUE: &str = "\u{0000}ahead_mcp_skip";
+
+pub fn validated_mcp_url(raw: &str) -> Option<url::Url> {
+    if raw.len() > 4096 || raw.trim() != raw || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(url)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1072,7 +1246,10 @@ pub struct AgentUserInputQuestion {
     pub id: String,
     pub header: String,
     pub question: String,
+    #[serde(default)]
+    pub external_url: Option<String>,
     pub options: Vec<AgentUserInputOption>,
+    pub default_answers: Vec<String>,
     pub allows_other: bool,
     pub is_secret: bool,
 }
@@ -1084,6 +1261,32 @@ pub struct AgentUserInputRequest {
     #[serde(default)]
     pub is_blocking: bool,
     pub questions: Vec<AgentUserInputQuestion>,
+}
+
+#[cfg(test)]
+mod mcp_url_tests {
+    use super::validated_mcp_url;
+
+    #[test]
+    fn only_bounded_credential_free_https_urls_can_be_opened() {
+        let accepted = validated_mcp_url("https://example.com/connect?state=abc")
+            .expect("safe destination");
+        assert_eq!(accepted.host_str(), Some("example.com"));
+        for rejected in [
+            "http://example.com/connect",
+            "file:///tmp/token",
+            "https://user:pass@example.com/connect",
+            "https://example.com/\nconnect",
+            " https://example.com/connect",
+            "https://",
+        ] {
+            assert!(validated_mcp_url(rejected).is_none(), "{rejected}");
+        }
+        assert!(
+            validated_mcp_url(&format!("https://example.com/{}", "x".repeat(4096)))
+                .is_none()
+        );
+    }
 }
 
 /// Retained phase conversation summary (messages are never deleted).
@@ -1194,7 +1397,7 @@ pub enum AheadRequest {
         workspace: PathBuf,
         server_id: String,
         expected_fingerprint: String,
-        enabled: bool,
+        action: McpServerApprovalAction,
     },
     GetSession {
         session_id: Id,
@@ -1213,6 +1416,9 @@ pub enum AheadRequest {
     },
     WriteEditorRecovery {
         snapshot: crate::file::EditorRecoverySnapshot,
+    },
+    DiscardSharedRemoteRecovery {
+        path: PathBuf,
     },
     /// Searches the current workspace and AHEAD user memory sources.
     SearchMemory {
@@ -1335,6 +1541,70 @@ pub enum AheadRequest {
         session_id: Id,
         before: Option<ConversationMessageCursor>,
         limit: usize,
+    },
+    /// Human-only message addressed to currently joined session participants.
+    /// The host resolves recipients again before storing it.
+    PostHumanMessage {
+        session_id: Id,
+        content: String,
+    },
+    ShareSession {
+        session_id: Id,
+        bind_address: String,
+    },
+    StopSharingSession {
+        session_id: Id,
+    },
+    PublishSharedTerminal {
+        session_id: Id,
+        content: String,
+    },
+    PublishSharedPresence {
+        session_id: Id,
+        path: Option<RepoPath>,
+        line: Option<u32>,
+    },
+    GetSharedPresence {
+        session_id: Id,
+    },
+    ReadSharedBuffer {
+        session_id: Id,
+        path: RepoPath,
+    },
+    ReplaceSharedBuffer {
+        session_id: Id,
+        path: RepoPath,
+        expected_revision: u64,
+        content: String,
+    },
+    AddSessionParticipant {
+        session_id: Id,
+        user_handle: String,
+        role: SessionRole,
+    },
+    RevokeSessionParticipant {
+        session_id: Id,
+        user_handle: String,
+    },
+    JoinSharedSession {
+        offer: SharedSessionOffer,
+    },
+    PollSharedSession {
+        session_id: Id,
+        after_sequence: i64,
+        active_path: Option<RepoPath>,
+        active_line: Option<u32>,
+    },
+    PostSharedHumanMessage {
+        session_id: Id,
+        content: String,
+    },
+    StartSharedAgentTurn {
+        session_id: Id,
+        content: String,
+    },
+    LeaveSharedSession {
+        session_id: Id,
     },
     /// Latest durable presentation state for streamed agent cards.
     AgentRuntimeState {
@@ -1465,6 +1735,11 @@ pub struct GitHubDeviceCodeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadNotification {
+    SharedBufferChanged {
+        session_id: Id,
+        snapshot: SharedBufferSnapshot,
+        previous_content: String,
+    },
     SessionUpdated {
         view: SessionView,
     },
@@ -1532,6 +1807,11 @@ pub enum AheadNotification {
         session_id: Id,
         turn_id: Id,
         request: AgentUserInputRequest,
+    },
+    AgentUserInputCancelled {
+        session_id: Id,
+        turn_id: Id,
+        request_id: Id,
     },
     AgentBufferSnapshotsRequested {
         session_id: Id,

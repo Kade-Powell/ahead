@@ -19,6 +19,9 @@ Manual smoke targets:
 | Terminal/tasks | Run `just verify` and interact with the PTY | Keystrokes, output, exit status |
 | Agent chat | Select a code range, send a turn; clear selection, then use `@currentFile` | Only selected text or explicit full file is sent |
 | Instructions/skills | Inspect root and nested `AGENTS.md`; type `/smoke` in chat | Applicable hierarchy and filtered skill |
+| Managed MCP | Explicitly approve the local `mcp_echo.py` server, ask the managed agent to call `echo`, then list resources/templates and read `memo://ahead-smoke`; deny one list and retry | One approval per tool or resource operation per server; denied list never contacts the server; exact echo arguments, listed resource/template and `MCP_RESOURCE_SENTINEL` content |
+| Managed MCP form | Start the local mock below, enable `mcp_echo.py` with `--form`, approve its exact declaration in Settings, and ask the agent to call `ask_form`. Enter count `2`, skip color, and enter nickname `Nora`. | The card shows all three fields; the server trace contains `{"action":"accept","content":{"count":2,"nickname":"Nora"}}`; the managed turn completes. Also exercise Decline and Cancel separately. |
+| Managed MCP URL | Start the local mock in `url` mode, enable `mcp_echo.py` with `--url`, approve its exact declaration in Settings, and ask the agent to call `ask_url`. Review the destination, then try Open, Decline and Cancel in separate turns. | The card names the server and shows the full `https://example.test/connect?state=abc` destination. Only Open attempts browser navigation; the server trace records the selected action without chat-collected credentials. |
 | External ACP/MCP, models, FIM, voice, debugger | Exercise when adapters, providers, devices and debug tools are available | Record untested gates in `TODO.md` |
 
 For local development use `just dev /absolute/path/to/disposable-copy` from
@@ -28,15 +31,38 @@ It requires Cargo, Node 24+ with npm, and Python 3.9+; no npm or pip package
 installation is needed. The Node tests execute TypeScript but do not replace
 a type-checker or an LSP check.
 
+`mcp_echo.py` is an offline stdio server for the Managed MCP row. Declare it
+under `.ahead/config.toml` as a `python3 -u` server using the script's absolute
+path, then explicitly enable and approve that declaration in private
+`.ahead/settings.toml`. The library test uses a disposable copy and mock model;
+it does not prove the in-app approval or resource UI until the native row is
+run.
+
+For a provider-free native form run, start `node mcp_form_model.mjs
+/absolute/disposable/path/model.port /absolute/disposable/path/model.trace`
+from the copied project. Use the written port for a private mock connection at
+`http://127.0.0.1:PORT/v1` with model `gpt-5.5`; the mock answers only on
+loopback and returns the `ask_form` tool call. Declare `mcp_echo.py` with an
+absolute trace path and `--form` in `.ahead/config.toml`, then use Settings >
+MCP Servers > Refresh > Approve & Enable. Do this after opening the copied
+project so the editor creates `.ahead/` itself. Stop the mock and `just dev`
+when the run finishes. This tests the native UI, not a real provider.
+
+For the URL row, start the same mock with `url` as the final argument and
+declare the stdio server with `--url` instead of `--form`. The destination is
+the reserved `.test` domain; it need not load a website to verify the editor's
+review, browser-open attempt and server response.
+
 Language support uses installed Zed language extensions and built-in adapters
 for Rust Analyzer, Vtsls (TypeScript/JavaScript), and BasedPyright (Python), as
-in Zed. The built-in executables currently need to be on the app's `PATH`:
-`rust-analyzer`, `vtsls`, and `basedpyright-langserver`. A rustup shim alone
-does not guarantee Rust Analyzer is installed. Use Language Servers > Restart
-after a server exits or after installation. Verify that unsaved text, diagnostics
-and completion survive that restart. Stop requests use a five-second graceful
-shutdown deadline before force termination. Automatic acquisition and the
-remaining native lifecycle checks are tracked in `TODO.md`.
+in Zed. Rust Analyzer currently needs to be on the app's `PATH`; a rustup shim
+alone does not guarantee it is installed. With Node/npm available, AHEAD can
+install Vtsls and BasedPyright into its own cache when missing from `PATH`.
+Use Language Servers > Restart after a server exits or after installing an
+extension. Verify that unsaved text, diagnostics and completion survive that
+restart. Stop requests use a five-second graceful shutdown deadline before
+force termination. Package updates and remaining native lifecycle checks are
+tracked in `TODO.md`.
 
 Repeat the Language/LSP row in each language before marking it verified:
 

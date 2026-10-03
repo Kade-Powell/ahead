@@ -40,19 +40,6 @@ fn project_config_cannot_enable_disabled_network_proxy() {
     }
 }
 
-#[test]
-fn project_config_cannot_bind_permission_shortcuts() {
-    let safe = "[tui.keymap.chat]\nincrease_reasoning_effort = 'f9'\n";
-    for key in ["previous_permission_mode", "next_permission_mode"] {
-        let mut config = toml::from_str(&format!("{safe}{key} = 'page-down'")).unwrap();
-        assert_eq!(
-            sanitize_project_config(&mut config),
-            [format!("tui.keymap.chat.{key}")]
-        );
-        assert_eq!(config, toml::from_str::<TomlValue>(safe).unwrap());
-    }
-}
-
 #[tokio::test]
 async fn managed_browser_import_denial_survives_user_and_session_config() {
     let tmp = tempdir().expect("tempdir");
@@ -370,54 +357,6 @@ async fn local_config_stack_omits_system_layer_without_host_path() {
 }
 
 #[tokio::test]
-async fn ignoring_login_requirements_preserves_local_auth_backend_requirements() {
-    let tmp = tempdir().expect("tempdir");
-    let requirements_path = tmp.path().join("requirements.toml");
-    std::fs::write(
-        &requirements_path,
-        r#"allowed_login_methods = ["chatgpt"]
-allowed_chatgpt_workspaces = ["managed-workspace"]
-cli_auth_credentials_store = "keyring"
-chatgpt_base_url = "https://managed.example/backend-api/"
-"#,
-    )
-    .expect("write local authentication requirements");
-
-    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
-    overrides.system_requirements_path = Some(requirements_path);
-    overrides.ignore_login_requirements = true;
-
-    let stack = load_config_layers_state(
-        &TestFileSystem,
-        tmp.path(),
-        /*cwd*/ None,
-        &[],
-        overrides,
-        &crate::NoopThreadConfigLoader,
-    )
-    .await
-    .expect("load configuration with remote login exemptions");
-
-    let requirements = stack.requirements();
-    assert_eq!(requirements.allowed_login_methods, None);
-    assert_eq!(requirements.allowed_chatgpt_workspaces, None);
-    assert_eq!(
-        requirements
-            .cli_auth_credentials_store
-            .as_ref()
-            .map(|required| required.value),
-        Some(crate::types::AuthCredentialsStoreMode::Keyring)
-    );
-    assert_eq!(
-        requirements
-            .chatgpt_base_url
-            .as_ref()
-            .map(|required| required.value.as_str()),
-        Some("https://managed.example/backend-api/")
-    );
-}
-
-#[tokio::test]
 async fn missing_packaged_defaults_file_returns_an_error() {
     let tmp = tempdir().expect("tempdir");
     let packaged_defaults_path =
@@ -444,6 +383,39 @@ async fn missing_packaged_defaults_file_returns_an_error() {
             packaged_defaults_path.display()
         )
     );
+}
+
+#[tokio::test]
+async fn ignored_managed_config_layers_do_not_read_host_managed_sources() {
+    let tmp = tempdir().expect("tempdir");
+    let codex_home = tmp.path().join("runtime-home");
+    std::fs::create_dir(&codex_home).expect("create runtime home");
+    let managed = codex_home.join("managed_config.toml");
+    std::fs::write(&managed, "invalid = [").expect("write invalid managed config");
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.managed_config_path = Some(managed);
+    overrides.ignore_managed_requirements = true;
+    overrides.ignore_managed_config_layers = true;
+    #[cfg(target_os = "macos")]
+    {
+        overrides.managed_preferences_base64 = Some("%%%".to_string());
+    }
+
+    let stack = load_config_layers_state(
+        &TestFileSystem,
+        &codex_home,
+        None,
+        &[],
+        overrides,
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("ignore managed config sources");
+    assert!(stack.all_layers_low_to_high().all(|layer| !matches!(
+        &layer.name,
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
+            | ConfigLayerSource::LegacyManagedConfigTomlFromMdm
+    )));
 }
 
 #[cfg(windows)]

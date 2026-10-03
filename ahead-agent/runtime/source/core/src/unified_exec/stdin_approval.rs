@@ -20,7 +20,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxPermissions;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
 
 #[derive(Clone, Copy)]
 pub(crate) enum TerminalSandboxSource {
@@ -33,7 +32,6 @@ pub(crate) struct TerminalPermissions {
     sandbox_source: TerminalSandboxSource,
     launch_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
-    internal_permissions: Option<AdditionalPermissionProfile>,
 }
 
 /// Host-owned launch settings. Never serialize these into approval messages.
@@ -83,21 +81,19 @@ impl TerminalPermissions {
         sandbox_source: TerminalSandboxSource,
         launch_permissions: SandboxPermissions,
         additional_permissions: Option<&AdditionalPermissionProfile>,
-        internal_permissions: Option<&AdditionalPermissionProfile>,
     ) -> Self {
         Self {
             policy: TerminalPolicy::capture(
                 environment,
                 turn,
                 sandbox_source,
-                merge_permission_profiles(additional_permissions, internal_permissions),
+                additional_permissions.cloned(),
             ),
             sandbox_source,
             // A bypass is a property of the successful attempt, not a difference
             // between settings: a full-access environment can still bypass a proxy.
             launch_permissions,
             additional_permissions: additional_permissions.cloned(),
-            internal_permissions: internal_permissions.cloned(),
         }
     }
 
@@ -159,13 +155,10 @@ impl TerminalPermissions {
             }
         };
         let mut reason = format!("Send input to an existing terminal. {authority}");
-        if self.internal_permissions.is_some() {
-            reason.push_str(" It also has an internal plugin metrics write grant.");
-        }
         reason.push_str(" The cwd is its launch directory; the terminal's current directory and state may have changed.");
         if let Some(grants) = &self.additional_permissions {
             // Stable reason text also reaches clients that strip the experimental
-            // additionalPermissions field. Internal paths never enter this text.
+            // additionalPermissions field.
             reason.push_str(&format!(
                 " Retained grants: {}.",
                 serde_json::to_string(grants)?
@@ -206,10 +199,7 @@ impl ProcessEntry {
             environment,
             &context.step_context.turn,
             permissions.sandbox_source,
-            merge_permission_profiles(
-                permissions.additional_permissions.as_ref(),
-                permissions.internal_permissions.as_ref(),
-            ),
+            permissions.additional_permissions.clone(),
         );
         let sandbox_permissions = permissions
             .review_requirement(&current, environment.permission_profile())

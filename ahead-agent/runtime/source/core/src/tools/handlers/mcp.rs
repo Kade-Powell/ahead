@@ -100,13 +100,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     }
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
-        let source_name = self
-            .tool_info
-            .connector_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|connector_name| !connector_name.is_empty())
-            .unwrap_or_else(|| self.tool_info.server_name.trim());
+        let source_name = self.tool_info.server_name.trim();
         let source_info = (!source_name.is_empty()).then(|| ToolSearchSourceInfo {
             name: source_name.to_string(),
             description: self
@@ -312,14 +306,6 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
         .map(str::trim)
         .filter(|description| !description.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            tool_info
-                .connector_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|connector_name| !connector_name.is_empty())
-                .map(|connector_name| format!("Tools for working with {connector_name}."))
-        })
         .unwrap_or_default();
 
     Ok(ToolSpec::Namespace(ResponsesApiNamespace {
@@ -363,11 +349,6 @@ fn build_mcp_search_text(info: &ToolInfo) -> String {
         && !description.is_empty()
     {
         parts.push(description.to_string());
-    }
-    if let Some(connector_name) = info.connector_name.as_deref().map(str::trim)
-        && !connector_name.is_empty()
-    {
-        parts.push(connector_name.to_string());
     }
     if let Some(namespace_description) = info.namespace_description.as_deref().map(str::trim)
         && !namespace_description.is_empty()
@@ -637,9 +618,6 @@ mod tests {
                     "type": "object",
                 }))),
             ),
-            openai_file_input_optional_fields: Default::default(),
-            connector_id: None,
-            connector_name: None,
         }
     }
 }

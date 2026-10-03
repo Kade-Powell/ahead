@@ -1,10 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
-use ahead_rpc::ahead::McpServerDeclaration;
+use ahead_rpc::ahead::{McpServerApprovalAction, McpServerDeclaration};
 use anyhow::{Context, Result};
 use codex_config::{AppToolApproval, McpServerConfig, McpServerTransportConfig};
 use codex_protocol::{
@@ -17,6 +17,9 @@ use codex_protocol::{
 use codex_utils_absolute_path::AbsolutePathBuf;
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
+
+#[cfg(any(not(unix), test))]
+use std::io::ErrorKind;
 
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -43,38 +46,66 @@ struct RuntimeProvider {
 }
 
 pub(crate) fn prepare_runtime_home(workspace: &Path) -> Result<PathBuf> {
-    let explicit = std::env::var_os("AHEAD_HOME");
-    let home = explicit
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join(".ahead/runtime"));
-    std::fs::create_dir_all(&home).with_context(|| {
-        format!("failed to create AHEAD runtime home `{}`", home.display())
-    })?;
-    let user_home = crate::instructions::user_home();
-    if let Some(config) =
-        runtime_config_from_sources(workspace, user_home.as_deref())
-    {
-        let path = home.join("config.toml");
-        if explicit.is_none() || !path.exists() {
-            write_runtime_config(&path, &config)?;
-        }
+    if let Some(path) = std::env::var_os("AHEAD_HOME") {
+        let home = PathBuf::from(path);
+        std::fs::create_dir_all(&home).with_context(|| {
+            format!("failed to create AHEAD runtime home `{}`", home.display())
+        })?;
+        return Ok(home);
     }
-    Ok(home)
+    #[cfg(unix)]
+    return open_default_runtime_directory(workspace);
+    #[cfg(not(unix))]
+    {
+        let home = workspace.canonicalize()?.join(".ahead/runtime");
+        std::fs::create_dir_all(&home).with_context(|| {
+            format!("failed to create AHEAD runtime home `{}`", home.display())
+        })?;
+        Ok(home)
+    }
 }
 
-fn write_runtime_config(path: &Path, contents: &str) -> Result<()> {
+#[cfg(unix)]
+fn open_default_runtime_directory(workspace: &Path) -> Result<PathBuf> {
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+    let workspace = workspace.canonicalize()?;
+    let mut directory = ahead_core::secure_fs::open_canonical_directory(&workspace)?;
+    for name in [".ahead", "runtime"] {
+        match mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => {
+                return Err(error)
+                    .context("failed to create AHEAD runtime directory");
+            }
+        }
+        directory = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| {
+            format!("AHEAD runtime directory `{name}` must not be a symlink")
+        })?
+        .into();
+    }
+    Ok(workspace.join(".ahead/runtime"))
+}
+
+#[cfg(any(not(unix), test))]
+fn write_private_toml_path(path: &Path, contents: &str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => anyhow::ensure!(
             metadata.is_file(),
-            "AHEAD runtime config `{}` must be a regular file",
+            "AHEAD private config `{}` must be a regular file",
             path.display()
         ),
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed to inspect AHEAD runtime config `{}`",
+                    "failed to inspect AHEAD private config `{}`",
                     path.display()
                 )
             });
@@ -83,23 +114,23 @@ fn write_runtime_config(path: &Path, contents: &str) -> Result<()> {
 
     let parent = path
         .parent()
-        .context("AHEAD runtime config has no parent")?;
+        .context("AHEAD private config has no parent")?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).with_context(|| {
             format!(
-                "failed to create AHEAD runtime config in `{}`",
+                "failed to create AHEAD private config in `{}`",
                 parent.display()
             )
         })?;
     temporary.write_all(contents.as_bytes()).with_context(|| {
-        format!("failed to write AHEAD runtime config `{}`", path.display())
+        format!("failed to write AHEAD private config `{}`", path.display())
     })?;
     temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| {
             format!(
-                "failed to persist AHEAD runtime config `{}`",
+                "failed to persist AHEAD private config `{}`",
                 path.display()
             )
         })?;
@@ -145,6 +176,8 @@ pub(crate) fn mcp_servers_for_workspace(
             )
         })
         .transpose()?;
+    let auto_approved =
+        auto_approved_mcp_server_ids(&settings, ".ahead/settings.toml")?;
     let approved_declarations = settings
         .get("mcp")
         .and_then(|mcp| mcp.get("approved_declarations"))
@@ -157,10 +190,6 @@ pub(crate) fn mcp_servers_for_workspace(
 
     let mut servers = HashMap::with_capacity(enabled_ids.len());
     for id in enabled_ids {
-        anyhow::ensure!(
-            id != "codex_apps",
-            "`codex_apps` is reserved and cannot name an AHEAD MCP server"
-        );
         let value = declarations.get(&id).with_context(|| {
             format!("AHEAD MCP server `{id}` is enabled but not declared in `.ahead/config.toml`")
         })?;
@@ -200,9 +229,14 @@ pub(crate) fn mcp_servers_for_workspace(
             "AHEAD MCP server `{id}` declaration is not approved; inspect `.ahead/config.toml`, then set `[mcp.approved_declarations]` `{id} = \"{fingerprint}\"` in ignored `.ahead/settings.toml`"
         );
         server.enabled = true;
-        server.default_tools_approval_mode = Some(AppToolApproval::Prompt);
+        let default_approval_mode = if auto_approved.contains(&id) {
+            AppToolApproval::Approve
+        } else {
+            AppToolApproval::Prompt
+        };
+        server.default_tools_approval_mode = Some(default_approval_mode);
         for tool in server.tools.values_mut() {
-            tool.approval_mode = Some(AppToolApproval::Prompt);
+            tool.approval_mode = Some(default_approval_mode);
         }
         if let Some(permissions) =
             tool_permissions.and_then(|permissions| permissions.get(&id))
@@ -230,7 +264,13 @@ pub(crate) fn mcp_servers_for_workspace(
                             disabled.push(tool_name.clone());
                         }
                     }
-                    Some("confirm") => {}
+                    Some("confirm") => {
+                        server
+                            .tools
+                            .entry(tool_name.clone())
+                            .or_default()
+                            .approval_mode = Some(AppToolApproval::Prompt);
+                    }
                     _ => anyhow::bail!(
                         "`.ahead/settings.toml` MCP tool `{id}.{tool_name}` must be `allow`, `deny`, or `confirm`"
                     ),
@@ -259,6 +299,13 @@ pub fn mcp_server_declarations(
         .map(|settings| enabled_mcp_server_ids(settings, ".ahead/settings.toml"))
         .transpose()?
         .flatten()
+        .unwrap_or_default();
+    let auto_approved = settings
+        .as_ref()
+        .map(|settings| {
+            auto_approved_mcp_server_ids(settings, ".ahead/settings.toml")
+        })
+        .transpose()?
         .unwrap_or_default();
     let approved = settings
         .as_ref()
@@ -290,6 +337,12 @@ pub fn mcp_server_declarations(
                     .and_then(|approved| approved.get(id))
                     .and_then(toml::Value::as_str)
                     == Some(fingerprint.as_str()),
+                auto_approve_all: enabled.contains(id)
+                    && auto_approved.contains(id)
+                    && approved
+                        .and_then(|approved| approved.get(id))
+                        .and_then(toml::Value::as_str)
+                        == Some(fingerprint.as_str()),
                 fingerprint,
             });
         }
@@ -303,6 +356,7 @@ pub fn mcp_server_declarations(
                 fingerprint: String::new(),
                 enabled: true,
                 approved: false,
+                auto_approve_all: false,
             });
         }
     }
@@ -333,12 +387,10 @@ pub fn set_mcp_server_approval(
     workspace: &Path,
     server_id: &str,
     expected_fingerprint: &str,
-    enabled: bool,
+    action: McpServerApprovalAction,
 ) -> Result<()> {
     anyhow::ensure!(
-        !server_id.trim().is_empty()
-            && server_id == server_id.trim()
-            && server_id != "codex_apps",
+        !server_id.trim().is_empty() && server_id == server_id.trim(),
         "invalid AHEAD MCP server ID"
     );
     let workspace = workspace
@@ -371,7 +423,7 @@ pub fn set_mcp_server_approval(
     #[cfg(not(unix))]
     let lock = open_mcp_settings_lock(&lock_path)?;
     let _lock = McpSettingsLock::acquire(lock)?;
-    if enabled {
+    if action != McpServerApprovalAction::Disable {
         #[cfg(unix)]
         let config = read_mcp_toml_at(&ahead_directory, "config.toml")?
             .context("AHEAD MCP declaration file is missing")?;
@@ -441,11 +493,30 @@ pub fn set_mcp_server_approval(
         .transpose()?
         .and_then(|approved| approved.get(server_id))
         .and_then(toml::Value::as_str);
-    if !enabled || previously_approved != Some(expected_fingerprint) {
+    let currently_enabled = ids.iter().any(|id| id == server_id);
+    if matches!(
+        action,
+        McpServerApprovalAction::AutoApproveAll
+            | McpServerApprovalAction::ReviewEachCall
+    ) {
+        anyhow::ensure!(
+            currently_enabled && previously_approved == Some(expected_fingerprint),
+            "MCP server must be enabled with this reviewed declaration before changing its call policy"
+        );
+    }
+    if action == McpServerApprovalAction::Disable
+        || previously_approved != Some(expected_fingerprint)
+    {
         if let Some(permissions) = mcp.get_mut("tool_permissions") {
             permissions
                 .as_table_mut()
                 .context("`.ahead/settings.toml` field `mcp.tool_permissions` must be a table")?
+                .remove(server_id);
+        }
+        if let Some(permissions) = mcp.get_mut("server_permissions") {
+            permissions
+                .as_table_mut()
+                .context("`.ahead/settings.toml` field `mcp.server_permissions` must be a table")?
                 .remove(server_id);
         }
     }
@@ -454,7 +525,10 @@ pub fn set_mcp_server_approval(
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
         .as_table_mut()
         .context("`.ahead/settings.toml` field `mcp.approved_declarations` must be a table")?;
-    if enabled {
+    if action == McpServerApprovalAction::Disable {
+        approved.remove(server_id);
+        ids.retain(|id| id != server_id);
+    } else {
         approved.insert(
             server_id.to_string(),
             toml::Value::String(expected_fingerprint.to_string()),
@@ -462,9 +536,25 @@ pub fn set_mcp_server_approval(
         if !ids.iter().any(|id| id == server_id) {
             ids.push(server_id.to_string());
         }
-    } else {
-        approved.remove(server_id);
-        ids.retain(|id| id != server_id);
+    }
+    match action {
+        McpServerApprovalAction::AutoApproveAll => {
+            mcp.entry("server_permissions")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .context("`.ahead/settings.toml` field `mcp.server_permissions` must be a table")?
+                .insert(server_id.to_string(), toml::Value::String("allow".to_string()));
+        }
+        McpServerApprovalAction::ReviewEachCall => {
+            if let Some(permissions) = mcp.get_mut("server_permissions") {
+                permissions
+                    .as_table_mut()
+                    .context("`.ahead/settings.toml` field `mcp.server_permissions` must be a table")?
+                    .remove(server_id);
+            }
+        }
+        McpServerApprovalAction::ApproveAndEnable
+        | McpServerApprovalAction::Disable => {}
     }
     mcp.insert(
         "enabled_servers".to_string(),
@@ -478,7 +568,7 @@ pub fn set_mcp_server_approval(
     #[cfg(unix)]
     return write_mcp_settings_at(&ahead_directory, &content);
     #[cfg(not(unix))]
-    write_runtime_config(&path, &content)
+    write_private_toml_path(&path, &content)
 }
 
 #[cfg(unix)]
@@ -564,6 +654,21 @@ fn read_mcp_toml_at(
 fn write_mcp_settings_at(directory: &std::fs::File, content: &str) -> Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
 
+    match openat(
+        directory,
+        "settings.toml",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => anyhow::ensure!(
+            std::fs::File::from(file).metadata()?.is_file(),
+            "AHEAD MCP settings must be a regular file"
+        ),
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(error).context("failed to inspect AHEAD MCP settings");
+        }
+    }
     let temporary_name = format!(".settings.toml-{}", uuid::Uuid::new_v4());
     let result = (|| -> Result<()> {
         let mut temporary: std::fs::File = openat(
@@ -603,37 +708,18 @@ fn read_project_toml_file(
     workspace: &Path,
     relative_path: &str,
 ) -> Result<Option<toml::Value>> {
-    let workspace = workspace
-        .canonicalize()
-        .context("AHEAD MCP configuration requires an existing workspace")?;
-    let path = workspace.join(relative_path);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to inspect AHEAD config `{relative_path}`")
-            });
-        }
+    let filename = relative_path
+        .strip_prefix(".ahead/")
+        .context("expected an AHEAD settings path")?;
+    let Some(contents) = ahead_core::config::read_ahead_config(workspace, filename)
+        .with_context(|| format!("failed to read AHEAD config `{relative_path}`"))?
+    else {
+        return Ok(None);
     };
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "AHEAD config `{relative_path}` must be a regular file"
-    );
-    let resolved_path = path.canonicalize().with_context(|| {
-        format!("failed to resolve AHEAD config `{relative_path}`")
+    let table = contents.parse::<toml::Table>().map_err(|_| {
+        anyhow::anyhow!("invalid TOML in AHEAD config `{relative_path}`")
     })?;
-    anyhow::ensure!(
-        resolved_path.starts_with(&workspace),
-        "AHEAD config `{relative_path}` resolves outside the workspace"
-    );
-    #[cfg(unix)]
-    let file = ahead_core::secure_fs::open_canonical_regular_file(&resolved_path)
-        .with_context(|| format!("failed to read AHEAD config `{relative_path}`"))?;
-    #[cfg(not(unix))]
-    let file = std::fs::File::open(&resolved_path)
-        .with_context(|| format!("failed to read AHEAD config `{relative_path}`"))?;
-    read_mcp_toml(file, relative_path).map(Some)
+    Ok(Some(toml::Value::Table(table)))
 }
 
 fn read_mcp_toml(file: std::fs::File, relative_path: &str) -> Result<toml::Value> {
@@ -659,7 +745,11 @@ fn read_mcp_toml(file: std::fs::File, relative_path: &str) -> Result<toml::Value
     let table = contents.parse::<toml::Table>().with_context(|| {
         format!("invalid TOML in AHEAD config `{relative_path}`")
     })?;
-    Ok(toml::Value::Table(table))
+    let value = toml::Value::Table(table);
+    if relative_path == ".ahead/config.toml" {
+        ahead_core::config::validate_tracked_config(&value)?;
+    }
+    Ok(value)
 }
 
 fn enabled_mcp_server_ids(
@@ -695,6 +785,38 @@ fn enabled_mcp_server_ids(
         ids.push(id.to_string());
     }
     Ok(Some(ids))
+}
+
+fn auto_approved_mcp_server_ids(
+    settings: &toml::Value,
+    source: &str,
+) -> Result<BTreeSet<String>> {
+    let Some(permissions) = settings
+        .get("mcp")
+        .and_then(|mcp| mcp.get("server_permissions"))
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let permissions = permissions.as_table().with_context(|| {
+        format!("`{source}` field `mcp.server_permissions` must be a table")
+    })?;
+    let mut allowed = BTreeSet::new();
+    for (id, choice) in permissions {
+        anyhow::ensure!(
+            !id.trim().is_empty() && id == id.trim(),
+            "`{source}` contains an empty or whitespace-padded MCP server permission ID"
+        );
+        match choice.as_str() {
+            Some("allow") => {
+                allowed.insert(id.clone());
+            }
+            Some("confirm") => {}
+            _ => anyhow::bail!(
+                "`{source}` MCP server permission `{id}` must be `allow` or `confirm`"
+            ),
+        }
+    }
+    Ok(allowed)
 }
 
 pub(crate) fn generate_thread_title(request: &str) -> String {
@@ -866,28 +988,44 @@ pub fn path_is_allowed(path: &str, allowed: &[String], workspace: &Path) -> bool
     })
 }
 
-fn runtime_config_from_sources(
+pub(crate) fn runtime_config_from_sources(
     workspace: &Path,
     user_home: Option<&Path>,
-) -> Option<String> {
-    let mut paths = Vec::with_capacity(4);
+) -> Result<Option<toml::Table>> {
+    let mut layers = Vec::with_capacity(4);
     if let Some(user_home) = user_home {
-        paths.push(user_home.join(".ahead/settings.toml"));
+        match std::fs::symlink_metadata(user_home) {
+            Ok(_) => layers.push((user_home, "settings.toml")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("failed to inspect AHEAD user home");
+            }
+        }
     }
-    paths.extend([
-        workspace.join(".ahead/settings.toml"),
-        workspace.join(".ahead/config.toml"),
-        workspace.join(".ahead/config.local.toml"),
+    layers.extend([
+        (workspace, "settings.toml"),
+        (workspace, "config.toml"),
+        (workspace, "config.local.toml"),
     ]);
     let mut providers = BTreeMap::<String, RuntimeProvider>::new();
     let mut preferred_provider = None;
-    for path in paths {
-        let Ok(contents) = std::fs::read_to_string(path) else {
+    for (root, filename) in layers {
+        let Some(contents) = ahead_core::config::read_ahead_config(root, filename)
+            .with_context(|| {
+            format!(
+                "failed to read AHEAD provider settings `{}`",
+                root.join(".ahead").join(filename).display()
+            )
+        })?
+        else {
             continue;
         };
-        let Ok(table) = contents.parse::<toml::Table>() else {
-            continue;
-        };
+        let table = contents.parse::<toml::Table>().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid AHEAD provider settings `{}`",
+                root.join(".ahead").join(filename).display()
+            )
+        })?;
         let value = toml::Value::Table(table);
         let Some(ai) = value.get("ai") else { continue };
         preferred_provider = ai
@@ -899,19 +1037,28 @@ fn runtime_config_from_sources(
             .get("provider")
             .and_then(toml::Value::as_str)
             .unwrap_or("openai-compatible");
-        if let Some(connections) =
-            ai.get("connections").and_then(toml::Value::as_array)
-        {
-            for connection in connections {
-                if let Some(provider) = runtime_provider(connection, fallback) {
-                    providers.insert(provider.id.clone(), provider);
+        let entries = ai
+            .get("connections")
+            .and_then(toml::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(ai));
+        for entry in entries {
+            if let Some(mut provider) = runtime_provider(entry, fallback) {
+                if provider.api_key.is_none() {
+                    if let Some(previous) = providers.get(&provider.id) {
+                        if provider.base_url == previous.base_url {
+                            provider.api_key = previous.api_key.clone();
+                        }
+                    }
                 }
+                providers.insert(provider.id.clone(), provider);
             }
-        } else if let Some(provider) = runtime_provider(ai, fallback) {
-            providers.insert(provider.id.clone(), provider);
         }
     }
-    render_runtime_config(&providers, preferred_provider.as_deref())
+    Ok(render_runtime_config(
+        &providers,
+        preferred_provider.as_deref(),
+    ))
 }
 
 fn runtime_provider(
@@ -977,7 +1124,7 @@ fn provider_id_for(name: &str, fallback: &str) -> String {
 fn render_runtime_config(
     providers: &BTreeMap<String, RuntimeProvider>,
     preferred_provider: Option<&str>,
-) -> Option<String> {
+) -> Option<toml::Table> {
     let default = preferred_provider
         .and_then(|preferred| {
             providers.values().find(|provider| {
@@ -1014,7 +1161,7 @@ fn render_runtime_config(
         "model_providers".into(),
         toml::Value::Table(model_providers),
     );
-    toml::to_string(&toml::Value::Table(root)).ok()
+    Some(root)
 }
 
 #[cfg(test)]
@@ -1077,24 +1224,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_replaces_regular_file_without_partial_contents() {
-        let directory = tempfile::tempdir().expect("runtime home");
-        let path = directory.path().join("config.toml");
-        std::fs::write(&path, "old config").expect("initial config");
+    fn private_settings_replace_regular_file_without_partial_contents() {
+        let directory = tempfile::tempdir().expect("private settings");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, "old settings").expect("initial settings");
 
-        write_runtime_config(&path, "new config").expect("replace config");
+        write_private_toml_path(&path, "new settings").expect("replace settings");
 
         assert_eq!(
-            std::fs::read_to_string(path).expect("read config"),
-            "new config"
+            std::fs::read_to_string(path).expect("read settings"),
+            "new settings"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
             assert_eq!(
-                std::fs::metadata(directory.path().join("config.toml"))
-                    .expect("config metadata")
+                std::fs::metadata(directory.path().join("settings.toml"))
+                    .expect("settings metadata")
                     .permissions()
                     .mode()
                     & 0o777,
@@ -1115,7 +1262,7 @@ mod tests {
         .expect("tracked MCP declaration");
         std::fs::write(
             ahead.join("settings.toml"),
-            "[ai]\napi_key = 'private'\n[mcp]\nenabled_servers = ['docs']\n[mcp.approved_declarations]\ndocs = 'sha256:old'\n[mcp.tool_permissions.docs]\nread = 'allow'\n",
+            "[ai]\napi_key = 'private'\n[mcp]\nenabled_servers = ['docs']\n[mcp.approved_declarations]\ndocs = 'sha256:old'\n[mcp.server_permissions]\ndocs = 'allow'\n[mcp.tool_permissions.docs]\nread = 'allow'\n",
         )
         .expect("private settings");
 
@@ -1124,8 +1271,13 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(!listed[0].approved);
         let first = listed[0].fingerprint.clone();
-        set_mcp_server_approval(directory.path(), "docs", &first, true)
-            .expect("approve current declaration");
+        set_mcp_server_approval(
+            directory.path(),
+            "docs",
+            &first,
+            McpServerApprovalAction::ApproveAndEnable,
+        )
+        .expect("approve current declaration");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1145,6 +1297,45 @@ mod tests {
             Some(first.as_str())
         );
         assert!(settings["mcp"]["tool_permissions"].get("docs").is_none());
+        assert!(settings["mcp"]["server_permissions"].get("docs").is_none());
+        assert!(
+            !mcp_server_declarations(directory.path())
+                .expect("list reviewed server")[0]
+                .auto_approve_all
+        );
+        set_mcp_server_approval(
+            directory.path(),
+            "docs",
+            &first,
+            McpServerApprovalAction::AutoApproveAll,
+        )
+        .expect("auto-approve reviewed server");
+        assert!(
+            mcp_server_declarations(directory.path())
+                .expect("list auto-approved server")[0]
+                .auto_approve_all
+        );
+        assert_eq!(
+            mcp_servers_for_workspace(
+                directory.path(),
+                McpServerPolicy::PromptEveryCall
+            )
+            .expect("load auto-approved server")["docs"]
+                .default_tools_approval_mode,
+            Some(AppToolApproval::Approve)
+        );
+        set_mcp_server_approval(
+            directory.path(),
+            "docs",
+            &first,
+            McpServerApprovalAction::ReviewEachCall,
+        )
+        .expect("restore per-call review");
+        assert!(
+            !mcp_server_declarations(directory.path())
+                .expect("list reviewed server")[0]
+                .auto_approve_all
+        );
 
         std::fs::write(
             ahead.join("config.toml"),
@@ -1154,7 +1345,13 @@ mod tests {
         let before = std::fs::read_to_string(ahead.join("settings.toml"))
             .expect("settings before stale approval");
         assert!(
-            set_mcp_server_approval(directory.path(), "docs", &first, true).is_err()
+            set_mcp_server_approval(
+                directory.path(),
+                "docs",
+                &first,
+                McpServerApprovalAction::ApproveAndEnable
+            )
+            .is_err()
         );
         assert_eq!(
             std::fs::read_to_string(ahead.join("settings.toml"))
@@ -1164,11 +1361,20 @@ mod tests {
         let current =
             mcp_server_declarations(directory.path()).expect("current declaration");
         assert!(!current[0].approved);
+        assert!(
+            set_mcp_server_approval(
+                directory.path(),
+                "docs",
+                &current[0].fingerprint,
+                McpServerApprovalAction::AutoApproveAll,
+            )
+            .is_err()
+        );
         set_mcp_server_approval(
             directory.path(),
             "docs",
             &current[0].fingerprint,
-            true,
+            McpServerApprovalAction::ApproveAndEnable,
         )
         .expect("approve changed declaration");
         std::fs::remove_file(ahead.join("config.toml"))
@@ -1178,8 +1384,13 @@ mod tests {
         assert_eq!(orphan.len(), 1);
         assert!(!orphan[0].declared);
         assert!(orphan[0].enabled);
-        set_mcp_server_approval(directory.path(), "docs", "", false)
-            .expect("revoke declaration");
+        set_mcp_server_approval(
+            directory.path(),
+            "docs",
+            "",
+            McpServerApprovalAction::Disable,
+        )
+        .expect("revoke declaration");
         let final_state =
             mcp_server_declarations(directory.path()).expect("revoked declaration");
         assert!(final_state.is_empty());
@@ -1205,8 +1416,13 @@ mod tests {
                 "the lock opener must reject a symlink even after preflight"
             );
             assert!(
-                set_mcp_server_approval(directory.path(), "docs", "", false)
-                    .is_err()
+                set_mcp_server_approval(
+                    directory.path(),
+                    "docs",
+                    "",
+                    McpServerApprovalAction::Disable
+                )
+                .is_err()
             );
             assert_eq!(
                 std::fs::read_to_string(target).expect("read outside lock target"),
@@ -1277,22 +1493,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_config_refuses_symlinks_without_touching_the_target() {
+    fn mcp_settings_writer_rejects_symlinked_target() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().expect("runtime home");
-        let target = directory.path().join("outside.toml");
-        let path = directory.path().join("config.toml");
-        std::fs::write(&target, "outside config").expect("target config");
-        symlink(&target, &path).expect("config symlink");
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("AHEAD settings directory");
+        let target = outside.path().join("settings.toml");
+        std::fs::write(&target, "untouched = true\n").expect("outside settings");
+        symlink(&target, ahead.join("settings.toml")).expect("settings symlink");
+        let directory = open_mcp_settings_directory(
+            &workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        )
+        .expect("open AHEAD settings directory");
 
-        let error = write_runtime_config(&path, "secret provider config")
-            .expect_err("runtime config symlink must be rejected");
+        assert!(write_mcp_settings_at(&directory, "approved = true\n").is_err());
+        assert_eq!(
+            std::fs::read_to_string(target).expect("read outside settings"),
+            "untouched = true\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_settings_refuse_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("private settings");
+        let target = directory.path().join("outside.toml");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&target, "outside settings").expect("target settings");
+        symlink(&target, &path).expect("settings symlink");
+
+        let error = write_private_toml_path(&path, "private settings")
+            .expect_err("settings symlink must be rejected");
 
         assert!(format!("{error:#}").contains("must be a regular file"));
         assert_eq!(
             std::fs::read_to_string(target).expect("read target"),
-            "outside config"
+            "outside settings"
         );
         assert!(
             std::fs::symlink_metadata(path)
@@ -1300,6 +1543,37 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_runtime_home_rejects_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let ahead = workspace.path().join(".ahead");
+        symlink(outside.path(), &ahead).expect("symlink AHEAD directory");
+        assert!(open_default_runtime_directory(workspace.path()).is_err());
+        std::fs::remove_file(&ahead).expect("remove AHEAD symlink");
+
+        std::fs::create_dir(&ahead).expect("create AHEAD directory");
+        symlink(outside.path(), ahead.join("runtime"))
+            .expect("symlink runtime directory");
+        assert!(open_default_runtime_directory(workspace.path()).is_err());
+        std::fs::remove_file(ahead.join("runtime")).expect("remove runtime symlink");
+
+        let home = open_default_runtime_directory(workspace.path())
+            .expect("open runtime directory");
+        assert_eq!(
+            home,
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join(".ahead/runtime")
+        );
+        assert!(home.is_dir());
     }
 
     #[test]
@@ -1494,6 +1768,36 @@ mod tests {
     }
 
     #[test]
+    fn missing_user_home_does_not_hide_workspace_provider_settings() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let ahead = workspace.join(".ahead");
+        std::fs::create_dir_all(&ahead).expect("workspace settings directory");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[ai]\nbase_url = 'https://example.invalid/v1'\nmodel = 'workspace-model'\n",
+        )
+        .expect("workspace settings");
+        let user_home = temp.path().join("new-user");
+        let config = runtime_config_from_sources(&workspace, Some(&user_home))
+            .expect("missing optional user home")
+            .expect("workspace provider config");
+        assert_eq!(config["model"].as_str(), Some("workspace-model"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                temp.path().join("nonexistent-target"),
+                &user_home,
+            )
+            .expect("dangling user-home link");
+            assert!(
+                runtime_config_from_sources(&workspace, Some(&user_home)).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn workspace_provider_settings_override_user_defaults() {
         let temp = tempfile::tempdir().expect("temp dir");
         let user_home = temp.path().join("user");
@@ -1521,9 +1825,9 @@ mod tests {
         )
         .expect("write workspace settings");
 
-        let rendered = runtime_config_from_sources(&workspace, Some(&user_home))
+        let config = runtime_config_from_sources(&workspace, Some(&user_home))
+            .expect("read provider settings")
             .expect("provider config");
-        let config = rendered.parse::<toml::Table>().expect("valid config");
         assert_eq!(config["model"].as_str(), Some("workspace-model"));
         let providers = config["model_providers"].as_table().expect("providers");
         assert_eq!(
@@ -1531,6 +1835,111 @@ mod tests {
             Some("https://workspace.example/v1")
         );
         assert_eq!(providers["user-only"]["name"].as_str(), Some("User only"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_provider_layers_reject_symlinks_and_tracked_credentials() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        let ahead = workspace.join(".ahead");
+        std::fs::create_dir_all(&ahead).expect("settings directory");
+        let outside = root.path().join("outside.toml");
+        std::fs::write(&outside, "[ai]\napi_key = 'outside'\n")
+            .expect("outside config");
+        symlink(&outside, ahead.join("settings.toml"))
+            .expect("symlink private settings");
+        assert!(runtime_config_from_sources(&workspace, None).is_err());
+
+        std::fs::remove_file(ahead.join("settings.toml"))
+            .expect("remove settings symlink");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[ai]\nbase_url = 'https://example.invalid/v1'\nmodel = 'test'\napi_key = 'private'\n",
+        )
+        .expect("private settings");
+        std::fs::write(ahead.join("config.toml"), "[ai]\nauth_token = 'tracked'\n")
+            .expect("tracked config");
+        assert!(runtime_config_from_sources(&workspace, None).is_err());
+
+        std::fs::write(ahead.join("config.toml"), "[ai]\nmodel = 'shared'\n")
+            .expect("shareable config");
+        assert!(
+            runtime_config_from_sources(&workspace, None)
+                .expect("read provider settings")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn managed_provider_key_stays_bound_to_its_endpoint() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[ai]\nactive_connection = 'Shared'\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared'\nbase_url = 'https://safe.example/v1'\nmodel = 'safe'\napi_key = 'private-token'\n",
+        )
+        .expect("private settings");
+        let shared = ahead.join("config.toml");
+        std::fs::write(
+            &shared,
+            "[ai]\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared'\nbase_url = 'https://safe.example/v1'\nmodel = 'shared'\n",
+        )
+        .expect("same-endpoint override");
+        let config = runtime_config_from_sources(workspace.path(), None)
+            .expect("read provider settings")
+            .expect("provider config");
+        assert_eq!(config["model"].as_str(), Some("shared"));
+        assert_eq!(
+            config["model_providers"]["shared"]["experimental_bearer_token"]
+                .as_str(),
+            Some("private-token")
+        );
+
+        std::fs::write(
+            &shared,
+            "[ai]\n[[ai.connections]]\nname = 'Shared'\nprovider_id = 'shared'\nbase_url = 'https://other.example/v1'\nmodel = 'other'\n",
+        )
+        .expect("different-endpoint override");
+        let config = runtime_config_from_sources(workspace.path(), None)
+            .expect("read provider settings")
+            .expect("provider config");
+        assert_eq!(config["model"].as_str(), Some("other"));
+        assert!(
+            config["model_providers"]["shared"]
+                .get("experimental_bearer_token")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn former_hosted_mcp_name_is_an_ordinary_workspace_server() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir_all(&ahead).expect("create AHEAD config directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[mcp.servers.codex_apps]\ncommand = \"echo\"\n",
+        )
+        .expect("declare ordinary MCP server");
+        let declarations =
+            mcp_server_declarations(workspace.path()).expect("list declaration");
+        set_mcp_server_approval(
+            workspace.path(),
+            "codex_apps",
+            &declarations[0].fingerprint,
+            McpServerApprovalAction::ApproveAndEnable,
+        )
+        .expect("approve ordinary server");
+        let servers = mcp_servers_for_workspace(
+            workspace.path(),
+            McpServerPolicy::PromptEveryCall,
+        )
+        .expect("load ordinary server");
+        assert!(servers.contains_key("codex_apps"));
     }
 
     #[test]
@@ -1619,7 +2028,7 @@ mod tests {
         .expect("write tracked declaration");
         approve_docs(
             &ahead,
-            "[mcp.tool_permissions.docs]\nread = \"allow\"\nwrite = \"deny\"\nother = \"confirm\"\n",
+            "[mcp.server_permissions]\ndocs = \"allow\"\n[mcp.tool_permissions.docs]\nread = \"allow\"\nwrite = \"deny\"\nother = \"confirm\"\n",
         );
 
         let servers = mcp_servers_for_workspace(
@@ -1630,7 +2039,7 @@ mod tests {
         let server = &servers["docs"];
         assert_eq!(
             server.default_tools_approval_mode,
-            Some(AppToolApproval::Prompt)
+            Some(AppToolApproval::Approve)
         );
         assert_eq!(
             server.tools["read"].approval_mode,
@@ -1640,12 +2049,23 @@ mod tests {
             server.disabled_tools.as_deref(),
             Some(["write".to_string()].as_slice())
         );
-        assert_eq!(server.tools.get("other"), None);
+        assert_eq!(
+            server.tools["other"].approval_mode,
+            Some(AppToolApproval::Prompt)
+        );
 
         approve_docs(
             &ahead,
-            "[mcp.tool_permissions.docs]\nread = \"automatic\"\n",
+            "[mcp.server_permissions]\ndocs = \"allow\"\n[mcp.tool_permissions.docs]\nread = \"automatic\"\n",
         );
+        assert!(
+            mcp_servers_for_workspace(
+                workspace.path(),
+                McpServerPolicy::PromptEveryCall,
+            )
+            .is_err()
+        );
+        approve_docs(&ahead, "[mcp.server_permissions]\ndocs = \"automatic\"\n");
         assert!(
             mcp_servers_for_workspace(
                 workspace.path(),
@@ -1671,7 +2091,7 @@ mod tests {
             McpServerPolicy::PromptEveryCall,
         )
         .expect_err("oversized MCP config must be rejected");
-        assert!(format!("{error:#}").contains("exceeds AHEAD's 1 MiB file limit"));
+        assert!(format!("{error:#}").contains("at most 1 MiB"));
     }
 
     #[test]
@@ -1723,5 +2143,30 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn mcp_declarations_reject_tracked_credentials() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("settings directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[ai]\napi_key = 'tracked'\n[mcp.servers.docs]\ncommand = 'echo'\n",
+        )
+        .expect("tracked declaration");
+
+        let error = mcp_server_declarations(workspace.path())
+            .expect_err("tracked credentials must be rejected");
+        assert!(format!("{error:#}").contains("credential field"));
+        let error = set_mcp_server_approval(
+            workspace.path(),
+            "docs",
+            "",
+            McpServerApprovalAction::ApproveAndEnable,
+        )
+        .expect_err("approval must reject tracked credentials too");
+        assert!(format!("{error:#}").contains("credential field"));
+        assert!(!ahead.join("settings.toml").exists());
     }
 }

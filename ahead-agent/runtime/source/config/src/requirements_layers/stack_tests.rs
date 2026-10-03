@@ -13,7 +13,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use tempfile::TempDir;
 use tempfile::tempdir;
 
 fn layer(id: &str, name: &str, contents: &str) -> RequirementsLayerEntry {
@@ -58,31 +57,36 @@ fn empty_layers_compose_to_none() {
 }
 
 #[test]
-fn cloud_auth_requirements_do_not_override_local_or_discard_other_policy() {
-    let local = RequirementsLayerEntry::from_toml(
-        RequirementSource::Unknown,
-        r#"allowed_login_methods = ["api"]
-cli_auth_credentials_store = "keyring"
-chatgpt_base_url = "https://managed.example/backend-api/""#,
-    );
-    let cloud = layer(
-        "req_cloud",
-        "Cloud policy",
-        r#"allowed_login_methods = ["saml"]
-allowed_chatgpt_workspaces = "invalid"
-cli_auth_credentials_store = "invalid"
-chatgpt_base_url = false
-allow_login_shell = false"#,
-    );
-    assert_eq!(
-        compose(vec![local, cloud]).expect("cloud auth cannot invalidate enterprise policy"),
-        Some(expected_requirements(
-            r#"allowed_login_methods = ["api"]
-cli_auth_credentials_store = "keyring"
-chatgpt_base_url = "https://managed.example/backend-api/"
-allow_login_shell = false"#
-        ))
-    );
+fn retired_runtime_requirements_are_rejected() {
+    for key in [
+        "allowed_login_methods",
+        "allowed_chatgpt_workspaces",
+        "cli_auth_credentials_store",
+        "chatgpt_base_url",
+        "feedback",
+        "check_for_update_on_startup",
+    ] {
+        for source in [
+            RequirementSource::Unknown,
+            RequirementSource::EnterpriseManaged {
+                id: "managed".into(),
+                name: "Managed".into(),
+            },
+        ] {
+            let error = compose(vec![RequirementsLayerEntry::from_toml(
+                source.clone(),
+                format!("{key} = []"),
+            )])
+            .expect_err("retired runtime policy must fail closed");
+            assert_eq!(
+                error,
+                RequirementsCompositionError::Parse {
+                    layer_source: source,
+                    message: format!("unsupported runtime requirement `{key}`"),
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -398,15 +402,6 @@ fn regular_toml_merge_recurses_into_tables() {
 [features]
 beta = false
 shared = false
-
-[apps.connector_1]
-enabled = false
-
-[apps.connector_1.tools.search]
-approval_mode = "prompt"
-
-[apps.connector_1.tools.list]
-approval_mode = "prompt"
 "#,
         ),
         layer(
@@ -416,12 +411,6 @@ approval_mode = "prompt"
 [features]
 alpha = true
 shared = true
-
-[apps.connector_1]
-enabled = true
-
-[apps.connector_1.tools.search]
-approval_mode = "approve"
 "#,
         ),
     ])
@@ -436,15 +425,6 @@ approval_mode = "approve"
 alpha = true
 beta = false
 shared = true
-
-[apps.connector_1]
-enabled = true
-
-[apps.connector_1.tools.list]
-approval_mode = "prompt"
-
-[apps.connector_1.tools.search]
-approval_mode = "approve"
 "#
         )
     );

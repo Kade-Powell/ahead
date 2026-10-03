@@ -7,7 +7,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_utils_home_dir::find_codex_home;
+use codex_utils_home_dir::find_ahead_home;
 use sha2::Digest;
 use sha2::Sha256;
 use std::fs;
@@ -32,23 +32,23 @@ pub(crate) struct RefreshCredentialLock {
 impl RefreshCredentialLock {
     pub(crate) async fn acquire_for_server(server_name: &str, url: &str) -> Result<Self> {
         let store_key = super::compute_store_key(server_name, url)?;
-        let codex_home = find_codex_home()?;
-        Self::acquire_in(&codex_home, &store_key, REFRESH_LOCK_ACQUIRE_TIMEOUT)
+        let ahead_home = find_ahead_home()?;
+        Self::acquire_in(&ahead_home, &store_key, REFRESH_LOCK_ACQUIRE_TIMEOUT)
             .await
             .with_context(|| format!("failed to acquire OAuth credential lock for {server_name}"))
     }
 
     async fn acquire_in(
-        codex_home: &Path,
+        ahead_home: &Path,
         store_key: &str,
         acquire_timeout: Duration,
     ) -> Result<Self> {
-        // Scope coordination to CODEX_HOME alongside File and Secrets state. Direct keyring
+        // Scope coordination to AHEAD_HOME alongside File and Secrets state. Direct keyring
         // coordination across homes needs a separate cross-platform rendezvous.
         // TODO(stevenlee): define that rendezvous before expanding this lock's scope.
         let mut hasher = Sha256::new();
         hasher.update(store_key.as_bytes());
-        let path = codex_home
+        let path = ahead_home
             .join(REFRESH_LOCK_DIR)
             .join(format!("{:x}.lock", hasher.finalize()));
         if let Some(parent) = path.parent() {

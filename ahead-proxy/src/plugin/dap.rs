@@ -153,6 +153,7 @@ impl DapClient {
                 generation,
                 revision: 0,
                 state: DapSessionState::Starting,
+                control_pending: false,
             };
             self.dap_rpc
                 .core_rpc
@@ -604,6 +605,7 @@ struct DapLifecycle {
     generation: u64,
     revision: u64,
     state: DapSessionState,
+    control_pending: bool,
 }
 
 impl DapLifecycle {
@@ -645,6 +647,7 @@ impl DapRpcHandler {
                 generation: 0,
                 revision: 0,
                 state: DapSessionState::Starting,
+                control_pending: false,
             })),
             stop_requested: Arc::new(AtomicBool::new(false)),
             supports_terminate: Arc::new(AtomicBool::new(false)),
@@ -693,6 +696,7 @@ impl DapRpcHandler {
             self.stop_requested.store(true, Ordering::Release);
         }
         lifecycle.state = state.clone();
+        lifecycle.control_pending = false;
         self.core_rpc.dap_session_state(self.dap_id, state);
         true
     }
@@ -1131,6 +1135,7 @@ impl DapRpcHandler {
             );
             self.stop_requested.store(true, Ordering::Release);
             lifecycle.state = DapSessionState::Stopping;
+            lifecycle.control_pending = false;
             lifecycle.revision += 1;
             self.core_rpc
                 .dap_session_state(self.dap_id, DapSessionState::Stopping);
@@ -1359,7 +1364,16 @@ impl DapRpcHandler {
     }
 
     fn step_request<R: Request>(&self, args: R::Arguments) {
-        let token = self.lifecycle.lock().token();
+        let token = {
+            let mut lifecycle = self.lifecycle.lock();
+            if lifecycle.state != DapSessionState::Stopped
+                || lifecycle.control_pending
+            {
+                return;
+            }
+            lifecycle.control_pending = true;
+            lifecycle.token()
+        };
         let rpc = self.clone();
         self.request_async_for_generation::<R>(
             args,
@@ -1368,10 +1382,17 @@ impl DapRpcHandler {
                 Ok(_) => {
                     rpc.set_state(token.0, Some(token.1), DapSessionState::Running);
                 }
-                Err(error) => rpc.report_error(
-                    token.0,
-                    format!("Debugger {} failed: {}", R::COMMAND, error.message),
-                ),
+                Err(error) => {
+                    let mut lifecycle = rpc.lifecycle.lock();
+                    if lifecycle.token() == token {
+                        lifecycle.control_pending = false;
+                    }
+                    drop(lifecycle);
+                    rpc.report_error(
+                        token.0,
+                        format!("Debugger {} failed: {}", R::COMMAND, error.message),
+                    );
+                }
             },
         );
     }
@@ -1621,6 +1642,60 @@ mod tests {
                         if message.contains(command) && message.contains("control rejected")))));
             assert_eq!(rpc.lifecycle.lock().state, DapSessionState::Stopped);
         }
+    }
+
+    #[test]
+    fn step_and_continue_admit_only_one_control_until_reply() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let client = client(directory.path(), "exec sleep 60");
+        client.start_process().expect("adapter");
+        let rpc = &client.dap_rpc;
+        let generation = rpc.generation.load(Ordering::Acquire);
+        rpc.set_state(generation, None, DapSessionState::Stopped);
+        let thread_id =
+            serde_json::from_value(serde_json::json!(17)).expect("thread");
+
+        rpc.continue_thread(thread_id);
+        let first = *rpc
+            .server_pending
+            .lock()
+            .keys()
+            .next()
+            .expect("continue request");
+        rpc.next(thread_id);
+        assert_eq!(rpc.server_pending.lock().len(), 1);
+        assert!(rpc.lifecycle.lock().control_pending);
+
+        rpc.handle_server_response(DapResponse {
+            seq: 99,
+            request_seq: first,
+            success: false,
+            command: "continue".into(),
+            message: Some("control rejected".into()),
+            body: None,
+        });
+        assert!(!rpc.lifecycle.lock().control_pending);
+        assert_eq!(rpc.lifecycle.lock().state, DapSessionState::Stopped);
+
+        rpc.next(thread_id);
+        let second = *rpc
+            .server_pending
+            .lock()
+            .keys()
+            .next()
+            .expect("step request");
+        rpc.continue_thread(thread_id);
+        assert_eq!(rpc.server_pending.lock().len(), 1);
+        rpc.handle_server_response(DapResponse {
+            seq: 100,
+            request_seq: second,
+            success: true,
+            command: "next".into(),
+            message: None,
+            body: None,
+        });
+        assert_eq!(rpc.lifecycle.lock().state, DapSessionState::Running);
+        assert!(!rpc.lifecycle.lock().control_pending);
     }
 
     #[test]

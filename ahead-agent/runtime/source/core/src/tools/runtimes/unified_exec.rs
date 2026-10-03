@@ -382,7 +382,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 SandboxPermissions::UseDefault
             },
             req.additional_permissions.as_ref(),
-            None,
         );
 
         if let UnifiedExecShellMode::ZshFork(zsh_fork_config) = &self.shell_mode {

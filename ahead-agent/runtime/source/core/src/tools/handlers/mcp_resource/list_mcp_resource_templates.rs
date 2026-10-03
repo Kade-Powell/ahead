@@ -10,9 +10,9 @@ use codex_tools::ToolSpec;
 
 use super::ListResourceArgs;
 use super::ListResourceTemplatesPayload;
-use super::model_can_access_mcp_server;
 use super::parse_args_with_default;
 use super::parse_arguments;
+use super::resource_servers;
 use super::run_resource_operation;
 
 pub struct ListMcpResourceTemplatesHandler;
@@ -50,7 +50,6 @@ impl ListMcpResourceTemplatesHandler {
             payload,
             ..
         } = invocation;
-        let turn = std::sync::Arc::clone(&step_context.turn);
         let mcp = &step_context.mcp;
 
         let arguments = match payload {
@@ -65,36 +64,47 @@ impl ListMcpResourceTemplatesHandler {
         let arguments = parse_arguments(arguments.as_str())?;
         let args: ListResourceArgs = parse_args_with_default(arguments.clone())?;
         let args = args.normalized();
+        let servers = resource_servers(&step_context, args.server.as_deref())?;
 
         let invocation = McpInvocation {
-            server: args.server.clone().unwrap_or_else(|| "codex".to_string()),
+            server: args
+                .server
+                .clone()
+                .unwrap_or_else(|| "all configured MCP servers".to_string()),
             tool: "list_mcp_resource_templates".to_string(),
             arguments: arguments.clone(),
         };
 
-        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
-            if let Some((server_name, params)) = args.target(turn.as_ref())? {
-                let result = mcp
-                    .list_resource_templates(&server_name, params)
-                    .await
-                    .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
-                            "resources/templates/list failed: {err:#}"
-                        ))
-                    })?;
-                Ok(ListResourceTemplatesPayload::from_single_server(
-                    server_name,
-                    result,
-                ))
-            } else {
-                let templates = mcp
-                    .list_all_resource_templates(|server_name| {
-                        model_can_access_mcp_server(turn.as_ref(), server_name)
-                    })
-                    .await;
-                Ok(ListResourceTemplatesPayload::from_all_servers(templates))
-            }
-        })
+        run_resource_operation(
+            &session,
+            &step_context,
+            &call_id,
+            invocation,
+            &servers,
+            async {
+                if let Some((server_name, params)) = args.target()? {
+                    let result = mcp
+                        .list_resource_templates(&server_name, params)
+                        .await
+                        .map_err(|err| {
+                            FunctionCallError::RespondToModel(format!(
+                                "resources/templates/list failed: {err:#}"
+                            ))
+                        })?;
+                    Ok(ListResourceTemplatesPayload::from_single_server(
+                        server_name,
+                        result,
+                    ))
+                } else {
+                    let templates = mcp
+                        .list_all_resource_templates(|server| {
+                            servers.iter().any(|allowed| allowed == server)
+                        })
+                        .await;
+                    Ok(ListResourceTemplatesPayload::from_all_servers(templates))
+                }
+            },
+        )
         .await
     }
 }

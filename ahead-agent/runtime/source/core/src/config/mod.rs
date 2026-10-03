@@ -7,7 +7,6 @@ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
 use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
-use ahead_model_auth::AuthManagerConfig;
 use ahead_model_auth::AuthRouteConfig;
 use codex_agent_roles::load_agent_roles;
 use codex_config::CloudConfigBundleLoader;
@@ -17,7 +16,6 @@ use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_config::ConstrainedWithSource;
 use codex_config::FeatureRequirementsToml;
-use codex_config::ManagedAuthPolicy;
 use codex_config::McpServerRequirement;
 use codex_config::ProfileV2Name;
 use codex_config::ResidencyRequirement;
@@ -35,21 +33,12 @@ use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
-use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
-use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
 use codex_config::types::MemoriesConfig;
-use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
 use codex_config::types::OAuthCredentialsStoreMode;
-use codex_config::types::ResumeCwdMode;
-use codex_config::types::SessionPickerViewMode;
-use codex_config::types::TuiKeymap;
-use codex_config::types::TuiNotificationSettings;
-use codex_config::types::TuiPetAnchor;
-use codex_config::types::UriBasedFileOpener;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
@@ -83,9 +72,7 @@ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_models_manager::ModelsManagerConfig;
-use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
-use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -114,6 +101,7 @@ use codex_protocol::protocol::SandboxPolicy;
 pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_home_dir::find_ahead_home;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use serde::Deserialize;
@@ -143,7 +131,6 @@ use codex_network_proxy::NetworkProxyConfig;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
-mod auth_keyring;
 pub mod edit;
 mod managed_features;
 mod network_proxy_spec;
@@ -153,8 +140,6 @@ mod permission_profile_selection;
 mod permissions;
 mod requirements;
 mod resolved_permission_profile;
-pub use auth_keyring::bootstrap_auth_config;
-pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_agent_roles::AgentRoleConfig;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
@@ -225,19 +210,6 @@ const LOCAL_DEV_BUILD_VERSION: &str = "0.0.0";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const CONFIG_PROFILE_V2_SUFFIX: &str = ".config.toml";
-
-fn resolve_cli_auth_credentials_store_mode(
-    configured: AuthCredentialsStoreMode,
-    package_version: &str,
-) -> AuthCredentialsStoreMode {
-    match (package_version, configured) {
-        (
-            LOCAL_DEV_BUILD_VERSION,
-            AuthCredentialsStoreMode::Keyring | AuthCredentialsStoreMode::Auto,
-        ) => AuthCredentialsStoreMode::File,
-        (_, mode) => mode,
-    }
-}
 
 fn resolve_mcp_oauth_credentials_store_mode(
     configured: OAuthCredentialsStoreMode,
@@ -648,106 +620,11 @@ pub struct Config {
     /// Whether orchestrator-owned skills are exposed to the model.
     pub orchestrator_skills_enabled: bool,
 
-    /// Whether orchestrator-owned MCP tools are exposed to the model.
-    pub orchestrator_mcp_enabled: bool,
-
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: bool,
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
-
-    /// Optional external notifier command. When set, Codex will spawn this
-    /// program after each completed *turn* (i.e. when the agent finishes
-    /// processing a user submission). The value must be the full command
-    /// broken into argv tokens **without** the trailing JSON argument - Codex
-    /// appends one extra argument containing a JSON payload describing the
-    /// event.
-    ///
-    /// Example `~/.codex/config.toml` snippet:
-    ///
-    /// ```toml
-    /// notify = ["notify-send", "Codex"]
-    /// ```
-    ///
-    /// which will be invoked as:
-    ///
-    /// ```shell
-    /// notify-send Codex '{"type":"agent-turn-complete","turn-id":"12345"}'
-    /// ```
-    ///
-    /// If unset the feature is disabled.
-    pub notify: Option<Vec<String>>,
-
-    /// TUI notification settings, including enabled events, delivery method, and focus condition.
-    pub tui_notifications: TuiNotificationSettings,
-
-    /// Enable ASCII animations and shimmer effects in the TUI.
-    pub animations: bool,
-
-    /// Show startup tooltips in the TUI welcome screen.
-    pub show_tooltips: bool,
-
-    /// Persisted startup availability NUX state for model tooltips.
-    pub model_availability_nux: ModelAvailabilityNuxConfig,
-
-    /// Start the composer in Vim mode (`Normal`) by default.
-    pub tui_vim_mode_default: bool,
-
-    /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
-    pub tui_raw_output_mode: bool,
-
-    /// Start the TUI in the specified collaboration mode (plan/default).
-
-    /// Controls whether the TUI uses the terminal's alternate screen buffer.
-    ///
-    /// This is the same `tui.alternate_screen` value from `config.toml`.
-    /// - `auto` (default): Use alternate screen.
-    /// - `always`: Always use alternate screen.
-    /// - `never`: Never use alternate screen (inline mode, preserves scrollback).
-    pub tui_alternate_screen: AltScreenMode,
-    /// Ordered list of status line item identifiers for the TUI.
-    ///
-    /// When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.
-    pub tui_status_line: Option<Vec<String>>,
-
-    /// Whether to color status line items with colors from the active syntax theme.
-    pub tui_status_line_use_colors: bool,
-
-    /// Ordered list of terminal title item identifiers for the TUI.
-    ///
-    /// When unset, the TUI defaults to: `activity` and `project`.
-    /// The `activity` item spins while working and shows an action-required
-    /// message when blocked on the user.
-    pub tui_terminal_title: Option<Vec<String>>,
-
-    /// Syntax highlighting theme override (kebab-case name).
-    pub tui_theme: Option<String>,
-
-    /// Pet id preselected by the terminal pet picker.
-    pub tui_pet: Option<String>,
-
-    /// Vertical anchor used by terminal pet rendering.
-    pub tui_pet_anchor: TuiPetAnchor,
-
-    /// Preferred layout for resume/fork session picker results.
-    pub tui_session_picker_view: SessionPickerViewMode,
-
-    /// Working directory to use when resuming or forking a session.
-    /// When unset, prompt if the current and session directories differ.
-    pub tui_resume_cwd: Option<ResumeCwdMode>,
-
-    /// Terminal resize-reflow tuning knobs.
-    pub terminal_resize_reflow: TerminalResizeReflowConfig,
-
-    /// Keybinding overrides for the TUI.
-    ///
-    /// Precedence is:
-    ///
-    /// 1. context table (`tui.keymap.chat`, `tui.keymap.composer`, etc.)
-    /// 2. `tui.keymap.global`
-    /// 3. built-in defaults
-    pub tui_keymap: TuiKeymap,
 
     /// The absolute directory that should be treated as the current working
     /// directory for the session. All relative paths inside the business-logic
@@ -762,12 +639,6 @@ pub struct Config {
     /// Whether runtime workspace roots were supplied explicitly by the caller
     /// or legacy config, rather than defaulting to `cwd`.
     pub workspace_roots_explicit: bool,
-
-    /// Preferred store for CLI auth credentials.
-    /// file (default): Use a file in the Codex home directory.
-    /// keyring: Use an OS-specific keyring service.
-    /// auto: Use the OS-specific keyring service if available, otherwise use a file.
-    pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
 
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     pub mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
@@ -835,15 +706,12 @@ pub struct Config {
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
 
-    /// Directory containing all Codex state (defaults to `~/.codex` but can be
-    /// overridden by the `CODEX_HOME` environment variable).
+    /// Runtime state directory (defaults to `~/.ahead` unless the host supplies
+    /// a project-specific path or `AHEAD_HOME` is set).
     pub codex_home: AbsolutePathBuf,
 
-    /// Directory where Codex writes log files (defaults to `$CODEX_HOME/log`).
+    /// Directory where the retained runtime writes log files.
     pub log_dir: PathBuf,
-
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
-    pub history: History,
 
     /// When true, session is not persisted on disk. Default to `false`
     pub ephemeral: bool,
@@ -855,10 +723,6 @@ pub struct Config {
     ///
     /// This is a runtime-only knob populated from invocation overrides, not from config files.
     pub bypass_hook_trust: bool,
-
-    /// Optional URI-based file opener. If set, citations to files in the model
-    /// output will be hyperlinked using the specified URI scheme.
-    pub file_opener: UriBasedFileOpener,
 
     /// Path to the current Codex executable. This cannot be set in the config
     /// file: it must be set in code via [`ConfigOverrides`].
@@ -903,7 +767,6 @@ pub struct Config {
     pub model_verbosity: Option<Verbosity>,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
-    pub chatgpt_base_url: String,
 
     /// Whether Codex-owned clients should respect host system proxy settings.
     pub respect_system_proxy: bool,
@@ -940,12 +803,6 @@ pub struct Config {
     /// instructions inserted into developer messages when realtime becomes
     /// active.
     pub experimental_realtime_start_instructions: Option<String>,
-    /// When set, restricts ChatGPT login to one or more workspace identifiers.
-    pub forced_chatgpt_workspace_id: Option<Vec<String>>,
-
-    /// When set, restricts the login mechanism users may use.
-    pub forced_login_method: Option<ForcedLoginMethod>,
-
     /// Explicit or feature-derived web search mode.
     pub web_search_mode: Constrained<WebSearchMode>,
 
@@ -1000,17 +857,6 @@ pub struct Config {
     /// When `true`, checks for Codex updates on startup and surfaces update prompts.
     /// Set to `false` only if your Codex updates are centrally managed.
     /// Defaults to `true`.
-    pub check_for_update_on_startup: bool,
-
-    /// When true, disables burst-paste detection for typed input entirely.
-    /// All characters are inserted as they are received, and no buffering
-    /// or placeholder replacement will occur for fast keypress bursts.
-    pub disable_paste_burst: bool,
-
-    /// When `false`, disables feedback collection across Codex product surfaces.
-    /// Defaults to `true`.
-    pub feedback_enabled: bool,
-
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: codex_config::types::OtelConfig,
 }
@@ -1233,56 +1079,6 @@ impl Default for MultiAgentV2Config {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TerminalResizeReflowMaxRows {
-    /// Use the runtime terminal detector to choose a scrollback-sized cap.
-    #[default]
-    Auto,
-    /// Keep all rendered transcript rows during resize reflow.
-    Disabled,
-    /// Keep at most this many rendered transcript rows during resize reflow.
-    Limit(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TerminalResizeReflowConfig {
-    pub max_rows: TerminalResizeReflowMaxRows,
-}
-
-impl AuthManagerConfig for Config {
-    fn codex_home(&self) -> PathBuf {
-        self.codex_home.to_path_buf()
-    }
-
-    fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
-        self.cli_auth_credentials_store_mode
-    }
-
-    fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind {
-        Config::auth_keyring_backend_kind(self)
-    }
-
-    fn forced_login_method(&self) -> Option<ForcedLoginMethod> {
-        self.forced_login_method
-    }
-
-    fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
-        self.forced_chatgpt_workspace_id.clone()
-    }
-
-    fn managed_auth_policy(&self) -> ManagedAuthPolicy {
-        self.config_layer_stack.requirements().managed_auth_policy()
-    }
-
-    fn chatgpt_base_url(&self) -> String {
-        self.chatgpt_base_url.clone()
-    }
-
-    fn auth_route_config(&self) -> AuthRouteConfig {
-        Config::auth_route_config(self)
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct ConfigBuilder {
     codex_home: Option<PathBuf>,
@@ -1357,7 +1153,7 @@ impl ConfigBuilder {
         } = self;
         let codex_home = match codex_home {
             Some(codex_home) => AbsolutePathBuf::from_absolute_path(codex_home)?,
-            None => find_codex_home()?,
+            None => find_ahead_home()?,
         };
         let cli_overrides = cli_overrides.unwrap_or_default();
         let mut harness_overrides = harness_overrides.unwrap_or_default();
@@ -1526,6 +1322,14 @@ impl Config {
         HttpClientFactory::new(outbound_proxy_policy)
     }
 
+    pub fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind {
+        if self.features.enabled(Feature::SecretAuthStorage) {
+            AuthKeyringBackendKind::Secrets
+        } else {
+            AuthKeyringBackendKind::Direct
+        }
+    }
+
     pub(crate) fn to_ahead_mcp_config(&self) -> McpConfig {
         let mut catalog = ResolvedMcpCatalog::builder();
         for (name, server) in self.mcp_servers.get() {
@@ -1559,7 +1363,9 @@ impl Config {
                 Vec::new()
             },
             protocol_mode: self.mcp_protocol_mode(),
-            client_elicitation_capability: ElicitationCapability::default(),
+            client_elicitation_capability: ElicitationCapability::new()
+                .with_form(rmcp::model::FormElicitationCapability::new())
+                .with_url(rmcp::model::UrlElicitationCapability::new()),
             mcp_server_catalog: catalog.build(),
         }
     }
@@ -1646,7 +1452,7 @@ impl Config {
     pub async fn load_default_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
     ) -> std::io::Result<Self> {
-        let codex_home = find_codex_home()?;
+        let codex_home = find_ahead_home()?;
         Self::load_default_with_cli_overrides_for_codex_home(
             codex_home.to_path_buf(),
             cli_overrides,
@@ -2552,20 +2358,6 @@ fn resolve_current_time_reminder_config(
     }))
 }
 
-fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalResizeReflowConfig {
-    let Some(tui) = config_toml.tui.as_ref() else {
-        return TerminalResizeReflowConfig::default();
-    };
-
-    TerminalResizeReflowConfig {
-        max_rows: match tui.terminal_resize_reflow_max_rows {
-            Some(0) => TerminalResizeReflowMaxRows::Disabled,
-            Some(rows) => TerminalResizeReflowMaxRows::Limit(rows),
-            None => TerminalResizeReflowMaxRows::Auto,
-        },
-    }
-}
-
 fn code_mode_toml_config(features: Option<&FeaturesToml>) -> Option<&CodeModeConfigToml> {
     match features?.code_mode.as_ref()? {
         FeatureToml::Enabled(_) => None,
@@ -2830,8 +2622,6 @@ impl Config {
         let orchestrator = cfg.orchestrator.as_ref();
         let orchestrator_skills_enabled =
             resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.skills.as_ref()));
-        let orchestrator_mcp_enabled =
-            resolve_orchestrator_feature_enabled(orchestrator.and_then(|value| value.mcp.as_ref()));
         let mut startup_warnings = config_layer_stack
             .startup_warnings()
             .unwrap_or_default()
@@ -2844,15 +2634,9 @@ impl Config {
         // Destructure every field to ensure ConfigRequirements additions are
         // either applied above or handled while constructing the final Config.
         let ConfigRequirements {
-            allowed_login_methods: _,
-            allowed_chatgpt_workspaces: _,
-            cli_auth_credentials_store,
-            chatgpt_base_url: _,
             log_dir: _,
             model_catalog_json: _,
-            check_for_update_on_startup: _,
             allow_login_shell: _,
-            feedback: _,
             approval_policy: mut constrained_approval_policy,
             permission_profile: mut constrained_permission_profile,
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
@@ -3335,7 +3119,6 @@ impl Config {
                 FeatureToml::Config(config) => config.mode,
             })
             .unwrap_or_default();
-        let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
             load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings).await?;
@@ -3367,7 +3150,6 @@ impl Config {
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
-        let history = cfg.history.unwrap_or_default();
 
         if multi_agent_v2.max_concurrent_threads_per_session == 0 {
             return Err(std::io::Error::new(
@@ -3469,21 +3251,6 @@ impl Config {
             config
         };
 
-        let forced_chatgpt_workspace_id = cfg
-            .forced_chatgpt_workspace_id
-            .clone()
-            .map(codex_config::config_toml::ForcedChatgptWorkspaceIds::into_vec)
-            .map(|values| {
-                values
-                    .into_iter()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|values| !values.is_empty());
-
-        let forced_login_method = cfg.forced_login_method;
-
         let model = model.or(cfg.model);
         let notices = cfg.notice.unwrap_or_default();
         let service_tier = match service_tier_override {
@@ -3560,7 +3327,6 @@ impl Config {
 
         let review_model = override_review_model.or(cfg.review_model);
 
-        let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let model_catalog = load_model_catalog(cfg.model_catalog_json.clone())?;
 
         let log_dir = cfg
@@ -3754,7 +3520,6 @@ impl Config {
             explicit_permission_profile_mode,
             custom_permission_profiles,
             enforce_residency: enforce_residency.value,
-            notify: cfg.notify,
             base_instructions,
             base_instructions_provenance,
             personality,
@@ -3765,17 +3530,7 @@ impl Config {
             include_skill_instructions,
             skill_max_context_tokens,
             orchestrator_skills_enabled,
-            orchestrator_mcp_enabled,
             include_environment_context,
-            // The config.toml omits "_mode" because it's a config file. However, "_mode"
-            // is important in code to differentiate the mode from the store implementation.
-            cli_auth_credentials_store_mode: match cli_auth_credentials_store {
-                Some(required) => required.value,
-                None => resolve_cli_auth_credentials_store_mode(
-                    cfg.cli_auth_credentials_store.unwrap_or_default(),
-                    env!("CARGO_PKG_VERSION"),
-                ),
-            },
             mcp_servers,
             non_prefixed_mcp_tool_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
@@ -3817,11 +3572,9 @@ impl Config {
             codex_home,
             log_dir,
             config_layer_stack,
-            history,
             ephemeral: ephemeral.unwrap_or_default(),
             extra_config: None,
             bypass_hook_trust,
-            file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             codex_self_exe,
             codex_linux_sandbox_exe,
             main_execve_wrapper_exe,
@@ -3837,9 +3590,6 @@ impl Config {
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_catalog,
             model_verbosity: cfg.model_verbosity,
-            chatgpt_base_url: cfg
-                .chatgpt_base_url
-                .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
             respect_system_proxy,
             responses_api_metadata: cfg.responses_api_metadata.unwrap_or_default(),
             realtime_audio: cfg
@@ -3866,8 +3616,6 @@ impl Config {
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
             experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
-            forced_chatgpt_workspace_id,
-            forced_login_method,
             web_search_mode: constrained_web_search_mode.value,
             web_search_config,
             experimental_request_user_input_enabled,
@@ -3887,66 +3635,6 @@ impl Config {
                 .unwrap_or(false),
             active_project,
             notices,
-            check_for_update_on_startup,
-            disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
-            feedback_enabled: cfg
-                .feedback
-                .as_ref()
-                .and_then(|feedback| feedback.enabled)
-                .unwrap_or(true),
-            tui_notifications: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.notification_settings.clone())
-                .unwrap_or_default(),
-            animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
-            show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
-            model_availability_nux: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.model_availability_nux.clone())
-                .unwrap_or_default(),
-            tui_vim_mode_default: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.vim_mode_default)
-                .unwrap_or(false),
-            tui_raw_output_mode: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.raw_output_mode)
-                .unwrap_or(false),
-            tui_alternate_screen: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.alternate_screen)
-                .unwrap_or_default(),
-            tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
-            tui_status_line_use_colors: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.status_line_use_colors)
-                .unwrap_or(true),
-            tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
-            tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
-            tui_pet: cfg.tui.as_ref().and_then(|t| t.pet.clone()),
-            tui_pet_anchor: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.pet_anchor)
-                .unwrap_or_default(),
-            tui_session_picker_view: cfg
-                .tui
-                .as_ref()
-                .and_then(|t| t.session_picker_view)
-                .unwrap_or_default(),
-            tui_resume_cwd: cfg.tui.as_ref().and_then(|t| t.resume_cwd),
-            terminal_resize_reflow,
-            tui_keymap: cfg
-                .tui
-                .as_ref()
-                .map(|t| t.keymap.clone())
-                .unwrap_or_default(),
             otel,
         };
         Ok(config)
@@ -4296,18 +3984,6 @@ fn is_permission_allowed(
         .get(profile_id)
         .copied()
         .unwrap_or(false)
-}
-
-/// Returns the path to the Codex configuration directory, which can be
-/// specified by the `CODEX_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
-///
-/// - If `CODEX_HOME` is set, the value must exist and be a directory. The
-///   value will be canonicalized and this function will Err otherwise.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
-pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
-    codex_utils_home_dir::find_codex_home()
 }
 
 /// Returns the path to the folder where Codex logs are stored. Does not verify

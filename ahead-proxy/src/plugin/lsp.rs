@@ -16,7 +16,7 @@ use ahead_rpc::{
     plugin::{PluginId, ServerId},
     style::LineStyle,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use jsonrpc_lite::{Id, Params};
 use lsp_types::{
     notification::{Initialized, Notification},
@@ -92,6 +92,9 @@ impl PluginServerHandler for LspClient {
             }
             InitializeResult(result) => {
                 self.host.initialized(result);
+            }
+            WorkspaceConfiguration(configuration) => {
+                self.host.update_workspace_configuration(configuration);
             }
             Shutdown => {
                 self.shutdown();
@@ -188,14 +191,6 @@ impl LspClient {
         let server = match server_uri.scheme() {
             "file" => {
                 let path = server_uri.to_file_path().map_err(|_| anyhow!(""))?;
-                #[cfg(unix)]
-                if let Err(err) = std::process::Command::new("chmod")
-                    .arg("+x")
-                    .arg(&path)
-                    .output()
-                {
-                    tracing::error!("{:?}", err);
-                }
                 path.to_str().ok_or_else(|| anyhow!(""))?.to_string()
             }
             "urn" => server_uri.path().to_string(),
@@ -474,6 +469,12 @@ impl LspClient {
         args: &[String],
         env: &[(String, String)],
     ) -> Result<Child> {
+        if let Some(workspace) = workspace {
+            anyhow::ensure!(
+                ahead_core::workspace_trust::is_trusted(workspace)?,
+                "Workspace is restricted; trust it before starting a language server"
+            );
+        }
         let mut process = Command::new(server);
         if let Some(workspace) = workspace {
             process.current_dir(workspace);
@@ -488,7 +489,8 @@ impl LspClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .with_context(|| format!("starting language server `{server}`"))?;
         Ok(child)
     }
 }
@@ -593,6 +595,86 @@ pub fn get_change_for_sync_kind(
 mod tests {
     use super::*;
     use crate::plugin::psp::{PluginServerRpc, ResponseHandler};
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_workspace_cannot_start_a_language_server() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let workspace = workspace.path().to_path_buf();
+        let marker = workspace.join("server-ran");
+        let result = LspClient::process(
+            Some(&workspace),
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "sh".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            &[],
+        );
+        assert!(
+            result.is_err(),
+            "untrusted project launched a language server"
+        );
+        assert!(
+            !marker.exists(),
+            "language server executed in a restricted project"
+        );
+    }
+
+    #[test]
+    fn missing_language_server_error_names_the_executable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let command = directory.path().join("missing-lsp");
+        let command = command.to_string_lossy();
+        let error = LspClient::process(None, command.as_ref(), &[], &[])
+            .expect_err("missing server must fail");
+        assert!(error.to_string().contains(command.as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_language_server_does_not_change_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let binary = directory.path().join("server");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("test server");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644))
+            .expect("non-executable server");
+        let core_rpc = ahead_rpc::core::CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc);
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test".into(),
+        };
+        assert!(
+            LspClient::new(
+                catalog_rpc,
+                Vec::new(),
+                None,
+                server_id,
+                "Test LSP".into(),
+                None,
+                None,
+                Url::from_file_path(&binary).expect("server URL"),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&binary)
+                .expect("server metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
 
     #[cfg(unix)]
     #[test]

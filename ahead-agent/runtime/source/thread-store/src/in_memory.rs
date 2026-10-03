@@ -25,7 +25,6 @@ use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveThreadToSectionParams;
 use crate::PersistContext;
-use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredModelContext;
@@ -53,6 +52,7 @@ fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SortDirection;
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paginated_threads_allow_metadata_reads_and_resume_but_reject_legacy_history_paths() {
+    async fn paginated_threads_allow_metadata_reads_and_resume_but_reject_full_history_reads() {
         let store = InMemoryThreadStore::default();
         let thread_id = ThreadId::default();
         let rollout_path = PathBuf::from("/tmp/paginated-thread.jsonl");
@@ -260,16 +260,17 @@ mod tests {
         assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
         assert!(thread.history.is_none());
 
-        let thread = store
-            .read_thread_by_rollout_path(ReadThreadByRolloutPathParams {
-                rollout_path,
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let next_read = store
+            .read_thread(ReadThreadParams {
+                thread_id,
                 include_archived: false,
                 include_history: false,
             })
             .await
-            .expect("metadata path read");
-        assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
-        assert!(thread.history.is_none());
+            .expect("repeat metadata read");
+        assert_eq!(thread.created_at, next_read.created_at);
+        assert_eq!(thread.updated_at, next_read.updated_at);
 
         assert_paginated_threads_unsupported(
             store
@@ -280,16 +281,6 @@ mod tests {
                 })
                 .await
                 .expect_err("full history read should fail"),
-        );
-        assert_paginated_threads_unsupported(
-            store
-                .read_thread_by_rollout_path(ReadThreadByRolloutPathParams {
-                    rollout_path: PathBuf::from("/tmp/paginated-thread.jsonl"),
-                    include_archived: false,
-                    include_history: true,
-                })
-                .await
-                .expect_err("full history path read should fail"),
         );
         assert_paginated_threads_unsupported(
             store
@@ -410,7 +401,6 @@ pub struct InMemoryThreadStoreCalls {
     pub load_latest_model_context: usize,
     pub read_thread: usize,
     pub read_thread_with_history: usize,
-    pub read_thread_by_rollout_path: usize,
     pub list_threads: usize,
     pub update_thread_metadata: usize,
     pub archive_thread: usize,
@@ -485,6 +475,15 @@ impl InMemoryThreadStore {
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
+        let created_at = Utc::now();
+        state
+            .metadata_updates
+            .entry(params.thread_id)
+            .or_insert_with(|| ThreadMetadataPatch {
+                created_at: Some(created_at),
+                updated_at: Some(created_at),
+                ..ThreadMetadataPatch::default()
+            });
         state
             .histories
             .entry(params.thread_id)
@@ -583,28 +582,6 @@ impl InMemoryThreadStore {
             reject_paginated_history_mode(history_mode_from_state(&state, params.thread_id))?;
         }
         let thread = stored_thread_from_state(&state, params.thread_id, params.include_history)?;
-        Ok(thread)
-    }
-
-    async fn read_thread_by_rollout_path(
-        &self,
-        params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreResult<StoredThread> {
-        let mut state = self.state.lock().await;
-        state.calls.read_thread_by_rollout_path += 1;
-        let Some(thread_id) = state.rollout_paths.get(&params.rollout_path).copied() else {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!(
-                    "in-memory thread store does not know rollout path {}",
-                    params.rollout_path.display()
-                ),
-            });
-        };
-        if params.include_history {
-            reject_paginated_history_mode(history_mode_from_state(&state, thread_id))?;
-        }
-        reject_archived(&state, thread_id, params.include_archived)?;
-        let thread = stored_thread_from_state(&state, thread_id, params.include_history)?;
         Ok(thread)
     }
 
@@ -833,15 +810,6 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
         Box::pin(InMemoryThreadStore::read_thread(self, params))
-    }
-
-    fn read_thread_by_rollout_path(
-        &self,
-        params: ReadThreadByRolloutPathParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
-        Box::pin(InMemoryThreadStore::read_thread_by_rollout_path(
-            self, params,
-        ))
     }
 
     fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage> {

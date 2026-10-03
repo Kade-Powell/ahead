@@ -10,10 +10,6 @@ use crate::browser_use::BrowserUseConfigToml;
 use crate::computer_use::ComputerUseConfigToml;
 use crate::permissions_toml::PermissionsToml;
 use crate::profile_toml::ConfigProfile;
-use crate::types::AppsConfigToml;
-use crate::types::AuthCredentialsStoreMode;
-use crate::types::FeedbackConfigToml;
-use crate::types::History;
 use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
 use crate::types::Notice;
@@ -22,8 +18,6 @@ use crate::types::OtelConfigToml;
 use crate::types::SandboxWorkspaceWrite;
 use crate::types::ShellEnvironmentPolicyToml;
 use crate::types::SkillsConfig;
-use crate::types::Tui;
-use crate::types::UriBasedFileOpener;
 use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
@@ -35,7 +29,6 @@ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
-use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
@@ -54,7 +47,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
-use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
 const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
@@ -66,10 +58,6 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
 ];
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
-
-fn default_history() -> Option<History> {
-    Some(History::default())
-}
 
 const fn default_project_doc_max_bytes() -> Option<usize> {
     Some(DEFAULT_PROJECT_DOC_MAX_BYTES)
@@ -83,54 +71,11 @@ const fn default_true() -> bool {
     true
 }
 
-/// Backward-compatible shape for ChatGPT workspace login restrictions in config.toml.
-#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema)]
-#[serde(untagged)]
-pub enum ForcedChatgptWorkspaceIds {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl ForcedChatgptWorkspaceIds {
-    pub fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::Single(value) => vec![value],
-            Self::Multiple(values) => values,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ForcedChatgptWorkspaceIds {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Single(String),
-            Multiple(Vec<String>),
-        }
-
-        match Repr::deserialize(deserializer)? {
-            Repr::Single(value) if value.contains(',') => Err(D::Error::custom(
-                "forced_chatgpt_workspace_id must be a single workspace ID string or a TOML list \
-of strings; comma-separated strings are not supported. Use \
-`forced_chatgpt_workspace_id = [\"123e4567-e89b-42d3-a456-426614174000\", \
-\"123e4567-e89b-42d3-a456-426614174001\"]` instead.",
-            )),
-            Repr::Single(value) => Ok(Self::Single(value)),
-            Repr::Multiple(values) => Ok(Self::Multiple(values)),
-        }
-    }
-}
-
 /// Orchestrator-owned feature settings.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct OrchestratorToml {
     pub skills: Option<OrchestratorFeatureToml>,
-    pub mcp: Option<OrchestratorFeatureToml>,
 }
 
 /// Settings for a feature owned by the orchestrator.
@@ -198,10 +143,6 @@ pub struct ConfigToml {
     #[serde(default)]
     pub permissions: Option<PermissionsToml>,
 
-    /// Optional external command to spawn for end-user notifications.
-    #[serde(default)]
-    pub notify: Option<Vec<String>>,
-
     /// System instructions.
     pub instructions: Option<String>,
 
@@ -226,21 +167,6 @@ pub struct ConfigToml {
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
-
-    /// When set, restricts ChatGPT login to one or more workspace identifiers.
-    #[serde(default)]
-    pub forced_chatgpt_workspace_id: Option<ForcedChatgptWorkspaceIds>,
-
-    /// When set, restricts the login mechanism users may use.
-    #[serde(default)]
-    pub forced_login_method: Option<ForcedLoginMethod>,
-
-    /// Preferred backend for storing CLI auth credentials.
-    /// file (default): Use a file in the Codex home directory.
-    /// keyring: Use an OS-specific keyring service.
-    /// auto: Use the keyring if available, otherwise use a file.
-    #[serde(default)]
-    pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
 
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     #[serde(default)]
@@ -303,21 +229,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub profiles: HashMap<String, ConfigProfile>,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
-    #[serde(default = "default_history")]
-    pub history: Option<History>,
-
     /// Directory where Codex writes log files. Setting this value explicitly
     /// also enables the TUI text log in this directory.
     /// Defaults to `$CODEX_HOME/log`.
     pub log_dir: Option<AbsolutePathBuf>,
-
-    /// Optional URI-based file opener. If set, citations to files in the model
-    /// output will be hyperlinked using the specified URI scheme.
-    pub file_opener: Option<UriBasedFileOpener>,
-
-    /// Collection of settings that are specific to the TUI.
-    pub tui: Option<Tui>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
@@ -344,9 +259,6 @@ pub struct ConfigToml {
     /// Optional explicit service tier request id for new turns (for example
     /// `default`, `priority`, or `flex`; legacy `fast` also works).
     pub service_tier: Option<String>,
-
-    /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
-    pub chatgpt_base_url: Option<String>,
 
     /// Bounded, product-owned metadata attached to every Responses API request.
     pub responses_api_metadata: Option<BTreeMap<String, String>>,
@@ -440,24 +352,6 @@ pub struct ConfigToml {
     /// directories for `.codex` folders. Defaults to [".git"] when unset.
     #[serde(default)]
     pub project_root_markers: Option<Vec<String>>,
-
-    /// When `true`, checks for Codex updates on startup and surfaces update prompts.
-    /// Set to `false` only if your Codex updates are centrally managed.
-    /// Defaults to `true`.
-    pub check_for_update_on_startup: Option<bool>,
-
-    /// When true, disables burst-paste detection for typed input entirely.
-    /// All characters are inserted as they are received, and no buffering
-    /// or placeholder replacement will occur for fast keypress bursts.
-    pub disable_paste_burst: Option<bool>,
-
-    /// When `false`, disables feedback collection across Codex product surfaces.
-    /// Defaults to `true`.
-    pub feedback: Option<FeedbackConfigToml>,
-
-    /// Settings for app-specific controls.
-    #[serde(default)]
-    pub apps: Option<AppsConfigToml>,
 
     /// Opaque desktop settings stored alongside the rest of config.toml.
     #[serde(default)]
@@ -913,54 +807,6 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
-
-    const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
-    const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
-
-    #[test]
-    fn forced_chatgpt_workspace_id_accepts_single_string() {
-        let config: ConfigToml = toml::from_str(&format!(
-            r#"forced_chatgpt_workspace_id = "{WORKSPACE_ID_A}""#
-        ))
-        .expect("single workspace id should deserialize");
-
-        assert_eq!(
-            config
-                .forced_chatgpt_workspace_id
-                .expect("workspace id should be set")
-                .into_vec(),
-            vec![WORKSPACE_ID_A.to_string()]
-        );
-    }
-
-    #[test]
-    fn forced_chatgpt_workspace_id_accepts_string_list() {
-        let config: ConfigToml = toml::from_str(&format!(
-            r#"forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]"#
-        ))
-        .expect("workspace id list should deserialize");
-
-        assert_eq!(
-            config
-                .forced_chatgpt_workspace_id
-                .expect("workspace ids should be set")
-                .into_vec(),
-            vec![WORKSPACE_ID_A.to_string(), WORKSPACE_ID_B.to_string()]
-        );
-    }
-
-    #[test]
-    fn forced_chatgpt_workspace_id_rejects_comma_separated_string() {
-        let err = toml::from_str::<ConfigToml>(&format!(
-            r#"forced_chatgpt_workspace_id = "{WORKSPACE_ID_A},{WORKSPACE_ID_B}""#
-        ))
-        .expect_err("comma-separated string should be rejected");
-
-        let message = err.to_string();
-        assert!(message.contains("TOML list of strings"));
-        assert!(message.contains("comma-separated strings are not supported"));
-    }
 
     #[test]
     fn amazon_bedrock_auth_command_must_not_be_empty() {

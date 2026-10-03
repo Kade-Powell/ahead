@@ -7,29 +7,12 @@ use codex_config::McpServerDisabledReason;
 use codex_config::RequirementSource;
 use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
 
-use crate::CODEX_APPS_MCP_SERVER_NAME;
-
 /// The component that declared an MCP server registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum McpServerSource {
     Config,
     Compatibility { id: String },
-    Extension { id: String, host_owned_apps: bool },
-}
-
-impl McpServerSource {
-    pub(crate) fn is_host_owned_apps(&self, name: &str, config: &McpServerConfig) -> bool {
-        name == CODEX_APPS_MCP_SERVER_NAME
-            && config.is_local_environment()
-            && matches!(
-                self,
-                Self::Compatibility { .. }
-                    | Self::Extension {
-                        host_owned_apps: true,
-                        ..
-                    }
-            )
-    }
+    Extension { id: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,28 +72,7 @@ impl McpServerRegistration {
     ) -> Self {
         Self::new(
             name,
-            McpServerSource::Extension {
-                id: id.into(),
-                host_owned_apps: false,
-            },
-            config,
-            RegistrationPrecedence::Extension(contribution_order),
-        )
-    }
-
-    /// Registers the controller-owned Apps server contributed by a host extension.
-    pub fn from_hosted_apps(
-        id: impl Into<String>,
-        contribution_order: usize,
-        config: McpServerConfig,
-    ) -> Self {
-        let host_owned_apps = config.is_local_environment();
-        Self::new(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            McpServerSource::Extension {
-                id: id.into(),
-                host_owned_apps,
-            },
+            McpServerSource::Extension { id: id.into() },
             config,
             RegistrationPrecedence::Extension(contribution_order),
         )
@@ -227,10 +189,7 @@ impl McpCatalogBuilder {
     ) {
         self.actions.push(CatalogAction::Remove {
             name,
-            source: McpServerSource::Extension {
-                id: id.into(),
-                host_owned_apps: false,
-            },
+            source: McpServerSource::Extension { id: id.into() },
             precedence: RegistrationPrecedence::Extension(contribution_order),
         });
     }
@@ -244,12 +203,7 @@ impl McpCatalogBuilder {
             let CatalogAction::Register(registration) = action else {
                 continue;
             };
-            // Controller-owned Apps and existing managed denials are not attachment-owned.
-            if !registration.config.enabled
-                || registration
-                    .source
-                    .is_host_owned_apps(&registration.name, &registration.config)
-            {
+            if !registration.config.enabled {
                 continue;
             }
 

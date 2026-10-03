@@ -4,10 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahead_model_auth::AuthEnvTelemetry;
 use ahead_model_auth::AuthManager;
 use ahead_model_auth::CodexAuth;
-use ahead_model_auth::collect_auth_env_telemetry;
 use ahead_model_auth::default_client::create_client_for_route_async;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ModelsClient;
@@ -90,7 +88,6 @@ impl OpenAiModelsEndpoint {
             auth_header_attached: auth_telemetry.attached,
             auth_header_name: auth_telemetry.name,
             agent_identity_telemetry: None,
-            auth_env: self.auth_env(),
         });
         timeout(MODELS_REFRESH_TIMEOUT, async {
             let transport = self
@@ -106,14 +103,6 @@ impl OpenAiModelsEndpoint {
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
-    }
-
-    fn auth_env(&self) -> AuthEnvTelemetry {
-        let codex_api_key_env_enabled = self
-            .auth_manager
-            .as_ref()
-            .is_some_and(|auth_manager| auth_manager.codex_api_key_env_enabled());
-        collect_auth_env_telemetry(&self.provider_info, codex_api_key_env_enabled)
     }
 }
 
@@ -176,7 +165,6 @@ struct ModelsRequestTelemetry {
     auth_header_attached: bool,
     auth_header_name: Option<&'static str>,
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
-    auth_env: AuthEnvTelemetry,
 }
 
 impl RequestTelemetry for ModelsRequestTelemetry {
@@ -205,12 +193,6 @@ impl RequestTelemetry for ModelsRequestTelemetry {
             endpoint = MODELS_ENDPOINT,
             auth.header_attached = self.auth_header_attached,
             auth.header_name = self.auth_header_name,
-            auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
-            auth.env_codex_api_key_present = self.auth_env.codex_api_key_env_present,
-            auth.env_codex_api_key_enabled = self.auth_env.codex_api_key_env_enabled,
-            auth.env_provider_key_name = self.auth_env.provider_env_key_name.as_deref(),
-            auth.env_provider_key_present = self.auth_env.provider_env_key_present,
-            auth.env_refresh_token_url_override_present = self.auth_env.refresh_token_url_override_present,
             auth.request_id = response_debug.request_id.as_deref(),
             auth.cf_ray = response_debug.cf_ray.as_deref(),
             auth.error = response_debug.auth_error.as_deref(),
@@ -231,12 +213,6 @@ impl RequestTelemetry for ModelsRequestTelemetry {
             endpoint = MODELS_ENDPOINT,
             auth.header_attached = self.auth_header_attached,
             auth.header_name = self.auth_header_name,
-            auth.env_openai_api_key_present = self.auth_env.openai_api_key_env_present,
-            auth.env_codex_api_key_present = self.auth_env.codex_api_key_env_present,
-            auth.env_codex_api_key_enabled = self.auth_env.codex_api_key_env_enabled,
-            auth.env_provider_key_name = self.auth_env.provider_env_key_name.as_deref(),
-            auth.env_provider_key_present = self.auth_env.provider_env_key_present,
-            auth.env_refresh_token_url_override_present = self.auth_env.refresh_token_url_override_present,
             auth.request_id = response_debug.request_id.as_deref(),
             auth.cf_ray = response_debug.cf_ray.as_deref(),
             auth.error = response_debug.auth_error.as_deref(),
