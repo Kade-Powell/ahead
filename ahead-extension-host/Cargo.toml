@@ -12,7 +12,7 @@ path = "src/lib.rs"
 ahead-core = { workspace = true }
 anyhow = { workspace = true }
 flate2 = { workspace = true }
-fs4 = "0.13.1"
+fs4 = "1.1.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
