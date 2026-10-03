@@ -156,7 +156,7 @@ serde_json        = { version = "1.0" }
 strum             = { version = "0.27.1" }
 strum_macros      = { version = "0.28" }
 thiserror         = { version = "2" }
-toml              = { version = "0.9.11" }
+toml              = { version = "1.1.6" }
 url               = { version = "2.5.0" }
 wasmtime          = { version = "48", default-features = false, features = [
     "anyhow",
@@ -328,7 +328,7 @@ tokio-rustls = "0.26"
 tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.28", features = ["proxy", "rustls-tls-native-roots"] }
 tokio-util = "0.7"
-toml_edit = "0.24"
+toml_edit = "0.25"
 tracing-appender = "0.2"
 tracing = "0.1"
 tracing-opentelemetry = "0.32"
