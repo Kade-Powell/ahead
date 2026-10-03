@@ -158,7 +158,7 @@ strum_macros      = { version = "0.28" }
 thiserror         = { version = "2" }
 toml              = { version = "0.9.11" }
 url               = { version = "2.5.0" }
-wasmtime          = { version = "48", default-features = false, features = [
+wasmtime          = { version = "49", default-features = false, features = [
     "anyhow",
     "async",
     "demangle",
@@ -168,7 +168,7 @@ wasmtime          = { version = "48", default-features = false, features = [
     "incremental-cache",
     "parallel-compilation",
 ] }
-wasmtime-wasi     = { version = "48", default-features = false, features = ["p2"] }
+wasmtime-wasi     = { version = "49", default-features = false, features = ["p2"] }
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
 
