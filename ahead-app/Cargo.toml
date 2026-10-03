@@ -23,7 +23,7 @@ gpui-util = { workspace = true }
 gpui-kit-assets = "=0.6.6"
 toml = { workspace = true }
 tempfile = { workspace = true }
-fs4 = "0.13.1"
+fs4 = "1.1.0"
 uuid = { version = "1.7", features = ["v4"] }
 crossbeam-channel = { workspace = true }
 serde_json = { workspace = true }
