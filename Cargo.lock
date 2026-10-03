@@ -2606,7 +2606,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "strum 0.27.2",
+ "strum",
  "strum_macros",
  "sys-locale",
  "thiserror 2.0.20",
@@ -6173,7 +6173,7 @@ dependencies = [
  "slotmap",
  "smallvec",
  "spin 0.10.1",
- "strum 0.28.0",
+ "strum",
  "taffy",
  "thiserror 2.0.20",
  "ttf-parser",
@@ -6285,7 +6285,7 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "smol",
- "strum 0.28.0",
+ "strum",
  "url",
  "uuid",
  "wayland-backend",
@@ -6343,7 +6343,7 @@ dependencies = [
  "raw-window-handle",
  "semver",
  "smallvec",
- "strum 0.28.0",
+ "strum",
  "uuid",
  "zed-font-kit",
 ]
@@ -12503,12 +12503,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
 
 [[package]]
 name = "strum"

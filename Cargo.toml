@@ -153,7 +153,7 @@ reqwest           = { version = "0.12", features = ["blocking", "json", "socks"]
 ropey             = { version = "2.0.0-beta.1" }
 serde             = { version = "1.0" }
 serde_json        = { version = "1.0" }
-strum             = { version = "0.27.1" }
+strum             = { version = "0.28.0" }
 strum_macros      = { version = "0.28" }
 thiserror         = { version = "2" }
 toml              = { version = "0.9.11" }
