@@ -9,7 +9,9 @@ use std::{
 };
 
 use ahead_core::directory::Directory;
-use ahead_core::encoding::offset_utf8_to_utf16;
+use ahead_core::encoding::{
+    TextEncoding, decode_text, encode_text, offset_utf8_to_utf16,
+};
 use ahead_rpc::{buffer::BufferId, delta::AheadDelta};
 use anyhow::{Result, anyhow};
 use lsp_types::*;
@@ -24,26 +26,39 @@ pub struct Buffer {
     pub path: PathBuf,
     pub rev: u64,
     pub mod_time: Option<SystemTime>,
+    pub encoding: TextEncoding,
 }
 
 impl Buffer {
     pub fn new(id: BufferId, path: PathBuf) -> Buffer {
-        let (s, read_only) = match load_file(&path) {
-            Ok(s) => (s, false),
+        let (s, read_only, encoding) = match load_file_with_encoding(&path) {
+            Ok((s, encoding)) => (s, false, encoding),
             Err(err) => {
                 use std::io::ErrorKind;
                 match err.downcast_ref::<std::io::Error>() {
                     Some(err) => match err.kind() {
-                        ErrorKind::PermissionDenied => {
-                            ("Permission Denied".to_string(), true)
+                        ErrorKind::PermissionDenied => (
+                            "Permission Denied".to_string(),
+                            true,
+                            TextEncoding::Utf8,
+                        ),
+                        ErrorKind::NotFound => {
+                            ("".to_string(), false, TextEncoding::Utf8)
                         }
-                        ErrorKind::NotFound => ("".to_string(), false),
-                        ErrorKind::OutOfMemory => {
-                            ("File too big (out of memory)".to_string(), false)
-                        }
-                        _ => (format!("Not supported: {err}"), true),
+                        ErrorKind::OutOfMemory => (
+                            "File too big (out of memory)".to_string(),
+                            false,
+                            TextEncoding::Utf8,
+                        ),
+                        _ => (
+                            format!("Not supported: {err}"),
+                            true,
+                            TextEncoding::Utf8,
+                        ),
                     },
-                    None => (format!("Not supported: {err}"), true),
+                    None => {
+                        (format!("Not supported: {err}"), true, TextEncoding::Utf8)
+                    }
                 }
             }
         };
@@ -60,6 +75,7 @@ impl Buffer {
             language_id,
             rev,
             mod_time,
+            encoding,
         }
     }
 
@@ -91,8 +107,12 @@ impl Buffer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        for chunk in self.rope.chunks() {
-            file.write_all(chunk.as_bytes())?;
+        if self.encoding == TextEncoding::Utf8 {
+            for chunk in self.rope.chunks() {
+                file.write_all(chunk.as_bytes())?;
+            }
+        } else {
+            file.write_all(&encode_text(&self.rope.to_string(), self.encoding))?;
         }
         file.as_file().sync_all()?;
         file.persist(&path)?;
@@ -109,8 +129,9 @@ impl Buffer {
             return None;
         }
         self.rev += 1;
-        let content_change = get_document_content_changes(delta, self);
-        self.rope = delta.apply(&self.rope);
+        let new_rope = delta.apply(&self.rope);
+        let content_change = get_document_content_changes(delta, self, &new_rope);
+        self.rope = new_rope;
         Some(
             content_change.unwrap_or_else(|| TextDocumentContentChangeEvent {
                 range: None,
@@ -184,7 +205,15 @@ impl Buffer {
 }
 
 pub fn load_file(path: &Path) -> Result<String> {
-    read_path_to_string(path)
+    load_file_with_encoding(path).map(|(text, _)| text)
+}
+
+fn load_file_with_encoding(path: &Path) -> Result<(String, TextEncoding)> {
+    let bytes = fs::read(path)?;
+    let decoded =
+        decode_text(&bytes).ok_or_else(|| anyhow!("unsupported text encoding"))?;
+    anyhow::ensure!(!decoded.text.contains('\0'), "file contains binary data");
+    Ok((decoded.text, decoded.encoding))
 }
 
 pub fn read_path_to_string<P: AsRef<Path>>(path: P) -> Result<String> {
@@ -323,38 +352,17 @@ fn builtin_language_id(path: &Path) -> Option<String> {
 fn get_document_content_changes(
     delta: &AheadDelta,
     buffer: &Buffer,
+    new_text: &Rope,
 ) -> Option<TextDocumentContentChangeEvent> {
-    let (start, end) = delta.summary();
-
-    // TODO: Handle more trivial cases like typing when there's a selection or transpose
-    if let Some(node) = delta.as_simple_insert() {
-        let start = buffer.offset_to_position(start);
-
-        let end = buffer.offset_to_position(end);
-
-        Some(TextDocumentContentChangeEvent {
-            range: Some(Range { start, end }),
-            range_length: None,
-            text: node.to_string(),
-        })
-    }
-    // Or a simple delete
-    else if delta.is_simple_delete() {
-        let end_position = buffer.offset_to_position(end);
-
-        let start = buffer.offset_to_position(start);
-
-        Some(TextDocumentContentChangeEvent {
-            range: Some(Range {
-                start,
-                end: end_position,
-            }),
-            range_length: None,
-            text: String::new(),
-        })
-    } else {
-        None
-    }
+    let (range, text) = delta.contiguous_replacement(&buffer.rope, new_text)?;
+    Some(TextDocumentContentChangeEvent {
+        range: Some(Range {
+            start: buffer.offset_to_position(range.start),
+            end: buffer.offset_to_position(range.end),
+        }),
+        range_length: None,
+        text,
+    })
 }
 
 /// Returns the modification timestamp for the file at a given path,
@@ -448,6 +456,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn save_preserves_utf16_encoding_and_byte_order_mark() {
+        let directory = tempfile::tempdir().expect("test directory");
+        for encoding in [TextEncoding::Utf16LeBom, TextEncoding::Utf16BeBom] {
+            let path = directory.path().join(format!("{encoding:?}.txt"));
+            let original = "café 🦀\r\n";
+            fs::write(&path, encode_text(original, encoding))
+                .expect("UTF-16 source");
+            let mut buffer = Buffer::new(BufferId::next(), path.clone());
+            assert!(!buffer.read_only);
+            assert_eq!(buffer.encoding, encoding);
+            assert_eq!(buffer.get_document(), original);
+
+            let edited = "updated café 🦀\r\n";
+            buffer.rope = Rope::from(edited);
+            buffer.save(buffer.rev, false).expect("save UTF-16 source");
+
+            assert_eq!(
+                fs::read(path).expect("saved bytes"),
+                encode_text(edited, encoding)
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_text_with_nul_is_read_only() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("binary.txt");
+        fs::write(&path, encode_text("not\0text", TextEncoding::Utf16LeBom))
+            .expect("binary-like text");
+
+        let buffer = Buffer::new(BufferId::next(), path);
+        assert!(buffer.read_only);
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_preserves_symlink_and_executable_permissions() {
@@ -523,6 +566,27 @@ mod tests {
         assert_eq!((range.start.line, range.start.character), (0, 6));
         assert_eq!((range.end.line, range.end.character), (0, 6));
         assert_eq!(change.text, "wonderful ");
+    }
+
+    #[test]
+    fn update_encodes_selection_replacement_as_incremental_change() {
+        let mut buffer = buffer_with("selection-replacement", "a🙂bcdef");
+        let delta = AheadDelta::new(
+            buffer.len(),
+            vec![
+                DeltaOp::Retain(1),
+                DeltaOp::Delete("🙂b".len()),
+                DeltaOp::Insert("🦀".into()),
+                DeltaOp::Retain("cdef".len()),
+            ],
+        );
+
+        let change = buffer.update(&delta, 2).expect("valid revision");
+        let range = change.range.expect("incremental replacement range");
+        assert_eq!(range.start, Position::new(0, 1));
+        assert_eq!(range.end, Position::new(0, 4));
+        assert_eq!(change.text, "🦀");
+        assert_eq!(buffer.get_document(), "a🦀cdef");
     }
 
     #[test]

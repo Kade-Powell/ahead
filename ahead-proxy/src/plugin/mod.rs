@@ -2,6 +2,8 @@ pub mod catalog;
 pub mod dap;
 pub mod lsp;
 pub mod psp;
+mod routing;
+pub mod watched_files;
 
 use std::{
     borrow::Cow,
@@ -9,16 +11,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
+use ahead_extension_host::{LanguageServerCommand, LanguageServerExtension};
 use ahead_rpc::{
     RequestId, RpcError,
     core::CoreRpcHandler,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
     delta::AheadDelta,
     plugin::PluginId,
+    proxy::LspCodeAction,
     style::LineStyle,
 };
 use anyhow::{Result, anyhow};
@@ -31,14 +35,15 @@ use lsp_types::{
     CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams,
     CodeActionResponse, CodeLens, CodeLensParams, CompletionClientCapabilities,
-    CompletionItem, CompletionItemCapability,
+    CompletionContext, CompletionItem, CompletionItemCapability,
     CompletionItemCapabilityResolveSupport, CompletionParams, CompletionResponse,
-    Diagnostic, DocumentFormattingParams, DocumentSymbolClientCapabilities,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
-    FoldingRangeClientCapabilities, FoldingRangeParams, FormattingOptions,
-    GotoCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverClientCapabilities, HoverParams, InlayHint, InlayHintClientCapabilities,
-    InlayHintParams, InlineCompletionClientCapabilities, InlineCompletionParams,
+    CompletionTriggerKind, Diagnostic, DocumentFormattingParams,
+    DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
+    ExecuteCommandParams, FoldingRange, FoldingRangeClientCapabilities,
+    FoldingRangeParams, FormattingOptions, GotoCapability, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams, InlayHint,
+    InlayHintClientCapabilities, InlayHintParams,
+    InlineCompletionClientCapabilities, InlineCompletionParams,
     InlineCompletionResponse, InlineCompletionTriggerKind, Location, MarkupKind,
     MessageActionItemCapabilities, ParameterInformationSettings,
     PartialResultParams, Position, PrepareRenameResponse,
@@ -46,7 +51,7 @@ use lsp_types::{
     ReferenceContext, ReferenceParams, RenameParams, SelectionRange,
     SelectionRangeParams, SemanticTokens, SemanticTokensClientCapabilities,
     SemanticTokensParams, ShowMessageRequestClientCapabilities, SignatureHelp,
-    SignatureHelpClientCapabilities, SignatureHelpParams,
+    SignatureHelpClientCapabilities, SignatureHelpContext, SignatureHelpParams,
     SignatureInformationSettings, SymbolInformation, TextDocumentClientCapabilities,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentSyncClientCapabilities, TextEdit, VersionedTextDocumentIdentifier,
@@ -55,12 +60,13 @@ use lsp_types::{
     request::{
         CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
         CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
-        DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
-        GotoImplementation, GotoImplementationResponse, GotoTypeDefinition,
-        GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest,
-        InlayHintRequest, InlineCompletionRequest, PrepareRenameRequest, References,
-        Rename, Request, ResolveCompletionItem, SelectionRangeRequest,
-        SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
+        DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting,
+        GotoDefinition, GotoImplementation, GotoImplementationResponse,
+        GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
+        HoverRequest, InlayHintRequest, InlineCompletionRequest,
+        PrepareRenameRequest, References, Rename, Request, ResolveCompletionItem,
+        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+        WorkspaceSymbolRequest,
     },
 };
 use parking_lot::Mutex;
@@ -151,20 +157,58 @@ pub enum PluginCatalogRpc {
         text_document: TextDocumentIdentifier,
         text: Rope,
     },
+    UninstallLanguageExtension {
+        extension_id: String,
+        f: Box<dyn RpcCallback<(), RpcError>>,
+    },
     Handler(PluginCatalogNotification),
     Shutdown,
 }
 
 #[allow(clippy::large_enum_variant)]
 pub enum PluginCatalogNotification {
+    RegisterWatchedFiles {
+        plugin_id: PluginId,
+        id: String,
+        registration: watched_files::WatchedFileRegistration,
+    },
+    UnregisterWatchedFiles {
+        plugin_id: PluginId,
+        id: String,
+    },
+    WatchedFilesChanged(notify::Event),
     RestartLanguageServers {
         documents: Vec<TextDocumentItem>,
+        extension_id: Option<String>,
+    },
+    RepairBuiltinNpmServer {
+        server_id: String,
+    },
+    RepairBuiltinNpmServerFinished {
+        server_id: String,
+        result: Result<(), String>,
+    },
+    BuiltinNpmServerUpdateAvailable {
+        server_id: String,
+        latest_version: String,
+    },
+    LanguageServerResolved {
+        language_id: String,
+        extension: LanguageServerExtension,
+        generation: u64,
+        result: Result<LanguageServerCommand, String>,
+    },
+    BuiltinServerResolved {
+        language_id: String,
+        server_name: &'static str,
+        generation: u64,
+        result: Result<LanguageServerCommand, String>,
     },
     RefreshWorkspaceConfigurations,
-    WorkspaceConfigurationResolved {
+    ExtensionConfigurationResolved {
         plugin_id: PluginId,
         generation: u64,
-        result: Result<Option<Value>, String>,
+        result: Result<LanguageServerCommand, String>,
     },
     LanguageServerStopped {
         plugin_id: PluginId,
@@ -331,6 +375,9 @@ impl PluginCatalogRpcHandler {
                         text,
                     );
                 }
+                PluginCatalogRpc::UninstallLanguageExtension { extension_id, f } => {
+                    plugin.uninstall_language_extension(extension_id, f)
+                }
                 PluginCatalogRpc::DidChangeTextDocument {
                     language_id,
                     document,
@@ -426,6 +473,16 @@ impl PluginCatalogRpcHandler {
         Ok(())
     }
 
+    pub(crate) fn uninstall_language_extension(
+        &self,
+        extension_id: String,
+        f: Box<dyn RpcCallback<(), RpcError>>,
+    ) -> Result<()> {
+        self.plugin_tx
+            .send(PluginCatalogRpc::UninstallLanguageExtension { extension_id, f })
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_receiver(&self) -> Receiver<PluginCatalogRpc> {
         self.plugin_rx
@@ -435,7 +492,7 @@ impl PluginCatalogRpcHandler {
             .clone()
     }
 
-    fn send_request_to_all_plugins<P, Resp>(
+    fn send_request_to_first_capable_plugin<P, Resp>(
         &self,
         method: &'static str,
         params: P,
@@ -446,43 +503,28 @@ impl PluginCatalogRpcHandler {
         P: Serialize,
         Resp: DeserializeOwned,
     {
-        let got_success = Arc::new(AtomicBool::new(false));
-        let request_sent = Arc::new(AtomicUsize::new(0));
-        let err_received = Arc::new(AtomicUsize::new(0));
         self.send_request(
             None,
-            Some(request_sent.clone()),
+            None,
             method,
             params,
             language_id,
             path,
             true,
             move |plugin_id, result| {
-                if got_success.load(Ordering::Acquire) {
-                    return;
-                }
-                let result = match result {
-                    Ok(value) => {
-                        if let Ok(item) = serde_json::from_value::<Resp>(value) {
-                            got_success.store(true, Ordering::Release);
-                            Ok(item)
-                        } else {
-                            Err(RpcError {
-                                code: 0,
-                                message: "deserialize error".to_string(),
-                            })
-                        }
-                    }
-                    Err(e) => Err(e),
-                };
-                if result.is_ok() {
-                    cb(plugin_id, result)
-                } else {
-                    let rx = err_received.fetch_add(1, Ordering::Relaxed) + 1;
-                    if request_sent.load(Ordering::Acquire) == rx {
-                        cb(plugin_id, result)
-                    }
-                }
+                cb(
+                    plugin_id,
+                    result.and_then(|value| {
+                        serde_json::from_value::<Resp>(value).map_err(|error| {
+                            RpcError {
+                                code: -32603,
+                                message: format!(
+                                    "Invalid language-server response: {error}"
+                                ),
+                            }
+                        })
+                    }),
+                );
             },
         );
     }
@@ -622,7 +664,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -652,7 +694,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -680,7 +722,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -709,7 +751,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -737,12 +779,12 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
             context: ReferenceContext {
-                include_declaration: false,
+                include_declaration: true,
             },
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -770,7 +812,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -800,7 +842,7 @@ impl PluginCatalogRpcHandler {
         };
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -814,10 +856,7 @@ impl PluginCatalogRpcHandler {
         path: &Path,
         position: Position,
         diagnostics: Vec<Diagnostic>,
-        cb: impl FnOnce(PluginId, Result<CodeActionResponse, RpcError>)
-        + Clone
-        + Send
-        + 'static,
+        cb: impl FnOnce(Result<Vec<LspCodeAction>, RpcError>) + Send + 'static,
     ) {
         let uri = Url::from_file_path(path).unwrap();
         let method = CodeActionRequest::METHOD;
@@ -836,12 +875,69 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        struct Replies<Callback> {
+            callback: Option<Callback>,
+            results: Vec<(PluginId, Result<Option<CodeActionResponse>, RpcError>)>,
+        }
+        let request_sent = Arc::new(AtomicUsize::new(0));
+        let replies = Arc::new(Mutex::new(Replies {
+            callback: Some(cb),
+            results: Vec::new(),
+        }));
+        self.send_request(
+            None,
+            Some(request_sent.clone()),
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
-            cb,
+            true,
+            move |plugin_id, result| {
+                let result = result.and_then(|value| {
+                    serde_json::from_value::<Option<CodeActionResponse>>(value)
+                        .map_err(|error| RpcError {
+                            code: -32603,
+                            message: format!("Invalid language-server code actions: {error}"),
+                        })
+                });
+                let (callback, mut results) = {
+                    let mut replies = replies.lock();
+                    replies.results.push((plugin_id, result));
+                    if replies.results.len() != request_sent.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(callback) = replies.callback.take() else {
+                        return;
+                    };
+                    (callback, std::mem::take(&mut replies.results))
+                };
+                results.sort_by_key(|(plugin_id, _)| plugin_id.0);
+                let mut actions = Vec::new();
+                let mut successful = false;
+                let mut last_error = None;
+                for (plugin_id, result) in results {
+                    match result {
+                        Ok(response) => {
+                            successful = true;
+                            actions.extend(response.into_iter().flatten().map(|action| {
+                                LspCodeAction { plugin_id, action }
+                            }));
+                        }
+                        Err(error) => {
+                            tracing::debug!(?plugin_id, message = %error.message, "language-server code-action request failed");
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                if successful {
+                    callback(Ok(actions));
+                } else {
+                    callback(Err(last_error.unwrap_or_else(|| RpcError {
+                        code: -32603,
+                        message: "No language server returned code actions".into(),
+                    })));
+                }
+            },
         );
     }
 
@@ -863,7 +959,7 @@ impl PluginCatalogRpcHandler {
 
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -881,7 +977,7 @@ impl PluginCatalogRpcHandler {
         let method = CodeLensResolve::METHOD;
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             code_lens,
             language_id,
@@ -907,7 +1003,7 @@ impl PluginCatalogRpcHandler {
             range,
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -940,7 +1036,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -965,7 +1061,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -988,7 +1084,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        self.send_request_to_all_plugins(method, params, None, None, cb);
+        self.send_request_to_first_capable_plugin(method, params, None, None, cb);
     }
 
     pub fn get_document_formatting(
@@ -1011,12 +1107,14 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
-            cb,
+            move |plugin_id, result: Result<Option<Vec<TextEdit>>, RpcError>| {
+                cb(plugin_id, result.map(Option::unwrap_or_default));
+            },
         );
     }
 
@@ -1036,7 +1134,7 @@ impl PluginCatalogRpcHandler {
             position,
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1066,7 +1164,7 @@ impl PluginCatalogRpcHandler {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1091,7 +1189,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: PartialResultParams::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1118,7 +1216,7 @@ impl PluginCatalogRpcHandler {
             partial_result_params: Default::default(),
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1144,7 +1242,7 @@ impl PluginCatalogRpcHandler {
         };
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1169,13 +1267,16 @@ impl PluginCatalogRpcHandler {
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
-            context: None,
+            context: Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            }),
         };
 
         let core_rpc = self.core_rpc.clone();
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
-        self.send_request_to_all_plugins(
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
@@ -1184,9 +1285,10 @@ impl PluginCatalogRpcHandler {
                 let response = result
                     .and_then(|value| {
                         if value.is_null() {
-                            Ok(CompletionResponse::Array(Vec::new()))
+                            Ok(None)
                         } else {
                             serde_json::from_value::<CompletionResponse>(value)
+                                .map(Some)
                                 .map_err(|error| RpcError {
                                     code: -32603,
                                     message: error.to_string(),
@@ -1195,7 +1297,7 @@ impl PluginCatalogRpcHandler {
                     })
                     .unwrap_or_else(|error| {
                         tracing::debug!(?error, "completion request failed");
-                        CompletionResponse::Array(Vec::new())
+                        Some(CompletionResponse::Array(Vec::new()))
                     });
                 core_rpc.completion_response(request_id, input, response, plugin_id);
             },
@@ -1244,12 +1346,12 @@ impl PluginCatalogRpcHandler {
         request_id: usize,
         path: &Path,
         position: Position,
+        context: SignatureHelpContext,
     ) {
         let uri = Url::from_file_path(path).unwrap();
         let method = SignatureHelpRequest::METHOD;
         let params = SignatureHelpParams {
-            // TODO: We could provide more information about the signature for the LSP to work with
-            context: None,
+            context: Some(context),
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri },
                 position,
@@ -1259,25 +1361,21 @@ impl PluginCatalogRpcHandler {
 
         let core_rpc = self.core_rpc.clone();
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
-        self.send_request(
-            None,
-            None,
+        self.send_request_to_first_capable_plugin(
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
-            true,
-            move |plugin_id, result| match result {
-                Ok(value) => {
-                    if let Ok(resp) = serde_json::from_value::<SignatureHelp>(value)
-                    {
-                        core_rpc
-                            .signature_help_response(request_id, resp, plugin_id);
+            move |plugin_id, result| {
+                let response = result.unwrap_or_else(|error| {
+                    tracing::error!("Signature help request failed: {error:?}");
+                    SignatureHelp {
+                        signatures: Vec::new(),
+                        active_signature: None,
+                        active_parameter: None,
                     }
-                }
-                Err(err) => {
-                    tracing::error!("{:?}", err);
-                }
+                });
+                core_rpc.signature_help_response(request_id, response, plugin_id);
             },
         );
     }
@@ -1315,6 +1413,29 @@ impl PluginCatalogRpcHandler {
                 };
                 cb(result)
             },
+        );
+    }
+
+    pub fn execute_command(
+        &self,
+        plugin_id: PluginId,
+        command: String,
+        arguments: Vec<Value>,
+        cb: impl FnOnce(Result<Value, RpcError>) + Clone + Send + 'static,
+    ) {
+        self.send_request(
+            Some(plugin_id),
+            None,
+            ExecuteCommand::METHOD,
+            ExecuteCommandParams {
+                command,
+                arguments,
+                ..Default::default()
+            },
+            None,
+            None,
+            true,
+            move |_, result| cb(result),
         );
     }
 
@@ -1499,7 +1620,7 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             completion: Some(CompletionClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
-                    snippet_support: Some(false),
+                    snippet_support: Some(true),
                     resolve_support: Some(CompletionItemCapabilityResolveSupport {
                         properties: vec!["additionalTextEdits".to_string()],
                     }),
@@ -1508,6 +1629,7 @@ fn client_capabilities() -> ClientCapabilities {
                 ..Default::default()
             }),
             signature_help: Some(SignatureHelpClientCapabilities {
+                context_support: Some(true),
                 signature_information: Some(SignatureInformationSettings {
                     documentation_format: Some(vec![
                         MarkupKind::Markdown,
@@ -1603,8 +1725,17 @@ fn client_capabilities() -> ClientCapabilities {
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
+            did_change_watched_files: Some(
+                lsp_types::DidChangeWatchedFilesClientCapabilities {
+                    dynamic_registration: Some(true),
+                    relative_pattern_support: Some(true),
+                },
+            ),
             symbol: Some(WorkspaceSymbolClientCapabilities {
                 ..Default::default()
+            }),
+            execute_command: Some(lsp_types::ExecuteCommandClientCapabilities {
+                dynamic_registration: Some(true),
             }),
             configuration: Some(true),
             workspace_folders: Some(true),
@@ -1612,5 +1743,398 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         experimental: Some(experimental.into()),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::client_capabilities;
+
+    #[test]
+    fn code_actions_collect_every_server_and_preserve_opaque_items() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use ahead_rpc::{RpcError, plugin::PluginId};
+        use serde_json::json;
+
+        let first = json!({ "title": "Same title", "data": { "server": 1 } });
+        let second = json!({
+            "title": "Same title", "command": "fixture.command",
+            "arguments": [{ "server": 2 }]
+        });
+        for replies in [
+            vec![
+                (2, Ok(json!([second.clone()]))),
+                (1, Ok(json!([first.clone()]))),
+            ],
+            vec![
+                (3, Ok(serde_json::Value::Null)),
+                (2, Ok(json!([second.clone()]))),
+                (4, Ok(json!([]))),
+                (1, Ok(json!([first.clone()]))),
+            ],
+            vec![
+                (5, Ok(json!(false))),
+                (
+                    6,
+                    Err(RpcError {
+                        code: -32097,
+                        message: "server stopped".into(),
+                    }),
+                ),
+                (2, Ok(json!([second.clone()]))),
+                (1, Ok(json!([first.clone()]))),
+            ],
+        ] {
+            let rpc =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            rpc.get_code_actions(
+                &std::env::temp_dir().join("actions.py"),
+                lsp_types::Position::new(0, 0),
+                Vec::new(),
+                move |result| sender.send(result).expect("action result"),
+            );
+            let PluginCatalogRpc::ServerRequest {
+                f,
+                request_sent: Some(request_sent),
+                ..
+            } = rpc.test_receiver().recv().expect("request")
+            else {
+                panic!("server request expected");
+            };
+            let count = replies.len();
+            request_sent.store(count, std::sync::atomic::Ordering::Release);
+            for (index, (id, reply)) in replies.into_iter().enumerate() {
+                dyn_clone::clone_box(&*f)(PluginId(id), reply);
+                if index + 1 < count {
+                    assert!(
+                        receiver.try_recv().is_err(),
+                        "wait for complementary servers"
+                    );
+                }
+            }
+            let actions = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reply")
+                .expect("healthy servers retain their actions");
+            assert_eq!(
+                actions
+                    .iter()
+                    .map(|action| action.plugin_id)
+                    .collect::<Vec<_>>(),
+                [PluginId(1), PluginId(2)]
+            );
+            assert_eq!(
+                serde_json::to_value(&actions[0].action).expect("action"),
+                first
+            );
+            assert_eq!(
+                serde_json::to_value(&actions[1].action).expect("command"),
+                second
+            );
+            assert!(receiver.try_recv().is_err(), "one aggregate callback");
+        }
+    }
+
+    #[test]
+    fn code_actions_propagate_total_failure_but_accept_empty_success() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use ahead_rpc::{RpcError, plugin::PluginId};
+        use serde_json::json;
+
+        for (replies, expected_error) in [
+            (vec![Ok(serde_json::Value::Null), Ok(json!([]))], None),
+            (vec![Ok(json!(false))], Some(-32603)),
+            (
+                vec![Err(RpcError {
+                    code: -32097,
+                    message: "server stopped".into(),
+                })],
+                Some(-32097),
+            ),
+        ] {
+            let rpc =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            rpc.get_code_actions(
+                &std::env::temp_dir().join("actions.py"),
+                lsp_types::Position::new(0, 0),
+                Vec::new(),
+                move |result| sender.send(result).expect("action result"),
+            );
+            let PluginCatalogRpc::ServerRequest {
+                f,
+                request_sent: Some(request_sent),
+                ..
+            } = rpc.test_receiver().recv().expect("request")
+            else {
+                panic!("server request expected");
+            };
+            request_sent.store(replies.len(), std::sync::atomic::Ordering::Release);
+            for (index, reply) in replies.into_iter().enumerate() {
+                dyn_clone::clone_box(&*f)(PluginId(index as u64), reply);
+            }
+            let result = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reply");
+            match expected_error {
+                Some(code) => {
+                    assert_eq!(result.expect_err("all servers failed").code, code)
+                }
+                None => {
+                    assert!(result.expect("valid no-actions response").is_empty())
+                }
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_code_actions_deliver_one_complete_response() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use ahead_rpc::plugin::PluginId;
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let rpc =
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let completed = callback_count.clone();
+        rpc.get_code_actions(
+            &std::env::temp_dir().join("actions.py"),
+            lsp_types::Position::new(0, 0),
+            Vec::new(),
+            move |result| {
+                completed.fetch_add(1, Ordering::SeqCst);
+                sender.send(result).expect("action result");
+            },
+        );
+        let PluginCatalogRpc::ServerRequest {
+            f,
+            request_sent: Some(request_sent),
+            ..
+        } = rpc.test_receiver().recv().expect("request")
+        else {
+            panic!("server request expected");
+        };
+        request_sent.store(4, Ordering::Release);
+        let barrier = Arc::new(Barrier::new(4));
+        std::thread::scope(|scope| {
+            for id in 1..=4 {
+                let callback = dyn_clone::clone_box(&*f);
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    callback(
+                        PluginId(id),
+                        Ok(serde_json::json!([
+                            { "title": "Same title", "data": { "server": id } }
+                        ])),
+                    );
+                });
+            }
+        });
+        let actions = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reply")
+            .expect("success");
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.plugin_id)
+                .collect::<Vec<_>>(),
+            [PluginId(1), PluginId(2), PluginId(3), PluginId(4)]
+        );
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn formatting_accepts_null_and_empty_edits_without_hiding_errors() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use ahead_rpc::{RpcError, plugin::PluginId};
+        use serde_json::json;
+
+        let edit = lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 0),
+                lsp_types::Position::new(0, 1),
+            ),
+            new_text: "formatted".into(),
+        };
+        for (reply, expected) in [
+            (Ok(serde_json::Value::Null), Ok(Vec::new())),
+            (Ok(json!([])), Ok(Vec::new())),
+            (Ok(json!([edit.clone()])), Ok(vec![edit])),
+            (
+                Err(RpcError {
+                    code: -32601,
+                    message: "server not capable".into(),
+                }),
+                Err("server not capable"),
+            ),
+        ] {
+            let rpc =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            rpc.get_document_formatting(
+                &std::env::temp_dir().join("format.py"),
+                move |id, result| {
+                    sender.send((id, result)).expect("format result");
+                },
+            );
+            let PluginCatalogRpc::ServerRequest {
+                f,
+                request_sent: None,
+                ..
+            } = rpc.test_receiver().recv().expect("request")
+            else {
+                panic!("server request expected");
+            };
+            f(PluginId(7), reply);
+            let (id, result) = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("response");
+            assert_eq!(id, PluginId(7));
+            match expected {
+                Ok(edits) => assert_eq!(result.expect("successful format"), edits),
+                Err(message) => assert_eq!(
+                    result.expect_err("unsupported format").message,
+                    message
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn first_capable_requests_preserve_null_and_report_invalid_responses() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        for (reply, succeeds) in [
+            (serde_json::Value::Null, true),
+            (serde_json::json!(false), false),
+        ] {
+            let rpc =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            rpc.send_request_to_first_capable_plugin::<_, Option<Vec<String>>>(
+                "test/request",
+                (),
+                None,
+                None,
+                move |id, result| sender.send((id, result)).expect("response"),
+            );
+            let PluginCatalogRpc::ServerRequest {
+                request_sent: None,
+                f,
+                ..
+            } = rpc.test_receiver().recv().expect("request")
+            else {
+                panic!("single-server request expected");
+            };
+            f(ahead_rpc::plugin::PluginId(7), Ok(reply));
+            let (id, result) = receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("response");
+            assert_eq!(id, ahead_rpc::plugin::PluginId(7));
+            if succeeds {
+                assert_eq!(result.expect("valid null"), None);
+            } else {
+                assert_eq!(result.expect_err("invalid response").code, -32603);
+            }
+        }
+    }
+
+    #[test]
+    fn advertises_lsp_snippet_completions() {
+        let capabilities = client_capabilities();
+        let completion_item = capabilities
+            .text_document
+            .and_then(|text_document| text_document.completion)
+            .and_then(|completion| completion.completion_item);
+        assert_eq!(
+            completion_item
+                .and_then(|completion_item| completion_item.snippet_support),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn advertises_signature_help_context_support() {
+        let signature_help = client_capabilities()
+            .text_document
+            .and_then(|text_document| text_document.signature_help)
+            .expect("signature-help capability");
+        assert_eq!(signature_help.context_support, Some(true));
+    }
+
+    #[test]
+    fn forwards_signature_help_retrigger_context_to_the_language_server() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use lsp_types::{
+            Position, SignatureHelp, SignatureHelpContext, SignatureHelpTriggerKind,
+            SignatureInformation,
+        };
+
+        let rpc =
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+        let active_signature_help = SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: "render(value: usize)".into(),
+                documentation: None,
+                parameters: None,
+                active_parameter: Some(0),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(0),
+        };
+        let context = SignatureHelpContext {
+            trigger_kind: SignatureHelpTriggerKind::CONTENT_CHANGE,
+            trigger_character: None,
+            is_retrigger: true,
+            active_signature_help: Some(active_signature_help),
+        };
+        rpc.signature_help(
+            7,
+            &std::env::temp_dir().join("signature.rs"),
+            Position::new(0, 12),
+            context.clone(),
+        );
+
+        let PluginCatalogRpc::ServerRequest { method, params, .. } = rpc
+            .test_receiver()
+            .recv()
+            .expect("signature-help server request")
+        else {
+            panic!("server request expected");
+        };
+        assert_eq!(method, "textDocument/signatureHelp");
+        let params: lsp_types::SignatureHelpParams =
+            serde_json::from_value(params).expect("signature-help params");
+        assert_eq!(params.context, Some(context));
+    }
+
+    #[test]
+    fn advertises_dynamic_execute_command_registration() {
+        let capabilities = client_capabilities();
+        assert_eq!(
+            capabilities
+                .workspace
+                .and_then(|workspace| workspace.execute_command)
+                .and_then(|execute_command| execute_command.dynamic_registration),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn advertises_dynamic_file_watchers_and_relative_patterns() {
+        let watched = client_capabilities()
+            .workspace
+            .and_then(|workspace| workspace.did_change_watched_files)
+            .expect("file watch capability");
+        assert_eq!(watched.dynamic_registration, Some(true));
+        assert_eq!(watched.relative_pattern_support, Some(true));
     }
 }

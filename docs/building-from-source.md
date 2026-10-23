@@ -2,7 +2,7 @@
 
 It is easy to build Ahead from source on a GNU/Linux distribution. Cargo handles the build process, all you need to do, is ensure the correct dependencies are installed.
 
-1. Install the Rust compiler and Cargo using [`rustup.rs`](https://rustup.rs/). If you already have the toolchain, ensure you are using latest Rust version.
+1. Install Rust 1.95 or newer with Cargo using [`rustup.rs`](https://rustup.rs/). If you already have the toolchain, ensure you are using a current Rust version.
 
 2. Install dependencies for your operating system:
 
@@ -38,7 +38,104 @@ cargo install --path . --bin ahead --profile release-lto --locked
 
 Once Ahead is compiled, the executable will be available in `$HOME/.cargo/bin/ahead` and should be available in `PATH` automatically.
 
-For day-to-day development, `cargo run -p ahead --bin ahead` (or `just dev` for the hot-reloading loop) runs the editor and its re-executed proxy process from one executable. `just dev` waits one second after a burst of file events before restarting, reducing rebuild churn while agents or formatters touch several files. Its macOS dev bundle uses the system's copy-on-write file copy to avoid duplicating the large debug executable on APFS; the system falls back to a regular copy on filesystems without cloning. On macOS, `just app` bundles it as `target/release-lto/macos/Ahead.app`.
+That direct `cargo install` installs only the editor executable. Models that
+require Code Mode also need `ahead-code-mode-host` beside it; without the
+sidecar, AHEAD leaves those tools unavailable instead of silently changing the
+model's tool contract. On macOS, use `just dev` for the full development build
+or `just app` for the bundle recipe. The bundle still needs native acceptance
+testing before release.
+
+On supported macOS and Linux hosts, install the sidecar into the same Cargo bin
+directory after installing the editor:
+
+```bash
+source scripts/ensure-code-mode-v8.sh
+cargo install --path ahead-code-mode-host --bin ahead-code-mode-host --profile release-lto --locked
+```
+
+The pinned sandboxed V8 artifacts currently cover macOS and Linux, not Windows;
+Code Mode models remain unavailable on Windows until that host is supported.
+
+For day-to-day development, `just dev` runs the editor, its re-executed proxy,
+and the sibling Code Mode host beside the editor binary. On its first
+supported macOS or Linux build,
+`scripts/ensure-code-mode-v8.sh` downloads the pinned sandboxed V8 archive and
+Rust binding from the OpenAI release, verifies their SHA-256 hashes, and caches
+them outside the Cargo target directory: `~/Library/Caches/ahead/code-mode-v8/`
+on macOS, or `$XDG_CACHE_HOME/ahead/code-mode-v8/` (defaulting to
+`~/.cache/ahead/code-mode-v8/`) on Linux. Set `AHEAD_V8_CACHE_DIR` to override
+that cache root. Subsequent builds reuse the verified cache, including after
+`cargo clean`. `just dev` waits two seconds after a burst of file events before
+restarting, reducing rebuild churn while agents or formatters touch several
+files. It watches all first-party workspace crates, including the separate
+agent graph store, skills, model-auth, runtime API and retained engine
+packages. Shell-script changes are watched as well. On macOS, the watcher polls
+once per second because native file events missed atomically replaced Rust
+sources in the local development checkout; this adds up to one second of event
+detection delay before the existing debounce. Its macOS dev bundle uses the
+system's copy-on-write file copy to avoid duplicating the large debug
+executable on APFS; the system falls back to a regular copy on filesystems
+without cloning. On macOS, `just app` bundles it
+as `target/release-lto/macos/Ahead.app`. A direct `cargo run -p ahead --bin
+ahead` still launches the editor but does not build or place the sidecar.
+
+`cargo clean` removes the Rust build cache but leaves the verified Code Mode V8
+assets in the user cache, avoiding a second download. It still forces a cold
+Rust rebuild, so use it to recover corrupted artifacts or reclaim disk, not as
+a general build-speed fix. Keep the shared `target/` warm and let Cargo rebuild
+only the changed packages.
+
+After building both debug binaries, run the headless managed Code Mode smoke
+without credentials or a real project:
+
+```sh
+node tests/agent-code-mode-smoke.mjs target/debug/ahead
+```
+
+It creates a disposable project and loopback model, checks the sibling host,
+delegated AHEAD file search, model continuation, explicit cancellation and
+retry after a proxy restart, Turso-restored chat and shutdown.
+It does not replace a rendered `just dev` or authenticated-provider pass.
+The disposable proxy smokes use an isolated `AHEAD_DATA_HOME`; managed-agent
+smokes also isolate `AHEAD_HOME` and `AHEAD_USER_HOME`, so they do not use your
+normal AHEAD profile.
+
+To exercise an authenticated managed turn against the supplied OpenRouter
+free model, set `OPENROUTER_API_KEY` in your environment and run:
+
+```sh
+rtk node tests/agent-openrouter-smoke.mjs target/debug/ahead
+```
+
+This is an opt-in network smoke. It uses a private temporary AHEAD profile and
+trusted disposable workspace, puts the key only in a mode-0600 temporary user
+settings file, removes it from the proxy process environment, and deletes the
+profile after the run. The agent must stream a response and use Code Mode
+`file_search` to return a random value that was not included in the prompt.
+Only synthetic test text is sent; do not adapt this test to include source or
+personal data. OpenRouter's free-model page warns that inputs may be logged for
+service improvement. This smoke does not verify the rendered chat UI or
+real-provider cancellation/resume.
+
+To exercise the installed Pi ACP adapter with a live OpenRouter model, make
+`OPENROUTER_API_KEY` available to the test process without putting it in the
+command history, then run this focused ignored test:
+
+```sh
+AHEAD_PI_TEST_MODEL=openrouter/nvidia/nemotron-3-ultra-550b-a55b:free \
+  rtk cargo test --locked -p ahead-agent --lib \
+  adapters::tests::pi_registry_adapter_completes_an_acp_turn -- \
+  --ignored --exact --test-threads=1
+```
+
+This smoke requires Node.js/npm and a separate Pi CLI (`pi`) v0.81.0 or newer
+on `PATH`; the ACP registry package is only the `pi-acp` bridge, which starts
+that CLI in RPC mode. The test installs the curated bridge into a disposable
+cache, creates a temporary Pi home with only the selected model, and sends one
+synthetic `PONG` prompt. The OpenRouter key stays in the process environment;
+the test does not read or write the user's Pi profile. It verifies one
+authenticated ACP turn, not Pi cancellation/resume or authenticated
+Codex/Claude turns. See the [adapter's prerequisites](https://github.com/svkozak/pi-acp#prerequisites).
 
 ### Agent development loop
 
@@ -47,16 +144,28 @@ in the shared terminal for agent testing; the path must be a test project, not a
 real workspace. `tests/fixtures/editor-smoke/` is the reusable template: copy
 it into a disposable directory and open the copy without precreating `.ahead/`
 to exercise the editor's first-time setup. Its README has the smoke matrix.
+The watcher takes one lock for the repository's shared Git directory, including
+linked worktrees. A second `just dev` exits before starting Cargo and reports
+the lock path (and holder when the platform can identify it); reuse the existing
+dev terminal instead of starting another watcher. Stop that watcher with
+Ctrl-C before a focused Cargo command. `just dev-lock-smoke` verifies the
+duplicate-loop guard without building the app.
 Plain `just dev` opens the AHEAD repository itself. Use a fresh disposable copy
-when the app reports an unsupported session-database schema. This hard fork
-does not migrate or reset older databases, and a workspace storage failure
-disables agent sessions instead of substituting an in-memory session.
-The editor's file tools remain available; old database files are left intact.
+when testing first-run storage or after changing the pre-production schema.
+There is one initial Turso schema and no schema-version checks, migrations or
+automatic resets yet. Startup reruns the initial transactional
+`CREATE ... IF NOT EXISTS` statements, but does not reconcile or validate
+existing table definitions. This also creates missing AHEAD tables in a
+nonempty database while leaving existing rows in place. If an existing
+pre-production database has an incompatible layout, storage operations can
+fail. Recreate disposable data when the schema changes. A workspace storage
+failure disables agent sessions instead of substituting an in-memory session,
+while the editor's file tools remain available.
 On Unix, `.ahead` must be owned by the current user and not writable by other
-users. New session databases use mode `0600`; supported databases and their
+users. New session databases use mode `0600`; opened databases and their
 sidecars are tightened on reopen. Linked/special database paths and orphaned
 sidecars produce a storage error instead of being followed or replaced. Keep
-rejected files intact for recovery with the matching build.
+valuable data outside disposable pre-production workspaces.
 
 For an isolated native smoke run, set all three absolute paths before starting
 the watcher:
@@ -70,8 +179,21 @@ just dev /private/tmp/ahead-smoke-workspace
 
 `AHEAD_DATA_HOME` redirects AHEAD's app data, config, plugins, cache and logs;
 `AHEAD_HOME` redirects the managed agent runtime; `AHEAD_USER_HOME` redirects
-user-scope memory. A disposable project path alone does **not** isolate
-installed extensions or user-level settings.
+the managed agent and extension host's user-home settings and memory. A
+disposable project path alone does **not** isolate installed extensions or
+user-level settings. For `just dev`, setting `AHEAD_DATA_HOME` alone now defaults
+the runtime and user homes to `runtime-home/` and `user-home/` beneath that data
+directory. Explicit `AHEAD_HOME` or `AHEAD_USER_HOME` values take precedence.
+These defaults are applied whenever the watcher launches the app; they do not
+change an already-running process.
+
+On macOS and Linux, AHEAD captures only `PATH` from the configured interactive
+login shell once at startup, following Zed's login-shell environment pattern.
+This makes tools available from a GUI launch visible to the integrated
+terminal, language servers and agent subprocesses. Common POSIX shells and
+Fish are supported; capture failures leave the inherited `PATH` unchanged and
+are logged. Other shell variables and per-project `direnv`/environment hooks
+are not captured by this startup step.
 
 The recipe launches the app once, then rebuilds
 and relaunches it when watched Rust sources, Cargo manifests, or build inputs
@@ -90,11 +212,16 @@ watcher's process tree. On macOS that copied bundle identifies as `io.ahead.dev`
   running and bind its existing bundle ID. Looking it up by path before its
   window appears can launch a second, unisolated copy.
   This does not bypass OS or computer-use approval requirements. Other platforms
-use the package-qualified run command. Both select the root `ahead` package; bare
-`cargo run --bin ahead` is ambiguous in this workspace.
+build the root `ahead` package and run `target/debug/ahead`. Use the
+package-qualified command `cargo run -p ahead --bin ahead` for an app-only launch.
+It does not provide the watcher or the bundled Code Mode host; use `just dev` for
+the full development loop.
 Test-only `tests/` trees and `*_tests.rs` files, plus source `README.md` and
 `AGENTS.md` files, are ignored so editing tests or guidance does not rebuild the
-editor. Embedded Markdown prompts and bundled skill files remain watched.
+editor. `TODO.md`, `docs/development/`, and these build instructions are also
+ignored, avoiding Cargo relinks for planning and workflow edits. User guides
+under `docs/guide/`, embedded Markdown prompts and bundled skill files remain
+watched because they are compiled into the app.
 
 The root and editor build scripts watch only their own linker setup. Ordinary
 documentation edits should not rerun those scripts and relink the app on the
@@ -114,22 +241,44 @@ same recipe with native-app access launched the disposable workspace normally.
 Do not classify that registration failure as an editor crash without checking
 the crash report.
 
-All agent tasks in a checkout share the same `target/`. Keep one broad Cargo
-build loop active: do not start a second `just dev`, `bacon run`, or workspace-wide
-Cargo build/check/test from another task at the same time. Before a one-off Cargo
-check or test, coordinate with the loop owner and stop the watcher with Ctrl-C;
-restart it with `just dev` afterward. Prefer a focused check such as
-`just ahead-check` when that is sufficient.
+All linked Git worktrees in a repository share the repository's `target/`
+directory for Cargo commands run through `just`, so dev, test, and focused
+check recipes can reuse compiled artifacts across agent worktrees. Just derives
+the target from Git's common directory and honors an explicit
+`CARGO_TARGET_DIR` override. Direct Cargo commands do not inherit Just's
+environment; from another worktree, set `CARGO_TARGET_DIR` to the common
+repository `target/` yourself if artifact reuse is intended. `just dev` also
+takes a per-user, per-repository OS lock (`lockf` on macOS or `flock` on Linux)
+and fails immediately if another dev watcher already owns it. When available,
+`lsof`/`fuser` reports the lock owner; reuse the existing watcher terminal
+rather than starting another build loop. The guard does not attach to or stop
+watchers that were already running when it was added. Keep one broad Cargo
+build loop active: do not start a second `just dev`, `bacon run`, or
+workspace-wide Cargo build/check/test from another task at the same time.
+To exercise the duplicate-loop guard without compiling or launching a watcher,
+stop any active AHEAD dev loop and run `just dev-lock-smoke`; it holds the same
+repository lock and substitutes an inert `watchexec` command for the nested
+`just dev` invocation.
+Before a one-off Cargo check or test, coordinate with the loop owner and stop
+the watcher with Ctrl-C; restart it with `just dev` afterward. Prefer a focused
+check such as `just ahead-check` when that is sufficient.
 
-After `cargo clean`, build the root executable through `just dev` before
-running `ahead-proxy`'s native-agent tests: they need `target/debug/ahead` as
-the sandbox helper. Stop the watcher before that one-off test and resume it
-afterward. Keep the package selection stable across repeated checks: switching
-between proxy-only and app-plus-proxy Clippy runs can change Cargo's unified
-dependency features and rebuild much of the retained agent closure. On
+After `cargo clean`, `just test-all` builds `target/debug/ahead` for native-agent
+tests. For a package-focused test, run `cargo build -p ahead --bin ahead`
+first, or use `just dev` for a rendered pass; stop its watcher before the test
+and resume it afterward. Keep the package selection stable across repeated
+checks: switching between proxy-only and app-plus-proxy Clippy runs can change
+Cargo's unified dependency features and rebuild much of the retained agent closure. On
 2026-10-01, separate package-focused test runs reused existing test artifacts
 more effectively than a new combined-package run; use the already-cached set
 when possible.
+
+After the current `just dev` loop has rebuilt `target/debug/ahead`, run
+`just agent-attribution-smoke` for a credential-free disposable acceptance of
+shell source-write denial, generated build output, Code Mode edits, direct
+OpenAI-compatible `apply_patch` function calls, Turso CodeAnchors, and the
+resulting staged commit metadata/anchor cleanup. The recipe uses the shared
+Cargo target for its temporary fixture and never builds the editor itself.
 
 Save or explicitly discard disposable-project edits before stopping or
 restarting the watcher. AHEAD's Close Window and Quit actions check dirty
@@ -149,6 +298,17 @@ It kills only its own proxies and keeps the fixture for inspection. It sends
 no model requests and does not install language servers. This protocol check
 does not replace the native restart and recovery-menu journey.
 
+With the watcher stopped, run
+`cargo test --locked -p ahead-proxy --lib session_storage_ -- --test-threads=1`
+for initial-schema creation, four-process concurrent startup/history writes,
+hot-journal recovery, file privacy, and retry after a blocked commit. These
+tests use disposable databases. Connections wait up to five seconds for a
+database lock; persistent contention returns an error rather than retrying
+forever or replacing the database. The blocked-commit tests shorten only their
+own connection's timeout and verify that rollback leaves it usable for retry.
+Linux CI runs these with the workspace tests; macOS and Windows have an
+explicit storage filter. Platform CI results remain separate from a local pass.
+
 `node tests/agent-shutdown-smoke.mjs target/debug/ahead` checks an active managed
 turn across real proxy exit and Turso reopen. It uses a loopback mock model in a
 disposable project, streams a partial answer, then closes the proxy both explicitly
@@ -156,6 +316,14 @@ and through stdin EOF. Reopen must retain the partial answer and cancelled statu
 No provider credentials or downloads are needed. The fixture remains on disk;
 forced process cleanup is used only when the test fails. This does not verify
 authenticated tools, external ACP descendants or native window interaction.
+
+`node tests/agent-mcp-smoke.mjs target/debug/ahead` exercises managed MCP through
+the rebuilt proxy in a disposable project. It uses a loopback mock model and the
+offline stdio fixture to verify modern discovery, tool-list exposure, per-call
+approval events, tool execution, resource/template listing, resource reads and
+model continuation. It contacts no external service or provider. Local loopback
+access is required; this proxy test does not verify rendered approval UI, legacy
+approval UI or in-flight cancellation.
 
 With the watcher stopped, run
 `cargo test --locked --offline -p ahead-app --lib terminal::tests -- --test-threads=1`
@@ -252,28 +420,87 @@ change it. These checks do not require an installed external agent or prove
 authenticated ACP interoperability.
 
 For installed language servers, run
-`node tests/lsp-smoke.mjs target/debug/ahead` with `rust-analyzer`, `vtsls` and
-`basedpyright-langserver` on PATH. It copies the multi-language fixture into
-a temporary directory, then checks completion, definition, diagnostics,
-auto-import resolution, close/reopen and language-server restart through the
-real proxy. Restart must preserve unsaved text without saving it, keep TS/JS
+`node tests/lsp-smoke.mjs target/debug/ahead` with `rust-analyzer`, `vtsls`,
+`basedpyright-langserver` and `ruff` on PATH; it defaults to all three language groups.
+Set `AHEAD_LSP_LANGUAGES=rust` or a comma-separated subset to run only the
+servers available locally (`typescript` also exercises JavaScript). It copies
+the multi-language fixture into
+a temporary directory, isolates AHEAD's data home and permits language servers
+only for that fixture, then checks completion, definition, semantic-token
+ranges, diagnostics, auto-import resolution, close/reopen and language-server restart through the
+real proxy. It also prepares symbol renames, follows references and applies
+cross-file declaration-rename edits to unsaved TypeScript, JavaScript and
+Python snapshots, checking navigation and diagnostic repair without saving
+source files. TypeScript formatting must be idempotent; TypeScript/JavaScript
+and Python signature checks retain argument types. Rust additionally checks
+formatting, hover, signature help, references and cross-file rename replies.
+Python runs BasedPyright and Ruff together: the smoke applies Ruff formatting,
+checks idempotence, combines a linter warning with a type error, repairs the
+type error without losing the warning, and confirms that typed analyzer hover
+still works. The fixture explicitly enables BasedPyright's unused-import warning
+to exercise code actions from both servers for the same range. The smoke
+resolves Ruff's fix with its owning server when needed and applies the edit to
+the unsaved buffer. It also creates, edits, renames and deletes
+`pyproject.toml`/`ruff.toml`, checking that formatting follows the new
+configuration without restarting Ruff. These checks repeat after server restart.
+The Python checks also edit `.ahead/config.toml` to reorder servers, pin hover
+and formatting to separate servers, disable and re-enable Ruff, and reject a
+formatting route to a disabled server. Native settings-file events must cause
+the restart; each replacement must preserve unsaved snapshots and leave disk
+source unchanged.
+Restart must preserve unsaved text without saving it, keep TS/JS
 on one replacement server, and reject completion items from the old process.
 The script also checks graceful proxy exit and that its language-server
 process group has stopped. It does not download servers or call a model.
 Check `rust-analyzer --version` before running it: a rustup shim on PATH can
 exist without the component installed. For a local smoke, already-installed
-Zed server binaries can be added to PATH; normal AHEAD startup does not depend
-on Zed's installation. The running app can acquire its built-in npm-backed
-servers into an AHEAD-owned cache when Node.js and npm are on PATH; the
-`lsp-smoke.mjs` protocol check deliberately uses installed binaries instead.
+Zed server binaries can be added to PATH; a versioned Rust Analyzer can be
+passed through `AHEAD_LSP_RUST_ANALYZER_PATH`. Normal AHEAD startup does not
+depend on Zed's installation. Ruff resolution prefers the project's
+`.venv/bin/ruff` (`.venv/Scripts/ruff.exe` on Windows), then PATH, then AHEAD's
+managed cache. Missing Ruff binaries are acquired from the official
+`astral-sh/ruff` GitHub release, using the same bounded downloads and staged
+cache publication as Rust Analyzer. GitHub's release checksum is verified when
+provided. The running app can acquire its built-in npm-backed
+servers into an AHEAD-owned cache. It prefers system Node.js/npm and otherwise
+downloads and checksum-verifies the latest Node.js LTS runtime from the official
+Node.js distribution site on demand; the
+`lsp-smoke.mjs` protocol check uses installed binaries by default. To allow it
+to exercise managed installation for selected servers missing from PATH, run
+`AHEAD_LSP_INSTALL_MISSING=1 node tests/lsp-smoke.mjs target/debug/ahead`;
+this mode needs access to the public npm registry and installs into the
+disposable fixture's `AHEAD_DATA_HOME` with lifecycle scripts disabled. It
+does not contact a model provider. The smoke retains and prints its disposable
+workspace path for inspection, and now reports a selected server's startup
+error immediately instead of waiting for the diagnostics timeout.
 
 To exercise an installed Zed HTML extension without installing it into
-AHEAD, put `vscode-html-language-server` on PATH and run
-`AHEAD_ZED_EXTENSION_SOURCE=/path/to/html cargo test --locked --offline -p ahead-proxy --lib installed_zed_html_extension_starts_a_real_server -- --ignored`.
-The ignored test copies `extension.toml` and `extension.wasm` into a disposable
-extension root alongside the HTML language config, opens an HTML file, then
-waits for a real LSP handshake. It does not modify the
-source extension or test gallery installation, completion or live settings.
+AHEAD, point `ZED_EXTENSIONS` at Zed's extensions directory and use the HTML
+server package from that same installation. The isolated user home prevents
+the smoke from reading personal `~/.ahead/settings.toml` settings.
+
+```sh
+ZED_EXTENSIONS=/path/to/Zed/extensions
+smoke_profile="$(mktemp -d "${TMPDIR:-/tmp}/ahead-html.XXXXXX")"
+mkdir -p "$smoke_profile/data" "$smoke_profile/user"
+AHEAD_DATA_HOME="$smoke_profile/data" \
+AHEAD_USER_HOME="$smoke_profile/user" \
+AHEAD_ZED_EXTENSION_SOURCE="$ZED_EXTENSIONS/installed/html" \
+PATH="$ZED_EXTENSIONS/work/html/node_modules/@zed-industries/vscode-langservers-extracted/bin:$PATH" \
+cargo test --locked --offline -p ahead-proxy --lib installed_zed_html_extension_refreshes_settings_and_uses_a_real_server -- --ignored
+```
+
+The ignored `installed_zed_html_extension_refreshes_settings_and_uses_a_real_server`
+test copies `extension.toml` and `extension.wasm` into a disposable extension
+root alongside the HTML language config, then runs Zed's matching HTML server.
+It enables embedded-CSS validation in project settings, observes an unknown
+property diagnostic, disables validation and verifies the diagnostic clears
+without restarting the server. It then requests `<di` completion, formats
+unformatted markup and renames a paired tag through LSP. This exercises the
+catalog's workspace-settings refresh event, not the native filesystem watcher
+or rendered editor. The HTML server registers workspace-folder-change
+dynamically; AHEAD currently supplies a static single workspace root. The test
+does not modify the source extension or exercise gallery installation.
 
 `node tests/lsp-shutdown-smoke.mjs target/debug/ahead` needs only Node and the
 built app on Unix. It creates disposable fake LSP executables to test explicit
@@ -302,7 +529,10 @@ executable for the filesystem sandbox helper; the Rust test harness cannot
 serve that protocol. Build the app for the same Cargo profile and target
 first. For default debug tests, `just dev` or
 `cargo build -p ahead --bin ahead` supplies `target/debug/ahead`; stop the dev
-watcher before running tests. CI also builds the app before tests.
+watcher before running tests. `just test-all` and CI build the debug helper
+before library tests, including after `cargo clean`. `just test-all` uses
+temporary app/user homes and leaves `AHEAD_HOME` unset so managed-runtime tests
+exercise the workspace-scoped `.ahead/runtime` default.
 The proxy's dev-dependency enables `ahead-agent/test-support`, since Rust's
 `cfg(test)` does not propagate to dependencies. Only test executables under
 the profile's `deps/` directory use the sibling AHEAD helper; a missing binary
@@ -331,6 +561,43 @@ checks recovery ownership and claim leases against a disposable Turso store.
 These tests must pass without serial reruns masking an inherited-lock failure;
 the old close-only release fails their deterministic duplicate-handle checks.
 They do not prove cross-platform or native process-exit behavior.
+
+With the watcher stopped, the shared-feature installer check is
+`cargo test --locked --offline -p ahead-agent -p ahead-proxy --lib adapters::tests -- --test-threads=1`.
+The focused tests cover missing-cache repair, failed repair, preservation of
+leased generations, malformed manifests, path escapes and concurrent installs.
+To exercise real Node/npm without registry access, use the same package
+selection with the filter
+`adapters::tests::npx_generations_launch_locally_packed_packages_offline` and
+append `-- --ignored --exact --test-threads=1`. It packs two disposable local
+packages, installs them offline with private npm config/cache and lifecycle
+scripts disabled, deletes the current fixture's executable, and verifies that
+repair leaves both the repaired version and earlier generation runnable.
+This does not verify public registry downloads or the native installation UI.
+
+The opt-in `adapters::tests::curated_acp_session_model_options_offline` check
+needs the public ACP registry, npm and the Pi CLI on PATH. Despite its name,
+only model inference is offline: it downloads registry metadata and installs
+the current Pi, Codex and Claude Code packages. It checks package provenance,
+ACP initialization, session creation, model selection and saved per-agent
+defaults. Authentication failures fail the test rather than silently skipping
+model verification. No model prompt or usable provider credential is supplied.
+On macOS/Linux, keep npm configuration isolated and lifecycle scripts disabled:
+
+```sh
+acp_test_config=$(mktemp -d)
+npm_config_userconfig="$acp_test_config/user.npmrc" \
+npm_config_globalconfig="$acp_test_config/global.npmrc" \
+npm_config_ignore_scripts=true \
+cargo test --locked --offline -p ahead-agent -p ahead-proxy --lib \
+  adapters::tests::curated_acp_session_model_options_offline \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+Cargo's `--offline` does not block the test's registry/npm downloads. Agent
+homes, projects and package caches are temporary; child HTTP proxy settings
+point at an unreachable localhost port. This check does not verify a real
+provider login, model turn, native picker or install/reconnect UI.
 
 `just bacon-test` runs the focused agent, proxy, and viewmodel test set.
 `just test-all` explicitly runs maintained AHEAD package tests and the retained

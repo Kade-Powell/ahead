@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-rollout"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_rollout"
+path = "src/lib.rs"
+
+[dependencies]
+codex-history = { workspace = true }
+codex-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

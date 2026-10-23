@@ -61,6 +61,8 @@ if (process.argv[2] === "--adapter") {
   const binary = path.resolve(process.argv[2] ?? "target/debug/ahead");
   const directory = await mkdtemp(path.join(tmpdir(), "ahead-dap-shutdown-"));
   console.log(`Disposable workspaces: ${directory}`);
+  const dataHome = path.join(directory, "data");
+  await mkdir(dataHome);
   const failures = [];
   for (const mode of ["running", "initializing", "stderr"]) {
     const workspace = path.join(directory, mode);
@@ -70,6 +72,7 @@ if (process.argv[2] === "--adapter") {
       cwd: workspace,
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, AHEAD_DATA_HOME: dataHome },
     });
     let output = "";
     let exited = false;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -10,12 +10,31 @@ import { createInterface } from "node:readline";
 // No model, language server, credentials, package install or real project is used.
 const binary = path.resolve(process.argv[2] ?? "target/debug/ahead");
 const workspace = await mkdtemp(path.join(tmpdir(), "ahead-recovery-smoke-"));
+const profile = `${workspace}-profile`;
+const dataHome = path.join(profile, "data");
+const runtimeHome = path.join(profile, "runtime");
+const userHome = path.join(profile, "user");
+const home = path.join(profile, "home");
+await Promise.all([dataHome, runtimeHome, userHome, home].map((directory) =>
+  mkdir(directory, { recursive: true }),
+));
+const smokeEnvironment = {
+  PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+  HOME: home,
+  TMPDIR: tmpdir(),
+  LANG: process.env.LANG,
+  LC_ALL: process.env.LC_ALL,
+  RUST_LOG: "error",
+  AHEAD_DATA_HOME: dataHome,
+  AHEAD_HOME: runtimeHome,
+  AHEAD_USER_HOME: userHome,
+};
 const original = "print('saved')\n";
 await writeFile(path.join(workspace, "main.py"), original);
 const clients = [];
 
 function start() {
-  const child = spawn(binary, ["--proxy"], { cwd: workspace, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(binary, ["--proxy"], { cwd: workspace, detached: true, stdio: ["pipe", "pipe", "pipe"], env: smokeEnvironment });
   const pending = new Map();
   let nextId = 0;
   let stderr = "";

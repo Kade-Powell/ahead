@@ -1,0 +1,1728 @@
+use crate::agent::AgentControl;
+use crate::codex_thread::CodexThread;
+use crate::config::Config;
+use crate::current_time::TimeProvider;
+use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::environment_selection::default_thread_environment_selections;
+use crate::mcp::McpManager;
+use crate::session::GitEnrichmentPolicy;
+use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::SessionIo;
+use crate::session::SessionSpawnArgs;
+use crate::session::resolve_multi_agent_version;
+use crate::session::session::Session;
+use ahead_agent_graph_store::AgentGraphStore;
+use ahead_agent_graph_store::ThreadSpawnEdgeStatus;
+use ahead_agent_skills::HostSkillsService;
+#[cfg(test)]
+use ahead_model_auth::AheadAuth;
+use ahead_model_auth::AuthManager;
+use ahead_model_auth::default_client::AHEAD_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
+use ahead_model_auth::default_client::originator;
+use ahead_runtime_api::LoadedUserInstructions;
+use ahead_runtime_api::UserInstructionsProvider;
+use codex_code_mode::CodeModeSessionProvider;
+use codex_code_mode::DisabledCodeModeSessionProvider;
+use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
+use codex_exec_server::EnvironmentManager;
+use codex_exec_server::LocalAgentRuntimePaths;
+use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_model_provider::create_model_provider;
+#[cfg(test)]
+use codex_model_provider_info::ModelProviderInfo;
+#[cfg(test)]
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationModeMask;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::W3cTraceContext;
+#[cfg(test)]
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::MoveThreadToSectionParams;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::StoredModelContext;
+use codex_thread_store::StoredThread;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadMetadataPatch;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreError;
+use codex_thread_store::UpdateThreadMetadataParams;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::sync::broadcast;
+use tracing::instrument;
+use tracing::warn;
+
+const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
+
+// Reject pathological selected cwd values at the environment-selection boundary.
+const MAX_TURN_ENVIRONMENT_CWD_BYTES: usize = 8 * 1024;
+
+/// Test-only override for enabling thread-manager behaviors used by integration
+/// tests.
+///
+/// In production builds this value should remain at its default (`false`) and
+/// must not be toggled.
+#[cfg(test)]
+static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+type CapturedOps = Vec<(ThreadId, Op)>;
+#[cfg(test)]
+type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
+pub(crate) type ThreadIdGenerator = Arc<dyn Fn() -> ThreadId + Send + Sync>;
+
+// `Op` is intentionally not `Clone`. Thread-manager tests only snapshot the
+// small subset of ops they inspect.
+#[cfg(test)]
+fn capture_test_op(op: &Op) -> Option<Op> {
+    match op {
+        Op::Interrupt => Some(Op::Interrupt),
+        Op::InterAgentCommunication {
+            communication,
+            start_options,
+        } => Some(Op::InterAgentCommunication {
+            communication: communication.clone(),
+            start_options: start_options.clone(),
+        }),
+        Op::Shutdown => Some(Op::Shutdown),
+        _ => None,
+    }
+}
+
+pub(crate) fn default_thread_id_generator() -> ThreadIdGenerator {
+    Arc::new(ThreadId::new)
+}
+
+#[cfg(test)]
+pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
+    FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn should_use_test_thread_manager_behavior() -> bool {
+    FORCE_TEST_THREAD_MANAGER_BEHAVIOR.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+struct TempCodexHomeGuard {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TempCodexHomeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Represents a newly created Codex thread (formerly called a conversation), including the first event
+/// (which is [`EventMsg::SessionConfigured`]).
+pub struct NewThread {
+    pub thread_id: ThreadId,
+    pub thread: Arc<CodexThread>,
+    pub session_configured: SessionConfiguredEvent,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ThreadShutdownReport {
+    pub completed: Vec<ThreadId>,
+    pub submit_failed: Vec<ThreadId>,
+    pub timed_out: Vec<ThreadId>,
+}
+
+enum ShutdownOutcome {
+    Complete,
+    SubmitFailed,
+    TimedOut,
+}
+
+/// [`ThreadManager`] is responsible for creating threads and maintaining
+/// them in memory.
+pub struct ThreadManager {
+    state: Arc<ThreadManagerState>,
+    #[cfg(test)]
+    _test_codex_home_guard: Option<TempCodexHomeGuard>,
+}
+
+pub struct StartThreadOptions {
+    pub config: Config,
+    pub allow_provider_model_fallback: bool,
+    pub initial_history: InitialHistory,
+    pub history_mode: Option<ThreadHistoryMode>,
+    pub session_source: Option<SessionSource>,
+    pub thread_source: Option<ThreadSource>,
+    pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    pub metrics_service_name: Option<String>,
+    pub parent_trace: Option<W3cTraceContext>,
+    pub environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub client_mcp_extensions: ClientMcpExtensions,
+    /// Thread ID reserved before startup so the caller can associate host-owned state with it.
+    pub reserved_thread_id: Option<ThreadId>,
+}
+
+impl StartThreadOptions {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            allow_provider_model_fallback: false,
+            initial_history: InitialHistory::New,
+            history_mode: None,
+            session_source: None,
+            thread_source: None,
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: None,
+            client_mcp_extensions: ClientMcpExtensions::default(),
+            reserved_thread_id: None,
+        }
+    }
+}
+
+struct ThreadSpawnRequest {
+    options: StartThreadOptions,
+    auth_manager: Arc<AuthManager>,
+    agent_control: AgentControl,
+    parent_thread_id: Option<ThreadId>,
+    forked_from_thread_id: Option<ThreadId>,
+    inherited_environments: Option<TurnEnvironmentSnapshot>,
+    inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+    user_shell_override: Option<crate::shell::Shell>,
+}
+
+impl ThreadSpawnRequest {
+    fn new(
+        options: StartThreadOptions,
+        auth_manager: Arc<AuthManager>,
+        agent_control: AgentControl,
+    ) -> Self {
+        Self {
+            options,
+            auth_manager,
+            agent_control,
+            parent_thread_id: None,
+            forked_from_thread_id: None,
+            inherited_environments: None,
+            inherited_exec_policy: None,
+            user_shell_override: None,
+        }
+    }
+}
+
+pub(crate) struct ResumeThreadWithHistoryOptions {
+    pub(crate) config: Config,
+    pub(crate) initial_history: InitialHistory,
+    pub(crate) agent_control: AgentControl,
+    pub(crate) session_source: SessionSource,
+    pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) environment_selections: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
+    pub(crate) inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+    pub(crate) client_mcp_extensions: Option<ClientMcpExtensions>,
+}
+
+/// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
+/// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
+/// function to require an `Arc<&Self>`.
+pub(crate) struct ThreadManagerState {
+    threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    thread_created_tx: broadcast::Sender<ThreadId>,
+    thread_id_generator: ThreadIdGenerator,
+    auth_manager: Arc<AuthManager>,
+    models_manager: SharedModelsManager,
+    environment_manager: Arc<EnvironmentManager>,
+    starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
+    skills_service: Arc<HostSkillsService>,
+    mcp_manager: Arc<McpManager>,
+    code_mode_session_provider: Arc<dyn CodeModeSessionProvider>,
+    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+    thread_store: Arc<dyn ThreadStore>,
+    agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+    external_time_provider: Option<Arc<dyn TimeProvider>>,
+    session_source: SessionSource,
+    installation_id: String,
+    // Captures submitted ops for testing purpose when test mode is enabled.
+    #[cfg(test)]
+    ops_log: Option<SharedCapturedOps>,
+}
+
+pub fn build_models_manager(
+    config: &Config,
+    auth_manager: Arc<AuthManager>,
+) -> SharedModelsManager {
+    let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
+    // AHEAD can switch named providers within one workspace runtime home. The
+    // retained file cache is keyed only by runtime home and client version, so
+    // it can supply one provider's catalog to another provider. Keep this
+    // manager's endpoint catalog scoped to its selected provider instead.
+    provider.models_manager_without_cache(config.model_catalog.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn in_memory_thread_store_for_tests() -> Arc<dyn ThreadStore> {
+    Arc::new(InMemoryThreadStore::default())
+}
+
+impl ThreadManager {
+    /// Builds the AHEAD host with an application-owned durable thread store.
+    pub async fn new_for_ahead_with_instructions_and_store(
+        config: &Config,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+        thread_store: Arc<dyn ThreadStore>,
+        agent_graph_store: Arc<dyn AgentGraphStore>,
+    ) -> CodexResult<Self> {
+        let auth_manager = AuthManager::shared_empty();
+        let local_runtime_paths = LocalAgentRuntimePaths::from_optional_paths(
+            config.ahead_self_exe.clone(),
+            config.ahead_linux_sandbox_exe.clone(),
+        )?;
+        let environment_manager = EnvironmentManager::local_only(local_runtime_paths);
+        let installation_id =
+            crate::installation_id::resolve_installation_id(&config.codex_home).await?;
+
+        Ok(Self::new(
+            config,
+            Arc::clone(&auth_manager),
+            build_models_manager(config, auth_manager),
+            SessionSource::Custom("ahead".to_string()),
+            Arc::new(environment_manager),
+            user_instructions_provider,
+            thread_store,
+            Some(agent_graph_store),
+            installation_id,
+            /*external_time_provider*/ None,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: &Config,
+        auth_manager: Arc<AuthManager>,
+        models_manager: SharedModelsManager,
+        session_source: SessionSource,
+        environment_manager: Arc<EnvironmentManager>,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+        thread_store: Arc<dyn ThreadStore>,
+        agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+        installation_id: String,
+        external_time_provider: Option<Arc<dyn TimeProvider>>,
+    ) -> Self {
+        let codex_home = config.codex_home.clone();
+        let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+        let skills_service = Arc::new(HostSkillsService::new(
+            codex_home.clone(),
+            config.bundled_skills_enabled(),
+        ));
+        let mcp_manager = Arc::new(McpManager::new());
+        let code_mode_session_provider: Arc<dyn CodeModeSessionProvider> =
+            if config.features.enabled(Feature::CodeModeHost)
+                || config.code_mode.disable_in_process_fallback
+            {
+                Arc::new(ProcessOwnedCodeModeSessionProvider::default())
+            } else {
+                Arc::new(DisabledCodeModeSessionProvider)
+            };
+        Self {
+            state: Arc::new(ThreadManagerState {
+                threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_created_tx,
+                thread_id_generator: default_thread_id_generator(),
+                models_manager,
+                environment_manager,
+                starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
+                skills_service,
+                mcp_manager,
+                code_mode_session_provider,
+                user_instructions_provider,
+                thread_store,
+                agent_graph_store,
+                external_time_provider,
+                auth_manager,
+                session_source,
+                installation_id,
+                #[cfg(test)]
+                ops_log: should_use_test_thread_manager_behavior()
+                    .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+            }),
+            #[cfg(test)]
+            _test_codex_home_guard: None,
+        }
+    }
+
+    /// Generate every new thread identifier with the caller-provided factory.
+    pub fn with_thread_id_generator(
+        mut self,
+        generator: impl Fn() -> ThreadId + Send + Sync + 'static,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("thread ID generator must be set before thread manager is shared");
+        };
+        state.thread_id_generator = Arc::new(generator);
+        self
+    }
+
+    /// Replaces the process-wide provider before this manager is shared with threads.
+    pub fn with_code_mode_session_provider(
+        mut self,
+        provider: Arc<dyn CodeModeSessionProvider>,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("code-mode session provider must be set before thread manager is shared");
+        };
+        state.code_mode_session_provider = provider;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_code_mode_host_program_for_tests(
+        mut self,
+        host_program: PathBuf,
+        _config: &Config,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("new thread manager state should not be shared");
+        };
+        state.code_mode_session_provider = Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(host_program),
+        );
+        self
+    }
+
+    /// Construct with a dummy AuthManager containing the provided AheadAuth.
+    /// Used for integration tests: should not be used by ordinary business logic.
+    #[cfg(test)]
+    pub(crate) fn with_models_provider_for_tests(
+        auth: AheadAuth,
+        provider: ModelProviderInfo,
+    ) -> Self {
+        set_thread_manager_test_mode_for_tests(/*enabled*/ true);
+        let codex_home = std::env::temp_dir().join(format!(
+            "codex-thread-manager-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&codex_home)
+            .unwrap_or_else(|err| panic!("temp codex home dir create failed: {err}"));
+        let mut manager = Self::with_models_provider_and_home_for_tests(
+            auth,
+            provider,
+            codex_home.clone(),
+            Arc::new(EnvironmentManager::default_for_tests()),
+        );
+        manager._test_codex_home_guard = Some(TempCodexHomeGuard { path: codex_home });
+        manager
+    }
+
+    /// Construct with a dummy AuthManager containing the provided AheadAuth and codex home.
+    /// Used for integration tests: should not be used by ordinary business logic.
+    #[cfg(test)]
+    pub(crate) fn with_models_provider_and_home_for_tests(
+        auth: AheadAuth,
+        provider: ModelProviderInfo,
+        codex_home: PathBuf,
+        environment_manager: Arc<EnvironmentManager>,
+    ) -> Self {
+        let store_id = format!("codex-core-test:{codex_home:?}");
+        Self::with_models_provider_home_and_thread_store_for_tests(
+            auth,
+            provider,
+            codex_home,
+            environment_manager,
+            InMemoryThreadStore::for_id(store_id),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_models_provider_home_and_thread_store_for_tests(
+        auth: AheadAuth,
+        provider: ModelProviderInfo,
+        codex_home: PathBuf,
+        environment_manager: Arc<EnvironmentManager>,
+        thread_store: Arc<dyn ThreadStore>,
+    ) -> Self {
+        set_thread_manager_test_mode_for_tests(/*enabled*/ true);
+        let auth_manager = AuthManager::from_auth_for_testing(auth);
+        let installation_id = uuid::Uuid::new_v4().to_string();
+        let absolute_codex_home = match AbsolutePathBuf::from_absolute_path_checked(&codex_home) {
+            Ok(codex_home) => codex_home,
+            Err(err) => panic!("test codex_home should be absolute: {err}"),
+        };
+        let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+        let skills_service = Arc::new(HostSkillsService::new(
+            absolute_codex_home.clone(),
+            /*bundled_skills_enabled*/ true,
+        ));
+        let mcp_manager = Arc::new(McpManager::new());
+        Self {
+            state: Arc::new(ThreadManagerState {
+                threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_created_tx,
+                thread_id_generator: default_thread_id_generator(),
+                models_manager: create_model_provider(provider, Some(auth_manager.clone()))
+                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                environment_manager,
+                starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
+                skills_service,
+                mcp_manager,
+                code_mode_session_provider: Arc::new(DisabledCodeModeSessionProvider),
+                user_instructions_provider: Arc::new(
+                    crate::test_support::EmptyUserInstructionsProvider,
+                ),
+                thread_store,
+                agent_graph_store: None,
+                external_time_provider: None,
+                auth_manager,
+                session_source: SessionSource::Exec,
+                installation_id,
+                #[cfg(test)]
+                ops_log: should_use_test_thread_manager_behavior()
+                    .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
+            }),
+            _test_codex_home_guard: None,
+        }
+    }
+
+    pub fn session_source(&self) -> SessionSource {
+        self.state.session_source.clone()
+    }
+
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        self.state.auth_manager.clone()
+    }
+
+    pub fn skills_service(&self) -> Arc<HostSkillsService> {
+        self.state.skills_service.clone()
+    }
+
+    pub fn mcp_manager(&self) -> Arc<McpManager> {
+        self.state.mcp_manager.clone()
+    }
+
+    pub fn environment_manager(&self) -> Arc<EnvironmentManager> {
+        self.state.environment_manager.clone()
+    }
+
+    /// Refreshes every loaded thread and marks threads that are still being created.
+    pub async fn invalidate_mcp_runtimes(&self) {
+        self.invalidate_starting_mcp_runtimes();
+        let threads = self
+            .state
+            .threads
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.session.request_mcp_runtime_refresh();
+        }
+    }
+
+    fn invalidate_starting_mcp_runtimes(&self) {
+        let mut starting = self
+            .state
+            .starting_mcp_runtimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        starting.retain(|runtime| {
+            let Some(runtime) = runtime.upgrade() else {
+                return false;
+            };
+            runtime.store(true, Ordering::Release);
+            true
+        });
+    }
+
+    pub fn default_environment_selections(
+        &self,
+        cwd: &AbsolutePathBuf,
+        workspace_roots: &[AbsolutePathBuf],
+    ) -> Vec<TurnEnvironmentSelection> {
+        default_thread_environment_selections(
+            self.state.environment_manager.as_ref(),
+            cwd,
+            workspace_roots,
+        )
+    }
+
+    pub fn validate_environment_selections(
+        &self,
+        environments: &[TurnEnvironmentSelection],
+    ) -> CodexResult<()> {
+        let mut environment_ids = HashSet::with_capacity(environments.len());
+        for environment in environments {
+            if environment.cwd.inferred_native_path_string().len() > MAX_TURN_ENVIRONMENT_CWD_BYTES
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "turn environment working directory exceeds the maximum size".to_string(),
+                ));
+            }
+            if !environment_ids.insert(environment.environment_id.as_str()) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "duplicate turn environment id `{}`",
+                    environment.environment_id
+                )));
+            }
+            self.state
+                .environment_manager
+                .get_environment(&environment.environment_id)
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "unknown turn environment id `{}`",
+                        environment.environment_id
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn get_models_manager(&self) -> SharedModelsManager {
+        self.state.models_manager.clone()
+    }
+
+    pub async fn list_models(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Vec<ModelPreset> {
+        self.state
+            .models_manager
+            .list_models(refresh_strategy, http_client_factory)
+            .await
+    }
+
+    pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        self.state.models_manager.list_collaboration_modes()
+    }
+
+    pub async fn list_thread_ids(&self) -> Vec<ThreadId> {
+        self.state.list_thread_ids().await
+    }
+
+    pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {
+        self.state.thread_created_tx.subscribe()
+    }
+
+    pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
+        self.state.get_thread(thread_id).await
+    }
+
+    /// Updates metadata for loaded and cold threads through one entrypoint.
+    ///
+    /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
+    /// with live rollout writes. Cold threads go directly to the store, which owns unloaded JSONL
+    /// compatibility and metadata updates. This API always returns a materialized thread;
+    /// if the store reports a successful no-op without one, it performs a fallback read.
+    pub async fn update_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: ThreadMetadataPatch,
+        include_archived: bool,
+    ) -> CodexResult<StoredThread> {
+        if let Ok(thread) = self.get_thread(thread_id).await {
+            if thread.config_snapshot().await.ephemeral {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "ephemeral thread does not support metadata updates: {thread_id}"
+                )));
+            }
+            return thread
+                .update_thread_metadata(patch, include_archived)
+                .await
+                .map_err(|err| thread_store_metadata_update_error(thread_id, err));
+        }
+        let updated = self
+            .state
+            .thread_store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch,
+                include_archived,
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                err => thread_store_metadata_update_error(thread_id, err),
+            })?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => self
+                .state
+                .thread_store
+                .read_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived,
+                    include_history: false,
+                })
+                .await
+                .map_err(|err| thread_store_metadata_update_error(thread_id, err)),
+        }
+    }
+
+    /// Moves a thread to, within, or out of a server-ordered section.
+    pub async fn move_thread_to_section(
+        &self,
+        thread_id: ThreadId,
+        section: Option<&str>,
+        before_thread_id: Option<ThreadId>,
+    ) -> CodexResult<()> {
+        if let Ok(thread) = self.get_thread(thread_id).await {
+            if thread.config_snapshot().await.ephemeral {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "ephemeral thread does not support section moves: {thread_id}"
+                )));
+            }
+            // Explicit placement must work before the first turn materializes the thread.
+            thread.ensure_rollout_materialized().await;
+            thread.flush_rollout().await?;
+        }
+
+        self.state
+            .thread_store
+            .move_thread_to_section(MoveThreadToSectionParams {
+                thread_id,
+                section: section.map(ToOwned::to_owned),
+                before_thread_id,
+            })
+            .await
+            .map_err(|err| thread_store_metadata_update_error(thread_id, err))
+    }
+
+    /// List `thread_id` plus all known descendants in its spawn subtree.
+    pub async fn list_agent_subtree_thread_ids(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let mut subtree_thread_ids = Vec::new();
+        let mut seen_thread_ids = HashSet::new();
+        subtree_thread_ids.push(thread_id);
+        seen_thread_ids.insert(thread_id);
+
+        if let Some(agent_graph_store) = self.state.agent_graph_store() {
+            for descendant_id in agent_graph_store
+                .list_thread_spawn_descendants(thread_id, /*status_filter*/ None)
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
+                })?
+            {
+                if seen_thread_ids.insert(descendant_id) {
+                    subtree_thread_ids.push(descendant_id);
+                }
+            }
+        }
+
+        for descendant_id in self
+            .agent_control()
+            .list_live_agent_subtree_thread_ids(thread_id)
+            .await?
+        {
+            if seen_thread_ids.insert(descendant_id) {
+                subtree_thread_ids.push(descendant_id);
+            }
+        }
+
+        Ok(subtree_thread_ids)
+    }
+
+    pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
+        Box::pin(self.start_thread_inner(options, /*forked_from_thread_id*/ None)).await
+    }
+
+    /// Restores a persisted AHEAD thread without routing through app-server.
+    pub async fn resume_thread_by_id(
+        &self,
+        thread_id: ThreadId,
+        config: Config,
+    ) -> CodexResult<NewThread> {
+        self.resume_thread_by_id_with_tools(thread_id, config, Vec::new())
+            .await
+    }
+
+    /// Restores a thread and reattaches host-owned dynamic tools.
+    pub async fn resume_thread_by_id_with_tools(
+        &self,
+        thread_id: ThreadId,
+        config: Config,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    ) -> CodexResult<NewThread> {
+        let mut stored_thread = self
+            .state
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+                err => CodexErr::Fatal(format!(
+                    "failed to read persisted AHEAD thread {thread_id}: {err}"
+                )),
+            })?;
+        let history_items = if stored_thread.history_mode == ThreadHistoryMode::Paginated {
+            self.state
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: true,
+                })
+                .await?
+                .items
+        } else {
+            self.state
+                .thread_store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: true,
+                })
+                .await
+                .map_err(|err| match err {
+                    ThreadStoreError::ThreadNotFound { thread_id } => {
+                        CodexErr::ThreadNotFound(thread_id)
+                    }
+                    ThreadStoreError::InvalidRequest { message } => {
+                        CodexErr::InvalidRequest(message)
+                    }
+                    err => CodexErr::Fatal(format!(
+                        "failed to read persisted AHEAD thread {thread_id}: {err}"
+                    )),
+                })?
+                .items
+        };
+        stored_thread.history = Some(StoredThreadHistory {
+            thread_id,
+            items: history_items,
+        });
+        let initial_history = stored_thread_to_initial_history(stored_thread, None)?;
+        self.resume_thread_with_history_with_tools(
+            config,
+            initial_history,
+            self.auth_manager(),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            dynamic_tools,
+        )
+        .await
+    }
+
+    /// Starts a fresh internal session associated with an existing parent thread.
+    pub async fn spawn_internal_session(
+        &self,
+        parent_thread_id: ThreadId,
+        mut options: StartThreadOptions,
+    ) -> CodexResult<NewThread> {
+        if !matches!(options.session_source, Some(SessionSource::Internal(_))) {
+            return Err(CodexErr::InvalidRequest(
+                "internal sessions require an internal session source".to_string(),
+            ));
+        }
+        let parent = self.get_thread(parent_thread_id).await?;
+        options.initial_history = InitialHistory::New;
+        let mut request = ThreadSpawnRequest::new(
+            options,
+            Arc::clone(&parent.session.services.auth_manager),
+            parent.session.services.agent_control.clone(),
+        );
+        request.parent_thread_id = Some(parent_thread_id);
+        Box::pin(self.state.spawn_thread(request)).await
+    }
+
+    /// Starts a fresh AHEAD-managed subagent thread owned by `parent_thread_id`.
+    /// The caller supplies its AHEAD dynamic tools and an explicit ThreadSpawn source;
+    /// this method preserves the parent's runtime control, MCP context and Turso edge.
+    pub async fn spawn_subagent_session(
+        &self,
+        parent_thread_id: ThreadId,
+        mut options: StartThreadOptions,
+    ) -> CodexResult<NewThread> {
+        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: source_parent_id,
+            ..
+        })) = options.session_source.as_ref()
+        else {
+            return Err(CodexErr::InvalidRequest(
+                "subagent threads require a ThreadSpawn session source".to_string(),
+            ));
+        };
+        if *source_parent_id != parent_thread_id {
+            return Err(CodexErr::InvalidRequest(
+                "subagent source parent does not match the owning thread".to_string(),
+            ));
+        }
+
+        let parent = self.get_thread(parent_thread_id).await?;
+        let graph_store = self.state.agent_graph_store().ok_or_else(|| {
+            CodexErr::Fatal("subagent threads require a durable agent graph store".to_string())
+        })?;
+        options.initial_history = InitialHistory::New;
+        options.thread_source = Some(ThreadSource::Subagent);
+        options.client_mcp_extensions = parent.session.services.client_mcp_extensions.clone();
+        if options.history_mode.is_none()
+            && matches!(
+                parent.config_snapshot().await.history_mode,
+                ThreadHistoryMode::Paginated
+            )
+        {
+            options.history_mode = Some(ThreadHistoryMode::Paginated);
+        }
+
+        let mut request = ThreadSpawnRequest::new(
+            options,
+            Arc::clone(&parent.session.services.auth_manager),
+            parent.session.services.agent_control.clone(),
+        );
+        request.parent_thread_id = Some(parent_thread_id);
+        request.inherited_exec_policy = Some(Arc::clone(&parent.session.services.exec_policy));
+        let child_thread_id = self.reserve_thread_id();
+        request.options.reserved_thread_id = Some(child_thread_id);
+        graph_store
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                child_thread_id,
+                ThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to persist subagent edge {} -> {} before thread creation: {error}",
+                    parent_thread_id, child_thread_id
+                ))
+            })?;
+        let child = match self.state.spawn_thread(request).await {
+            Ok(child) => child,
+            Err(spawn_error) => {
+                return match graph_store
+                    .set_thread_spawn_edge_status(child_thread_id, ThreadSpawnEdgeStatus::Closed)
+                    .await
+                {
+                    Ok(()) => Err(spawn_error),
+                    Err(close_error) => Err(CodexErr::Fatal(format!(
+                        "failed to spawn subagent {child_thread_id}: {spawn_error}; also failed to close its graph edge: {close_error}"
+                    ))),
+                };
+            }
+        };
+        self.state.notify_thread_created(child.thread_id);
+        Ok(child)
+    }
+
+    /// Allocates a thread ID before startup so a caller can associate host-owned state with it.
+    pub fn reserve_thread_id(&self) -> ThreadId {
+        self.state.thread_id_generator.as_ref()()
+    }
+
+    async fn start_thread_inner(
+        &self,
+        mut options: StartThreadOptions,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> CodexResult<NewThread> {
+        let agent_control = self.agent_control_for_config(&options.config);
+        let (resumed_session_source, resumed_thread_source) = options
+            .initial_history
+            .get_resumed_session_sources()
+            .unwrap_or_else(|| (self.state.session_source.clone(), None));
+        options.session_source = Some(
+            options
+                .session_source
+                .take()
+                .unwrap_or(resumed_session_source),
+        );
+        options.thread_source = options.thread_source.take().or(resumed_thread_source);
+        let mut request =
+            ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
+        request.forked_from_thread_id = forked_from_thread_id;
+        Box::pin(self.state.spawn_thread(request)).await
+    }
+
+    /// Reloads a recorded Multi-Agent V2 child through its currently loaded immediate parent.
+    ///
+    /// The child keeps the existing parent-controlled reload semantics. Callers cannot supply
+    /// configuration overrides, and an unavailable or unrecognized owner is an error.
+    pub async fn ensure_multi_agent_v2_child_loaded(
+        &self,
+        child_thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        let stored_thread = self
+            .state
+            .read_stored_thread(ReadThreadParams {
+                thread_id: child_thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await?;
+        let Some(parent_thread_id) = stored_thread.parent_thread_id else {
+            return Err(CodexErr::InvalidRequest(format!(
+                "thread {child_thread_id} is not a recorded multi-agent v2 child"
+            )));
+        };
+        let parent = self.get_thread(parent_thread_id).await.map_err(|_| {
+            CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {child_thread_id}: parent {parent_thread_id} is not loaded; resume the parent first"
+            ))
+        })?;
+        let config = parent.session.get_config().await.as_ref().clone();
+        let agent_control = parent.session.services.agent_control.clone();
+        agent_control
+            .ensure_v2_agent_loaded(config, child_thread_id, Some(parent))
+            .await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    pub async fn resume_thread_with_history(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        client_mcp_extensions: ClientMcpExtensions,
+    ) -> CodexResult<NewThread> {
+        self.resume_thread_with_history_with_tools(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            client_mcp_extensions,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn resume_thread_with_history_with_tools(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        client_mcp_extensions: ClientMcpExtensions,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    ) -> CodexResult<NewThread> {
+        let agent_control = self.agent_control_for_config(&config);
+        let (session_source, thread_source) = initial_history
+            .get_resumed_session_sources()
+            .unwrap_or_else(|| (self.state.session_source.clone(), None));
+        if let InitialHistory::Resumed(resumed) = &initial_history
+            && initial_history.get_multi_agent_version() == Some(MultiAgentVersion::V2)
+            && !session_source.is_non_root_agent()
+        {
+            agent_control
+                .restore_v2_agent_metadata(resumed.conversation_id)
+                .await;
+        }
+        let options = StartThreadOptions {
+            initial_history,
+            session_source: Some(session_source),
+            thread_source,
+            parent_trace,
+            client_mcp_extensions,
+            dynamic_tools,
+            ..StartThreadOptions::new(config)
+        };
+        Box::pin(self.state.spawn_thread(ThreadSpawnRequest::new(
+            options,
+            auth_manager,
+            agent_control,
+        )))
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_thread_with_user_shell_override_for_tests(
+        &self,
+        config: Config,
+        user_shell_override: crate::shell::Shell,
+        client_mcp_extensions: ClientMcpExtensions,
+    ) -> CodexResult<NewThread> {
+        let agent_control = self.agent_control_for_config(&config);
+        let options = StartThreadOptions {
+            client_mcp_extensions,
+            ..StartThreadOptions::new(config)
+        };
+        let mut request =
+            ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
+        request.user_shell_override = Some(user_shell_override);
+        Box::pin(self.state.spawn_thread(request)).await
+    }
+
+    /// Removes the thread from the manager's internal map, though the thread is stored
+    /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
+    /// Returns the thread if the thread was found and removed.
+    pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
+        self.state.threads.write().await.remove(thread_id)
+    }
+
+    /// Removes a thread only if `thread_id` still maps to `expected`.
+    ///
+    /// Delayed cleanup uses this to avoid removing a replacement runtime registered under the
+    /// same thread ID.
+    pub async fn remove_thread_if_matches(
+        &self,
+        thread_id: &ThreadId,
+        expected: &Arc<CodexThread>,
+    ) -> Option<Arc<CodexThread>> {
+        let mut threads = self.state.threads.write().await;
+        if threads
+            .get(thread_id)
+            .is_some_and(|thread| Arc::ptr_eq(thread, expected))
+        {
+            threads.remove(thread_id)
+        } else {
+            None
+        }
+    }
+
+    /// Tries to shut down all tracked threads concurrently within the provided timeout.
+    /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
+    /// remain tracked so callers can retry or inspect them later.
+    pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
+        let threads = {
+            let threads = self.state.threads.read().await;
+            threads
+                .iter()
+                .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut shutdowns = threads
+            .into_iter()
+            .map(|(thread_id, thread)| async move {
+                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
+                {
+                    Ok(Ok(())) => ShutdownOutcome::Complete,
+                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                    Err(_) => ShutdownOutcome::TimedOut,
+                };
+                (thread_id, outcome)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut report = ThreadShutdownReport::default();
+
+        while let Some((thread_id, outcome)) = shutdowns.next().await {
+            match outcome {
+                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
+                ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
+            }
+        }
+
+        let mut tracked_threads = self.state.threads.write().await;
+        for thread_id in &report.completed {
+            tracked_threads.remove(thread_id);
+        }
+
+        report
+            .completed
+            .sort_by_key(std::string::ToString::to_string);
+        report
+            .submit_failed
+            .sort_by_key(std::string::ToString::to_string);
+        report
+            .timed_out
+            .sort_by_key(std::string::ToString::to_string);
+        report
+    }
+
+    pub(crate) fn agent_control(&self) -> AgentControl {
+        AgentControl::new(
+            Arc::downgrade(&self.state),
+            self.state.thread_id_generator.clone(),
+            /*rollout_budget*/ None,
+        )
+    }
+
+    fn agent_control_for_config(&self, config: &Config) -> AgentControl {
+        AgentControl::new(
+            Arc::downgrade(&self.state),
+            self.state.thread_id_generator.clone(),
+            config.rollout_budget.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_ops(&self) -> Vec<(ThreadId, Op)> {
+        self.state
+            .ops_log
+            .as_ref()
+            .and_then(|ops_log| {
+                ops_log.lock().ok().map(|log| {
+                    log.iter()
+                        .filter_map(|(thread_id, op)| {
+                            capture_test_op(op).map(|op| (*thread_id, op))
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl ThreadManagerState {
+    pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
+        self.agent_graph_store.clone()
+    }
+
+    pub(crate) async fn list_thread_ids(&self) -> Vec<ThreadId> {
+        self.threads
+            .read()
+            .await
+            .iter()
+            .filter_map(|(thread_id, thread)| {
+                (!thread.session_source.is_internal()).then_some(*thread_id)
+            })
+            .collect()
+    }
+
+    /// List parent-child edges for currently loaded thread-spawn agents.
+    pub(crate) async fn list_live_thread_spawn_edges(&self) -> Vec<(ThreadId, ThreadId)> {
+        self.threads
+            .read()
+            .await
+            .iter()
+            .filter_map(|(thread_id, thread)| {
+                if thread.session_source.is_internal() {
+                    return None;
+                }
+                match &thread.session_source {
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id,
+                        ..
+                    }) => Some((*parent_thread_id, *thread_id)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Fetch a thread by ID or return ThreadNotFound.
+    pub(crate) async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
+        let threads = self.threads.read().await;
+        match threads.get(&thread_id) {
+            Some(thread) if !thread.session_source.is_internal() => Ok(thread.clone()),
+            Some(_) | None => Err(CodexErr::ThreadNotFound(thread_id)),
+        }
+    }
+
+    pub(crate) async fn read_stored_thread(
+        &self,
+        params: ReadThreadParams,
+    ) -> CodexResult<StoredThread> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .read_thread(params)
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                ThreadStoreError::InvalidRequest { message } => {
+                    if message.starts_with("no rollout found for thread id ") {
+                        CodexErr::ThreadNotFound(thread_id)
+                    } else {
+                        CodexErr::Fatal(format!(
+                            "failed to read stored thread {thread_id}: invalid thread-store request: {message}"
+                        ))
+                    }
+                }
+                err => CodexErr::Fatal(format!("failed to read stored thread {thread_id}: {err}")),
+            })
+    }
+
+    pub(crate) async fn load_latest_model_context(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> CodexResult<StoredModelContext> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .load_latest_model_context(params)
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                err => CodexErr::Fatal(format!(
+                    "failed to load model context for thread {thread_id}: {err}"
+                )),
+            })
+    }
+
+    /// Send an operation to a thread by ID.
+    pub(crate) async fn send_op(
+        &self,
+        thread_id: ThreadId,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+    ) -> CodexResult<String> {
+        let thread = self.get_thread(thread_id).await?;
+        #[cfg(test)]
+        if let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+            && let Some(captured_op) = capture_test_op(&op)
+        {
+            log.push((thread_id, captured_op));
+        }
+        thread
+            .io
+            .submit_with_trace(op, /*trace*/ None, parent_turn_id, root_turn_id)
+            .await
+    }
+
+    /// Remove a thread from the manager by ID, returning it when present.
+    pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
+        self.threads.write().await.remove(thread_id)
+    }
+
+    async fn initial_multi_agent_version_for_spawn(
+        &self,
+        initial_history: &InitialHistory,
+        session_source: Option<&SessionSource>,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> Option<MultiAgentVersion> {
+        let inherited_thread_id = match session_source {
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            })) => Some(*parent_thread_id),
+            _ => match initial_history {
+                InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+                InitialHistory::Forked(_) => forked_from_thread_id.or(parent_thread_id),
+                InitialHistory::New | InitialHistory::Cleared => parent_thread_id,
+            },
+        };
+        let inherited_multi_agent_version = match inherited_thread_id {
+            Some(thread_id) => self
+                .get_thread(thread_id)
+                .await
+                .ok()
+                .and_then(|thread| thread.multi_agent_version()),
+            None => None,
+        };
+        resolve_multi_agent_version(initial_history, inherited_multi_agent_version)
+    }
+
+    /// Resolves the provider snapshot for a newly spawned runtime.
+    ///
+    /// Loads a fresh provider snapshot for:
+    /// - fresh root threads;
+    /// - cold resumes;
+    /// - root forks.
+    ///
+    /// Uses an existing snapshot for:
+    /// - subagents, which inherit from their parent without invoking the
+    ///   provider;
+    /// - running resumes and compaction paths, which retain the live session.
+    ///
+    /// Provider warnings only apply to fresh loads. If a parent runtime is no
+    /// longer available, its child starts without provider instructions rather
+    /// than loading independently.
+    async fn user_instructions_for_spawn(
+        &self,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> LoadedUserInstructions {
+        let is_root_agent = !session_source.is_non_root_agent();
+        if is_root_agent {
+            return self
+                .user_instructions_provider
+                .load_user_instructions()
+                .await;
+        }
+
+        let inherited_thread_id = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            _ => parent_thread_id.or(forked_from_thread_id),
+        };
+        let instructions = match inherited_thread_id {
+            // The spawn path retains only thread IDs, so look up the live
+            // runtime again here to inherit its user instructions.
+            Some(thread_id) => match self.get_thread(thread_id).await {
+                Ok(thread) => thread.session.user_instructions().await,
+                Err(_) => None,
+            },
+            None => None,
+        };
+        LoadedUserInstructions {
+            instructions,
+            warnings: Vec::new(),
+        }
+    }
+
+    async fn inherited_originator_for_parent_thread(
+        &self,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> Option<String> {
+        let inherited_thread_id = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            _ => parent_thread_id.or(forked_from_thread_id),
+        };
+        let thread = self.get_thread(inherited_thread_id?).await.ok()?;
+        let originator = thread.config_snapshot().await.originator;
+        (!originator.is_empty()).then_some(originator)
+    }
+
+    async fn effective_originator(
+        &self,
+        initial_history: &InitialHistory,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> String {
+        let persisted_originator = initial_history.get_session_originator();
+        let inherited_originator = match initial_history {
+            InitialHistory::New | InitialHistory::Cleared => {
+                self.inherited_originator_for_parent_thread(
+                    session_source,
+                    parent_thread_id,
+                    forked_from_thread_id,
+                )
+                .await
+            }
+            InitialHistory::Forked(_) if persisted_originator.is_none() => {
+                self.inherited_originator_for_parent_thread(
+                    session_source,
+                    parent_thread_id,
+                    forked_from_thread_id,
+                )
+                .await
+            }
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => None,
+        };
+
+        let env_originator = std::env::var(AHEAD_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
+            .is_ok()
+            .then(|| originator().value);
+        persisted_originator
+            .or(inherited_originator)
+            .or(env_originator)
+            .unwrap_or_else(|| originator().value)
+    }
+
+    pub(crate) async fn resume_thread_with_history_with_source(
+        &self,
+        options: ResumeThreadWithHistoryOptions,
+    ) -> CodexResult<NewThread> {
+        let ResumeThreadWithHistoryOptions {
+            config,
+            initial_history,
+            agent_control,
+            session_source,
+            parent_thread_id,
+            environment_selections,
+            inherited_environments,
+            inherited_exec_policy,
+            client_mcp_extensions,
+        } = options;
+        let client_mcp_extensions = match client_mcp_extensions {
+            Some(client_mcp_extensions) => client_mcp_extensions,
+            None => self.client_mcp_extensions_for_child(parent_thread_id).await,
+        };
+        let thread_source = initial_history.get_resumed_thread_source();
+        let environments = environment_selections.or_else(|| {
+            inherited_environments
+                .as_ref()
+                .map(TurnEnvironmentSnapshot::to_selections)
+        });
+        let options = StartThreadOptions {
+            initial_history,
+            session_source: Some(session_source),
+            thread_source,
+            environments,
+            client_mcp_extensions,
+            ..StartThreadOptions::new(config)
+        };
+        let mut request =
+            ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
+        request.parent_thread_id = parent_thread_id;
+        request.inherited_environments = inherited_environments;
+        request.inherited_exec_policy = inherited_exec_policy;
+        Box::pin(self.spawn_thread(request)).await
+    }
+
+    async fn client_mcp_extensions_for_child(
+        &self,
+        parent_thread_id: Option<ThreadId>,
+    ) -> ClientMcpExtensions {
+        let Some(parent_thread_id) = parent_thread_id else {
+            return ClientMcpExtensions::default();
+        };
+        self.get_thread(parent_thread_id)
+            .await
+            .map(|parent| parent.session.services.client_mcp_extensions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Spawn a new thread with optional history and register it with the manager.
+    async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let ThreadSpawnRequest {
+            options,
+            auth_manager,
+            agent_control,
+            parent_thread_id,
+            forked_from_thread_id,
+            inherited_environments,
+            inherited_exec_policy,
+            user_shell_override,
+        } = request;
+        let StartThreadOptions {
+            config,
+            allow_provider_model_fallback,
+            initial_history,
+            history_mode,
+            session_source,
+            thread_source,
+            dynamic_tools,
+            metrics_service_name,
+            parent_trace,
+            environments,
+            client_mcp_extensions,
+            reserved_thread_id,
+        } = options;
+        let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
+        let environments = environments.unwrap_or_else(|| {
+            default_thread_environment_selections(
+                self.environment_manager.as_ref(),
+                &config.cwd,
+                &config.workspace_roots,
+            )
+        });
+        if reserved_thread_id.is_some() && matches!(&initial_history, InitialHistory::Resumed(_)) {
+            return Err(CodexErr::InvalidRequest(
+                "reserved thread ID cannot be used when resuming a thread".to_string(),
+            ));
+        }
+        if let InitialHistory::Resumed(resumed) = &initial_history {
+            let mut threads = self.threads.write().await;
+            if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
+                if thread.is_running() {
+                    return Ok(NewThread {
+                        thread_id: resumed.conversation_id,
+                        session_configured: thread.session_configured(),
+                        thread,
+                    });
+                }
+                threads.remove(&resumed.conversation_id);
+            }
+        }
+        let user_instructions = self
+            .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
+            .await;
+        let mcp_manager = Arc::clone(&self.mcp_manager);
+        let multi_agent_version = self
+            .initial_multi_agent_version_for_spawn(
+                &initial_history,
+                Some(&session_source),
+                parent_thread_id,
+                forked_from_thread_id,
+            )
+            .await;
+        let parent_rollout_thread_trace = self
+            .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
+            .await;
+        let tracked_session_source = session_source.clone();
+        let originator = self
+            .effective_originator(
+                &initial_history,
+                &session_source,
+                parent_thread_id,
+                forked_from_thread_id,
+            )
+            .await;
+        let source_changed_during_startup = Arc::new(AtomicBool::new(false));
+        {
+            let mut starting = self
+                .starting_mcp_runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            starting.retain(|runtime| runtime.strong_count() != 0);
+            starting.push(Arc::downgrade(&source_changed_during_startup));
+        }
+        let (session, io) = Session::spawn(SessionSpawnArgs {
+            config,
+            allow_provider_model_fallback,
+            user_instructions,
+            installation_id: self.installation_id.clone(),
+            auth_manager,
+            models_manager: Arc::clone(&self.models_manager),
+            environment_manager: Arc::clone(&self.environment_manager),
+            skills_service: Arc::clone(&self.skills_service),
+            mcp_manager,
+            code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+            conversation_history: initial_history,
+            requested_history_mode: history_mode,
+            session_source,
+            forked_from_thread_id,
+            parent_thread_id,
+            thread_source: thread_source.clone(),
+            originator,
+            agent_control,
+            dynamic_tools,
+            metrics_service_name,
+            inherited_environments,
+            inherited_exec_policy,
+            parent_rollout_thread_trace,
+            user_shell_override,
+            parent_trace,
+            environment_selections: environments,
+            client_mcp_extensions,
+            reserved_thread_id,
+            thread_store: Arc::clone(&self.thread_store),
+            external_time_provider: self.external_time_provider.clone(),
+            inherited_multi_agent_version: multi_agent_version,
+            git_enrichment_policy: GitEnrichmentPolicy::Fresh,
+        })
+        .await?;
+        let new_thread = self
+            .finalize_thread_spawn(session, io, tracked_session_source)
+            .await?;
+        if source_changed_during_startup.load(Ordering::Acquire) {
+            new_thread.thread.session.request_mcp_runtime_refresh();
+        }
+        Ok(new_thread)
+    }
+
+    async fn finalize_thread_spawn(
+        &self,
+        session: Arc<Session>,
+        io: SessionIo,
+        session_source: SessionSource,
+    ) -> CodexResult<NewThread> {
+        let thread_id = session.thread_id();
+        let event = io.next_event().await?;
+        let session_configured = match event {
+            Event {
+                id,
+                msg: EventMsg::SessionConfigured(session_configured),
+            } if id == INITIAL_SUBMIT_ID => session_configured,
+            _ => {
+                return Err(CodexErr::SessionConfiguredNotFirstEvent);
+            }
+        };
+
+        {
+            let mut threads = self.threads.write().await;
+            if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
+                let thread = Arc::new(CodexThread::new(
+                    session,
+                    io,
+                    session_configured.clone(),
+                    session_source,
+                ));
+                e.insert(thread.clone());
+                return Ok(NewThread {
+                    thread_id,
+                    thread,
+                    session_configured,
+                });
+            }
+        }
+
+        if let Err(err) = io.shutdown_and_wait().await {
+            warn!("failed to shut down duplicate thread {thread_id}: {err}");
+        }
+        Err(CodexErr::InvalidRequest(format!(
+            "thread {thread_id} is already running"
+        )))
+    }
+
+    pub(crate) fn notify_thread_created(&self, thread_id: ThreadId) {
+        let _ = self.thread_created_tx.send(thread_id);
+    }
+
+    async fn parent_rollout_thread_trace_for_source(
+        &self,
+        session_source: &SessionSource,
+        initial_history: &InitialHistory,
+    ) -> codex_rollout_trace::ThreadTraceContext {
+        // A fresh v2 child belongs to the same rollout tree as its parent, so
+        // session startup derives its child trace from the parent's thread
+        // context. Resumed children already have a prior `ThreadStarted` event
+        // for this thread id; deriving a child trace during resume would write
+        // that start event again and make the bundle unreplayable.
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        }) = session_source
+        else {
+            return codex_rollout_trace::ThreadTraceContext::disabled();
+        };
+        if matches!(initial_history, InitialHistory::Resumed(_)) {
+            return codex_rollout_trace::ThreadTraceContext::disabled();
+        }
+        // Parent lookup can fail if the parent was closed or released between
+        // spawn preparation and session construction. Tracing is diagnostic, so
+        // that race should not block child creation; the child simply starts
+        // without a parent rollout trace.
+        self.get_thread(*parent_thread_id)
+            .await
+            .ok()
+            .map(|thread| thread.session.services.rollout_thread_trace.clone())
+            .unwrap_or_else(codex_rollout_trace::ThreadTraceContext::disabled)
+    }
+}
+
+fn stored_thread_to_initial_history(
+    stored_thread: StoredThread,
+    rollout_path: Option<PathBuf>,
+) -> CodexResult<InitialHistory> {
+    let thread_id = stored_thread.thread_id;
+    let history = stored_thread.history.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "thread {thread_id} did not include persisted history"
+        ))
+    })?;
+    Ok(InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(history.items),
+        rollout_path: rollout_path.or(stored_thread.rollout_path),
+    }))
+}
+
+fn thread_store_metadata_update_error(thread_id: ThreadId, err: ThreadStoreError) -> CodexErr {
+    match err {
+        ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
+        ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ThreadStoreError::Unsupported { operation } => CodexErr::UnsupportedOperation(format!(
+            "thread metadata update is not supported by this store: {operation}"
+        )),
+        err => CodexErr::Fatal(format!(
+            "failed to update thread metadata {thread_id}: {err}"
+        )),
+    }
+}

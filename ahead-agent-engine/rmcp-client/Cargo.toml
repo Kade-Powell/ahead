@@ -1,0 +1,47 @@
+[package]
+name = "codex-rmcp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+codex-config = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-protocol = { workspace = true }
+codex-utils-path-uri = { workspace = true }
+codex-utils-pty = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true, default-features = false, features = ["std"] }
+memchr = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = [
+	"base64",
+    "client",
+    "macros",
+    "schemars",
+    "server",
+    "transport-async-rw",
+    "transport-child-process",
+] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "io-std",
+    "time",
+] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true, features = ["log"] }
+which = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+
+[lib]
+doctest = false

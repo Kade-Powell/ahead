@@ -3,13 +3,76 @@
 //! Keep these schemas and their argument validation independent of any agent
 //! runtime so every adapter can expose the same editor capability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use ahead_rpc::ahead::AgentPresentationAction;
+use ahead_rpc::ahead::{AgentBufferSnapshot, AgentPresentationAction};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::runtime_support::path_is_allowed;
+
+/// Validates and returns a worktree-relative path for an open editor buffer.
+pub(crate) fn read_editor_buffer_path(
+    arguments: &Value,
+    workspace: &Path,
+    allowed_paths: Option<&[String]>,
+) -> Result<PathBuf> {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .context("AHEAD read_editor_buffer requires a worktree-relative path")?;
+    anyhow::ensure!(path.len() <= 512, "AHEAD editor path is too long");
+    let relative = Path::new(path);
+    anyhow::ensure!(
+        !relative.is_absolute()
+            && relative.components().all(|component| matches!(
+                component,
+                std::path::Component::Normal(_)
+            )),
+        "AHEAD editor path must stay inside the worktree"
+    );
+    anyhow::ensure!(
+        !ahead_core::search::is_private_file(relative),
+        "AHEAD cannot read a private editor buffer"
+    );
+    anyhow::ensure!(
+        ahead_core::search::resolve_open_buffer_path(workspace, relative).is_some(),
+        "AHEAD editor path is not a safe file in the worktree"
+    );
+    if let Some(allowed_paths) = allowed_paths {
+        anyhow::ensure!(
+            path_is_allowed(path, allowed_paths, workspace),
+            "AHEAD editor path is outside this session's file scope"
+        );
+    }
+    Ok(relative.to_path_buf())
+}
+
+/// Formats a verified open-buffer snapshot without falling back to disk.
+pub(crate) fn format_read_editor_buffer(
+    path: &Path,
+    buffers: &[AgentBufferSnapshot],
+) -> Result<String> {
+    let buffer = buffers
+        .iter()
+        .find(|buffer| Path::new(&buffer.path) == path)
+        .with_context(|| {
+            format!(
+                "`{}` is not currently open in the AHEAD editor",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        buffer.content.len() <= 262_144,
+        "AHEAD editor buffer is larger than 256 KiB; use a search tool for a focused excerpt"
+    );
+    Ok(format!(
+        "Unsaved editor buffer `{}`:\n{}",
+        path.display(),
+        buffer.content
+    ))
+}
 
 /// Tool name for reading unsaved content from an open editor buffer.
 pub const AHEAD_READ_EDITOR_BUFFER_TOOL: &str = "read_editor_buffer";
@@ -227,6 +290,62 @@ pub fn parse_presentation_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_editor_buffer_uses_an_open_snapshot_within_scope() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        std::fs::create_dir_all(workspace.path().join("src"))
+            .expect("create source directory");
+        std::fs::write(workspace.path().join("src/lib.rs"), "disk value")
+            .expect("write disk source");
+        let arguments = json!({ "path": "src/lib.rs" });
+        let allowed_paths = ["src".to_string()];
+        let path = read_editor_buffer_path(
+            &arguments,
+            workspace.path(),
+            Some(&allowed_paths),
+        )
+        .expect("validate scoped path");
+        let buffers = [AgentBufferSnapshot {
+            path: "src/lib.rs".to_string(),
+            content: "unsaved editor value".to_string(),
+            symbols: Vec::new(),
+        }];
+
+        let result = format_read_editor_buffer(&path, &buffers)
+            .expect("read open editor snapshot");
+        assert!(result.contains("unsaved editor value"));
+        assert!(!result.contains("disk value"));
+    }
+
+    #[test]
+    fn read_editor_buffer_rejects_private_and_out_of_scope_paths() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        std::fs::create_dir_all(workspace.path().join("src"))
+            .expect("create source directory");
+        std::fs::write(workspace.path().join("src/lib.rs"), "source")
+            .expect("write source");
+        std::fs::write(workspace.path().join("README.md"), "readme")
+            .expect("write out-of-scope file");
+        let allowed_paths = ["src".to_string()];
+
+        assert!(
+            read_editor_buffer_path(
+                &json!({ "path": ".env" }),
+                workspace.path(),
+                Some(&allowed_paths),
+            )
+            .is_err()
+        );
+        assert!(
+            read_editor_buffer_path(
+                &json!({ "path": "README.md" }),
+                workspace.path(),
+                Some(&allowed_paths),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn present_code_respects_the_calling_agents_file_scope() {

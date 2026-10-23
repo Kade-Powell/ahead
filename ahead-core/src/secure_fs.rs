@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsStr,
     fs::File,
-    io,
+    io::{self, Write},
     path::{Component, Path},
 };
 
@@ -98,6 +99,136 @@ pub fn open_relative_regular_file(root: &File, relative: &Path) -> io::Result<Fi
         io::ErrorKind::InvalidInput,
         "expected a relative file path",
     ))
+}
+
+pub fn open_relative_directory(root: &File, name: &OsStr) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let relative = Path::new(name);
+    let mut components = relative.components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single directory name",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single directory name",
+        ));
+    }
+    openat(
+        root,
+        component,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(Into::into)
+    .map_err(io::Error::from)
+}
+
+pub fn open_or_create_relative_lock_file(
+    root: &File,
+    name: &OsStr,
+) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let relative = Path::new(name);
+    let mut components = relative.components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single lock-file name",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single lock-file name",
+        ));
+    }
+    let file: File = openat(
+        root,
+        component,
+        OFlags::RDWR
+            | OFlags::CREATE
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?
+    .into();
+    validate_regular_file(&file)?;
+    Ok(file)
+}
+
+pub fn atomic_replace_relative_file(
+    root: &File,
+    name: &OsStr,
+    contents: &[u8],
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+    let relative = Path::new(name);
+    let mut components = relative.components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single destination file name",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single destination file name",
+        ));
+    }
+    match open_relative_regular_file(root, relative) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let temporary_name = format!(".ahead-tmp-{}", uuid::Uuid::new_v4());
+    let result = (|| {
+        let mut temporary: File = openat(
+            root,
+            temporary_name.as_str(),
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?
+        .into();
+        temporary.write_all(contents)?;
+        temporary.sync_all()?;
+        renameat(root, temporary_name.as_str(), root, component)
+            .map_err(io::Error::from)
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(replacement_error) => {
+            match unlinkat(root, temporary_name.as_str(), AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => Err(replacement_error),
+                Err(cleanup_error) => Err(io::Error::other(format!(
+                    "atomic file replacement failed: {replacement_error}; temporary cleanup failed: {cleanup_error}"
+                ))),
+            }
+        }
+    }
+}
+
+fn validate_regular_file(file: &File) -> io::Result<()> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

@@ -30,32 +30,39 @@ Users do not configure separate arbitrary language-server commands.
   `language-server-command` export and starts one native server for its languages
   on first `did_open`. Extension-provided environment variables are passed
   through. The host mediates worktree access, downloads, executable bits and
-  declared process capabilities. The Wasmtime engine is shared process-wide,
+  Zed-style user-granted extension capabilities. The
+  `granted_extension_capabilities` setting is read only from user-level
+  `~/.ahead/settings.toml` and defaults to Zed's grants when absent. A process
+  command must be both requested by the extension manifest and granted by the
+  user; `download_file` and `npm:install` require a matching user grant.
+  Workspace manifests cannot grant themselves host capabilities. If user grant
+  settings are invalid, the extension host fails closed and reports the issue
+  in Language Servers rather than silently enabling extensions. The Wasmtime
+  engine is shared process-wide,
   while each extension host retains its own guest sessions, following Zed's
-  `extension_host/src/wasm_host.rs` engine lifecycle. On macOS, AHEAD selects
+  `extension_host/src/wasm_host.rs` engine lifecycle. Extension updates carry
+  their ID through the restart notification and evict only that package's
+  cached guests; manual language-server restarts clear all guests. On macOS,
+  AHEAD selects
   Wasmtime's Unix-signal trap handling instead of its default Mach ports:
   AHEAD launches forked agent/server processes, and the pinned Wasmtime 48
   docs warn that Mach ports do not work well across `fork()`. A serial
   unrestricted proxy suite previously aborted in Wasmtime's Mach handler;
   with signal mode it passes 212 tests (1 ignored).
-- **Built-in adapters:** Rust Analyzer, Vtsls and BasedPyright currently resolve
-  their executables from the app's `PATH`. Vtsls shares one process across
-  TypeScript, TSX, JavaScript and JSX. Missing executables are reported through
-  language-server status. Automatic acquisition and process restart are still
-  release gaps in `TODO.md`; the adapter table alone does not prove usable
-  language support.
-- **File icon themes (added 2026-10-02):** AHEAD accepts icon-only Zed
-  extension packages without a Wasm component. The Extensions tab installs
-  them through the same bounded package path, and the explorer reads their
-  `icon_themes/*.json` file and referenced SVGs for file stems, suffixes and
-  folder names. Zed's built-in stem and suffix associations apply first, then
-  the extension's JSON mappings override them. The built-in map in
-  `ahead-extension-host/src/default_icon_associations.json` tracks the pinned
-  [Zed associations](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/theme/src/icon_theme.rs).
-  The selected icon theme is stored in the user config directory; Material Icon
-  Theme is the default when installed. Invalid mappings fall
-  back to the built-in file and folder icons.
-- **DAP extensions, snippets, color themes and MCP:** out of scope for this path.
+- **Built-in adapters (current implementation, 2026-10-07):** Rust Analyzer
+  follows Zed's worktree-aware resolution: use `rustup which rust-analyzer` for
+  a workspace toolchain override when available, validate the executable, then
+  try AHEAD's `PATH`, its managed cache, and finally the latest official
+  GitHub release. AHEAD validates the installed binary and checks the release
+  digest when GitHub provides one. Vtsls and BasedPyright use a runnable binary
+  on `PATH` or an AHEAD-owned npm cache; a cache miss triggers a background
+  install with lifecycle scripts disabled. Vtsls shares one process across
+  TypeScript, TSX, JavaScript and JSX. Project trust gates startup. Native
+  acquisition, restart and recovery checks remain tracked in `TODO.md`; unit
+  and proxy tests alone do not prove the full user experience.
+- **File icon themes, DAP extensions, snippets, color themes and MCP:** out of
+  scope. The Extensions tab installs language-server packages; file and folder
+  glyphs remain AHEAD's built-in icons.
 
 ## Priority reminder (from 0006)
 
@@ -101,26 +108,104 @@ adds after compilation, then serves the package from loopback. AHEAD downloads,
 installs, discovers and invokes its settings callback. This proves the package
 path offline, not a native Settings click or a live language-server session.
 
-The current preview catalog endpoint is operated by Zed, not AHEAD. Production
-installation needs an AHEAD-owned live registry sourced from reviewed
-[public extension repositories](https://github.com/zed-industries/extensions),
-with independently built, hashed, versioned packages; alternatively, direct
-third-party use of Zed's service needs explicit permission. The public
-`extensions.toml`, `.gitmodules` and the submodule gitlinks identify source
-repositories and pinned revisions, not installable archives. A publisher
-should sync that public index, review each source/license and host capability,
-build and test a package at
-the pinned revision, then publish metadata containing the source revision,
-package hash and AHEAD-owned download URL. The app refreshes this published
-feed; it must not clone and execute arbitrary extension source just to browse
-or install. This keeps the gallery live without baking a list into the editor
-or depending on Zed's package service. Do not treat a successful HTTP query
-or offline package test as permission or production UI proof. Track the
-publisher and native install verification in `TODO.md`.
+The Extensions gallery queries Zed's live catalog and versioned package
+download endpoint in both development and release builds, per the product
+decision recorded on 2026-10-14. It filters to language-server packages whose
+manifest and WASM API versions AHEAD can parse, then labels them as compatibility
+candidates. The UI states that AHEAD is independent and not endorsed by Zed;
+API-version compatibility does not guarantee that an extension or its server
+will work in AHEAD. The app does not clone and execute source while browsing or
+installing.
+
+Installed language grammars now have a separate production highlighting path.
+The proxy loads a matching extension's bounded `grammars/*.wasm` and
+`highlights.scm`, parses the live buffer off the UI thread, and returns plain
+capture names and UTF-8 byte ranges. A bounded cache reuses the loaded grammar
+and query while checking safe file-size/mtime stamps for asset changes; the
+parser/query cache is keyed by extension and asset digest. The app rejects
+stale path/generation/buffer-length responses before applying captures through
+GPUI's active syntax theme and `TextDecorationCollection`. This follows Zed's
+[`LanguageRegistry::get_or_load_grammar`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/language/src/language_registry.rs)
+and `with_parser` lifetime pattern without passing Tree-sitter types across the
+GPUI boundary. `injections.scm` now supports static or captured language names,
+`injection.content`, optional `injection.host`, combined ranges and nested
+injections using grammars from installed extensions. Parsing is bounded by
+source/injected-byte, range, capture and nesting limits. `locals.scm` remains
+unsupported, and rendered native verification is still open. Injection lookup
+and grouping follow pinned Zed's
+[`get_injections`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/language/src/syntax_map.rs#L1667)
+and `language_for_name_or_extension` behavior; AHEAD intentionally omits Zed's
+incremental changed-range queue because this path reparses one bounded snapshot.
+GPUI Kit pins Tree-sitter 0.26.13, whose WASM feature brings Wasmtime C API 36;
+the extension guest host remains on Wasmtime 48. This is a separate grammar
+engine with a measurable first-build cost, not a second GPUI parser type.
+
+The optional AHEAD additions feed remains available for packages reviewed,
+built and published by AHEAD. Zed's public `extensions.toml`, `.gitmodules` and
+submodule gitlinks identify source repositories and pinned revisions, not
+installable archives. The publisher reviews each source/license and requested
+host capability, builds and tests at the pinned revision, then publishes
+metadata with source revision, package hash and AHEAD-owned download URL. A
+live Zed result takes precedence over an AHEAD feed entry with the same ID.
+AHEAD entries supplement missing Zed results and remain available when its
+catalog cannot be fetched. This feed is currently empty.
+
+The client reads `extensions/registry.json` locally in debug builds and from
+AHEAD's public `main` branch in release builds, and queries Zed's live catalog
+in both. AHEAD feed entries require a SHA-256 and an asset URL under this
+repository's GitHub Releases, named `<id>-<version>.tar.gz`. Zed rows win over
+AHEAD rows with the same ID; AHEAD rows supplement missing Zed results and
+remain as fallback entries when Zed is unavailable. The checked-in feed is
+empty. A manual-only
+publisher builds from a pinned source checkout and CLI revision; individual
+packages may pin separate repositories and commits, including submodules from
+Zed's public extension catalog. The publisher checks repository identity,
+clean state, revision, license and package metadata, then publishes a versioned,
+hashed AHEAD GitHub Release asset and updates the feed. Offline tests cover
+both the monorepo source and a pinned catalog-submodule source, but the workflow
+has not been run, no AHEAD package has been published, and the rendered native
+install journey remains unverified. See
+[`extensions/README.md`](../../../extensions/README.md) for the feed contract.
+
+Current endpoint/terms review (rechecked 2026-10-14): AHEAD calls the public
+`https://api.zed.dev/extensions` catalog and versioned package-download route.
+The pinned Zed source at
+[`extension_host.rs`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/extension_host/src/extension_host.rs)
+also shows that Zed rebuilds its local installed-extension index from installed
+directories; that code does not establish third-party access rights for
+AHEAD's client. Zed's [publishing
+guide](https://zed.dev/docs/extensions/publishing/publishing-guide) describes
+review and packaging through `zed-industries/extensions`, and its [license
+requirements](https://zed.dev/docs/extensions/publishing/license-requirements)
+specify which extension binaries Zed distributes; that license requirement
+covers extension code, not external tools an extension downloads or uses.
+AHEAD's registry review must assess those language-server binaries and download
+terms separately. The [Terms of Service](https://zed.dev/terms), last updated
+2026-03-02, require access through Zed-designated mechanisms (section 2.2) and
+prohibit non-public APIs (section 2.4), but do not name the extension catalog
+or package routes. Their availability to third-party clients is therefore
+unconfirmed; this is not a legal determination. The user's release direction
+is to use these live routes with a compatibility/non-endorsement disclaimer.
+That disclaimer does not grant service permission. Confirm endpoint-specific
+authorization before broad commercial distribution; retain the AHEAD-reviewed
+feed as the fallback if Zed restricts direct access.
+
+Publisher reference, rechecked 2026-10-08: Zed's public
+[`extensions` repository](https://github.com/zed-industries/extensions) records
+source repos and pinned commits in `extensions.toml`, `.gitmodules` and
+submodule gitlinks. Its [CI workflow](https://github.com/zed-industries/extensions/blob/main/.github/workflows/ci.yml)
+pins the `zed-extension` CLI, builds and validates changed packages, and
+publishes them from `main` to Zed's object store; the packaging flow is visible
+in [`package-extensions.js`](https://github.com/zed-industries/extensions/blob/main/src/package-extensions.js).
+The source repository's Releases page has no package assets. Its public index
+alone cannot provide installable packages. AHEAD's direct live Zed API path is
+the release default by product decision; the optional reviewed AHEAD feed can
+supplement it or serve as a fallback if the endpoint is unavailable or
+restricted. Do not clone and execute source while users browse or install.
 
 The existing install RPC carries the selected package version and an optional
 archive SHA-256. The host compares the manifest version and, when supplied,
-the digest before replacing a package. Zed's preview catalog does not supply
+the digest before replacing a package. Zed's live catalog does not supply
 a digest; the AHEAD publisher must include one for every production package.
 
 The extension host is part of normal product builds and the `just dev` watch

@@ -9,12 +9,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Prefix for a user-selected terminal transcript attached to an agent turn.
+/// This is a context label, not a filesystem path.
+pub const TERMINAL_CONTEXT_PATH_PREFIX: &str = "ahead-terminal://";
+
 pub type Id = String;
 pub type Sha256 = String;
 pub type GitOid = String;
 pub type Timestamp = String;
 pub type Revision = u64;
 pub type RepoPath = String;
+
+/// JSON-RPC error returned by an ACP agent when the user must authenticate.
+pub const ACP_AUTH_REQUIRED_ERROR_CODE: i64 = -32000;
 
 /// The six descriptive work categories inferred from the human request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -298,6 +305,11 @@ pub struct ExternalAcpAdapter {
     pub id: String,
     pub display_name: String,
     pub installed: bool,
+    pub available: bool,
+    pub latest_version: Option<String>,
+    pub installed_version: Option<String>,
+    pub update_available: bool,
+    pub prerequisite_note: Option<String>,
 }
 
 /// A tracked MCP process declaration awaiting workspace-local approval.
@@ -447,15 +459,14 @@ pub fn mentioned_participants(
             continue;
         }
         for record in participants {
-            if let Participant::Human { id, .. } = &record.participant {
-                if !id.eq_ignore_ascii_case(sender_id)
-                    && id.eq_ignore_ascii_case(&handle)
-                    && !recipients
-                        .iter()
-                        .any(|recipient: &String| recipient.eq_ignore_ascii_case(id))
-                {
-                    recipients.push(id.clone());
-                }
+            if let Participant::Human { id, .. } = &record.participant
+                && !id.eq_ignore_ascii_case(sender_id)
+                && id.eq_ignore_ascii_case(&handle)
+                && !recipients
+                    .iter()
+                    .any(|recipient: &String| recipient.eq_ignore_ascii_case(id))
+            {
+                recipients.push(id.clone());
             }
         }
     }
@@ -626,12 +637,36 @@ pub struct VoiceTranscriptUpdate {
     pub speaker_id: Id,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceTranscriptSpeaker {
+    Human,
+    Agent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoicePlaybackReceipt {
     pub voice_session_id: Id,
     pub generation: u64,
     pub played_up_to_offset_ms: u64,
     pub completed: bool,
+}
+
+/// Provider-relative timing retained with one persisted voice transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceTranscriptTiming {
+    pub call_id: Id,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Host-issued identity for one voice connection owned by a managed session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceCallLease {
+    pub session_id: Id,
+    pub voice_session_id: Id,
+    pub call_id: Id,
+    pub connection_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,7 +682,7 @@ pub enum VoiceControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionRequest {
     pub request_id: Id,
-    pub session_id: Id,
+    pub session_id: Option<Id>,
     pub path: RepoPath,
     pub cursor: DisplayPosition,
     pub prefix: String,
@@ -655,11 +690,46 @@ pub struct PredictionRequest {
     pub work_context: String,
 }
 
+/// The managed model selected for the session that requested an inline
+/// prediction. `context_window` is present only when it came from provider
+/// metadata or an explicit connection setting, never a picker fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionModelContext {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionResult {
     pub request_id: Id,
     pub replacement: String,
     pub cursor_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionBinding {
+    pub version: u32,
+    pub request_id: Id,
+    pub context_sha256: String,
+    pub target_revision: u64,
+}
+
+/// A human-accepted FIM insertion, tied to the session and exact prediction
+/// context that produced it. The inserted source is represented by a hash so
+/// the audit record does not duplicate project code in session history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionAcceptance {
+    pub id: Id,
+    pub session_id: Id,
+    pub actor_id: Id,
+    pub path: RepoPath,
+    pub range: DisplayRange,
+    pub binding: PredictionBinding,
+    pub model_context: Option<PredictionModelContext>,
+    pub accepted_text_sha256: String,
+    pub accepted_at: Timestamp,
 }
 
 /// Editor context attached to a governed turn: active document version,
@@ -677,6 +747,66 @@ pub struct TurnEditorContext {
     /// Human-selected excerpts from AHEAD's project or user memory.
     #[serde(default)]
     pub attached_memories: Vec<MemoryExcerpt>,
+}
+
+impl TurnEditorContext {
+    /// Returns the selected text when the UTF-16 range still maps to this
+    /// captured editor snapshot.
+    pub fn selected_text(&self) -> Option<&str> {
+        let selection = self.selection.as_ref()?;
+        let start = byte_offset_at(&self.file_content, selection.start)?;
+        let end = byte_offset_at(&self.file_content, selection.end)?;
+        self.file_content
+            .get(start..end)
+            .filter(|text| !text.is_empty())
+    }
+
+    /// Drops stale editor-only context before it can affect scope or
+    /// instruction resolution. Explicit attachments remain intact.
+    pub fn discard_stale_selection(&mut self) -> bool {
+        if self.selection.is_none() || self.selected_text().is_some() {
+            return false;
+        }
+
+        let active_path_is_explicitly_attached = self
+            .attached_files
+            .iter()
+            .any(|file| file.path == self.active_path);
+        self.selection = None;
+        self.caret = DisplayPosition { line: 0, col: 0 };
+        self.file_content.clear();
+        self.visible_end = None;
+        self.attached_anchor_ids.clear();
+        if !active_path_is_explicitly_attached {
+            self.active_path.clear();
+        }
+        true
+    }
+}
+
+fn byte_offset_at(content: &str, position: DisplayPosition) -> Option<usize> {
+    let mut line_start = 0;
+    let mut line = 0usize;
+    for segment in content.split_inclusive('\n') {
+        if line == position.line as usize {
+            let text = segment.strip_suffix('\n').unwrap_or(segment);
+            let mut column = 0;
+            for (offset, character) in text.char_indices() {
+                if column == position.col as usize {
+                    return Some(line_start + offset);
+                }
+                column += character.len_utf16();
+            }
+            return (column == position.col as usize)
+                .then_some(line_start + text.len());
+        }
+        line_start += segment.len();
+        line += 1;
+    }
+    (line == position.line as usize
+        && position.col == 0
+        && (content.ends_with('\n') || content.is_empty()))
+    .then_some(content.len())
 }
 
 /// A file explicitly attached from the user's computer through the chat
@@ -752,6 +882,80 @@ mod turn_editor_context_tests {
             .expect("older turn context should remain readable");
         assert!(context.attached_memories.is_empty());
     }
+
+    fn turn_context() -> TurnEditorContext {
+        TurnEditorContext {
+            active_path: "src/main.rs".into(),
+            caret: DisplayPosition { line: 1, col: 3 },
+            selection: Some(DisplayRange {
+                start: DisplayPosition { line: 0, col: 1 },
+                end: DisplayPosition { line: 0, col: 3 },
+            }),
+            file_content: "a😀猫\nnext".into(),
+            visible_end: Some(DisplayPosition { line: 3, col: 0 }),
+            attached_anchor_ids: vec!["anchor-1".into()],
+            attached_files: Vec::new(),
+            attached_memories: vec![MemoryExcerpt {
+                scope: MemoryScope::Project,
+                source: ".ahead/memories/MEMORY.md".into(),
+                line: 1,
+                excerpt: "remember this".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn selected_text_uses_utf16_columns_and_rejects_stale_ranges() {
+        let context = turn_context();
+        assert_eq!(context.selected_text(), Some("😀"));
+
+        let mut multiline = context.clone();
+        multiline.selection = Some(DisplayRange {
+            start: DisplayPosition { line: 0, col: 3 },
+            end: DisplayPosition { line: 1, col: 2 },
+        });
+        assert_eq!(multiline.selected_text(), Some("猫\nne"));
+
+        let mut invalid = context;
+        invalid.selection = Some(DisplayRange {
+            start: DisplayPosition { line: 0, col: 2 },
+            end: DisplayPosition { line: 0, col: 3 },
+        });
+        assert_eq!(invalid.selected_text(), None);
+    }
+
+    #[test]
+    fn stale_selection_cleanup_removes_implicit_focus_but_keeps_explicit_context() {
+        let mut context = turn_context();
+        context.selection = Some(DisplayRange {
+            start: DisplayPosition { line: 99, col: 0 },
+            end: DisplayPosition { line: 99, col: 1 },
+        });
+        assert!(context.discard_stale_selection());
+        assert!(context.active_path.is_empty());
+        assert_eq!(context.caret, DisplayPosition { line: 0, col: 0 });
+        assert!(context.selection.is_none());
+        assert!(context.file_content.is_empty());
+        assert!(context.visible_end.is_none());
+        assert!(context.attached_anchor_ids.is_empty());
+        assert_eq!(context.attached_memories.len(), 1);
+
+        let mut explicitly_attached = turn_context();
+        explicitly_attached.selection = Some(DisplayRange {
+            start: DisplayPosition { line: 99, col: 0 },
+            end: DisplayPosition { line: 99, col: 1 },
+        });
+        explicitly_attached.attached_files.push(TurnContextFile {
+            path: "src/main.rs".into(),
+            content: "explicit file contents".into(),
+        });
+        assert!(explicitly_attached.discard_stale_selection());
+        assert_eq!(explicitly_attached.active_path, "src/main.rs");
+        assert_eq!(
+            explicitly_attached.attached_files[0].content,
+            "explicit file contents"
+        );
+    }
 }
 
 /// A current, unsaved editor buffer returned to the managed agent on demand.
@@ -760,10 +964,26 @@ mod turn_editor_context_tests {
 pub struct AgentBufferSnapshot {
     pub path: RepoPath,
     pub content: String,
+    pub symbols: Vec<AgentBufferSymbol>,
+}
+
+/// Best-effort LSP document-symbol scope for an open editor buffer.
+/// Lines use zero-based LSP coordinates and `end_line` is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBufferSymbol {
+    pub name: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub depth: u16,
 }
 
 pub const MAX_AGENT_BUFFER_SNAPSHOTS: usize = 128;
 pub const MAX_AGENT_BUFFER_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+// ponytail: cap per-search LSP fan-out; expand only if representative projects show useful scopes are being missed.
+pub const MAX_AGENT_BUFFER_SYMBOL_DOCUMENTS: usize = 16;
+pub const MAX_AGENT_BUFFER_SYMBOLS_PER_SNAPSHOT: usize = 128;
+pub const MAX_AGENT_BUFFER_SYMBOL_NAME_BYTES: usize = 256;
+pub const AGENT_BUFFER_SYMBOL_WIRE_OVERHEAD_BYTES: usize = 64;
 
 pub fn validate_agent_buffer_snapshots(
     buffers: &[AgentBufferSnapshot],
@@ -777,7 +997,22 @@ pub fn validate_agent_buffer_snapshots(
         total
             .saturating_add(buffer.path.len())
             .saturating_add(buffer.content.len())
+            .saturating_add(buffer.symbols.iter().fold(0usize, |bytes, symbol| {
+                bytes
+                    .saturating_add(symbol.name.len())
+                    .saturating_add(AGENT_BUFFER_SYMBOL_WIRE_OVERHEAD_BYTES)
+            }))
     });
+    if buffers.iter().any(|buffer| {
+        buffer.symbols.len() > MAX_AGENT_BUFFER_SYMBOLS_PER_SNAPSHOT
+            || buffer.symbols.iter().any(|symbol| {
+                symbol.name.trim().is_empty()
+                    || symbol.name.len() > MAX_AGENT_BUFFER_SYMBOL_NAME_BYTES
+                    || symbol.start_line >= symbol.end_line
+            })
+    }) {
+        return Err("AHEAD editor returned invalid document-symbol context".into());
+    }
     if total_bytes > MAX_AGENT_BUFFER_SNAPSHOT_BYTES {
         return Err(format!(
             "AHEAD editor buffers exceed the {} MiB search snapshot limit",
@@ -796,6 +1031,7 @@ mod buffer_snapshot_tests {
         let snapshot = AgentBufferSnapshot {
             path: "src/lib.rs".into(),
             content: "unsaved".into(),
+            symbols: Vec::new(),
         };
         assert!(validate_agent_buffer_snapshots(&[snapshot.clone()]).is_ok());
         assert!(
@@ -809,6 +1045,7 @@ mod buffer_snapshot_tests {
             validate_agent_buffer_snapshots(&[AgentBufferSnapshot {
                 path: "large.rs".into(),
                 content: "x".repeat(MAX_AGENT_BUFFER_SNAPSHOT_BYTES),
+                symbols: Vec::new(),
             }])
             .is_err()
         );
@@ -837,6 +1074,37 @@ mod buffer_snapshot_tests {
             })
             .expect("serialize failure reply");
         assert_eq!(failed["method"], "agent_buffer_snapshots_failed");
+    }
+
+    #[test]
+    fn validates_bounded_document_symbol_context() {
+        let snapshot = AgentBufferSnapshot {
+            path: "src/lib.rs".into(),
+            content: "unsaved".into(),
+            symbols: vec![AgentBufferSymbol {
+                name: "nested_fn".into(),
+                start_line: 1,
+                end_line: 4,
+                depth: 1,
+            }],
+        };
+        assert!(validate_agent_buffer_snapshots(&[snapshot.clone()]).is_ok());
+
+        let mut too_many = snapshot.clone();
+        too_many.symbols = vec![
+            snapshot.symbols[0].clone();
+            MAX_AGENT_BUFFER_SYMBOLS_PER_SNAPSHOT + 1
+        ];
+        assert!(validate_agent_buffer_snapshots(&[too_many]).is_err());
+
+        let mut invalid_range = snapshot.clone();
+        invalid_range.symbols[0].end_line = invalid_range.symbols[0].start_line;
+        assert!(validate_agent_buffer_snapshots(&[invalid_range]).is_err());
+
+        let mut oversized_name = snapshot;
+        oversized_name.symbols[0].name =
+            "x".repeat(MAX_AGENT_BUFFER_SYMBOL_NAME_BYTES + 1);
+        assert!(validate_agent_buffer_snapshots(&[oversized_name]).is_err());
     }
 }
 
@@ -887,6 +1155,16 @@ pub struct AgentTurnRequestDto {
     /// receives this as its native `modelProvider`; external ACP adapters may
     /// ignore it.
     pub model_provider: Option<String>,
+    /// Endpoint-reported context limit for the selected model. Managed turns
+    /// use it as a per-turn model-info override; external ACP adapters may
+    /// ignore it.
+    #[serde(default)]
+    pub model_context_window: Option<u32>,
+    /// Optional managed-agent reasoning effort for this turn. `None` clears a
+    /// previously selected effort and follows the model's default. External
+    /// ACP adapters ignore this value.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub user_message: String,
     /// Host-assembled task and durable work state; separate from the human's
     /// message so retries preserve the exact prompt context.
@@ -992,6 +1270,8 @@ pub struct ConversationMessage {
     pub content: String,
     pub status: String,
     pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_timing: Option<VoiceTranscriptTiming>,
 }
 
 impl ConversationMessage {
@@ -1074,6 +1354,19 @@ pub struct AgentToolCall {
     pub title: String,
     pub status: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPatchFilePreview {
+    pub path: RepoPath,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPatchPreview {
+    pub call_id: String,
+    pub files: Vec<AgentPatchFilePreview>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1191,6 +1484,45 @@ pub enum AgentConfigOptionValue {
 pub struct AgentConfigChoice {
     pub value: String,
     pub name: String,
+}
+
+/// Reasoning effort metadata advertised by the managed runtime for one model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReasoningEffort {
+    pub value: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReasoningOptions {
+    pub default_effort: Option<String>,
+    pub supported_efforts: Vec<AgentReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAuthMethodType {
+    Agent,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAuthMethod {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub method_type: AgentAuthMethodType,
+}
+
+/// User-selected terminal login invocation derived from the installed ACP
+/// adapter and its advertised terminal authentication method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTerminalAuthLaunch {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1457,6 +1789,17 @@ pub enum AheadRequest {
         range: DisplayRange,
         quote: String,
     },
+    RecordPredictionAcceptance {
+        session_id: Id,
+        path: RepoPath,
+        range: DisplayRange,
+        binding: PredictionBinding,
+        model_context: Option<PredictionModelContext>,
+        accepted_text_sha256: String,
+    },
+    ListPredictionAcceptances {
+        session_id: Id,
+    },
     CreateCodeComment {
         session_id: Id,
         path: RepoPath,
@@ -1489,6 +1832,21 @@ pub enum AheadRequest {
     /// Connect an external agent and load its advertised config before a turn.
     AgentSessionPrepare {
         session_id: Id,
+    },
+    /// Runs one advertised agent-managed ACP authentication method.
+    AgentAuthenticate {
+        session_id: Id,
+        method_id: String,
+    },
+    /// Returns the configured command for a user-selected terminal auth method.
+    AgentTerminalAuthLaunch {
+        session_id: Id,
+        method_id: String,
+    },
+    /// Reconnects the ACP agent after a terminal authentication process exits.
+    AgentTerminalAuthComplete {
+        session_id: Id,
+        succeeded: bool,
     },
     /// Change an advertised option on a live external ACP session.
     AgentConfigOptionSet {
@@ -1547,6 +1905,22 @@ pub enum AheadRequest {
     PostHumanMessage {
         session_id: Id,
         content: String,
+    },
+    /// Persists one finalized voice transcript segment in the session timeline.
+    RecordVoiceTranscript {
+        session_id: Id,
+        call_id: Id,
+        segment_id: Id,
+        speaker: VoiceTranscriptSpeaker,
+        start_ms: u64,
+        end_ms: u64,
+        content: String,
+    },
+    StartVoiceCall {
+        session_id: Id,
+    },
+    EndVoiceCall {
+        lease: VoiceCallLease,
     },
     ShareSession {
         session_id: Id,
@@ -1614,6 +1988,12 @@ pub enum AheadRequest {
     AgentSkills {
         session_id: Id,
         model: Option<String>,
+        model_provider: Option<String>,
+    },
+    /// Returns the managed model's advertised reasoning effort choices.
+    AgentReasoningOptions {
+        session_id: Id,
+        model: String,
         model_provider: Option<String>,
     },
     WorkItemCreate {
@@ -1686,6 +2066,9 @@ pub enum AheadRequest {
         request: PredictionRequest,
     },
     VoiceControl {
+        session_id: Id,
+        call_id: Id,
+        connection_epoch: u64,
         control: VoiceControl,
     },
     GitHubAuthStart,
@@ -1735,6 +2118,9 @@ pub struct GitHubDeviceCodeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AheadNotification {
+    PredictionContextChanged {
+        session_id: Option<Id>,
+    },
     SharedBufferChanged {
         session_id: Id,
         snapshot: SharedBufferSnapshot,
@@ -1798,6 +2184,11 @@ pub enum AheadNotification {
         turn_id: Id,
         call: AgentToolCall,
     },
+    AgentPatchProgress {
+        session_id: Id,
+        turn_id: Id,
+        preview: AgentPatchPreview,
+    },
     AgentUsage {
         session_id: Id,
         turn_id: Id,
@@ -1817,6 +2208,7 @@ pub enum AheadNotification {
         session_id: Id,
         turn_id: Id,
         request_id: String,
+        include_document_symbols: bool,
     },
     AgentPresentationRequested {
         session_id: Id,
@@ -1837,5 +2229,14 @@ pub enum AheadNotification {
     AgentConfigOptionsAvailable {
         session_id: Id,
         options: Vec<AgentConfigOption>,
+    },
+    /// The external ACP agent requires user authentication before a session can start.
+    AgentAuthenticationRequired {
+        session_id: Id,
+        methods: Vec<AgentAuthMethod>,
+    },
+    /// Clears the sign-in prompt after authentication and ACP reconnection succeed.
+    AgentAuthenticationCleared {
+        session_id: Id,
     },
 }

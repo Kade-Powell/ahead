@@ -167,10 +167,14 @@ Authenticated turn, stop, rendered failure and complete Markdown interaction
 remain separate acceptance gates.
 
 The Pi adapter is installed with the Zed-style pinned npm layout and successfully
-completes initialize, new-session, command discovery and prompt lifecycle. The
-local Pi model request currently returns `AccessDeniedException: Bearer Token has
-expired`, so a successful model delta remains an authentication gate rather than
-an AHEAD protocol failure.
+completes initialize, new-session, command discovery and prompt lifecycle. A
+source-current 2026-10-12 test against Pi CLI 0.87.1 and `pi-acp@0.0.34` used an
+isolated Pi home and the user-authorized OpenRouter model, then received a
+streamed `PONG` `AgentDelta`; the key was supplied only to that test process and
+no user Pi profile was read or changed. This proves one provider-backed Pi
+response, not cancellation/resume against a live provider, Codex/Claude provider
+turns, or the rendered editor picker. Revalidate provider availability before
+using this as current service-health evidence.
 
 The architecture and current acceptance gates belong in
 [Editor MVP §§3.4–3.5](ahead-editor-mvp.md#34-own-the-policy-boundary-reuse-the-agent-machinery),

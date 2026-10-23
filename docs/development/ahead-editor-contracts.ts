@@ -120,7 +120,7 @@ export interface SkillDescriptor {
   supported_task_intents: TaskIntent[];
   required_capabilities: Capability[];
   source:
-    | { kind: "builtin"; root: "ahead-agent/skills" }
+    | { kind: "builtin"; root: "ahead-agent-skills/builtins" }
     | {
         kind: "workspace";
         root: ".agents/skills";
@@ -600,7 +600,7 @@ export interface AcceptChangeInput {
 
 export interface PredictionRequest {
   request_id: Id;
-  session_id: Id;
+  session_id: Id | null;
   scope_id: Id;
   model_route_id: Id;
   expected_policy_sha256: Sha256;

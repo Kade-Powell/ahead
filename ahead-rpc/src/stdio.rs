@@ -89,7 +89,17 @@ where
     Resp: DeserializeOwned,
 {
     let mut buf = String::new();
-    let _ = inp.read_line(&mut buf)?;
+    loop {
+        match inp.read_line(&mut buf) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     let value: Value = serde_json::from_str(&buf)?;
 
     match parse_value(value) {
@@ -98,6 +108,67 @@ where
             tracing::error!("receive rpc from stdio error: {e:#}");
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io::Read};
+
+    use serde_json::Value;
+
+    use super::read_msg;
+
+    enum ReadStep {
+        Bytes(&'static [u8]),
+        WouldBlock,
+    }
+
+    struct IntermittentReader {
+        steps: VecDeque<ReadStep>,
+        current: &'static [u8],
+    }
+
+    impl Read for IntermittentReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                if !self.current.is_empty() {
+                    let count = buffer.len().min(self.current.len());
+                    buffer[..count].copy_from_slice(&self.current[..count]);
+                    self.current = &self.current[count..];
+                    return Ok(count);
+                }
+
+                match self.steps.pop_front() {
+                    Some(ReadStep::Bytes(bytes)) => self.current = bytes,
+                    Some(ReadStep::WouldBlock) => {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    None => return Ok(0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_msg_retries_would_block_without_losing_partial_message() {
+        let reader = IntermittentReader {
+            steps: VecDeque::from([
+                ReadStep::Bytes(b"{\"method\":"),
+                ReadStep::WouldBlock,
+                ReadStep::Bytes(b"\"test\"}\n"),
+            ]),
+            current: &[],
+        };
+        let mut reader = std::io::BufReader::new(reader);
+
+        let message = read_msg::<_, Value, Value, Value>(&mut reader)
+            .expect("read message after transient WouldBlock");
+
+        assert!(matches!(
+            message,
+            Some(crate::RpcMessage::Notification(Value::Object(_)))
+        ));
     }
 }
 

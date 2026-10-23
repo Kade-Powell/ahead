@@ -1,5 +1,3 @@
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
 use std::{
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
@@ -8,10 +6,10 @@ use std::{
 use crate::store::InstructionFileSource;
 pub use ahead_rpc::ahead::MemoryScope;
 use ahead_rpc::ahead::TurnEditorContext;
-use anyhow::{Context, Result, bail};
-use codex_extension_api::{
+use ahead_runtime_api::{
     LoadUserInstructionsFuture, LoadedUserInstructions, UserInstructionsProvider,
 };
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 const TARGET_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
@@ -29,6 +27,7 @@ struct TargetInstructionEntry {
 pub(crate) struct TargetInstructionContext {
     pub(crate) prompt: String,
     pub(crate) sources: Vec<InstructionFileSource>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,12 +92,17 @@ pub(crate) fn target_instruction_context(
     for file in &context.attached_files {
         add_target_path(&workspace_root, workspace, &file.path, false, &mut targets);
     }
-    target_instruction_context_for_paths(&workspace_root, targets, false)
+    target_instruction_context_for_paths(
+        &workspace_root,
+        &workspace_root,
+        targets,
+        false,
+    )
 }
 
 /// Loads the full project `AGENTS.md` hierarchy for file targets used by an
 /// editor inference request. Unlike native agent turns, this path has no core
-/// instruction loader, so it includes the workspace-root file as well.
+/// instruction loader, so it includes the repository hierarchy itself.
 pub fn project_instruction_prompt_for_targets(
     workspace: &Path,
     target_paths: &[&str],
@@ -106,15 +110,28 @@ pub fn project_instruction_prompt_for_targets(
     let workspace_root = workspace
         .canonicalize()
         .context("AHEAD workspace is unavailable for project instructions")?;
+    let instruction_root = project_instruction_root(&workspace_root);
     let mut targets = Vec::<(PathBuf, String)>::new();
     for target_path in target_paths {
         add_target_path(&workspace_root, workspace, target_path, true, &mut targets);
     }
-    Ok(target_instruction_context_for_paths(&workspace_root, targets, true)?.prompt)
+    let context = target_instruction_context_for_paths(
+        &workspace_root,
+        &instruction_root,
+        targets,
+        true,
+    )?;
+    if context.truncated {
+        bail!(
+            "applicable AGENTS.md instructions exceed AHEAD's 32 KiB prediction context limit"
+        );
+    }
+    Ok(context.prompt)
 }
 
 fn target_instruction_context_for_paths(
     workspace_root: &Path,
+    instruction_root: &Path,
     targets: Vec<(PathBuf, String)>,
     include_workspace_root: bool,
 ) -> Result<TargetInstructionContext> {
@@ -127,28 +144,31 @@ fn target_instruction_context_for_paths(
     let mut truncated = false;
     'targets: for (target_path, target_label) in targets {
         let mut directories = Vec::new();
-        let mut directory = target_path.parent();
+        let target = workspace_root.join(&target_path);
+        let mut directory = target.parent();
         while let Some(path) = directory {
-            if path.as_os_str().is_empty() {
+            if !path.starts_with(instruction_root)
+                || (!include_workspace_root && path == workspace_root)
+            {
                 break;
             }
-            directories.push(path.to_path_buf());
+            directories.push(path.strip_prefix(instruction_root)?.to_path_buf());
+            if path == instruction_root {
+                break;
+            }
             directory = path.parent();
         }
         directories.reverse();
-        if include_workspace_root {
-            directories.insert(0, PathBuf::new());
-        }
 
         for directory in directories {
             let Some(source_path) = ahead_core::search::resolve_open_buffer_path(
-                workspace_root,
+                instruction_root,
                 &directory.join("AGENTS.md"),
             ) else {
                 continue;
             };
             let Some(relative_source) =
-                source_path.strip_prefix(workspace_root).ok()
+                source_path.strip_prefix(instruction_root).ok()
             else {
                 continue;
             };
@@ -163,15 +183,10 @@ fn target_instruction_context_for_paths(
                 }
                 continue;
             }
-            if remaining == 0 {
-                truncated = true;
-                break 'targets;
-            }
-
             let source = path_label(&source_path);
             let Some((sha256, contents, source_truncated)) =
                 read_target_instruction(
-                    &workspace_root.join(&source_path),
+                    &instruction_root.join(&source_path),
                     &source,
                     remaining,
                 )?
@@ -232,7 +247,30 @@ fn target_instruction_context_for_paths(
             "Additional target-scoped instruction content was omitted or truncated at AHEAD's 32 KiB per-turn budget. Read the applicable AGENTS.md before acting if more detail is required.\n",
         );
     }
-    Ok(TargetInstructionContext { prompt, sources })
+    Ok(TargetInstructionContext {
+        prompt,
+        sources,
+        truncated,
+    })
+}
+
+/// Finds the instruction boundary for a canonical workspace path. Watchers
+/// share this discovery with the loader so nested workspaces use the same root.
+pub fn project_instruction_root(workspace_root: &Path) -> PathBuf {
+    // The retained chat loader discovers the nearest repository root by `.git`.
+    // FIM has no runtime loader, so use the same root when a nested folder is open.
+    let mut directory = Some(workspace_root);
+    while let Some(path) = directory {
+        let marker = path.join(".git");
+        if std::fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+            let file_type = metadata.file_type();
+            file_type.is_file() || file_type.is_dir()
+        }) {
+            return path.to_path_buf();
+        }
+        directory = path.parent();
+    }
+    workspace_root.to_path_buf()
 }
 
 fn add_target_path(
@@ -288,11 +326,7 @@ fn read_target_instruction(
     source: &str,
     remaining: usize,
 ) -> Result<Option<(String, String, bool)>> {
-    #[cfg(unix)]
-    let opened = ahead_core::secure_fs::open_canonical_regular_file(path);
-    #[cfg(not(unix))]
-    let opened = OpenOptions::new().read(true).open(path);
-    let file = match opened {
+    let file = match codex_exec_server::open_regular_file_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -301,9 +335,6 @@ fn read_target_instruction(
             });
         }
     };
-    if !file.metadata()?.file_type().is_file() {
-        bail!("project instructions `{source}` are not a regular file");
-    }
     if file.metadata()?.len() > TARGET_INSTRUCTION_FILE_MAX_BYTES as u64 {
         bail!("project instructions `{source}` exceed AHEAD's 1 MiB file limit");
     }
@@ -467,6 +498,80 @@ mod tests {
         assert!(prompt.contains("Targets: \"docs/guide.md\""));
     }
 
+    #[test]
+    fn fim_loads_repository_instructions_above_a_nested_workspace() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repository = temp.path().join("repository");
+        let workspace = repository.join("packages/widget");
+        std::fs::create_dir_all(workspace.join("src"))
+            .expect("create nested workspace");
+        std::fs::create_dir_all(repository.join(".git"))
+            .expect("create repository marker");
+        std::fs::write(repository.join("AGENTS.md"), "repository policy")
+            .expect("write repository instructions");
+        std::fs::write(repository.join("packages/AGENTS.md"), "packages policy")
+            .expect("write parent-package instructions");
+        std::fs::write(workspace.join("AGENTS.md"), "workspace policy")
+            .expect("write workspace instructions");
+        std::fs::write(workspace.join("src/AGENTS.md"), "source policy")
+            .expect("write source instructions");
+
+        let prompt =
+            project_instruction_prompt_for_targets(&workspace, &["src/main.rs"])
+                .expect("load repository instruction hierarchy");
+        let repository_index =
+            prompt.find("repository policy").expect("repository policy");
+        let packages_index =
+            prompt.find("packages policy").expect("packages policy");
+        let workspace_index =
+            prompt.find("workspace policy").expect("workspace policy");
+        let source_index = prompt.find("source policy").expect("source policy");
+        assert!(
+            repository_index < packages_index
+                && packages_index < workspace_index
+                && workspace_index < source_index
+        );
+        assert!(prompt.contains("Source: \"AGENTS.md\""));
+        assert!(prompt.contains("Source: \"packages/AGENTS.md\""));
+        assert!(prompt.contains("Source: \"packages/widget/AGENTS.md\""));
+        assert!(prompt.contains("Source: \"packages/widget/src/AGENTS.md\""));
+        assert!(prompt.contains("Targets: \"src/main.rs\""));
+        assert!(!prompt.contains(&repository.display().to_string()));
+    }
+
+    #[test]
+    fn project_instruction_root_accepts_git_worktree_marker_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let repository = temp.path().join("repository");
+        let workspace = repository.join("packages/widget");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(repository.join(".git"), "gitdir: ../.git/worktrees/widget")
+            .expect("write worktree marker");
+
+        assert_eq!(project_instruction_root(&workspace), repository);
+    }
+
+    #[test]
+    fn fim_rejects_instruction_budget_that_would_omit_nearer_rules() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src"))
+            .expect("create source directory");
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "a".repeat(TARGET_INSTRUCTIONS_MAX_BYTES),
+        )
+        .expect("write root instructions");
+        let path = "src/new.rs";
+        assert!(project_instruction_prompt_for_targets(&workspace, &[path]).is_ok());
+
+        std::fs::write(workspace.join("src/AGENTS.md"), "nearer rule")
+            .expect("write nested instructions");
+        let error = project_instruction_prompt_for_targets(&workspace, &[path])
+            .expect_err("FIM must not silently omit nearer instructions");
+        assert!(error.to_string().contains("prediction context limit"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn skips_symlinked_target_instruction_paths() {
@@ -517,11 +622,69 @@ mod tests {
         std::fs::create_dir_all(workspace.join("src"))
             .expect("create project directory");
         std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(workspace.join("src/AGENTS.md"), "inside instructions")
+            .expect("write project instructions");
         std::fs::write(outside.join("AGENTS.md"), "outside instructions")
             .expect("write outside instructions");
+
+        let (_, contents, truncated) = read_target_instruction(
+            &workspace.join("src/AGENTS.md"),
+            "src/AGENTS.md",
+            TARGET_INSTRUCTIONS_MAX_BYTES,
+        )
+        .expect("read regular project instructions")
+        .expect("project instructions are non-empty");
+        assert_eq!(contents, "inside instructions");
+        assert!(!truncated);
+
+        std::fs::remove_file(workspace.join("src/AGENTS.md"))
+            .expect("remove prior instruction file");
         std::fs::remove_dir(workspace.join("src"))
             .expect("replace project directory");
         symlink(&outside, workspace.join("src")).expect("link to outside directory");
+
+        assert!(
+            read_target_instruction(
+                &workspace.join("src/AGENTS.md"),
+                "src/AGENTS.md",
+                TARGET_INSTRUCTIONS_MAX_BYTES,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_instruction_read_rejects_reparse_parent_directory() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = tempfile::tempdir().expect("disposable project");
+        let temporary_root =
+            temp.path().canonicalize().expect("canonical temp root");
+        let workspace = temporary_root.join("workspace");
+        let outside = temporary_root.join("outside");
+        std::fs::create_dir_all(workspace.join("src"))
+            .expect("create project directory");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(workspace.join("src/AGENTS.md"), "inside instructions")
+            .expect("write project instructions");
+        std::fs::write(outside.join("AGENTS.md"), "outside instructions")
+            .expect("write outside instructions");
+
+        let (_, contents, truncated) = read_target_instruction(
+            &workspace.join("src/AGENTS.md"),
+            "src/AGENTS.md",
+            TARGET_INSTRUCTIONS_MAX_BYTES,
+        )
+        .expect("read regular project instructions")
+        .expect("project instructions are non-empty");
+        assert_eq!(contents, "inside instructions");
+        assert!(!truncated);
+
+        std::fs::remove_dir(workspace.join("src"))
+            .expect("replace project directory");
+        symlink_dir(&outside, workspace.join("src"))
+            .expect("create reparse-point directory");
 
         assert!(
             read_target_instruction(

@@ -18,10 +18,15 @@ reqwest           = { workspace = true }
 regex             = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
+semver            = "1.0"
 toml              = { workspace = true }
 tempfile          = { workspace = true }
 sha2              = "0.10"
 fs4               = "0.13.1"
+flate2            = { workspace = true }
+tar               = { workspace = true }
+zip               = { workspace = true }
+bzip2             = "0.5"
 tracing           = { workspace = true }
 url               = { workspace = true }
 uuid              = { version = "1.5", features = ["v4", "serde"] }
@@ -31,18 +36,27 @@ ahead-rpc       = { workspace = true }
 ahead-core      = { workspace = true }
 
 # Built-in agent: direct in-process hard fork. ACP is external-agent only.
-codex-core     = { path = "runtime/source/core" }
+codex-core     = { workspace = true }
 codex-config   = { workspace = true }
-codex-agent-graph-store = { workspace = true }
-codex-protocol = { path = "runtime/source/protocol" }
-codex-features = { path = "runtime/source/features" }
+codex-models-manager = { workspace = true }
+ahead-agent-graph-store = { workspace = true }
+codex-protocol = { workspace = true }
+codex-features = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-rollout = { workspace = true }
 codex-thread-store = { workspace = true }
-codex-extension-api = { path = "runtime/source/ext/extension-api" }
+ahead-runtime-api = { workspace = true }
 ahead-agent-skills = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 dirs = { workspace = true }
+futures = { workspace = true }
+walkdir = { workspace = true }
+zstd = "0.13.3"
+
+[dev-dependencies]
+codex-code-mode = { workspace = true }
+codex-mcp = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }

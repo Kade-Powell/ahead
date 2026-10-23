@@ -1,0 +1,109 @@
+use std::any::Any;
+use std::any::TypeId;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+
+type ErasedData = Arc<dyn Any + Send + Sync>;
+
+/// Typed ephemeral state attached to one runtime scope.
+#[derive(Debug)]
+pub struct RuntimeData {
+    level_id: String,
+    entries: Mutex<HashMap<TypeId, ErasedData>>,
+}
+
+impl RuntimeData {
+    /// Creates an empty attachment map for one host-owned scope.
+    pub fn new(level_id: impl Into<String>) -> Self {
+        Self {
+            level_id: level_id.into(),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the host identity for the scope this data is attached to.
+    pub fn level_id(&self) -> &str {
+        &self.level_id
+    }
+
+    /// Returns the attached value of type `T`, if one exists.
+    pub fn get<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let value = self.entries().get(&TypeId::of::<T>())?.clone();
+        Some(downcast_data(value))
+    }
+
+    /// Returns the attached value of type `T`, inserting one from `init` when absent.
+    ///
+    /// The initializer runs while this map is locked, so it should stay cheap;
+    /// heavyweight lazy work belongs inside the attached value itself.
+    pub fn get_or_init<T>(&self, init: impl FnOnce() -> T) -> Arc<T>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self.entries();
+        let value = entries
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Arc::new(init()));
+        downcast_data(Arc::clone(value))
+    }
+
+    /// Stores `value` as the attachment of type `T`, returning any previous value.
+    pub fn insert<T>(&self, value: T) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.entries()
+            .insert(TypeId::of::<T>(), Arc::new(value))
+            .map(downcast_data)
+    }
+
+    /// Stores `value` only when `should_insert` accepts the current attachment.
+    ///
+    /// The predicate and insertion happen while this map is locked, so concurrent
+    /// callers cannot replace a value after checking a stale attachment.
+    pub fn insert_if<T>(
+        &self,
+        value: T,
+        should_insert: impl FnOnce(Option<&T>) -> bool,
+    ) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self.entries();
+        let existing = entries
+            .get(&TypeId::of::<T>())
+            .map(|value| downcast_data::<T>(Arc::clone(value)));
+        if !should_insert(existing.as_deref()) {
+            return false;
+        }
+        entries.insert(TypeId::of::<T>(), Arc::new(value));
+        true
+    }
+
+    /// Removes and returns the attached value of type `T`, if one exists.
+    pub fn remove<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        self.entries().remove(&TypeId::of::<T>()).map(downcast_data)
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TypeId, ErasedData>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn downcast_data<T>(value: ErasedData) -> Arc<T>
+where
+    T: Any + Send + Sync,
+{
+    let Ok(value) = value.downcast::<T>() else {
+        unreachable!("typed runtime data stored an incompatible value");
+    };
+    value
+}

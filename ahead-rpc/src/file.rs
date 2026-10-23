@@ -480,14 +480,12 @@ impl FileNodeItem {
         }
 
         if current >= min {
-            let kind = if let Naming::Renaming(r) = &naming {
-                if r.path == self.path {
-                    FileNodeViewKind::Renaming {
-                        path: self.path.clone(),
-                        err: r.state.err().map(ToString::to_string),
-                    }
-                } else {
-                    FileNodeViewKind::Path(self.path.clone())
+            let kind = if let Naming::Renaming(r) = &naming
+                && r.path == self.path
+            {
+                FileNodeViewKind::Renaming {
+                    path: self.path.clone(),
+                    err: r.state.err().map(ToString::to_string),
                 }
             } else {
                 FileNodeViewKind::Path(self.path.clone())
@@ -543,25 +541,24 @@ impl FileNodeItem {
 
         if !self.open {
             // If the folder isn't open, then we just put it right at the top
-            if i >= min {
-                if let Some(naming_extra) = naming_extra {
-                    view_items.push(naming_extra);
-                    i += 1;
-                }
+            if i >= min
+                && let Some(naming_extra) = naming_extra
+            {
+                view_items.push(naming_extra);
+                i += 1;
             }
             return i;
         }
 
         let naming_is_dir = naming_extra.as_ref().map(|n| n.is_dir).unwrap_or(false);
         // Immediately put the naming entry first if it's a directory
-        if naming_is_dir {
-            if let Some(node) = naming_extra.take() {
-                // Actually add the node if it's within the range
-                if i >= min {
-                    view_items.push(node);
-                    i += 1;
-                }
-            }
+        if naming_is_dir
+            && let Some(node) = naming_extra.take()
+            && i >= min
+        {
+            // Actually add the node if it's within the range
+            view_items.push(node);
+            i += 1;
         }
 
         let mut after_dirs = false;
@@ -578,11 +575,11 @@ impl FileNodeItem {
 
                 // If we're creating a new file node, then we show it after the directories
                 // TODO(minor): should this be i >= min or i + 1 >= min?
-                if i >= min {
-                    if let Some(node) = naming_extra.take() {
-                        view_items.push(node);
-                        i += 1;
-                    }
+                if i >= min
+                    && let Some(node) = naming_extra.take()
+                {
+                    view_items.push(node);
+                    i += 1;
                 }
             }
             i = item.append_view_slice(
@@ -599,11 +596,11 @@ impl FileNodeItem {
         }
 
         // If it has not been added yet, add it now.
-        if i >= min {
-            if let Some(node) = naming_extra {
-                view_items.push(node);
-                i += 1;
-            }
+        if i >= min
+            && let Some(node) = naming_extra
+        {
+            view_items.push(node);
+            i += 1;
         }
 
         i

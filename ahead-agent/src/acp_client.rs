@@ -36,15 +36,18 @@ use std::{
 };
 
 use ahead_rpc::ahead::{
+    ACP_AUTH_REQUIRED_ERROR_CODE, AgentAuthMethod, AgentAuthMethodType,
     AgentBufferSnapshot, AgentCommand, AgentConfigChoice, AgentConfigOption,
-    AgentConfigOptionValue, AgentPresentationAction,
+    AgentConfigOptionValue, AgentTerminalAuthLaunch,
     validate_agent_buffer_snapshots,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::editor_tools::{
+    AHEAD_READ_EDITOR_BUFFER_TOOL, format_read_editor_buffer,
     parse_presentation_action, presentation_tool_definitions,
+    read_editor_buffer_path,
 };
 
 /// ACP protocol version advertised by this client.
@@ -168,122 +171,45 @@ fn mcp_success_response(id: Value, modern: bool, result: Value) -> Value {
     }
 }
 
-/// One streamed update from the harness, normalized for AHEAD storage and UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HarnessEvent {
-    AgentDelta {
-        acp_session_id: String,
-        text: String,
-    },
-    AgentThought {
-        acp_session_id: String,
-        text: String,
-    },
-    Warning {
-        acp_session_id: String,
-        message: String,
-    },
-    ContextCompacted {
-        acp_session_id: String,
-    },
-    ToolCall {
-        acp_session_id: String,
-        call_id: String,
-        title: String,
-        status: String,
-        kind: String,
-    },
-    FileChange {
-        acp_session_id: String,
-        status: String,
-        changes: Vec<HarnessFileChange>,
-    },
-    Plan {
-        acp_session_id: String,
-        entries: Vec<HarnessPlanEntry>,
-    },
-    Usage {
-        acp_session_id: String,
-        total_tokens: u64,
-        context_window: Option<u64>,
-    },
-    UserInputRequested {
-        acp_session_id: String,
-        request_id: String,
-        is_blocking: bool,
-        questions: Vec<HarnessUserInputQuestion>,
-    },
-    UserInputCancelled {
-        acp_session_id: String,
-        request_id: String,
-    },
-    BufferSnapshotsRequested {
-        acp_session_id: String,
-        request_id: String,
-    },
-    EditorPresentationRequested {
-        acp_session_id: String,
-        request_id: String,
-        action: AgentPresentationAction,
-    },
-    ModeChanged {
-        acp_session_id: String,
-        mode_id: String,
-    },
-    SessionTitle {
-        acp_session_id: String,
-        title: String,
-    },
-    AvailableCommands {
-        acp_session_id: String,
-        commands: Vec<AgentCommand>,
-    },
-    ConfigOptions {
-        acp_session_id: String,
-        options: Vec<AgentConfigOption>,
-    },
-}
-
-/// A single plan step reported by the harness.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessPlanEntry {
-    pub content: String,
-    pub status: String,
-    pub priority: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessUserInputOption {
-    pub value: String,
-    pub label: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessUserInputQuestion {
-    pub id: String,
-    pub header: String,
-    pub question: String,
-    pub external_url: Option<String>,
-    pub options: Vec<HarnessUserInputOption>,
-    pub default_answers: Vec<String>,
-    pub allows_other: bool,
-    pub is_secret: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessFileChange {
-    pub path: String,
-    pub diff: String,
-}
-
-/// Callback invoked on the reader thread for every streamed event.
-pub type HarnessSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
+pub use crate::events::{
+    HarnessEvent, HarnessFileChange, HarnessPlanEntry, HarnessSink,
+    HarnessUserInputOption, HarnessUserInputQuestion,
+};
 
 /// One outstanding request awaiting a JSON-RPC response from the agent.
-type PendingSender = mpsc::Sender<Result<Value, String>>;
+type PendingSender = mpsc::Sender<Result<Value, AcpResponseError>>;
 /// Correlates JSON-RPC ids with the caller waiting on each response.
 type PendingMap = Arc<Mutex<HashMap<u64, PendingSender>>>;
+
+#[derive(Debug)]
+struct AcpResponseError {
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for AcpResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ACP error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AcpResponseError {}
+
+pub fn acp_error_code(error: &anyhow::Error) -> Option<i64> {
+    error
+        .downcast_ref::<AcpResponseError>()
+        .map(|error| error.code)
+}
+
+pub(crate) fn is_auth_required_error(error: &anyhow::Error) -> bool {
+    acp_error_code(error) == Some(ACP_AUTH_REQUIRED_ERROR_CODE)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalAuthMethod {
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
 
 struct ReaderState {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -474,6 +400,7 @@ impl HarnessClientConfig {
 pub struct HarnessClient {
     child: Mutex<Child>,
     _generation_lease: Option<Arc<File>>,
+    launch_config: HarnessClientConfig,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -484,6 +411,7 @@ pub struct HarnessClient {
     policy_modes: Arc<Mutex<HashMap<String, String>>>,
     pending_acp_permissions: PendingAcpPermissions,
     config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
+    config_option_updates: Mutex<()>,
     default_config_options: Mutex<HashMap<String, AgentConfigOptionValue>>,
     default_config_options_path: Option<PathBuf>,
     sink: HarnessSink,
@@ -496,6 +424,8 @@ pub struct HarnessClient {
     /// ACP mode ids advertised by each external agent session.
     agent_modes: Mutex<HashMap<String, Vec<String>>>,
     session_capabilities: Mutex<AcpSessionCapabilities>,
+    auth_methods: Mutex<Vec<AgentAuthMethod>>,
+    terminal_auth_methods: Mutex<HashMap<String, TerminalAuthMethod>>,
     /// In-flight prompt request id per ACP session. Cancellation removes the
     /// correlated response waiter so the controller settles immediately.
     prompt_requests: Mutex<HashMap<String, u64>>,
@@ -551,17 +481,21 @@ impl HarnessClient {
         let editor_mcp_accepting =
             Arc::new(AtomicBool::new(enable_editor_mcp_bridge));
 
-        let mut child = Command::new(&config.command)
+        let mut process = Command::new(&config.command);
+        process
             .args(&config.args)
             .envs(&config.env)
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!("Failed to spawn ACP agent `{}`", config.command)
-            })?;
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        if let Some(lease) = &config.generation_lease {
+            retain_generation_lease_in_child(&mut process, lease);
+        }
+        let mut child = process.spawn().with_context(|| {
+            format!("Failed to spawn ACP agent `{}`", config.command)
+        })?;
 
         let stdin = Arc::new(Mutex::new(
             child.stdin.take().context("ACP agent stdin unavailable")?,
@@ -592,6 +526,7 @@ impl HarnessClient {
         let harness = Self {
             child: Mutex::new(child),
             _generation_lease: config.generation_lease.clone(),
+            launch_config: config.clone(),
             stdin: stdin.clone(),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
@@ -599,6 +534,7 @@ impl HarnessClient {
             policy_modes: policy_modes.clone(),
             pending_acp_permissions: pending_acp_permissions.clone(),
             config_options: config_options.clone(),
+            config_option_updates: Mutex::new(()),
             default_config_options: Mutex::new(
                 config.default_config_options.clone(),
             ),
@@ -612,6 +548,8 @@ impl HarnessClient {
             editor_mcp_accepting,
             agent_modes: Mutex::new(HashMap::new()),
             session_capabilities: Mutex::new(AcpSessionCapabilities::default()),
+            auth_methods: Mutex::new(Vec::new()),
+            terminal_auth_methods: Mutex::new(HashMap::new()),
             prompt_requests: Mutex::new(HashMap::new()),
             active_prompt_sessions: active_prompt_sessions.clone(),
             cancelled_sessions: cancelled_sessions.clone(),
@@ -655,9 +593,11 @@ impl HarnessClient {
             }
             if let Ok(mut pending) = state.pending.lock() {
                 for (_, sender) in pending.drain() {
-                    drop(sender.send(Err(
-                        "ACP agent closed its stdout during a request".to_string(),
-                    )));
+                    drop(sender.send(Err(AcpResponseError {
+                        code: -1,
+                        message:
+                            "ACP agent closed its stdout during a request".into(),
+                    })));
                 }
             }
             if let Ok(mut pending) = state.pending_acp_permissions.lock() {
@@ -698,7 +638,7 @@ impl HarnessClient {
                     pending.lock().ok().and_then(|mut p| p.remove(&id_num))
                 {
                     let outcome = if let Some(err) = msg.get("error") {
-                        Err(err.to_string())
+                        Err(acp_response_error(err))
                     } else {
                         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -1258,7 +1198,7 @@ impl HarnessClient {
         &self,
         method: &str,
         params: Value,
-    ) -> Result<(u64, mpsc::Receiver<Result<Value, String>>)> {
+    ) -> Result<(u64, mpsc::Receiver<Result<Value, AcpResponseError>>)> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         let mut pending = self
@@ -1293,11 +1233,13 @@ impl HarnessClient {
         timeout: Duration,
     ) -> Result<Value> {
         let (id, rx) = self.send_request(method, params)?;
-        let result = match rx.recv_timeout(timeout) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(err)) => Err(anyhow!("ACP `{method}` failed: {err}")),
-            Err(_) => Err(anyhow!("ACP `{method}` timed out after {timeout:?}")),
-        };
+        let result =
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(err)) => Err(anyhow::Error::new(err)
+                    .context(format!("ACP `{method}` failed"))),
+                Err(_) => Err(anyhow!("ACP `{method}` timed out after {timeout:?}")),
+            };
         if result.is_err() {
             self.pending
                 .lock()
@@ -1335,6 +1277,7 @@ impl HarnessClient {
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
                     "terminal": false,
+                    "auth": { "terminal": true },
                     "session": { "configOptions": { "boolean": {} } },
                 },
                 "clientInfo": { "name": "ahead", "version": env!("CARGO_PKG_VERSION") },
@@ -1345,12 +1288,82 @@ impl HarnessClient {
             .get("agentCapabilities")
             .map(session_capabilities)
             .unwrap_or_default();
+        let (auth_methods, terminal_auth_methods) = parse_auth_methods(&result);
         *self
             .session_capabilities
             .lock()
             .map_err(|error| anyhow!("ACP capability lock: {error}"))? =
             capabilities;
+        *self
+            .auth_methods
+            .lock()
+            .map_err(|error| anyhow!("ACP auth-method lock: {error}"))? =
+            auth_methods;
+        *self
+            .terminal_auth_methods
+            .lock()
+            .map_err(|error| anyhow!("ACP terminal-auth lock: {error}"))? =
+            terminal_auth_methods;
         Ok(result)
+    }
+
+    pub fn auth_methods(&self) -> Vec<AgentAuthMethod> {
+        self.auth_methods
+            .lock()
+            .map(|methods| methods.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn authenticate(&self, method_id: &str) -> Result<()> {
+        let is_agent_method = self
+            .auth_methods
+            .lock()
+            .map_err(|error| anyhow!("ACP auth-method lock: {error}"))?
+            .iter()
+            .any(|method| {
+                method.id == method_id
+                    && method.method_type == AgentAuthMethodType::Agent
+            });
+        anyhow::ensure!(
+            is_agent_method,
+            "ACP authentication method `{method_id}` is not an advertised agent method"
+        );
+        self.request(
+            "authenticate",
+            json!({ "methodId": method_id }),
+            Duration::from_secs(60),
+        )?;
+        Ok(())
+    }
+
+    pub fn terminal_auth_launch(
+        &self,
+        method_id: &str,
+    ) -> Result<AgentTerminalAuthLaunch> {
+        let method = self
+            .terminal_auth_methods
+            .lock()
+            .map_err(|error| anyhow!("ACP terminal-auth lock: {error}"))?
+            .get(method_id)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "ACP authentication method `{method_id}` is not an advertised terminal method"
+                )
+            })?;
+        let name = self
+            .auth_methods
+            .lock()
+            .map_err(|error| anyhow!("ACP auth-method lock: {error}"))?
+            .iter()
+            .find(|candidate| candidate.id == method_id)
+            .map(|candidate| candidate.name.clone())
+            .unwrap_or_else(|| "Agent sign-in".to_string());
+        Ok(build_terminal_auth_launch(
+            &self.launch_config,
+            name,
+            method,
+        ))
     }
 
     pub fn supports_editor_presentation(&self) -> bool {
@@ -1599,7 +1612,10 @@ impl HarnessClient {
                 .map_err(|error| anyhow!("pending lock: {error}"))?
                 .remove(&request_id)
             {
-                drop(sender.send(Err("prompt cancelled by AHEAD".to_string())));
+                drop(sender.send(Err(AcpResponseError {
+                    code: -1,
+                    message: "prompt cancelled by AHEAD".to_string(),
+                })));
             }
         }
         let result = match receiver.recv_timeout(Duration::from_secs(60 * 30)) {
@@ -1698,16 +1714,15 @@ impl HarnessClient {
                 .pending_acp_permissions
                 .lock()
                 .map_err(|error| anyhow!("ACP permission lock: {error}"))?;
-            let keys = pending
-                .keys()
-                .filter(|(session_id, _)| session_id == acp_session_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| {
-                    pending.remove(&key).map(|request| (key.1, request.rpc_id))
-                })
-                .collect::<Vec<_>>()
+            let mut cancelled = Vec::new();
+            pending.retain(|(session_id, request_id), request| {
+                if session_id != acp_session_id {
+                    return true;
+                }
+                cancelled.push((request_id.clone(), request.rpc_id.clone()));
+                false
+            });
+            cancelled
         };
         for (request_id, rpc_id) in cancelled_permissions {
             if let Err(error) =
@@ -1744,7 +1759,10 @@ impl HarnessClient {
                 .map_err(|error| anyhow!("pending lock: {error}"))?
                 .remove(&request_id)
             {
-                drop(sender.send(Err("prompt cancelled by AHEAD".to_string())));
+                drop(sender.send(Err(AcpResponseError {
+                    code: -1,
+                    message: "prompt cancelled by AHEAD".to_string(),
+                })));
             }
         }
         if let Ok(mut pending) = self.pending_editor_buffer_snapshots.lock() {
@@ -1969,6 +1987,11 @@ impl HarnessClient {
         config_id: &str,
         value: &AgentConfigOptionValue,
     ) -> Result<()> {
+        // ponytail: one lock per ACP process; use per-session queues only if option updates become throughput-sensitive.
+        let _update = self
+            .config_option_updates
+            .lock()
+            .map_err(|error| anyhow!("ACP config option update lock: {error}"))?;
         let options = self
             .config_options
             .lock()
@@ -2041,7 +2064,10 @@ impl HarnessClient {
         self.editor_mcp_accepting.store(false, Ordering::SeqCst);
         if let Ok(mut pending) = self.pending.lock() {
             for (_, sender) in pending.drain() {
-                drop(sender.send(Err("ACP agent shut down by AHEAD".into())));
+                drop(sender.send(Err(AcpResponseError {
+                    code: -1,
+                    message: "ACP agent shut down by AHEAD".into(),
+                })));
             }
         }
         if let Ok(mut pending) = self.pending_acp_permissions.lock() {
@@ -2080,6 +2106,30 @@ impl HarnessClient {
                 tracing::warn!(%error, "failed to reap ACP agent");
             }
         }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn retain_generation_lease_in_child(command: &mut Command, lease: &File) {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    let lease_fd = lease.as_raw_fd();
+    // SAFETY: the caller retains `lease` until `Command::spawn` returns. The
+    // pre-exec hook only changes descriptor flags with fcntl, which is safe
+    // between fork and exec in a multithreaded process.
+    unsafe {
+        command.pre_exec(move || {
+            let lease_fd = std::os::fd::BorrowedFd::borrow_raw(lease_fd);
+            let flags = rustix::io::fcntl_getfd(lease_fd).map_err(|error| {
+                std::io::Error::from_raw_os_error(error.raw_os_error())
+            })?;
+            rustix::io::fcntl_setfd(
+                lease_fd,
+                flags.difference(rustix::io::FdFlags::CLOEXEC),
+            )
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        });
     }
 }
 
@@ -2148,7 +2198,14 @@ fn handle_editor_tool_call_for_server(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if tool == "read_editor_buffer" {
+    if tool == AHEAD_READ_EDITOR_BUFFER_TOOL {
+        let path = match read_editor_buffer_path(&arguments, &server.workspace, None)
+        {
+            Ok(path) => path,
+            Err(error) => {
+                return editor_tool_result(false, error.to_string());
+            }
+        };
         let buffers = match request_editor_buffer_snapshots(
             &session_id,
             request_id,
@@ -2159,11 +2216,7 @@ fn handle_editor_tool_call_for_server(
             Ok(buffers) => buffers,
             Err(error) => return editor_tool_result(false, error),
         };
-        return match read_editor_buffer_from_snapshots(
-            &arguments,
-            &server.workspace,
-            buffers,
-        ) {
+        return match format_read_editor_buffer(&path, &buffers) {
             Ok(content) => editor_tool_result(true, content),
             Err(error) => editor_tool_result(false, error.to_string()),
         };
@@ -2239,6 +2292,7 @@ fn request_editor_buffer_snapshots(
     sink(HarnessEvent::BufferSnapshotsRequested {
         acp_session_id: session_id.to_string(),
         request_id: request_id.to_string(),
+        include_document_symbols: false,
     });
     let result = receiver.recv_timeout(Duration::from_secs(10));
     if let Ok(mut pending) = pending_editor_buffer_snapshots.lock() {
@@ -2330,50 +2384,6 @@ fn cancel_editor_tool_call_for_server(
         );
     }
     editor_tool_result(true, "ACP editor tool cancellation recorded.".to_string())
-}
-
-fn read_editor_buffer_from_snapshots(
-    arguments: &Value,
-    workspace: &Path,
-    buffers: Vec<AgentBufferSnapshot>,
-) -> Result<String> {
-    let path = arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .context("AHEAD read_editor_buffer requires a worktree-relative path")?;
-    anyhow::ensure!(path.len() <= 512, "AHEAD editor path is too long");
-    let relative = Path::new(path);
-    anyhow::ensure!(
-        !relative.is_absolute()
-            && relative.components().all(|component| matches!(
-                component,
-                std::path::Component::Normal(_)
-            )),
-        "AHEAD editor path must stay inside the worktree"
-    );
-    anyhow::ensure!(
-        !ahead_core::search::is_private_file(relative),
-        "AHEAD cannot read a private editor buffer"
-    );
-    anyhow::ensure!(
-        ahead_core::search::resolve_open_buffer_path(workspace, relative).is_some(),
-        "AHEAD editor path is not a safe file in the worktree"
-    );
-    let buffer = buffers
-        .iter()
-        .find(|buffer| Path::new(&buffer.path) == relative)
-        .with_context(|| {
-            format!("`{path}` is not currently open in the AHEAD editor")
-        })?;
-    anyhow::ensure!(
-        buffer.content.len() <= 262_144,
-        "AHEAD editor buffer is larger than 256 KiB; use the agent's file tools for a focused excerpt"
-    );
-    Ok(format!(
-        "Unsaved editor buffer `{path}`:\n{}",
-        buffer.content
-    ))
 }
 
 fn editor_tool_result(applied: bool, message: String) -> Value {
@@ -3310,9 +3320,194 @@ fn session_capabilities(agent_capabilities: &Value) -> AcpSessionCapabilities {
     }
 }
 
+fn acp_response_error(error: &Value) -> AcpResponseError {
+    AcpResponseError {
+        code: error.get("code").and_then(Value::as_i64).unwrap_or(-1),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("ACP request failed")
+            .to_string(),
+    }
+}
+
+fn build_terminal_auth_launch(
+    config: &HarnessClientConfig,
+    name: String,
+    method: TerminalAuthMethod,
+) -> AgentTerminalAuthLaunch {
+    let mut args = config.args.clone();
+    args.extend(method.args);
+    let mut env = config.env.clone();
+    env.extend(method.env);
+    AgentTerminalAuthLaunch {
+        name,
+        program: config.command.clone(),
+        args,
+        env,
+        cwd: config.cwd.clone(),
+    }
+}
+
+fn parse_auth_methods(
+    initialize_result: &Value,
+) -> (Vec<AgentAuthMethod>, HashMap<String, TerminalAuthMethod>) {
+    let mut methods = Vec::new();
+    let mut terminal_methods = HashMap::new();
+    for value in initialize_result
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(name) = value.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() || name.trim().is_empty() {
+            continue;
+        }
+        let method_type = match value.get("type").and_then(Value::as_str) {
+            None | Some("agent") => AgentAuthMethodType::Agent,
+            Some("terminal") => AgentAuthMethodType::Terminal,
+            Some(_) => continue,
+        };
+        if method_type == AgentAuthMethodType::Terminal {
+            let args = match value.get("args") {
+                None => Vec::new(),
+                Some(Value::Array(args)) => {
+                    let parsed =
+                        args.iter().map(Value::as_str).collect::<Option<Vec<_>>>();
+                    let Some(parsed) = parsed else {
+                        continue;
+                    };
+                    parsed.into_iter().map(str::to_string).collect()
+                }
+                Some(_) => continue,
+            };
+            let env = match value.get("env") {
+                None => HashMap::new(),
+                Some(Value::Object(env)) => {
+                    let parsed = env
+                        .iter()
+                        .map(|(key, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect::<Option<HashMap<_, _>>>();
+                    let Some(parsed) = parsed else {
+                        continue;
+                    };
+                    parsed
+                }
+                Some(_) => continue,
+            };
+            terminal_methods
+                .insert(id.to_string(), TerminalAuthMethod { args, env });
+        }
+        methods.push(AgentAuthMethod {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            method_type,
+        });
+    }
+    (methods, terminal_methods)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahead_rpc::ahead::AgentPresentationAction;
+
+    #[test]
+    fn initialize_auth_methods_parse_agent_defaults_and_terminal_launch() {
+        let (methods, terminal_methods) = parse_auth_methods(&json!({
+            "authMethods": [
+                { "id": "browser", "name": "Browser login" },
+                {
+                    "id": "terminal-login",
+                    "name": "Log in from terminal",
+                    "description": "Complete sign-in in the terminal",
+                    "type": "terminal",
+                    "args": ["--terminal-login"],
+                    "env": { "ACP_LOGIN": "1", "TOKEN_SOURCE": "login" }
+                },
+                { "id": "future", "name": "Unsupported", "type": "future" }
+            ]
+        }));
+
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].method_type, AgentAuthMethodType::Agent);
+        assert_eq!(methods[1].method_type, AgentAuthMethodType::Terminal);
+        assert_eq!(
+            methods[1].description.as_deref(),
+            Some("Complete sign-in in the terminal")
+        );
+        assert_eq!(
+            terminal_methods.get("terminal-login"),
+            Some(&TerminalAuthMethod {
+                args: vec!["--terminal-login".to_string()],
+                env: HashMap::from([
+                    ("ACP_LOGIN".to_string(), "1".to_string()),
+                    ("TOKEN_SOURCE".to_string(), "login".to_string()),
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_auth_launch_reuses_adapter_invocation_and_overrides_environment() {
+        let config = HarnessClientConfig {
+            command: "/opt/ahead/bin/pi".to_string(),
+            args: vec!["--acp".to_string(), "--workspace".to_string()],
+            env: HashMap::from([
+                ("TOKEN_SOURCE".to_string(), "configured".to_string()),
+                ("PATH".to_string(), "/usr/bin".to_string()),
+            ]),
+            cwd: PathBuf::from("/workspace"),
+            default_config_options: HashMap::new(),
+            default_config_options_path: None,
+            generation_lease: None,
+        };
+        let launch = build_terminal_auth_launch(
+            &config,
+            "Pi sign-in".to_string(),
+            TerminalAuthMethod {
+                args: vec!["--terminal-login".to_string()],
+                env: HashMap::from([
+                    ("TOKEN_SOURCE".to_string(), "login".to_string()),
+                    ("ACP_LOGIN".to_string(), "1".to_string()),
+                ]),
+            },
+        );
+
+        assert_eq!(launch.name, "Pi sign-in");
+        assert_eq!(launch.program, "/opt/ahead/bin/pi");
+        assert_eq!(launch.args, ["--acp", "--workspace", "--terminal-login"]);
+        assert_eq!(launch.cwd, PathBuf::from("/workspace"));
+        assert_eq!(launch.env["TOKEN_SOURCE"], "login");
+        assert_eq!(launch.env["PATH"], "/usr/bin");
+        assert_eq!(launch.env["ACP_LOGIN"], "1");
+    }
+
+    #[test]
+    fn auth_required_json_rpc_error_keeps_its_protocol_code() {
+        let error = anyhow::Error::new(acp_response_error(&json!({
+            "code": ACP_AUTH_REQUIRED_ERROR_CODE,
+            "message": "Authentication required"
+        })));
+
+        assert!(is_auth_required_error(&error));
+        assert_eq!(acp_error_code(&error), Some(ACP_AUTH_REQUIRED_ERROR_CODE));
+        assert!(error.to_string().contains("Authentication required"));
+    }
 
     #[test]
     fn editor_mcp_negotiates_a_zed_supported_legacy_protocol_version() {
@@ -4152,21 +4347,24 @@ mod tests {
         let buffer = AgentBufferSnapshot {
             path: "src/lib.rs".to_string(),
             content: "unsaved editor value".to_string(),
+            symbols: Vec::new(),
         };
 
-        let text = read_editor_buffer_from_snapshots(
+        let path = read_editor_buffer_path(
             &json!({ "path": "src/lib.rs" }),
             workspace.path(),
-            vec![buffer],
+            None,
         )
-        .expect("read open editor snapshot");
+        .expect("validate editor path");
+        let text = format_read_editor_buffer(&path, &[buffer])
+            .expect("read open editor snapshot");
         assert!(text.contains("unsaved editor value"));
         assert!(!text.contains("disk value"));
         assert!(
-            read_editor_buffer_from_snapshots(
+            read_editor_buffer_path(
                 &json!({ "path": ".env" }),
                 workspace.path(),
-                Vec::new(),
+                None,
             )
             .is_err()
         );
@@ -4633,7 +4831,7 @@ esac
                 .recv_timeout(Duration::from_secs(1))
                 .expect("shutdown must settle every request")
                 .expect_err("shutdown must not acknowledge a request as successful");
-            assert_eq!(error, "ACP agent shut down by AHEAD");
+            assert_eq!(error.message, "ACP agent shut down by AHEAD");
         }
         assert!(!client.is_running());
         assert!(client.child.lock().unwrap().try_wait().unwrap().is_some());
@@ -5018,6 +5216,105 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model",
             [
                 AgentConfigOptionValue::Select("provider/old".to_string()),
                 AgentConfigOptionValue::Select("provider/new".to_string())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serializes_acp_config_updates_before_publishing_and_saving_defaults() {
+        let temporary = tempfile::tempdir().expect("temporary ACP settings");
+        let defaults_path = temporary.path().join("config-options.json");
+        let first_request_path = temporary.path().join("first-request");
+        let mut config = HarnessClientConfig::new("sh", std::env::temp_dir());
+        config.default_config_options_path = Some(defaults_path.clone());
+        config.env.insert(
+            "AHEAD_FIRST_REQUEST".into(),
+            first_request_path.to_string_lossy().into_owned(),
+        );
+        config.args = vec![
+            "-c".into(),
+            r#"
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+IFS= read -r line || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"provider/old","options":[{"value":"provider/old","name":"Old"},{"value":"provider/new","name":"New"}]}]}}'
+IFS= read -r line || exit 1
+case "$line" in *'"method":"session/set_config_option"'*'"value":"provider/new"'*) ;; *) exit 2 ;; esac
+: > "$AHEAD_FIRST_REQUEST"
+(sleep 0.2; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"provider/new","options":[{"value":"provider/old","name":"Old"},{"value":"provider/new","name":"New"}]}]}}') &
+IFS= read -r line || exit 1
+case "$line" in *'"method":"session/set_config_option"'*'"value":"provider/old"'*) ;; *) exit 3 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"provider/old","options":[{"value":"provider/old","name":"Old"},{"value":"provider/new","name":"New"}]}]}}'
+wait
+"#
+            .into(),
+        ];
+        let events: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let client = HarnessClient::spawn_without_editor_mcp(
+            &config,
+            Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+        )
+        .expect("spawn ACP fixture");
+        client.initialize().expect("initialize fixture");
+        let session_id = client
+            .new_session(&config.cwd, "agent", None, None)
+            .expect("create session with advertised options");
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                client.set_config_option(
+                    &session_id,
+                    "model",
+                    &AgentConfigOptionValue::Select("provider/new".into()),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !first_request_path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(first_request_path.exists(), "first request was not sent");
+            client
+                .set_config_option(
+                    &session_id,
+                    "model",
+                    &AgentConfigOptionValue::Select("provider/old".into()),
+                )
+                .expect("set second option");
+            first
+                .join()
+                .expect("first update thread")
+                .expect("set first option");
+        });
+        client.shutdown();
+
+        let persisted: HashMap<String, AgentConfigOptionValue> =
+            serde_json::from_slice(
+                &std::fs::read(defaults_path).expect("read defaults"),
+            )
+            .expect("parse defaults");
+        assert_eq!(
+            persisted.get("model"),
+            Some(&AgentConfigOptionValue::Select("provider/old".into()))
+        );
+        let published = events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .filter_map(|event| match event {
+                HarnessEvent::ConfigOptions { options, .. } => {
+                    options.first().map(|option| option.current_value.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            [
+                AgentConfigOptionValue::Select("provider/old".into()),
+                AgentConfigOptionValue::Select("provider/new".into()),
+                AgentConfigOptionValue::Select("provider/old".into())
             ]
         );
     }

@@ -163,6 +163,7 @@ pub struct ThreadsPanel {
     pub checkpoints: Vec<CheckpointSummary>,
     error: Option<SharedString>,
     external_adapters: Vec<ahead_rpc::ahead::ExternalAcpAdapter>,
+    external_adapter_catalog_error: Option<SharedString>,
     selected_external_adapter: Option<String>,
     external_adapter_catalog_loading: bool,
     new_session_generation: u64,
@@ -182,7 +183,7 @@ impl ThreadsPanel {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let starting_point_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Describe what you want help with, in your own words")
+                .placeholder("Describe what your goal is... ")
                 .auto_grow(3, 8)
                 .submit_on_enter(false)
         });
@@ -220,6 +221,7 @@ impl ThreadsPanel {
             checkpoints: Vec::new(),
             error: None,
             external_adapters: Vec::new(),
+            external_adapter_catalog_error: None,
             selected_external_adapter: None,
             external_adapter_catalog_loading: false,
             new_session_generation: 0,
@@ -614,6 +616,7 @@ impl ThreadsPanel {
         self.new_thread_kind = harness_kind;
         self.new_session_generation = self.new_session_generation.wrapping_add(1);
         self.external_adapter_catalog_loading = false;
+        self.external_adapter_catalog_error = None;
         if harness_kind == ahead_rpc::ahead::HarnessKind::ExternalAcp {
             self.external_adapters.clear();
             self.selected_external_adapter = None;
@@ -625,10 +628,19 @@ impl ThreadsPanel {
         self.wizard_step = 0;
         self.show_new_session = true;
         self.error = None;
+        if harness_kind == ahead_rpc::ahead::HarnessKind::Ahead {
+            self.starting_point_input.focus_handle(cx).focus(window, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
         if harness_kind == ahead_rpc::ahead::HarnessKind::ExternalAcp {
             self.load_external_adapter_catalog(window, cx);
         }
+    }
+
+    pub(crate) fn is_new_session_open(&self) -> bool {
+        self.show_new_session
     }
 
     pub fn open_implementation_handoff(
@@ -658,6 +670,7 @@ impl ThreadsPanel {
         cx: &mut Context<Self>,
     ) {
         self.external_adapter_catalog_loading = true;
+        self.external_adapter_catalog_error = None;
         // An older installation may still be changing the catalogue on disk.
         // Wait for its reply before taking the new form's snapshot.
         if self.pending_external_adapter.is_some() {
@@ -666,9 +679,8 @@ impl ThreadsPanel {
         }
         let Some(proxy) = self.proxy.clone() else {
             self.external_adapter_catalog_loading = false;
-            self.error.get_or_insert_with(|| {
-                "Could not load supported agents: AHEAD host is unavailable".into()
-            });
+            self.external_adapter_catalog_error =
+                Some("AHEAD host is unavailable".into());
             cx.notify();
             return;
         };
@@ -691,14 +703,12 @@ impl ThreadsPanel {
                 match result {
                     Ok(adapters) => {
                         panel.external_adapters = adapters;
+                        panel.external_adapter_catalog_error = None;
                         panel.refresh_external_adapter_picker(window, cx);
                     }
                     Err(error) => {
-                        panel.error.get_or_insert_with(|| format!(
-                            "Could not load supported agents: {}. Close and reopen this panel to retry.",
-                            error.message
-                        )
-                        .into());
+                        panel.external_adapter_catalog_error =
+                            Some(error.message.into());
                     }
                 }
                 cx.notify();
@@ -914,8 +924,7 @@ impl ThreadsPanel {
         if self.wizard_step == 0
             && self.starting_point_input.read(cx).value().trim().is_empty()
         {
-            self.error =
-                Some("Describe what you want help with before continuing".into());
+            self.error = Some("Describe what your goal is before continuing".into());
             cx.notify();
             return;
         }
@@ -1014,9 +1023,8 @@ impl ThreadsPanel {
                 (title, starting_point, Some(adapter_id), Some(display_name))
             } else {
                 if starting_point.is_empty() {
-                    self.error = Some(
-                        "Describe what you want help with before continuing".into(),
-                    );
+                    self.error =
+                        Some("Describe what your goal is before continuing".into());
                     cx.notify();
                     return None;
                 }
@@ -1028,8 +1036,7 @@ impl ThreadsPanel {
                 )
             };
         if title.is_empty() || starting_point.is_empty() {
-            self.error =
-                Some("Describe what you want help with before continuing".into());
+            self.error = Some("Describe what your goal is before continuing".into());
             cx.notify();
             return None;
         }
@@ -1347,46 +1354,92 @@ impl ThreadsPanel {
         let adapter_catalog_loading = self.external_adapter_catalog_loading;
         let agent_rows = self.external_adapters.iter().map(|adapter| {
             let agent_id = adapter.id.clone();
+            let prerequisite_selector =
+                format!("external-agent-prerequisite-{}", adapter.id);
+            let version_selector = format!("external-agent-version-{}", adapter.id);
+            let prerequisite_note = adapter.prerequisite_note.clone();
+            let version_note = match (
+                adapter.update_available,
+                adapter.latest_version.as_deref(),
+                adapter.installed_version.as_deref(),
+            ) {
+                (true, Some(latest), Some(installed)) => Some(format!(
+                    "v{latest} available · installed v{installed}; updates when started"
+                )),
+                (_, Some(version), _) => Some(format!("v{version}")),
+                _ => None,
+            };
+            let is_available = adapter.available;
             let is_installed = adapter.installed;
             let is_pending = self.pending_external_adapter.as_deref()
                 == Some(adapter.id.as_str());
-            h_flex()
-                .items_center()
-                .justify_between()
+            let action_label = if is_pending {
+                if is_installed {
+                    "Removing…"
+                } else {
+                    "Adding…"
+                }
+            } else if is_installed {
+                "Remove"
+            } else {
+                "Install"
+            };
+            let accessible_action_label =
+                format!("{action_label} {}", adapter.display_name);
+            v_flex()
+                .w_full()
+                .gap_1()
                 .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(text)
-                        .child(adapter.display_name.clone()),
-                )
-                .child(
-                    Button::new(format!("toggle-acp-agent-{agent_id}"))
-                        .label(if is_pending {
-                            if is_installed {
-                                "Removing…"
-                            } else {
-                                "Adding…"
-                            }
-                        } else if is_installed {
-                            "Remove"
-                        } else {
-                            "Install"
-                        })
-                        .disabled(
-                            adapter_operation_pending
-                                || adapter_catalog_loading
-                                || session_creation_pending,
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(text)
+                                .child(adapter.display_name.clone()),
                         )
-                        .when(!is_installed, |button| button.primary())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_external_adapter_installed(
-                                agent_id.clone(),
-                                !is_installed,
-                                window,
-                                cx,
-                            );
-                        })),
+                        .child(
+                            Button::new(format!("toggle-acp-agent-{agent_id}"))
+                                .label(action_label)
+                                .accessibility_label(accessible_action_label)
+                                .disabled(
+                                    adapter_operation_pending
+                                        || adapter_catalog_loading
+                                        || session_creation_pending
+                                        || (!is_available && !is_installed),
+                                )
+                                .when(!is_installed, |button| button.primary())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.set_external_adapter_installed(
+                                            agent_id.clone(),
+                                            !is_installed,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        ),
                 )
+                .when_some(prerequisite_note, |row, note| {
+                    row.child(
+                        div()
+                            .debug_selector(move || prerequisite_selector.clone())
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(note),
+                    )
+                })
+                .when_some(version_note, |row, note| {
+                    row.child(
+                        div()
+                            .debug_selector(move || version_selector.clone())
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(note),
+                    )
+                })
         });
         let content = v_flex()
             .gap_3()
@@ -1432,13 +1485,62 @@ impl ThreadsPanel {
                 } else {
                     "Install a supported agent to start an external thread. The agent package is fetched on first launch; Node.js/npm is required.".into()
                 };
-                content.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(muted)
-                        .child(message),
+                content.when(
+                    self.external_adapter_catalog_error.is_none(),
+                    |content| {
+                        content.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .child(message),
+                        )
+                    },
                 )
             })
+            .when_some(
+                self.external_adapter_catalog_error.clone(),
+                |content, error| {
+                    content.child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .debug_selector(|| {
+                                        "external-agent-catalog-error".into()
+                                    })
+                                    .min_w_0()
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().danger)
+                                    .child(format!(
+                                        "Could not load supported agents: {error}"
+                                    )),
+                            )
+                            .child(
+                                Button::new("retry-external-agent-catalog")
+                                    .icon(IconName::RefreshCw)
+                                    .label(if adapter_catalog_loading {
+                                        "Retrying…"
+                                    } else {
+                                        "Retry"
+                                    })
+                                    .tooltip("Retry loading supported agents")
+                                    .disabled(
+                                        adapter_catalog_loading
+                                            || adapter_operation_pending,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.load_external_adapter_catalog(
+                                                window, cx,
+                                            );
+                                        },
+                                    )),
+                            ),
+                    )
+                },
+            )
             .child(
                 div()
                     .text_size(px(11.))
@@ -1840,6 +1942,7 @@ mod tests {
         ExternalAcpAdapter, HarnessKind, SessionLifecycle, SessionListItem,
     };
     use gpui_kit::TestAppContext;
+    use gpui_kit::test::TestWindowExt;
 
     #[test]
     fn implementation_child_stays_beneath_parent_after_restore() {
@@ -1907,16 +2010,37 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn failed_adapter_install_renders_error_in_external_picker(
-        cx: &mut TestAppContext,
-    ) {
+    fn pi_cli_prerequisite_is_visible_in_external_picker(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         let (panel, cx) = cx.add_window_view(ThreadsPanel::new);
         panel.update_in(cx, |panel, window, cx| {
             panel.new_external_thread(window, cx);
-            panel.set_external_adapter_installed("pi".into(), true, window, cx);
+            panel.external_adapters = vec![ExternalAcpAdapter {
+                id: "pi-acp".into(),
+                display_name: "Pi".into(),
+                installed: true,
+                available: true,
+                latest_version: Some("0.1.0".into()),
+                installed_version: Some("0.0.9".into()),
+                update_available: true,
+                prerequisite_note: Some(
+                    "Requires the Pi CLI v0.81+ on PATH; AHEAD installs only the ACP bridge."
+                        .into(),
+                ),
+            }];
+            panel.set_external_adapter_installed(
+                "pi-acp".into(),
+                true,
+                window,
+                cx,
+            );
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("external-agent-prerequisite-pi-acp")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("external-agent-version-pi-acp").is_some());
         assert!(cx.debug_bounds("thread-request-error").is_some());
         panel.update_in(cx, |panel, window, cx| {
             assert!(panel.pending_external_adapter.is_none());
@@ -1925,6 +2049,34 @@ mod tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("thread-request-error").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn failed_external_catalog_load_can_be_retried_in_place(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(ThreadsPanel::new);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_new_thread(HarnessKind::ExternalAcp, window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("external-agent-catalog-error").is_some());
+        assert!(cx.debug_bounds("retry-external-agent-catalog").is_some());
+        assert!(cx.debug_bounds("thread-request-error").is_none());
+
+        cx.update(|window, cx| {
+            window.click("retry-external-agent-catalog", cx);
+            window.draw(cx).clear(cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.external_adapter_catalog_loading);
+            assert_eq!(
+                panel.external_adapter_catalog_error.as_deref(),
+                Some("AHEAD host is unavailable")
+            );
+        });
+        assert!(cx.debug_bounds("retry-external-agent-catalog").is_some());
     }
 
     #[gpui_kit::test]
@@ -2078,6 +2230,14 @@ mod tests {
                 id: "pi".into(),
                 display_name: "Pi".into(),
                 installed: true,
+                available: true,
+                latest_version: Some("0.0.34".into()),
+                installed_version: Some("0.0.34".into()),
+                update_available: false,
+                prerequisite_note: Some(
+                    "Requires the Pi CLI v0.81+ on PATH; AHEAD installs only the ACP bridge."
+                        .into(),
+                ),
             }];
             panel.selected_external_adapter = Some("pi".into());
             let (_, request) = panel
@@ -2114,6 +2274,14 @@ mod tests {
                 id: "pi".into(),
                 display_name: "Pi".into(),
                 installed: false,
+                available: true,
+                latest_version: Some("0.0.34".into()),
+                installed_version: None,
+                update_available: false,
+                prerequisite_note: Some(
+                    "Requires the Pi CLI v0.81+ on PATH; AHEAD installs only the ACP bridge."
+                        .into(),
+                ),
             }];
             let (_, change) = panel
                 .prepare_adapter_change("pi".into(), true, cx)

@@ -6,7 +6,7 @@ use crate::code_panel::CodePanel;
 use crate::proxy_client::ProxyClient;
 use crate::workspace_panels::{
     ActivityBar, GitPanel, JustTasksPanel, LanguageServersPanel, ProblemsPanel,
-    SearchPanel,
+    SearchPanel, SearchReplaceFile, SearchReplaceRequest,
 };
 use ahead_rpc::ahead::AheadRequest;
 use ahead_rpc::ahead::{
@@ -18,7 +18,7 @@ use ahead_rpc::proxy::{
     ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse, ProxyRpc,
     ProxyRpcHandler,
 };
-use gpui_kit::component::dock::DockSkin;
+use gpui_kit::component::dock::{DockLayout, DockPlacement, DockSkin, panel_handle};
 use gpui_kit::{AppContext, Entity, Focusable, TestAppContext, VisualTestContext};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -116,6 +116,35 @@ fn start_mock_host_model() -> (
             };
             let headers =
                 String::from_utf8_lossy(&request[..header_end]).into_owned();
+            if headers.starts_with("GET /v1/models") {
+                let catalog = r#"{"models":[]}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{catalog}",
+                    catalog.len()
+                )
+                .expect("host model catalog response");
+                socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "host model request missing"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("host model accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("model read timeout");
+                request.clear();
+                continue;
+            }
             let length = headers
                 .lines()
                 .find_map(|line| {
@@ -124,7 +153,9 @@ fn start_mock_host_model() -> (
                         .then(|| value.trim().parse::<usize>().ok())
                         .flatten()
                 })
-                .expect("host model content length");
+                .expect(&format!(
+                    "host model content length missing; headers: {headers}"
+                ));
             if request.len() >= header_end + length {
                 let body = serde_json::from_slice(
                     &request[header_end..header_end + length],
@@ -228,6 +259,8 @@ fn two_authenticated_shells_join_a_direct_shared_session(cx: &mut TestAppContext
     use ahead_proxy::ahead::GitHubAuthManager;
     use ahead_proxy::dispatch::Dispatcher;
 
+    // The real dispatcher/TLS threads can wake RPC tasks outside the test scheduler.
+    cx.background_executor.allow_parking();
     let host_workspace = tempfile::tempdir().expect("host workspace");
     let guest_workspace = tempfile::tempdir().expect("guest workspace");
     std::fs::create_dir(host_workspace.path().join(".ahead"))
@@ -376,7 +409,7 @@ fn two_authenticated_shells_join_a_direct_shared_session(cx: &mut TestAppContext
     let guest_session =
         guest_shell.read_with(guest_cx, |shell, _| shell.session.clone());
     guest_session.update_in(guest_cx, |panel, window, cx| {
-        panel.chat_input.update(cx, |input, cx| {
+        panel.shared_session_input.update(cx, |input, cx| {
             input.set_value(
                 serde_json::to_string(&offer).expect("invite JSON"),
                 window,
@@ -732,6 +765,8 @@ fn shared_guest_child_process(cx: &mut TestAppContext) {
     let Ok(offer_json) = std::env::var("AHEAD_COLLAB_PROCESS_OFFER") else {
         return;
     };
+    // This child uses real TLS and dispatcher threads, not deterministic I/O.
+    cx.background_executor.allow_parking();
     let offer: ahead_rpc::ahead::SharedSessionOffer =
         serde_json::from_str(&offer_json).expect("shared offer");
     let guest_workspace = tempfile::tempdir().expect("guest workspace");
@@ -755,7 +790,7 @@ fn shared_guest_child_process(cx: &mut TestAppContext) {
         guest_shell.read_with(guest_cx, |shell, _| shell.session.clone());
     guest_session.update_in(guest_cx, |panel, window, cx| {
         panel
-            .chat_input
+            .shared_session_input
             .update(cx, |input, cx| input.set_value(offer_json, window, cx));
         panel.join_shared_session(window, cx);
     });
@@ -927,6 +962,8 @@ fn shared_guest_child_process(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn separate_ahead_processes_share_code_and_chat(cx: &mut TestAppContext) {
+    // The separate guest process and dispatcher threads perform real I/O.
+    cx.background_executor.allow_parking();
     use std::process::{Command, Stdio};
 
     let host_workspace = tempfile::tempdir().expect("host workspace");
@@ -1283,9 +1320,8 @@ fn open_shell<'a>(
         });
         let git = cx.new(|cx| GitPanel::new(&root_path, window, cx));
         let tasks = cx.new(|cx| JustTasksPanel::new(&root_path, cx));
-        let languages = cx.new(|cx| {
-            LanguageServersPanel::new(workspace, proxy.clone(), cx)
-        });
+        let languages =
+            cx.new(|cx| LanguageServersPanel::new(workspace, proxy.clone(), cx));
         let search = cx.new(|cx| {
             SearchPanel::new(
                 &root_path,
@@ -1301,7 +1337,13 @@ fn open_shell<'a>(
             AgentWorkspacePanel::new(session.clone(), threads.clone(), cx)
         });
         let activity = cx.new(|_| {
-            ActivityBar::new(area.clone(), explorer.clone(), git, tasks, languages)
+            ActivityBar::new(
+                area.clone(),
+                explorer.clone(),
+                git.clone(),
+                tasks,
+                languages,
+            )
         });
         let shell = cx.new(|cx| {
             Shell::new(
@@ -1310,6 +1352,7 @@ fn open_shell<'a>(
                 threads,
                 code.clone(),
                 explorer,
+                git,
                 debug,
                 Vec::new(),
                 problems,
@@ -1345,6 +1388,207 @@ fn open_shell<'a>(
         root.view().clone().downcast::<Shell>().ok().expect("shell")
     });
     (shell, cx, proxy)
+}
+
+#[gpui_kit::test]
+fn opening_a_fresh_editor_workspace_bootstraps_private_settings(
+    cx: &mut TestAppContext,
+) {
+    let workspace = tempfile::tempdir().expect("disposable workspace");
+    let ahead_directory = workspace.path().join(".ahead");
+    let settings_path = ahead_directory.join("settings.toml");
+    assert!(!ahead_directory.exists());
+
+    let (shell, cx, _) = open_shell(workspace.path(), &["src/main.rs"], cx);
+    cx.run_until_parked();
+
+    let settings = shell.update(cx, |shell, _| shell.settings.clone());
+    let status = settings.update(cx, |settings, _| settings.status.to_string());
+    assert!(!status.contains("Loading workspace settings"));
+    assert_eq!(
+        std::fs::read_to_string(&settings_path).expect("private settings created"),
+        include_str!("../../defaults/settings.toml"),
+    );
+    assert!(!ahead_directory.join("config.toml").exists());
+}
+
+#[gpui_kit::test]
+fn opening_a_file_through_an_alias_reuses_its_existing_buffer(
+    cx: &mut TestAppContext,
+) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["src/main.rs"], cx);
+    let original = shell.read_with(cx, |shell, _| shell.code_tabs[0].clone());
+    let original_id = original.entity_id();
+    let alias = workspace
+        .path()
+        .join("src")
+        .join("..")
+        .join("src/main.rs")
+        .to_string_lossy()
+        .into_owned();
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_file_request(
+            crate::ross::OpenRequest {
+                path: alias,
+                permanent: true,
+                location: None,
+            },
+            window,
+            cx,
+        );
+    });
+
+    assert_eq!(shell.read_with(cx, |shell, _| shell.code_tabs.len()), 1);
+    assert_eq!(
+        shell.read_with(cx, |shell, _| shell.code_tabs[0].entity_id()),
+        original_id,
+    );
+    assert_eq!(
+        shell.read_with(cx, |shell, _| shell.code.entity_id()),
+        original_id,
+    );
+}
+
+#[gpui_kit::test]
+fn search_replacement_edits_a_file_opened_by_the_search_action(
+    cx: &mut TestAppContext,
+) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let path = workspace.path().join("notes.md");
+    let original_text = "This project is disposable test data.\n";
+    let replacement_text = "This project is disposable smoke data.\n";
+    std::fs::write(&path, original_text).expect("source file");
+    let canonical_path = path.canonicalize().expect("canonical source path");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+
+    let result = shell.update_in(cx, |shell, window, cx| {
+        shell.apply_search_replacements(
+            SearchReplaceRequest {
+                files: vec![SearchReplaceFile {
+                    path: path.clone(),
+                    original_text: original_text.into(),
+                    replacement_text: replacement_text.into(),
+                    match_count: 1,
+                }],
+                match_count: 1,
+            },
+            window,
+            cx,
+        )
+    });
+
+    assert!(result.is_ok(), "search replacement failed: {result:?}");
+    let edited_text = shell.update(cx, |shell, cx| {
+        let tab_paths: Vec<_> = shell
+            .code_tabs
+            .iter()
+            .map(|panel| panel.read(cx).file_path.clone())
+            .collect();
+        shell
+            .code_tabs
+            .iter()
+            .find(|panel| {
+                Path::new(&panel.read(cx).file_path)
+                    .canonicalize()
+                    .is_ok_and(|open_path| open_path == canonical_path)
+            })
+            .unwrap_or_else(|| {
+                panic!("search target {path:?} not in tabs {tab_paths:?}")
+            })
+            .read_with(cx, |panel, cx| {
+                panel
+                    .workspace_edit_snapshot(cx)
+                    .expect("editor snapshot")
+                    .text
+            })
+    });
+    assert_eq!(edited_text, replacement_text);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("source remains readable"),
+        original_text,
+        "search replacement should remain an unsaved editor change"
+    );
+}
+
+#[gpui_kit::test]
+fn empty_agent_panel_routes_ahead_and_external_start_actions(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+    let (area, agent_workspace, session, threads) =
+        shell.read_with(cx, |shell, _| {
+            (
+                shell.area.clone(),
+                shell.agent_workspace.clone(),
+                shell.session.clone(),
+                shell.threads.clone(),
+            )
+        });
+    session.update(cx, |panel, cx| {
+        panel.set_thread_launcher(threads.clone(), cx);
+    });
+    cx.simulate_resize(gpui_kit::size(gpui_kit::px(1440.), gpui_kit::px(900.)));
+
+    cx.update(|window, cx| {
+        area.update(cx, |area, cx| {
+            area.set_dock(
+                DockPlacement::Right,
+                DockLayout::tabs()
+                    .panel_view(panel_handle(agent_workspace.clone()), cx),
+                window,
+                cx,
+            );
+            area.set_dock_size(DockPlacement::Right, gpui_kit::px(520.), window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("empty_new_ahead").is_some());
+        let ahead = window.find("empty_new_ahead").bounds();
+        let external = window.find("empty_new_external").bounds();
+        let join = window.find("join_shared_ahead_session").bounds();
+        let dock = window.find("dock-area").bounds();
+        let threads_width = agent_workspace.read(cx).threads_width;
+        let divider_x =
+            dock.origin.x + dock.size.width - threads_width - gpui_kit::px(4.);
+        assert!(ahead.origin.y + ahead.size.height <= external.origin.y);
+        assert!(external.origin.y + external.size.height <= join.origin.y);
+        assert!(ahead.origin.x + ahead.size.width <= divider_x);
+        assert!(external.origin.x + external.size.width <= divider_x);
+        assert!(join.origin.x + join.size.width <= divider_x);
+        agent_workspace.update(cx, |panel, cx| {
+            panel.set_threads_visible(false, cx);
+        });
+        window.render_frame(cx);
+        window.click("empty_new_ahead", cx);
+        window.render_frame(cx);
+        assert!(agent_workspace.read(cx).threads_visible);
+        assert!(window.try_find("new_session_next").is_some());
+
+        window.click("cancel_new_session", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("empty_new_external").is_some());
+        agent_workspace.update(cx, |panel, cx| {
+            panel.set_threads_visible(false, cx);
+        });
+        window.render_frame(cx);
+        window.click("empty_new_external", cx);
+        window.render_frame(cx);
+        assert!(agent_workspace.read(cx).threads_visible);
+        assert!(window.try_find("cancel_external_session").is_some());
+
+        window.click("cancel_external_session", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("join_shared_ahead_session").is_some());
+        window.click("join_shared_ahead_session", cx);
+        assert_eq!(
+            session.read(cx).status.as_ref(),
+            "Paste the session invite JSON copied from the host."
+        );
+    });
 }
 
 fn edit(
@@ -1476,6 +1720,31 @@ fn center_utility_tabs_remain_open_together(cx: &mut TestAppContext) {
     }));
 }
 
+#[gpui_kit::test]
+fn dirty_file_tab_keeps_its_marker_inline_at_narrow_width(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(
+        workspace.path(),
+        &["very-long-file-name-that-must-truncate.rs"],
+        cx,
+    );
+    shell.update_in(cx, |shell, window, cx| shell.show_code(window, cx));
+    cx.simulate_resize(gpui_kit::size(gpui_kit::px(520.), gpui_kit::px(720.)));
+    edit(&shell, 0, "modified\n", cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let filename = cx.debug_bounds("code-tab-filename").expect("file tab name");
+    let dirty_marker = cx
+        .debug_bounds("code-tab-dirty-marker")
+        .expect("dirty marker");
+    assert_eq!(filename.center().y, dirty_marker.center().y);
+    assert!(
+        filename.origin.x + filename.size.width <= dirty_marker.origin.x,
+        "filename {filename:?} overlaps dirty marker {dirty_marker:?}"
+    );
+}
+
 #[cfg(unix)]
 fn add_terminal(
     shell: &Entity<Shell>,
@@ -1504,6 +1773,85 @@ fn terminal_close_stops_backend_while_panel_is_retained(cx: &mut TestAppContext)
     shell.update_in(cx, |shell, window, cx| shell.close_terminal(17, window, cx));
     assert!(shell.read_with(cx, |shell, _| shell.terminals.is_empty()));
     assert!(terminal.read_with(cx, |terminal, _| terminal.is_shutdown()));
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+async fn just_tasks_open_fresh_named_terminals(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("disposable task workspace");
+    let directory = workspace.path().join("task's directory");
+    std::fs::create_dir(&directory).expect("task directory");
+    std::fs::write(
+        directory.join("justfile"),
+        "smoke:\n    @printf 'WRONG_JUSTFILE\\n'\n",
+    )
+    .expect("decoy justfile");
+    let justfile = directory.join(".justfile");
+    std::fs::write(
+        &justfile,
+        "smoke:\n    @printf 'AHEAD_TASK_OUTPUT\\n'\n    @printf '\\033]0;shell title\\007'\n",
+    )
+    .expect("selected justfile");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs"], cx);
+    let original = add_terminal(&shell, workspace.path(), cx);
+    let mut task_terminals = Vec::new();
+    for _ in 0..2 {
+        let terminal = shell.update_in(cx, |shell, window, cx| {
+            shell.new_task_terminal(
+                "smoke".into(),
+                directory.to_string_lossy().into_owned(),
+                justfile.to_string_lossy().into_owned(),
+                window,
+                cx,
+            );
+            assert!(shell.area.read(cx).is_dock_open(DockPlacement::Bottom));
+            let terminal = shell.terminals[shell.active_terminal].clone();
+            assert!(terminal.read(cx).focus.is_focused(window));
+            terminal
+        });
+        task_terminals.push(terminal);
+    }
+    assert_eq!(shell.read_with(cx, |shell, _| shell.terminals.len()), 3);
+    assert_ne!(task_terminals[0].entity_id(), original.entity_id());
+    assert_ne!(task_terminals[1].entity_id(), task_terminals[0].entity_id());
+    for terminal in &task_terminals {
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _| terminal.terminal_title()),
+            "smoke"
+        );
+    }
+    assert_ne!(
+        task_terminals[0].read_with(cx, |terminal, _| terminal.process_id()),
+        task_terminals[1].read_with(cx, |terminal, _| terminal.process_id())
+    );
+    for terminal in &task_terminals {
+        let mut output = String::new();
+        for _ in 0..300 {
+            output = terminal
+                .read_with(cx, |terminal, _| terminal.shared_snapshot_text());
+            if output.contains("AHEAD_TASK_OUTPUT") {
+                break;
+            }
+            cx.background_executor
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+            // The GPUI clock cannot advance native PTY child processes.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            output.contains("AHEAD_TASK_OUTPUT"),
+            "task output: {output}"
+        );
+        assert!(!output.contains("WRONG_JUSTFILE"), "task output: {output}");
+        assert_eq!(output.lines().next(), Some("smoke"));
+    }
+    assert!(!original.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    shell.update_in(cx, |shell, window, cx| {
+        for terminal in task_terminals.iter().chain(std::iter::once(&original)) {
+            let id = terminal.read(cx).terminal_id();
+            shell.close_terminal(id, window, cx);
+        }
+    });
 }
 
 fn take_request(

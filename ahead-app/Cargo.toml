@@ -6,8 +6,6 @@ version      = { workspace = true }
 authors      = { workspace = true }
 edition      = { workspace = true }
 rust-version = { workspace = true }
-build = "build.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 async-channel = { workspace = true }
@@ -15,12 +13,15 @@ ahead-voice = { path = "../ahead-voice" }
 ahead-viewmodel = { path = "../ahead-viewmodel" }
 ahead-rpc = { workspace = true }
 ahead-core = { workspace = true }
-ahead-extension-host = { path = "../ahead-extension-host" }
 alacritty_terminal = { workspace = true }
 chrono = { workspace = true }
+directories = { workspace = true }
+fancy-regex = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-util = { workspace = true }
 gpui-kit-assets = "=0.6.6"
+iana-time-zone = "0.1"
+log = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 fs4 = "0.13.1"
@@ -30,9 +31,11 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 lsp-types = { workspace = true }
 serde = { workspace = true }
+shlex = { workspace = true }
 semver = "1.0.28"
 sha2 = { workspace = true }
 nucleo-matcher = { workspace = true }
+similar = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

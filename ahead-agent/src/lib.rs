@@ -23,6 +23,7 @@
 pub mod acp_client;
 pub mod adapters;
 pub mod editor_tools;
+pub mod events;
 mod instructions;
 mod mcp_form;
 pub mod native_client;
@@ -33,16 +34,19 @@ mod turso_agent_graph_store;
 mod turso_thread_store;
 
 pub use acp_client::{
-    ACP_PROTOCOL_VERSION, HarnessClient, HarnessClientConfig, HarnessEvent,
-    HarnessFileChange, HarnessPlanEntry, HarnessSink, run_editor_mcp_stdio,
+    ACP_PROTOCOL_VERSION, HarnessClient, HarnessClientConfig, run_editor_mcp_stdio,
 };
 pub use adapters::{
     external_acp_adapter_is_installed, external_acp_adapters, external_agent_config,
     set_external_acp_adapter_installed,
 };
+pub use events::{
+    HarnessEvent, HarnessFileChange, HarnessPatchPreview, HarnessPlanEntry,
+    HarnessSink,
+};
 pub use instructions::{
     MemoryScope, MemorySource, memory_sources,
-    project_instruction_prompt_for_targets,
+    project_instruction_prompt_for_targets, project_instruction_root,
 };
 pub use native_client::{NativeClient, NativeClientConfig};
 pub use runtime_support::{
@@ -53,5 +57,6 @@ pub use store::{
     HarnessStore, InstructionFileSource, LegacyNativeThreadImport,
     NativeAgentEdgeStatus, NativeThreadHeader, NativeThreadHeaderPageRequest,
     NativeThreadRelationFilter, NativeThreadReplayPage, NativeThreadSnapshot,
-    NativeThreadSortDirection, NativeThreadTimestampSort,
+    NativeThreadSortDirection, NativeThreadTimestampSort, ProjectInstructionSource,
+    TurnSkillReference, TurnSkillSource,
 };

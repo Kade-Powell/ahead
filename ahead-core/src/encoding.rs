@@ -1,3 +1,76 @@
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextEncoding {
+    #[default]
+    Utf8,
+    Utf16LeBom,
+    Utf16BeBom,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DecodedText {
+    pub text: String,
+    pub encoding: TextEncoding,
+}
+
+pub fn decode_text(bytes: &[u8]) -> Option<DecodedText> {
+    if let Some(bytes) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Some(DecodedText {
+            text: decode_utf16(bytes, true)?,
+            encoding: TextEncoding::Utf16LeBom,
+        });
+    }
+    if let Some(bytes) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Some(DecodedText {
+            text: decode_utf16(bytes, false)?,
+            encoding: TextEncoding::Utf16BeBom,
+        });
+    }
+    String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(|text| DecodedText {
+            text,
+            encoding: TextEncoding::Utf8,
+        })
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let code_units = pairs
+        .iter()
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes(*pair)
+            } else {
+                u16::from_be_bytes(*pair)
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&code_units).ok()
+}
+
+pub fn encode_text(text: &str, encoding: TextEncoding) -> Vec<u8> {
+    match encoding {
+        TextEncoding::Utf8 => text.as_bytes().to_vec(),
+        TextEncoding::Utf16LeBom => encode_utf16(text, true),
+        TextEncoding::Utf16BeBom => encode_utf16(text, false),
+    }
+}
+
+fn encode_utf16(text: &str, little_endian: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if little_endian {
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    } else {
+        bytes.extend_from_slice(&[0xFE, 0xFF]);
+        bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+    }
+    bytes
+}
+
 /// Convert a utf8 offset into a utf16 offset, if possible  
 /// `text` is what the offsets are into
 pub fn offset_utf8_to_utf16(
@@ -99,7 +172,38 @@ pub fn offset_utf16_to_utf8_str(text: &str, offset: usize) -> usize {
 mod tests {
     // TODO: more tests with unicode characters
 
-    use crate::encoding::{offset_utf8_to_utf16_str, offset_utf16_to_utf8_str};
+    use crate::encoding::{
+        DecodedText, TextEncoding, decode_text, encode_text,
+        offset_utf8_to_utf16_str, offset_utf16_to_utf8_str,
+    };
+
+    #[test]
+    fn utf16_bom_text_round_trips_without_loss() {
+        let text = "café 🦀\r\n";
+        for encoding in [TextEncoding::Utf16LeBom, TextEncoding::Utf16BeBom] {
+            let bytes = encode_text(text, encoding);
+            let decoded = decode_text(&bytes).expect("decode UTF-16 text");
+            assert_eq!(
+                decoded,
+                DecodedText {
+                    text: text.into(),
+                    encoding
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_utf16_bom_is_rejected_and_unmarked_bytes_remain_utf8() {
+        assert!(decode_text(&[0xFF, 0xFE, 0x00]).is_none());
+        assert!(decode_text(&[0xFF, 0xFE, 0x00, 0xD8]).is_none());
+        assert_eq!(
+            decode_text(&[b'h', 0, b'i', 0])
+                .expect("valid UTF-8 bytes")
+                .encoding,
+            TextEncoding::Utf8
+        );
+    }
 
     #[test]
     fn utf8_to_utf16() {

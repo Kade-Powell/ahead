@@ -4,6 +4,7 @@ pub mod ahead;
 pub mod buffer;
 pub mod cli;
 pub mod dispatch;
+pub mod git_askpass;
 pub mod plugin;
 pub mod terminal;
 pub mod watcher;
@@ -20,12 +21,12 @@ fn run_helper_if_requested() {
     let argument = std::env::args_os().nth(1);
     #[cfg(unix)]
     if argument.as_deref()
-        == Some(OsStr::new(codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1))
+        == Some(OsStr::new(codex_exec_server::AHEAD_ARG0_EXEC_HELPER_ARG1))
     {
         codex_exec_server::run_arg0_exec_helper_main();
     }
     if argument.as_deref()
-        == Some(OsStr::new(codex_exec_server::CODEX_FS_HELPER_ARG1))
+        == Some(OsStr::new(codex_exec_server::AHEAD_FS_HELPER_ARG1))
     {
         codex_exec_server::run_fs_helper_main();
     }
@@ -34,6 +35,9 @@ fn run_helper_if_requested() {
 /// Runs the proxy or sandbox helper when the AHEAD executable was re-entered.
 pub fn run_if_requested() -> bool {
     run_helper_if_requested();
+    if git_askpass::run_if_requested() {
+        return true;
+    }
     if std::env::args_os().nth(1).as_deref()
         == Some(OsStr::new("--ahead-editor-mcp"))
     {
@@ -44,7 +48,13 @@ pub fn run_if_requested() -> bool {
         return true;
     }
     if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--proxy")) {
+        if cfg!(debug_assertions) {
+            eprintln!("AHEAD proxy child entering mainloop");
+        }
         mainloop();
+        if cfg!(debug_assertions) {
+            eprintln!("AHEAD proxy child mainloop exited");
+        }
         return true;
     }
     false

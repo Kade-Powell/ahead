@@ -29,6 +29,8 @@ Record new agreements here as the design conversation continues. Distinguish a u
 | W17 | Settled 2026-10-01 | Human implementation remains the default. At any point during implementation, the human may hand work to a new external agent thread with the session context and work directly with that agent. Show it indented beneath the originating AHEAD thread in the unified sidebar. The human returns to the original thread for verification, review and the remaining workflow; child completion does not complete the parent. |
 | W18 | Settled 2026-10-01; direct comment sync implemented | Session participants select code and write comments in an editor popover. A gutter icon and range rail expose open comments; the session panel lists them for navigation, chat attachment and resolution. Comments retain author, range, quote and source hash and expire with the archived session after 30 days. Opening a changed source avoids selecting the stale range. Directly shared comments enforce participant roles; headless two-window and separate-process tests cover guest comments reaching the host navigator. Rendered multi-client verification, diff-hunk anchoring, stale-range relocation and explicit child-thread attachment remain implementation work. |
 | W19 | Settled 2026-10-02; direct chat and shared editing implemented | An active AHEAD session may be shared from within that session. Its owner is the execution host and pays for agent model usage; other participants are clients of that host. A message with an `@` mention of another session participant is for people in the session and does not reach the agent. A message without a participant mention is sent to the agent under session role policy. A checked-in team manifest lists allowed GitHub accounts and default roles; the owner selects members for each session. |
+| W20 | Settled 2026-10-07; implementation in progress | Replace session dictation with a voice call started from the microphone position. Keep speech in the same AHEAD session and delegate engineering work to its existing agent. Prioritize conversation quality and support paid cloud and self-hosted GPU servers only; Mac-local model inference is out of scope. Choose the server model using benchmark evidence. Ending a call and cancelling coding work have separate lifecycles. See §6 and the [implementation plan](../plans/session-voice-calls.md). |
+| W21 | Recommended cloud route 2026-10-07; require live certification | Use OpenAI `gpt-live-1` with client delegation as the cloud route. Benchmark Realtime-Venus-Audio 9B against open-weight Qwen3-Omni-30B-A3B-Instruct for self-hosted GPU servers; Venus is a provisional evaluation candidate because its published evidence more directly covers full-duplex tool use. No self-hosted model is selected. Source contains separate vLLM-Omni Realtime duplex and experimental Realtime-Venus HTTP session adapters; neither establishes a qualified model or live delegation. Qwen compatibility is unverified. The hosted Alibaba `qwen-audio-3.0-realtime-plus` is not the self-hosted Qwen checkpoint. Keep the coding model independently selectable. The [implementation plan](../plans/session-voice-calls.md) records benchmark evidence and limitations, proposed call controls, serving requirements and acceptance checks. |
 
 No diagram introduces per-edit approval cards. A human decision or instruction can be given naturally in text or speech; an already instructed action does not need another confirmation. External publication and execution remain within the actual instruction and runtime permissions.
 
@@ -349,19 +351,57 @@ The local [Maieutic README](../../../vscode-maieutic/README.md) and [focus contr
 ```mermaid
 sequenceDiagram
   participant H as Human speaking or typing
-  participant E as AHEAD editor and voice
+  participant V as Speech frontend
+  participant E as AHEAD session host and editor
   participant A as Selected agent harness
-  H->>E: Explain this branch / here is what I think
-  E->>A: Same work, selected code, transcript and current decisions
-  A->>E: Request one verified focus or pointer change
-  E-->>A: Render acknowledged or target unavailable
-  A-->>E: Explain the visible concept and identify it in text
-  E-->>H: Show transcript and speak while keeping the cue stable
-  H->>E: Interrupt, ask a question, or keep coding
-  E->>E: Stop obsolete speech and keep typing responsive
-  E->>A: Corrected intent and updated code context
-  A-->>H: Adapt the explanation or propose the next observation
+  H->>E: Start voice call in this session
+  E->>V: Connect selected voice route with bounded session context
+  H->>V: Explain this branch / here is what I think
+  V-->>E: Live captions and delegation request
+  E->>A: Accepted request once, selected code and current decisions
+  par Agent work continues
+    A->>E: Verified progress or presentation request
+    E-->>A: Actual render acknowledgment or target unavailable
+    E-->>V: Correlated evidence and ready-to-speak context
+  and Conversation stays interactive
+    V-->>H: Speak and listen concurrently
+    H->>V: Interrupt or correct while continuing to type
+    V-->>E: Updated intent; explicit steer/cancel only when requested
+    E->>E: Stop obsolete playback; preserve caret and running work
+    E->>A: Queue or steer through existing turn controller
+  end
+  H->>E: End voice call
+  E->>V: Close call and release audio
+  A-->>E: Existing work can still complete in this session
 ```
+
+The agreed replacement for dictation is a session voice call (W20). The call
+uses the same conversation and task history; accepted speech enters it without
+an Add transcript or Send step. The human and speech frontend can keep talking
+while the managed agent works. The session host owns request dispatch, policy,
+task identity and verified results. Speech does not gain independent tool or
+execution authority. The detailed controls and cloud-first acceptance order
+are in the [session voice call plan](../plans/session-voice-calls.md).
+
+Persist submitted speech as conversation text with its origin and timing;
+correlate delegations with existing tasks instead of creating a second work
+history. Partial captions and audio buffers are transient; raw audio recording
+is off by default. Lasting decisions and plans retain the artifact convention
+in §9. These remain target behaviors. Source now has an initial OpenAI GPT-Live
+call path, a vLLM-Omni Realtime duplex adapter with managed-session function
+delegation, and an experimental Realtime-Venus HTTP session adapter that checks
+the reported session limit and local/server tokenizer IDs. Native Mac
+capture/playback and the replacement call control are also in source. Both
+self-hosted adapters still need GPU-backed verification; Venus is an evaluation
+path, not a qualified provider. Self-hosted local-VAD turn endings flush a
+padded model frame and send a duplex input commit; the server response still
+needs verification. Code questions are directed through the managed agent with
+instructions to inspect the unsaved editor buffer. Teaching and questions about
+a specific section require an exact verified highlight before explanation, with
+the separate pointer following the explanation while preserving the human caret.
+Neither the cloud nor self-hosted route has passed a live provider/device
+walkthrough; complete overlap behavior remains unverified. No self-hosted model
+is qualified, and the AHEAD-shaped benchmark remains open.
 
 Presentation Core is an editor tool surface, independent of the agent runtime.
 Every supported AHEAD agent implementation and version exposes the same
@@ -386,18 +426,22 @@ inline note remain in place. Both editor actions preserve the human selection
 and acknowledge after the updated frame. Pointer movement, cue-specific clear,
 and cue-linked speech are limited to cues created by that session; each queued
 editor action is checked against both its session and active turn, so cancelled
-or superseded turns are rejected too. Switching sessions stops
-speech and microphone capture, drops that session's transcript drafts, and clears
-its cue. The speaker uses macOS `/usr/bin/say`; typing in the editor or
-agent composer, changing a breakpoint, or using a debugger control interrupts
-playback without cancelling the agent turn. The microphone path uses AVAudioEngine
-and Apple's Speech framework on macOS, requires the current language to support on-device
-recognition, and explicitly requires on-device requests so microphone audio is
-not sent to a speech service. Partial text is shown as the user speaks; each
-final transcript stays as a draft until the user adds it to the composer,
-reviews or corrects it, and sends it through the selected harness. These are
-source-level behaviors; the interactive native and ACP journeys still need
-validation, including OS permissions and unavailable on-device languages.
+or superseded turns are rejected too. Switching sessions ends the active voice
+call, stops capture and playback, clears its transient captions and queued
+delegations, and clears that session's cue. The voice-call frontend uses
+AVAudioEngine to stream audio to the selected cloud or self-hosted server; it
+does not use Apple's Speech framework or Mac-local inference. Live captions and
+timestamped delegation events are correlated by the app, and an accepted spoken
+request starts a managed AHEAD turn without an Add transcript or Send step.
+That turn receives the current editor context and can use the verified buffer,
+highlight, and pointer tools. Initial and changing editor context is bounded;
+private-file contents are withheld from the voice frontend. Acoustic
+interruption stops remote voice playback while leaving coding work running.
+The separate `speak_text` presentation tool uses macOS `/usr/bin/say`; typing
+in the editor or agent composer, changing a breakpoint, or using a debugger
+control interrupts that presentation speech without cancelling the agent turn.
+These are source-level behaviors; provider/device overlap, the rendered teaching
+journey, and app lifecycle recovery still need live validation.
 Session code comments are persistent until the session expires; presentation
 code notes remain transient and serve a separate teaching purpose.
 
@@ -520,18 +564,21 @@ that directory:
 | `.ahead/sessions/<id>/` | tracked when explicitly published | Portable session checkpoint and selected human-readable artifacts. |
 | `docs/{research,design,plans,verification,reviews}/` by default | tracked when committed | Canonical lasting documents, named for their subject. `[documentation].root` changes the root. |
 | `~/.ahead/settings.toml` | outside the repository | Private user-level defaults and credentials. |
+| `~/.ahead/auth.json` | outside the repository | Private GitHub collaboration identity; `$AHEAD_USER_HOME` relocates this user-level `.ahead` directory. |
 | `.ahead/settings.toml` | ignored | Workspace-private AI connections, credentials and personal overrides. |
 | `.ahead/config.local.toml` | ignored | Checkout-specific non-secret overrides. |
-| `.ahead/local/`, `.ahead/session.db*`, `.ahead/auth.json` | ignored | Private working documents, runtime history, caches and credentials. |
+| `.ahead/local/`, `.ahead/session.db*` | ignored | Private working documents, runtime history and caches. |
 
-**Proposed MCP default:** use an AHEAD-owned `[mcp.servers.<id>]` settings shape
-that maps to MCP's standard transports; do not claim compatibility with a
-private editor config format. Require explicit local opt-in in
-`.ahead/settings.toml` or `~/.ahead/settings.toml`; never auto-launch a server
-from tracked config. This is a proposed config contract, not a working
-server-launch path. The native host must keep MCP unavailable in Learn until it
-can enforce read-only behavior for external server effects; MCP writes are not
-AHEAD CodeAnchors. See the [agent standards boundary](ahead-agent-standards.md#protocols).
+**Managed MCP:** tracked `.ahead/config.toml` declares workspace-local stdio
+servers; ignored `.ahead/settings.toml` must explicitly approve the exact
+declaration fingerprint before launch. Tool and resource calls are reviewed by
+default and can receive workspace-local per-tool decisions. Learn sessions do
+not receive these servers. AHEAD cannot mediate effects performed inside an
+opted-in server process, so those effects are not `CodeAnchor`-attributed.
+Streamable HTTP and OAuth remain unsupported in the editor; this is an explicit
+transport boundary, not a claim that MCP itself lacks HTTP. See the [agent
+standards boundary](ahead-agent-standards.md#protocols) for the implemented
+configuration and policy contract; rendered approval remains unverified.
 
 Live shared conversation, participant membership and message audience remain
 private session database state on the host. An explicitly exported checkpoint

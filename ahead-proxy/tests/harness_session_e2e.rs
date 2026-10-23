@@ -27,6 +27,8 @@ fn turn_dto(session_id: &str, message: &str) -> AgentTurnRequestDto {
         external_agent_id: None,
         model: None,
         model_provider: None,
+        model_context_window: None,
+        reasoning_effort: None,
         user_message: message.to_string(),
         session_context: String::new(),
         context: TurnEditorContext {
@@ -77,6 +79,191 @@ fn all_messages(
     Ok(pages.into_iter().flatten().collect())
 }
 
+fn mock_patch_provider() -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    listener.set_nonblocking(true).expect("set nonblocking");
+    let endpoint = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("provider address")
+    );
+    let patch = "*** Begin Patch\n*** Add File: proof.txt\n+AHEAD managed proof\n*** End Patch";
+    let responses = vec![
+        vec![
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "patch-item",
+                        "type": "custom_tool_call",
+                        "call_id": "patch-call",
+                        "name": "apply_patch",
+                        "input": ""
+                    }
+                }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "patch-item",
+                        "type": "custom_tool_call",
+                        "call_id": "patch-call",
+                        "name": "apply_patch",
+                        "input": patch
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "patch-response", "end_turn": false}
+                }),
+            ),
+        ],
+        vec![
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "answer-item",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": []
+                    }
+                }),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "answer-item",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Created proof.txt."
+                        }]
+                    }
+                }),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "answer-response", "end_turn": true}
+                }),
+            ),
+        ],
+    ];
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::with_capacity(responses.len());
+        let mut response_index = 0;
+        while response_index < responses.len() {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream: TcpStream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "model request did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept model request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set request timeout");
+
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut buffer).expect("read model request");
+                assert_ne!(read, 0, "model request ended before body");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+                if request.len() >= header_end + content_length.unwrap_or_default() {
+                    break (header_end, content_length);
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let request_line = headers.lines().next().expect("request line");
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer ahead-test-key"),
+                "managed request did not use the fixture credential"
+            );
+            if request_line.starts_with("GET /v1/models") {
+                let body = r#"{"models":[]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model catalog");
+                continue;
+            }
+            assert!(
+                request_line.starts_with("POST /v1/responses "),
+                "unexpected mock provider request: {request_line}"
+            );
+            let content_length =
+                content_length.expect("Responses request content length");
+            let request_body = String::from_utf8(
+                request[header_end..header_end + content_length].to_vec(),
+            )
+            .expect("request JSON");
+
+            let body = responses[response_index]
+                .iter()
+                .map(|(event, payload)| {
+                    format!("event: {event}\ndata: {payload}\n\n")
+                })
+                .collect::<String>();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write mock Responses stream");
+            requests.push(request_body);
+            response_index += 1;
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
 #[test]
 #[ignore = "requires a configured external ACP agent and model credentials"]
 fn durable_streamed_turn_persists_cancels_and_reopens() {
@@ -97,7 +284,7 @@ fn durable_streamed_turn_persists_cancels_and_reopens() {
     // The controller reads sessions from its own store, so insert the view
     // before wrapping the shared store in the `HarnessStore` adapter.
     let database_dir = tempfile::tempdir().expect("temporary database directory");
-    let database_path = database_dir.path().join("sessions.db");
+    let database_path = database_dir.path().join("session.db");
     let mut store_impl = SessionStore::open(&database_path).expect("file store");
     store_impl.insert_session(&view).expect("insert session");
     let shared = Arc::new(parking_lot::RwLock::new(store_impl));
@@ -216,17 +403,18 @@ fn durable_streamed_turn_persists_cancels_and_reopens() {
 }
 
 #[test]
-#[ignore = "requires managed model credentials and native sandbox support"]
 fn managed_file_change_records_ahead_anchor() {
-    let root = std::env::temp_dir().join(format!(
-        "ahead-managed-anchor-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let workspace = tempfile::tempdir().expect("disposable workspace");
+    std::fs::create_dir(workspace.path().join(".ahead"))
+        .expect("create workspace settings directory");
+    let (endpoint, model_server) = mock_patch_provider();
+    std::fs::write(
+        workspace.path().join(".ahead/settings.toml"),
+        format!(
+            "[ai]\nactive_connection = 'Mock'\n[[ai.connections]]\nname = 'Mock'\nprovider_id = 'mock'\nbase_url = '{endpoint}'\napi_key = 'ahead-test-key'\nmodel = 'gpt-5.6-sol'\n"
+        ),
+    )
+    .expect("write private mock-provider settings");
 
     let host = ahead_proxy::ahead::host::AheadSessionHost::new(
         SessionStore::in_memory().unwrap(),
@@ -247,36 +435,22 @@ fn managed_file_change_records_ahead_anchor() {
     let controller = HarnessController::new(Arc::new(
         ahead_proxy::ahead::store::SharedSessionStore(shared.clone()),
     ));
-    controller.set_workspace(root.clone());
+    controller.set_workspace(workspace.path().to_path_buf());
+    let mut turn = turn_dto(
+        &session_id,
+        "Create proof.txt containing exactly AHEAD managed proof using apply_patch.",
+    );
+    turn.thread_id = "managed-anchor-e2e".to_string();
+    turn.harness = ahead_rpc::ahead::HarnessKind::Ahead;
+    turn.model = Some("gpt-5.6-sol".to_string());
+    turn.model_provider = Some("mock".to_string());
+    turn.cwd = Some(workspace.path().to_string_lossy().into_owned());
+    turn.context.active_path = "proof.txt".to_string();
     controller
-        .start_turn(AgentTurnRequestDto {
-            session_id: session_id.clone(),
-            thread_id: "managed-anchor-e2e".to_string(),
-            harness: ahead_rpc::ahead::HarnessKind::Ahead,
-            external_agent_id: None,
-            model: None,
-            model_provider: Some("openai".to_string()),
-            user_message: "Use the native file editing tool, not shell, to create proof.txt containing exactly `AHEAD managed proof`. Do not edit any other path.".to_string(),
-            session_context: String::new(),
-            context: TurnEditorContext {
-                active_path: "proof.txt".to_string(),
-                caret: DisplayPosition { line: 0, col: 0 },
-                selection: None,
-                file_content: String::new(),
-                visible_end: None,
-                attached_anchor_ids: Vec::new(),
-                attached_files: Vec::new(),
-                attached_memories: Vec::new(),
-            },
-            invariants: Vec::new(),
-            cwd: Some(root.to_string_lossy().to_string()),
-            expected_policy_sha256: String::new(),
-            read_only: false,
-            scope: None,
-        }, "human")
+        .start_turn(turn, "human")
         .expect("start managed turn");
 
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while controller.has_active_turn(&session_id) {
         if Instant::now() > deadline {
             panic!("managed file-change turn did not complete");
@@ -284,8 +458,17 @@ fn managed_file_change_records_ahead_anchor() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let content = std::fs::read_to_string(root.join("proof.txt")).unwrap();
-    assert!(content.contains("AHEAD managed proof"));
+    let requests = model_server.join().expect("mock model server");
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should trigger a follow-up turn"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("proof.txt"))
+            .expect("managed apply_patch created the file"),
+        "AHEAD managed proof\n"
+    );
     let anchors = shared.read().list_anchors(&session_id).unwrap();
     assert!(anchors.iter().any(|anchor| {
         anchor.actor_id == ahead_rpc::ahead::AHEAD_ACTOR_ID
@@ -297,7 +480,6 @@ fn managed_file_change_records_ahead_anchor() {
     }));
 
     controller.shutdown_harness();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -316,104 +498,127 @@ fn managed_connection_change_resumes_history_on_new_endpoint() {
             listener.local_addr().expect("model address")
         );
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut stream: TcpStream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "model request did not arrive"
-                        );
-                        std::thread::sleep(Duration::from_millis(20));
+            loop {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut stream: TcpStream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            assert!(
+                                Instant::now() < deadline,
+                                "model request did not arrive"
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(error) => panic!("accept model request: {error}"),
                     }
-                    Err(error) => panic!("accept model request: {error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("set read timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            let (header_end, content_length) = loop {
-                let read = stream.read(&mut buffer).expect("read model request");
-                assert_ne!(read, 0, "model request ended before body");
-                request.extend_from_slice(&buffer[..read]);
-                let Some(header_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|index| index + 4)
-                else {
-                    continue;
                 };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("set read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut buffer).expect("read model request");
+                    assert_ne!(read, 0, "model request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length")
                             .then(|| value.trim().parse::<usize>().ok())
                             .flatten()
-                    })
-                    .expect("request content length");
+                    });
+                    if request.len()
+                        >= header_end + content_length.unwrap_or_default()
+                    {
+                        break (header_end, content_length);
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let request_line = headers.lines().next().expect("request line");
                 assert!(
                     headers
                         .to_ascii_lowercase()
                         .contains(&format!("authorization: bearer {key}")),
                     "model request used the wrong connection credential"
                 );
-                if request.len() >= header_end + content_length {
-                    break (header_end, content_length);
+                if request_line.starts_with("GET /v1/models") {
+                    let body = r#"{"models":[]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .expect("write model catalog");
+                    continue;
                 }
-            };
-            let item = serde_json::json!({
-                "id": format!("message-{reply}"),
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": reply}],
-            });
-            let events = [
-                (
-                    "response.output_item.added",
-                    serde_json::json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {"id": format!("message-{reply}"), "type": "message", "role": "assistant", "content": []},
-                    }),
-                ),
-                (
-                    "response.output_item.done",
-                    serde_json::json!({
-                        "type": "response.output_item.done",
-                        "output_index": 0,
-                        "item": item,
-                    }),
-                ),
-                (
-                    "response.completed",
-                    serde_json::json!({
-                        "type": "response.completed",
-                        "response": {"id": format!("response-{reply}"), "end_turn": true},
-                    }),
-                ),
-            ];
-            let body = events
-                .iter()
-                .map(|(event, payload)| {
-                    format!("event: {event}\ndata: {payload}\n\n")
-                })
-                .collect::<String>();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write model response");
-            String::from_utf8(
-                request[header_end..header_end + content_length].to_vec(),
-            )
-            .expect("request JSON")
+
+                assert!(
+                    request_line.starts_with("POST /v1/responses "),
+                    "unexpected model request: {request_line}"
+                );
+                let content_length =
+                    content_length.expect("Responses request content length");
+                let item = serde_json::json!({
+                    "id": format!("message-{reply}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": reply}],
+                });
+                let events = [
+                    (
+                        "response.output_item.added",
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {"id": format!("message-{reply}"), "type": "message", "role": "assistant", "content": []},
+                        }),
+                    ),
+                    (
+                        "response.output_item.done",
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": item,
+                        }),
+                    ),
+                    (
+                        "response.completed",
+                        serde_json::json!({
+                            "type": "response.completed",
+                            "response": {"id": format!("response-{reply}"), "end_turn": true},
+                        }),
+                    ),
+                ];
+                let body = events
+                    .iter()
+                    .map(|(event, payload)| {
+                        format!("event: {event}\ndata: {payload}\n\n")
+                    })
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+                return String::from_utf8(
+                    request[header_end..header_end + content_length].to_vec(),
+                )
+                .expect("request JSON");
+            }
         });
         (endpoint, server)
     }

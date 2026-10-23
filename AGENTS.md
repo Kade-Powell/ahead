@@ -45,12 +45,12 @@
 - The runtime choice is settled as two tiers (managed native `ahead-agent` vs external ACP agents). The built-in path talks directly to the retained native runtime; it does not launch a Codex App Server executable or use an App Server JSON-RPC hop. See the [harness decision](docs/development/ahead-humanlayer-workflows.md#harness-decision-2026-09-18) and live probe results; do not claim an ACP-only path enforces AHEAD's lifecycle.
 - **Native runtime boundary**: `ahead-agent/src/native_client.rs` and
   `ahead-agent/src/session.rs` own the managed turn path; the retained runtime
-  source lives under `ahead-agent/runtime/source/`. Keep model-facing tool
+  source lives under `ahead-agent-engine/`. Keep model-facing tool
   contracts, streaming, cancellation and compaction behavior faithful to that
   pinned source. Do not reintroduce the removed App Server executable or its
   generated schema tree without a new architecture decision.
 - **Distilled Codex maintenance guidance**: before changing files under
-  `ahead-agent/runtime/source/`, read its scoped `AGENTS.md` and use the
+  `ahead-agent-engine/`, read its scoped `AGENTS.md` and use the
   applicable workspace skills under `.agents/skills/ahead-agent-*`.
 - **Bloat to Gut**:
   - `codex-analytics`: Eliminates cloud telemetry and the 35-second shutdown flush timeout.
@@ -139,7 +139,7 @@
 ### Build & lint
 
 - Zed uses `./script/clippy`; AHEAD has no script wrapper — run `cargo clippy --workspace --all-targets` directly. `bacon` runs the fast local check loop; CI runs `cargo clippy` and `cargo fmt --all --check`.
-- For live editor work, use `just dev` from the repository root. Keep one shared Cargo build loop at a time; coordinate before starting another broad `cargo` build/check/test, and stop your watcher with Ctrl-C before a one-off check. Use the package-qualified run command in the recipe, not ambiguous `cargo run --bin ahead`. See [Building from Source](docs/building-from-source.md#agent-development-loop) for the agent workflow.
+- For live editor work, use `just dev` from the repository root. Keep one shared Cargo build loop at a time; coordinate before starting another broad `cargo` build/check/test, and stop your watcher with Ctrl-C before a one-off check. This workspace has `ahead` binaries in both `ahead` and `ahead-app`, so bare `cargo run --bin ahead` is ambiguous; a direct app-only run must use `cargo run -p ahead --bin ahead` and will not build the bundled Code Mode host. See [Building from Source](docs/building-from-source.md#agent-development-loop) for the agent workflow.
 
 ## GPUI Primitives (ported from Zed `.rules`)
 

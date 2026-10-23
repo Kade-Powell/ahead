@@ -17,17 +17,19 @@ use crate::{
     file_line::FileLine,
     plugin::PluginId,
     source_control::{FileDiff, GitFileState},
+    style::ExtensionSyntax,
     style::SemanticStyles,
     terminal::{TermId, TerminalProfile},
 };
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
 use lsp_types::{
-    CallHierarchyIncomingCall, CallHierarchyItem, CodeAction, CodeActionResponse,
+    CallHierarchyIncomingCall, CallHierarchyItem, CodeAction, CodeActionOrCommand,
     CodeLens, CompletionItem, Diagnostic, DocumentSymbolResponse, FoldingRange,
     GotoDefinitionResponse, Hover, InlayHint, InlineCompletionResponse,
     InlineCompletionTriggerKind, Location, Position, PrepareRenameResponse,
-    SelectionRange, SymbolInformation, TextDocumentItem, TextEdit, WorkspaceEdit,
+    SelectionRange, SignatureHelpContext, SymbolInformation, TextDocumentItem,
+    TextEdit, WorkspaceEdit,
     request::{GotoImplementationResponse, GotoTypeDefinitionResponse},
 };
 use parking_lot::Mutex;
@@ -59,6 +61,12 @@ pub struct SearchMatch {
     pub line_content: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LspCodeAction {
+    pub plugin_id: PluginId,
+    pub action: CodeActionOrCommand,
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "request envelope carries buffer/search payloads by value; consumed once per dispatch"
@@ -78,6 +86,33 @@ pub enum ProxyRequest {
         path: PathBuf,
         content: String,
     },
+    GitStatus {},
+    GitCheckout {
+        reference: String,
+    },
+    GitCreateBranch {
+        reference: String,
+    },
+    GitDeleteBranch {
+        reference: String,
+    },
+    GitPush {
+        remote: Option<String>,
+    },
+    GitHistory {
+        limit: u32,
+    },
+    GitCommitPatch {
+        id: String,
+    },
+    GitWorktreeFilePatch {
+        path: PathBuf,
+    },
+    GitWorktreePatch {},
+    GitStagePaths {
+        paths: Vec<String>,
+        staged: bool,
+    },
     GitCommit {
         message: String,
         diffs: Vec<FileDiff>,
@@ -96,6 +131,11 @@ pub enum ProxyRequest {
         plugin_id: PluginId,
         completion_item: Box<CompletionItem>,
     },
+    ExecuteLspCommand {
+        plugin_id: PluginId,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    },
     CodeActionResolve {
         plugin_id: PluginId,
         action_item: Box<CodeAction>,
@@ -103,10 +143,6 @@ pub enum ProxyRequest {
     GetHover {
         request_id: usize,
         path: PathBuf,
-        position: Position,
-    },
-    GetSignature {
-        buffer_id: BufferId,
         position: Position,
     },
     GetSelectionRange {
@@ -149,8 +185,20 @@ pub enum ProxyRequest {
         path: PathBuf,
         position: Position,
         trigger_kind: InlineCompletionTriggerKind,
+        session_id: Option<String>,
+        model_context: Option<crate::ahead::PredictionModelContext>,
+    },
+    ValidateInlinePrediction {
+        path: PathBuf,
+        position: Position,
+        content_sha256: String,
+        replacement: String,
+        binding: crate::ahead::PredictionBinding,
     },
     GetSemanticTokens {
+        path: PathBuf,
+    },
+    GetExtensionSyntax {
         path: PathBuf,
     },
     LspFoldingRange {
@@ -249,6 +297,9 @@ pub enum ProxyRequest {
         version: String,
         expected_sha256: Option<String>,
     },
+    UninstallLanguageExtension {
+        extension_id: String,
+    },
 }
 
 #[expect(
@@ -274,6 +325,9 @@ pub enum ProxyNotification {
     CancelWorkspaceFiles {
         request_id: u64,
     },
+    CancelInlineCompletions {
+        request_id: RequestId,
+    },
     Completion {
         request_id: usize,
         path: PathBuf,
@@ -284,11 +338,16 @@ pub enum ProxyNotification {
         request_id: usize,
         path: PathBuf,
         position: Position,
+        context: SignatureHelpContext,
     },
     Update {
         path: PathBuf,
         delta: AheadDelta,
         rev: u64,
+    },
+    EditorEdit {
+        path: PathBuf,
+        delta: AheadDelta,
     },
     EditorSnapshot {
         path: PathBuf,
@@ -301,9 +360,6 @@ pub enum ProxyNotification {
         term_id: TermId,
         profile: TerminalProfile,
     },
-    GitCheckout {
-        reference: String,
-    },
     GitDiscardFilesChanges {
         files: Vec<PathBuf>,
     },
@@ -312,7 +368,12 @@ pub enum ProxyNotification {
     LspCancel {
         id: i32,
     },
-    RestartLanguageServers {},
+    RepairLanguageServer {
+        server_id: String,
+    },
+    RestartLanguageServers {
+        extension_id: Option<String>,
+    },
     TerminalWrite {
         term_id: TermId,
         content: String,
@@ -376,6 +437,21 @@ pub enum ProxyNotification {
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
 pub enum ProxyResponse {
+    GitStatus {
+        status: crate::source_control::GitWorkspaceStatus,
+    },
+    GitHistory {
+        commits: Vec<crate::source_control::GitCommitSummary>,
+    },
+    GitCommitPatch {
+        patch: crate::source_control::GitPatch,
+    },
+    GitWorktreeFilePatch {
+        patch: crate::source_control::GitPatch,
+    },
+    GitWorktreePatch {
+        patch: crate::source_control::GitPatch,
+    },
     GitFileState {
         state: GitFileState,
     },
@@ -396,6 +472,7 @@ pub enum ProxyResponse {
     CompletionResolveResponse {
         item: Box<CompletionItem>,
     },
+    ExecuteLspCommandResponse {},
     CodeActionResolveResponse {
         item: Box<CodeAction>,
     },
@@ -421,8 +498,7 @@ pub enum ProxyResponse {
         references: Vec<Location>,
     },
     GetCodeActionsResponse {
-        plugin_id: PluginId,
-        resp: CodeActionResponse,
+        actions: Vec<LspCodeAction>,
     },
     LspFoldingRangeResponse {
         plugin_id: PluginId,
@@ -457,9 +533,17 @@ pub enum ProxyResponse {
     },
     GetInlineCompletions {
         completions: InlineCompletionResponse,
+        context_paths: Vec<PathBuf>,
+        prediction: Option<crate::ahead::PredictionBinding>,
+    },
+    ValidateInlinePrediction {
+        valid: bool,
     },
     GetSemanticTokens {
         styles: SemanticStyles,
+    },
+    GetExtensionSyntax {
+        syntax: ExtensionSyntax,
     },
     PrepareRename {
         resp: PrepareRenameResponse,
@@ -620,14 +704,18 @@ impl ProxyRpcHandler {
         }
     }
 
-    fn request_common(&self, request: ProxyRequest, rh: ResponseHandler) {
+    fn request_common(
+        &self,
+        request: ProxyRequest,
+        rh: ResponseHandler,
+    ) -> RequestId {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
 
         let mut pending = self.pending.lock();
         let Some(handlers) = pending.as_mut() else {
             drop(pending);
             rh.invoke(Err(Self::connection_closed_error()));
-            return;
+            return id;
         };
         handlers.insert(id, rh);
         let sent = self.tx.send(ProxyRpc::Request(id, request));
@@ -636,6 +724,7 @@ impl ProxyRpcHandler {
             tracing::error!("{error:?}");
             self.disconnect();
         }
+        id
     }
 
     fn request(&self, request: ProxyRequest) -> Result<ProxyResponse, RpcError> {
@@ -716,6 +805,23 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::CancelWorkspaceFiles { request_id });
     }
 
+    pub fn cancel_inline_completions(&self, request_id: RequestId) {
+        let handler = self
+            .pending
+            .lock()
+            .as_mut()
+            .and_then(|pending| pending.remove(&request_id));
+        if let Some(handler) = handler {
+            self.notification(ProxyNotification::CancelInlineCompletions {
+                request_id,
+            });
+            handler.invoke(Err(RpcError {
+                code: 0,
+                message: "inline prediction cancelled".into(),
+            }));
+        }
+    }
+
     pub fn request_async(
         &self,
         request: ProxyRequest,
@@ -761,10 +867,6 @@ impl ProxyRpcHandler {
         self.notification(ProxyNotification::GitInit {});
     }
 
-    pub fn git_checkout(&self, reference: String) {
-        self.notification(ProxyNotification::GitCheckout { reference });
-    }
-
     pub fn shutdown(&self) {
         self.notification(ProxyNotification::Shutdown {});
         self.disconnect();
@@ -803,11 +905,13 @@ impl ProxyRpcHandler {
         request_id: usize,
         path: PathBuf,
         position: Position,
+        context: SignatureHelpContext,
     ) {
         self.notification(ProxyNotification::SignatureHelp {
             request_id,
             path,
             position,
+            context,
         });
     }
 
@@ -855,6 +959,17 @@ impl ProxyRpcHandler {
                 version,
                 expected_sha256,
             },
+            f,
+        );
+    }
+
+    pub fn uninstall_language_extension(
+        &self,
+        extension_id: String,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(
+            ProxyRequest::UninstallLanguageExtension { extension_id },
             f,
         );
     }
@@ -997,6 +1112,23 @@ impl ProxyRpcHandler {
             ProxyRequest::CodeActionResolve {
                 action_item: Box::new(action_item),
                 plugin_id,
+            },
+            f,
+        );
+    }
+
+    pub fn execute_lsp_command(
+        &self,
+        plugin_id: PluginId,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(
+            ProxyRequest::ExecuteLspCommand {
+                plugin_id,
+                command,
+                arguments,
             },
             f,
         );
@@ -1157,6 +1289,14 @@ impl ProxyRpcHandler {
         self.request_async(ProxyRequest::GetSemanticTokens { path }, f);
     }
 
+    pub fn get_extension_syntax(
+        &self,
+        path: PathBuf,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::GetExtensionSyntax { path }, f);
+    }
+
     pub fn get_document_symbols(
         &self,
         path: PathBuf,
@@ -1216,20 +1356,28 @@ impl ProxyRpcHandler {
         path: PathBuf,
         position: Position,
         trigger_kind: InlineCompletionTriggerKind,
+        session_id: Option<String>,
+        model_context: Option<crate::ahead::PredictionModelContext>,
         f: impl ProxyCallback + 'static,
-    ) {
-        self.request_async(
+    ) -> RequestId {
+        self.request_common(
             ProxyRequest::GetInlineCompletions {
                 path,
                 position,
                 trigger_kind,
+                session_id,
+                model_context,
             },
-            f,
-        );
+            ResponseHandler::Callback(Box::new(f)),
+        )
     }
 
     pub fn update(&self, path: PathBuf, delta: AheadDelta, rev: u64) {
         self.notification(ProxyNotification::Update { path, delta, rev });
+    }
+
+    pub fn editor_edit(&self, path: PathBuf, delta: AheadDelta) {
+        self.notification(ProxyNotification::EditorEdit { path, delta });
     }
 
     pub fn editor_snapshot(&self, path: PathBuf, content: String) {
@@ -1404,6 +1552,59 @@ mod tests {
             external_agent_id: None,
             parent_session_id: None,
         }
+    }
+
+    #[test]
+    fn inline_prediction_cancellation_retires_only_its_request() {
+        let rpc = ProxyRpcHandler::new();
+        let mut replies = Vec::new();
+        let ids = (0..2)
+            .map(|column| {
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                replies.push(receiver);
+                rpc.get_inline_completions(
+                    "main.rs".into(),
+                    lsp_types::Position::new(0, column),
+                    lsp_types::InlineCompletionTriggerKind::Automatic,
+                    None,
+                    None,
+                    move |result| sender.send(result).expect("inline outcome"),
+                )
+            })
+            .collect::<Vec<_>>();
+        rpc.rx().try_iter().for_each(drop);
+        rpc.cancel_inline_completions(ids[0]);
+        assert!(matches!(rpc.rx().try_recv().expect("cancel notification"),
+            ProxyRpc::Notification(super::ProxyNotification::CancelInlineCompletions { request_id })
+                if request_id == ids[0]));
+        assert!(
+            replies[0]
+                .try_recv()
+                .expect("cancelled callback")
+                .expect_err("cancelled request")
+                .message
+                .contains("cancelled")
+        );
+        assert!(replies[1].try_recv().is_err());
+        assert_eq!(rpc.pending.lock().as_ref().expect("connected").len(), 1);
+        rpc.cancel_inline_completions(ids[0]);
+        assert!(rpc.rx().is_empty(), "repeated cancellation is a no-op");
+        let response = || {
+            Ok(ProxyResponse::GetInlineCompletions {
+                prediction: None,
+                context_paths: Vec::new(),
+                completions: lsp_types::InlineCompletionResponse::Array(Vec::new()),
+            })
+        };
+        rpc.handle_response(ids[0], response());
+        assert!(replies[0].try_recv().is_err(), "late reply stays retired");
+        rpc.handle_response(ids[1], response());
+        assert!(replies[1].try_recv().expect("newer outcome").is_ok());
+        rpc.cancel_inline_completions(ids[1]);
+        assert!(
+            rpc.rx().is_empty(),
+            "completed requests do not emit cancellation"
+        );
     }
 
     #[test]

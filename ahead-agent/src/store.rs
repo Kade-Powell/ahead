@@ -10,6 +10,7 @@ use ahead_rpc::ahead::{
     ConversationMessageCursor, ConversationMessagePage, RepoPath, TaskIntent,
 };
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -23,7 +24,7 @@ pub struct NativeThreadSnapshot {
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// One legacy rollout imported as a single durable thread-store transaction.
+/// A bounded, one-time import from an earlier local rollout into durable storage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LegacyNativeThreadImport {
     pub thread_id: String,
@@ -52,6 +53,36 @@ pub struct InstructionFileSource {
     pub path: RepoPath,
     pub content_sha256: String,
     pub targets: Vec<RepoPath>,
+}
+
+/// Local project instructions actually loaded by the managed model turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstructionSource {
+    pub path: PathBuf,
+    pub content_sha256: String,
+}
+
+/// Host-skill provenance captured for one managed turn, without host paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSkillSource {
+    pub skill_id: String,
+    pub name: String,
+    pub scope: String,
+    pub source_sha256: String,
+    pub prompt_sha256: String,
+    pub selected_by: String,
+}
+
+/// One skill package resource and the exact response page exposed to the model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSkillReference {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub scope: String,
+    pub resource_path: String,
+    pub source_sha256: String,
+    pub response_sha256: String,
+    pub loaded_by: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +186,52 @@ pub trait HarnessStore: Send + Sync {
     fn get_turn_request(&self, turn_id: &str)
     -> Result<Option<AgentTurnRequestDto>>;
 
+    /// Loads the target-scoped instruction files recorded with a turn.
+    fn list_turn_instruction_sources(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<InstructionFileSource>>;
+
+    /// `None` means core never completed its instruction refresh for this turn.
+    fn get_project_instruction_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<ProjectInstructionSource>>>;
+
+    /// Atomically marks a completed core instruction snapshot, including an empty one.
+    fn set_project_instruction_sources(
+        &self,
+        turn_id: &str,
+        sources: &[ProjectInstructionSource],
+    ) -> Result<()>;
+
+    /// Records the exact selected skill prompts delivered for a managed turn.
+    fn set_turn_skill_sources(
+        &self,
+        turn_id: &str,
+        sources: &[TurnSkillSource],
+    ) -> Result<()>;
+
+    /// Loads selected skill provenance, distinguishing uncaptured from empty.
+    fn get_turn_skill_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillSource>>>;
+
+    /// Appends one deduplicated skill resource read to the managed turn.
+    fn append_turn_skill_reference(
+        &self,
+        turn_id: &str,
+        reference: &TurnSkillReference,
+    ) -> Result<()>;
+
+    /// Loads skill resource reads, distinguishing uncaptured from empty.
+    fn get_turn_skill_references(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillReference>>>;
+
     /// Removes retry state after a turn completes successfully.
     fn remove_turn_request(&self, turn_id: &str) -> Result<()>;
 
@@ -240,7 +317,7 @@ pub trait HarnessStore: Send + Sync {
         anyhow::bail!("native thread persistence is unavailable")
     }
 
-    /// Imports a legacy rollout once; the header and replay rows must commit atomically.
+    /// Atomically imports one validated rollout, returning false if it already exists.
     fn import_legacy_native_thread(
         &self,
         _import: LegacyNativeThreadImport,

@@ -7,6 +7,8 @@ fn main() {
             .flag("-fblocks")
             .compile("ahead_voice");
         println!("cargo:rustc-link-lib=framework=AVFoundation");
+        println!("cargo:rustc-link-lib=framework=AVFAudio");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
 }

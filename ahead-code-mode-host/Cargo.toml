@@ -1,0 +1,27 @@
+[package]
+name = "ahead-code-mode-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ahead-code-mode-host"
+path = "src/main.rs"
+
+[lib]
+doctest = false
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+ahead-code-mode-runtime = { path = "../ahead-code-mode-runtime" }
+codex-code-mode-protocol.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+codex-code-mode.workspace = true
+codex-protocol.workspace = true
+pretty_assertions.workspace = true
+serde_json.workspace = true

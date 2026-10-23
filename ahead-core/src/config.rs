@@ -89,6 +89,144 @@ pub fn read_ahead_config(root: &Path, filename: &str) -> io::Result<Option<Strin
     Ok(Some(content))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanguageEditorSettings {
+    pub tab_size: u32,
+    pub hard_tabs: bool,
+    pub preferred_line_length: u32,
+}
+
+impl Default for LanguageEditorSettings {
+    fn default() -> Self {
+        Self {
+            tab_size: 4,
+            hard_tabs: false,
+            preferred_line_length: 80,
+        }
+    }
+}
+
+/// Resolves language indentation settings from the same layered AHEAD config
+/// used by language extensions.
+pub fn language_editor_settings(
+    workspace_root: &Path,
+    user_home: Option<&Path>,
+    language_name: Option<&str>,
+) -> io::Result<LanguageEditorSettings> {
+    let mut settings = LanguageEditorSettings::default();
+    let Some(language_name) = language_name else {
+        return Ok(settings);
+    };
+
+    let mut layers = Vec::with_capacity(4);
+    if let Some(user_home) = user_home {
+        layers.push((user_home, "settings.toml", "~/.ahead/settings.toml"));
+    }
+    layers.extend([
+        (workspace_root, "config.toml", ".ahead/config.toml"),
+        (
+            workspace_root,
+            "config.local.toml",
+            ".ahead/config.local.toml",
+        ),
+        (workspace_root, "settings.toml", ".ahead/settings.toml"),
+    ]);
+
+    for (root, filename, source) in layers {
+        let content = read_ahead_config(root, filename).map_err(|error| {
+            io::Error::new(error.kind(), format!("reading {source}: {error}"))
+        })?;
+        let Some(content) = content else {
+            continue;
+        };
+        let config: toml::Table =
+            content.parse().map_err(|error: toml::de::Error| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("parsing {source}: {}", error.message()),
+                )
+            })?;
+        let Some(languages) = config.get("languages") else {
+            continue;
+        };
+        let languages = languages.as_table().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{source} [languages] must be a table"),
+            )
+        })?;
+        let mut matching_languages = languages
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(language_name));
+        let Some((configured_name, configured)) = matching_languages.next() else {
+            continue;
+        };
+        if matching_languages.next().is_some() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "{source} defines language `{language_name}` more than once"
+                ),
+            ));
+        }
+        let configured = configured.as_table().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{source} [languages.{configured_name}] must be a table"),
+            )
+        })?;
+
+        for (key, value) in configured {
+            match key.as_str() {
+                "tab_size" => {
+                    let Some(size) = value
+                        .as_integer()
+                        .filter(|size| (1..=i64::from(u32::MAX)).contains(size))
+                    else {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "{source} [languages.{configured_name}].{key} has an invalid value"
+                            ),
+                        ));
+                    };
+                    settings.tab_size = size as u32;
+                }
+                "hard_tabs" => {
+                    let Some(hard_tabs) = value.as_bool() else {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "{source} [languages.{configured_name}].{key} has an invalid value"
+                            ),
+                        ));
+                    };
+                    settings.hard_tabs = hard_tabs;
+                }
+                "preferred_line_length" => {
+                    let Some(length) = value
+                        .as_integer()
+                        .filter(|length| (0..=i64::from(u32::MAX)).contains(length))
+                    else {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "{source} [languages.{configured_name}].{key} has an invalid value"
+                            ),
+                        ));
+                    };
+                    settings.preferred_line_length = length as u32;
+                }
+                // These values route extensions and are not editor settings.
+                "language_servers" | "requests" => {}
+                _ => {}
+            }
+        }
+    }
+
+    Ok(settings)
+}
+
 pub fn validate_tracked_config(value: &toml::Value) -> io::Result<()> {
     if has_secret_field(value) {
         return Err(io::Error::new(
@@ -142,7 +280,81 @@ fn credential_key(key: &str, string_value: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::read_ahead_config;
+    use super::{
+        LanguageEditorSettings, language_editor_settings, read_ahead_config,
+    };
+
+    #[test]
+    fn language_editor_settings_merge_case_insensitive_layers() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let user_home = tempfile::tempdir().expect("user home");
+        std::fs::create_dir(user_home.path().join(".ahead"))
+            .expect("user settings directory");
+        std::fs::write(
+            user_home.path().join(".ahead/settings.toml"),
+            "[languages.Python]\ntab_size = 2\nhard_tabs = true\n",
+        )
+        .expect("user settings");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("workspace config directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[languages.python]\npreferred_line_length = 100\n",
+        )
+        .expect("tracked config");
+        std::fs::write(
+            ahead.join("settings.toml"),
+            "[languages.PYTHON]\ntab_size = 8\nhard_tabs = false\n",
+        )
+        .expect("workspace settings");
+
+        assert_eq!(
+            language_editor_settings(
+                workspace.path(),
+                Some(user_home.path()),
+                Some("Python"),
+            )
+            .expect("resolved settings"),
+            LanguageEditorSettings {
+                tab_size: 8,
+                hard_tabs: false,
+                preferred_line_length: 100,
+            }
+        );
+        assert_eq!(
+            language_editor_settings(workspace.path(), None, None)
+                .expect("defaults"),
+            LanguageEditorSettings::default()
+        );
+    }
+
+    #[test]
+    fn language_editor_settings_reject_invalid_and_duplicate_values() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let ahead = workspace.path().join(".ahead");
+        std::fs::create_dir(&ahead).expect("workspace config directory");
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[languages.Rust]\ntab_size = 0\n",
+        )
+        .expect("invalid config");
+        let error = language_editor_settings(workspace.path(), None, Some("Rust"))
+            .expect_err("zero tab size is invalid");
+        assert!(error.to_string().contains("tab_size has an invalid value"));
+
+        std::fs::write(
+            ahead.join("config.toml"),
+            "[languages.Rust]\ntab_size = 2\n[languages.rust]\nhard_tabs = true\n",
+        )
+        .expect("duplicate config");
+        let error = language_editor_settings(workspace.path(), None, Some("Rust"))
+            .expect_err("case-insensitive duplicate names are invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("defines language `Rust` more than once")
+        );
+    }
 
     #[test]
     fn reads_regular_config_and_rejects_links_and_large_files() {

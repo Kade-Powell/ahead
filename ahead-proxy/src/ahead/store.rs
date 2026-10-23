@@ -5,14 +5,18 @@
 //! Uses local embedded databases through the Turso/libSQL client.
 //! Corresponds to Section 7.1 of `ahead-editor-mvp.md`.
 
-use ahead_agent::{InstructionFileSource, LegacyNativeThreadImport};
+use ahead_agent::{
+    InstructionFileSource, LegacyNativeThreadImport, ProjectInstructionSource,
+    TurnSkillReference, TurnSkillSource,
+};
 use ahead_rpc::ahead::{
-    AgentRuntimeState, ApprovalRecord, CodeAnchor, CodeComment, ConversationMessage,
-    ConversationMessageCursor, ConversationMessagePage, ConversationSummary,
-    DisplayPosition, DisplayRange, GithubIssueRef, Id, LearningArc, LearningRecord,
-    Participant, Revision, SessionLifecycle, SessionListItem,
-    SessionParticipantRecord, SessionPolicySnapshot, SessionRole, SessionTask,
-    SessionView, TaskIntent, WorkItem, WorkItemCloseout, WorkItemEvent,
+    AgentPlanEntry, AgentRuntimeState, ApprovalRecord, CodeAnchor, CodeComment,
+    ConversationMessage, ConversationMessageCursor, ConversationMessagePage,
+    ConversationSummary, DisplayPosition, DisplayRange, GithubIssueRef, Id,
+    LearningArc, LearningRecord, Participant, PredictionAcceptance, Revision,
+    SessionLifecycle, SessionListItem, SessionParticipantRecord,
+    SessionPolicySnapshot, SessionRole, SessionTask, SessionView, TaskIntent,
+    VoiceTranscriptTiming, WorkItem, WorkItemCloseout, WorkItemEvent,
     WorkItemStatus, WorkKind, WorkSession, WorkflowPhase, WorkflowState,
 };
 use ahead_rpc::file::{
@@ -21,12 +25,13 @@ use ahead_rpc::file::{
 use anyhow::{Context, Result, bail};
 use libsql::{Builder, Connection, Value as SqlValue, params, params_from_iter};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::fs;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::OpenOptions,
     io::{ErrorKind, Read},
     path::Path,
@@ -34,10 +39,46 @@ use std::{
 };
 
 const RECENT_WORKSPACE_FILE_LIMIT: i64 = 20;
-const SESSION_APPLICATION_ID: i64 = 0x41484544;
-const SESSION_SCHEMA_VERSION: i64 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct SavedTurnRequest<TRequest> {
+    #[serde(flatten)]
+    request: TRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_instruction_sources: Option<Vec<ProjectInstructionSource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skill_sources: Option<Vec<TurnSkillSource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skill_references: Option<Vec<TurnSkillReference>>,
+}
 // A raw descriptor closed during another local open could release its POSIX locks.
 static SESSION_STORE_OPEN_LOCK: Mutex<()> = Mutex::new(());
+
+fn voice_transcript_timing_from_columns(
+    call_id: Option<String>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> Result<Option<VoiceTranscriptTiming>> {
+    match (call_id, start_ms, end_ms) {
+        (None, None, None) => Ok(None),
+        (Some(call_id), Some(start_ms), Some(end_ms)) => {
+            let start_ms = u64::try_from(start_ms)
+                .context("Voice transcript start offset is negative")?;
+            let end_ms = u64::try_from(end_ms)
+                .context("Voice transcript end offset is negative")?;
+            anyhow::ensure!(
+                start_ms <= end_ms,
+                "Voice transcript timing is reversed"
+            );
+            Ok(Some(VoiceTranscriptTiming {
+                call_id,
+                start_ms,
+                end_ms,
+            }))
+        }
+        _ => bail!("Voice transcript timing event is incomplete"),
+    }
+}
 
 pub(crate) fn anchor_matches_content(anchor: &CodeAnchor, content: &str) -> bool {
     anchor.surrounding_context.as_deref().is_some_and(|quote| {
@@ -47,38 +88,12 @@ pub(crate) fn anchor_matches_content(anchor: &CodeAnchor, content: &str) -> bool
     })
 }
 
-async fn session_schema_is_current(connection: &Connection) -> Result<bool> {
-    let mut rows = connection
-        .query(
-            "SELECT application_id, user_version,
-                EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')
-         FROM pragma_application_id, pragma_user_version",
-            (),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .context("missing session schema header")?;
-    let application_id = row.get::<i64>(0)?;
-    let version = row.get::<i64>(1)?;
-    let has_schema = row.get::<i64>(2)? != 0;
-    if application_id == 0 && version == 0 && !has_schema {
-        return Ok(false);
-    }
-    validate_session_version(application_id, version)?;
-    Ok(true)
-}
-
-fn validate_session_version(application_id: i64, version: i64) -> Result<()> {
-    anyhow::ensure!(
-        application_id == SESSION_APPLICATION_ID
-            && version == SESSION_SCHEMA_VERSION,
-        "Unsupported AHEAD session database (application {application_id:#x}, schema {version}). \
-         This build requires AHEAD schema {SESSION_SCHEMA_VERSION}; no migration is provided. \
-         The database was not changed."
-    );
-    Ok(())
+#[derive(Debug, Default)]
+pub(crate) struct PredictionAgentPlanSummary {
+    pub status_counts: BTreeMap<String, usize>,
+    pub opening_step: Option<AgentPlanEntry>,
+    pub active_steps: Vec<AgentPlanEntry>,
+    pub next_step: Option<AgentPlanEntry>,
 }
 
 #[cfg(unix)]
@@ -178,7 +193,22 @@ fn session_database_files(
     Ok(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn session_database_files(
+    path: &Path,
+    restrict: bool,
+) -> Result<std::path::PathBuf> {
+    let path = std::path::absolute(path)?;
+    if restrict {
+        // The first call secures the parent and existing files before libSQL
+        // opens them; new sidecars inherit the parent's protected ACL. Do not
+        // reopen the live database while libSQL owns it.
+        return Ok(path);
+    }
+    Ok(super::memory_fs::secure_session_database_files(&path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn session_database_files(
     path: &Path,
     _restrict: bool,
@@ -258,21 +288,6 @@ impl SessionStore {
                 // The pinned client omits a named flag for SQLITE_OPEN_NOFOLLOW.
                 // Keep the VFS check enabled as well as our file-kind validation.
                 let nofollow = libsql::OpenFlags::from_bits_retain(0x01000000);
-                if std::fs::metadata(&path)?.len() > 0 {
-                    // Schema markers never change in this hard fork. Inspect the
-                    // main header without recovering journals or creating SHM;
-                    // a supported store can then use normal crash recovery.
-                    let mut uri = url::Url::from_file_path(&path).map_err(|_| anyhow::anyhow!("invalid session database path"))?;
-                    uri.query_pairs_mut().append_pair("immutable", "1");
-                    let database = Builder::new_local(uri.as_str())
-                        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY | nofollow | libsql::OpenFlags::from_bits_retain(0x00000040))
-                        .build().await?;
-                    let connection = database.connect()?;
-                    let mut header = connection.query("SELECT application_id, user_version FROM pragma_application_id, pragma_user_version", ()).await
-                        .context("Read-only session validation failed; keep the database and its recovery sidecars intact")?;
-                    let row = header.next().await?.context("missing session database header")?;
-                    validate_session_version(row.get(0)?, row.get(1)?)?;
-                }
                 let flags = libsql::OpenFlags::SQLITE_OPEN_READ_WRITE | nofollow;
                 let db = Builder::new_local(&path).flags(flags).build().await?;
                 Ok::<_, anyhow::Error>(db.connect()?)
@@ -323,9 +338,11 @@ impl SessionStore {
         }
         let path = path.to_string();
         self.block_on(async {
-            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let update = async {
-                self.conn
+                transaction
                     .execute(
                         "INSERT INTO recent_workspace_files(path, opened_at)
                          VALUES (?1, ?2)
@@ -334,7 +351,7 @@ impl SessionStore {
                         params![path, opened_at],
                     )
                     .await?;
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM recent_workspace_files
                          WHERE path NOT IN (
@@ -348,13 +365,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = update {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back recent workspace file update")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })
         .context("Failed to record recent workspace file")
@@ -554,19 +571,14 @@ impl SessionStore {
 
     fn init_schema(&self) -> Result<()> {
         self.block_on(async {
-            // Lock before inspecting the header so two first opens cannot both
-            // decide to initialize the same database.
+            // Separate editor processes can initialize or write this store together.
+            self.conn.execute_batch("PRAGMA busy_timeout = 5000;").await?;
             let transaction = self.conn
                 .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
                 .await?;
-            match session_schema_is_current(&transaction).await {
-                Ok(true) => { transaction.rollback().await?; return Ok(()); }
-                Ok(false) => {}
-                Err(error) => { transaction.rollback().await?; return Err(error); }
-            }
             transaction.execute_batch(
                 "
-                CREATE TABLE sessions (
+                CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
                     worktree_id TEXT NOT NULL,
@@ -579,12 +591,12 @@ impl SessionStore {
                     created_at TEXT NOT NULL
                 );
 
-                CREATE TABLE recent_workspace_files (
+                CREATE TABLE IF NOT EXISTS recent_workspace_files (
                     path TEXT PRIMARY KEY,
                     opened_at INTEGER NOT NULL
                 );
 
-                CREATE TABLE editor_recoveries (
+                CREATE TABLE IF NOT EXISTS editor_recoveries (
                     buffer_id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL,
                     revision INTEGER NOT NULL CHECK(revision > 0),
@@ -592,15 +604,15 @@ impl SessionStore {
                     contents TEXT,
                     saved_sha256 TEXT
                 );
-                CREATE INDEX editor_recoveries_owner ON editor_recoveries(owner_id);
+                CREATE INDEX IF NOT EXISTS editor_recoveries_owner ON editor_recoveries(owner_id);
 
-                CREATE TABLE archived_sessions (
+                CREATE TABLE IF NOT EXISTS archived_sessions (
                     session_id TEXT PRIMARY KEY,
                     archived_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE session_tasks (
+                CREATE TABLE IF NOT EXISTS session_tasks (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     intent TEXT NOT NULL,
@@ -614,7 +626,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE learning_arcs (
+                CREATE TABLE IF NOT EXISTS learning_arcs (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL,
                     mission TEXT NOT NULL,
@@ -625,7 +637,7 @@ impl SessionStore {
                     FOREIGN KEY (task_id) REFERENCES session_tasks(id)
                 );
 
-                CREATE TABLE learning_records (
+                CREATE TABLE IF NOT EXISTS learning_records (
                     id TEXT PRIMARY KEY,
                     arc_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
@@ -635,7 +647,7 @@ impl SessionStore {
                     FOREIGN KEY (arc_id) REFERENCES learning_arcs(id)
                 );
 
-                CREATE TABLE workflow_state (
+                CREATE TABLE IF NOT EXISTS workflow_state (
                     session_id TEXT PRIMARY KEY,
                     revision INTEGER NOT NULL,
                     definition_version TEXT NOT NULL,
@@ -648,7 +660,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE participants (
+                CREATE TABLE IF NOT EXISTS participants (
                     id TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     participant_json TEXT NOT NULL,
@@ -657,7 +669,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE session_events (
+                CREATE TABLE IF NOT EXISTS session_events (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
@@ -669,7 +681,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE anchors (
+                CREATE TABLE IF NOT EXISTS anchors (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     actor_id TEXT NOT NULL DEFAULT 'human',
@@ -683,7 +695,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE work_items (
+                CREATE TABLE IF NOT EXISTS work_items (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     title TEXT NOT NULL,
@@ -695,7 +707,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE work_item_events (
+                CREATE TABLE IF NOT EXISTS work_item_events (
                     id TEXT PRIMARY KEY,
                     item_id TEXT NOT NULL,
                     session_id TEXT NOT NULL,
@@ -708,7 +720,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE work_item_closeouts (
+                CREATE TABLE IF NOT EXISTS work_item_closeouts (
                     item_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     summary_markdown TEXT NOT NULL,
@@ -719,7 +731,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE conversation_summaries (
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     phase TEXT NOT NULL,
@@ -729,7 +741,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE conversation_messages (
+                CREATE TABLE IF NOT EXISTS conversation_messages (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
@@ -742,14 +754,19 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE harness_runtime_state (
+                CREATE TABLE IF NOT EXISTS prediction_context_versions (
+                    session_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL CHECK(revision > 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_runtime_state (
                     session_id TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE harness_bindings (
+                CREATE TABLE IF NOT EXISTS harness_bindings (
                     session_id TEXT PRIMARY KEY,
                     acp_session_id TEXT NOT NULL,
                     backend TEXT NOT NULL,
@@ -757,7 +774,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE agent_runtime_threads (
+                CREATE TABLE IF NOT EXISTS agent_runtime_threads (
                     thread_id TEXT PRIMARY KEY,
                     session_id TEXT,
                     create_params_json TEXT NOT NULL,
@@ -768,7 +785,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE agent_runtime_thread_items (
+                CREATE TABLE IF NOT EXISTS agent_runtime_thread_items (
                     thread_id TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
                     item_json TEXT NOT NULL,
@@ -776,7 +793,7 @@ impl SessionStore {
                     FOREIGN KEY (thread_id) REFERENCES agent_runtime_threads(thread_id) ON DELETE CASCADE
                 );
 
-                CREATE TABLE agent_runtime_thread_metadata (
+                CREATE TABLE IF NOT EXISTS agent_runtime_thread_metadata (
                     thread_id TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
                     patch_json TEXT NOT NULL,
@@ -784,13 +801,13 @@ impl SessionStore {
                     FOREIGN KEY (thread_id) REFERENCES agent_runtime_threads(thread_id) ON DELETE CASCADE
                 );
 
-                CREATE TABLE agent_spawn_edges (
+                CREATE TABLE IF NOT EXISTS agent_spawn_edges (
                     child_thread_id TEXT PRIMARY KEY,
                     parent_thread_id TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('open', 'closed'))
                 );
 
-                CREATE TABLE harness_turn_requests (
+                CREATE TABLE IF NOT EXISTS harness_turn_requests (
                     turn_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     request_json TEXT NOT NULL,
@@ -798,7 +815,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE turn_instruction_sources (
+                CREATE TABLE IF NOT EXISTS turn_instruction_sources (
                     session_id TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
@@ -809,7 +826,7 @@ impl SessionStore {
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 );
 
-                CREATE TABLE memory_revisions (
+                CREATE TABLE IF NOT EXISTS memory_revisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     scope TEXT NOT NULL,
                     path TEXT NOT NULL,
@@ -819,7 +836,7 @@ impl SessionStore {
                     UNIQUE(scope, path, content_sha256)
                 );
 
-                CREATE TABLE memory_sources (
+                CREATE TABLE IF NOT EXISTS memory_sources (
                     scope TEXT NOT NULL,
                     path TEXT NOT NULL,
                     current_sha256 TEXT NOT NULL,
@@ -827,7 +844,7 @@ impl SessionStore {
                     PRIMARY KEY (scope, path)
                 );
 
-                CREATE TABLE memory_search_lines (
+                CREATE TABLE IF NOT EXISTS memory_search_lines (
                     scope TEXT NOT NULL,
                     path TEXT NOT NULL,
                     content_sha256 TEXT NOT NULL,
@@ -836,7 +853,7 @@ impl SessionStore {
                     PRIMARY KEY (scope, path, content_sha256, line)
                 );
 
-                CREATE TABLE memory_search_terms (
+                CREATE TABLE IF NOT EXISTS memory_search_terms (
                     scope TEXT NOT NULL,
                     path TEXT NOT NULL,
                     content_sha256 TEXT NOT NULL,
@@ -845,41 +862,79 @@ impl SessionStore {
                     PRIMARY KEY (scope, path, content_sha256, line, term)
                 );
 
-                CREATE INDEX idx_items_session ON work_items(session_id, position);
-                CREATE INDEX idx_item_events ON work_item_events(item_id);
-                CREATE INDEX idx_summaries_session ON conversation_summaries(session_id);
-                CREATE INDEX idx_messages_session_sequence_id ON conversation_messages(session_id, sequence, id);
-                CREATE INDEX idx_messages_session_created_at ON conversation_messages(session_id, created_at DESC);
-                CREATE INDEX idx_memory_revisions_source ON memory_revisions(scope, path, id);
-                CREATE INDEX idx_memory_search_terms_term
+                CREATE INDEX IF NOT EXISTS idx_items_session ON work_items(session_id, position);
+                CREATE INDEX IF NOT EXISTS idx_item_events ON work_item_events(item_id);
+                CREATE INDEX IF NOT EXISTS idx_summaries_session ON conversation_summaries(session_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_session_sequence_id ON conversation_messages(session_id, sequence, id);
+                CREATE INDEX IF NOT EXISTS idx_messages_session_created_at ON conversation_messages(session_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_memory_revisions_source ON memory_revisions(scope, path, id);
+                CREATE INDEX IF NOT EXISTS idx_memory_search_terms_term
                     ON memory_search_terms(term, scope, path, content_sha256, line);
-                CREATE INDEX idx_agent_runtime_threads_session ON agent_runtime_threads(session_id);
-                CREATE INDEX idx_agent_runtime_threads_archived_created ON agent_runtime_threads(archived, created_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_archived_updated ON agent_runtime_threads(archived, updated_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_source_created
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_session ON agent_runtime_threads(session_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_archived_created ON agent_runtime_threads(archived, created_at, thread_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_archived_updated ON agent_runtime_threads(archived, updated_at, thread_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_source_created
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.source'), created_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_source_updated
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_source_updated
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.source'), updated_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_provider_created
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_provider_created
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.metadata.model_provider'), created_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_provider_updated
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_provider_updated
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.metadata.model_provider'), updated_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_cwd_created
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_cwd_created
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.metadata.cwd'), created_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_cwd_updated
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_cwd_updated
                     ON agent_runtime_threads(archived, json_extract(create_params_json, '$.metadata.cwd'), updated_at, thread_id);
-                CREATE INDEX idx_agent_runtime_threads_parent
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_threads_parent
                     ON agent_runtime_threads(json_extract(create_params_json, '$.parent_thread_id'), thread_id);
-                CREATE INDEX idx_agent_spawn_edges_parent ON agent_spawn_edges(parent_thread_id, status, child_thread_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_spawn_edges_parent ON agent_spawn_edges(parent_thread_id, status, child_thread_id);
                 "
             ).await?;
-            transaction.execute_batch(&format!(
-                "PRAGMA application_id = {SESSION_APPLICATION_ID};
-                 PRAGMA user_version = {SESSION_SCHEMA_VERSION};"
-            )).await?;
+            // Database triggers also cover writes from another editor process.
+            for table in ["work_items", "work_item_events", "conversation_summaries", "conversation_messages", "harness_runtime_state"] {
+                for (operation, references) in [
+                    ("INSERT", &["NEW"][..]),
+                    ("UPDATE", &["OLD", "NEW"][..]),
+                    ("DELETE", &["OLD"][..]),
+                ] {
+                    let mut statements = String::new();
+                    for reference in references {
+                        let condition = if operation == "UPDATE" && *reference == "NEW" {
+                            " WHERE NEW.session_id != OLD.session_id"
+                        } else {
+                            " WHERE 1"
+                        };
+                        statements.push_str(&format!(
+                            "INSERT INTO prediction_context_versions(session_id, revision)
+                             SELECT {reference}.session_id, 1{condition}
+                             ON CONFLICT(session_id) DO UPDATE SET revision = revision + 1;"
+                        ));
+                    }
+                    transaction.execute_batch(&format!(
+                        "CREATE TRIGGER IF NOT EXISTS prediction_context_{table}_{operation}
+                         AFTER {operation} ON {table} BEGIN {statements} END;"
+                    )).await?;
+                }
+            }
             transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         }).context("Failed to initialize AHEAD Turso/libsql schema")
+    }
+
+    pub(crate) fn prediction_context_revision(
+        &self,
+        session_id: &str,
+    ) -> Result<u64> {
+        self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT revision FROM prediction_context_versions WHERE session_id = ?1",
+                params![session_id],
+            ).await?;
+            rows.next().await?
+                .map(|row| Ok(u64::try_from(row.get::<i64>(0)?)?))
+                .transpose()
+                .map(|revision| revision.unwrap_or(0))
+        })
     }
 
     /// Synchronizes one human-readable AHEAD memory file into the local search
@@ -973,9 +1028,11 @@ impl SessionStore {
             })
             .collect::<Vec<_>>();
         self.block_on(async {
-            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let index_memory = async {
-                self.conn.execute(
+                transaction.execute(
                     "INSERT OR IGNORE INTO memory_revisions
                      (scope, path, content_sha256, content, indexed_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -989,7 +1046,7 @@ impl SessionStore {
                 )
                 .await?;
                 for (line_number, line, terms) in &lines {
-                    self.conn.execute(
+                    transaction.execute(
                         "INSERT OR IGNORE INTO memory_search_lines
                          (scope, path, content_sha256, line, content)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1002,7 +1059,7 @@ impl SessionStore {
                         ],
                     ).await?;
                     for term in terms {
-                        self.conn.execute(
+                        transaction.execute(
                             "INSERT OR IGNORE INTO memory_search_terms
                              (scope, path, content_sha256, line, term)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1016,7 +1073,7 @@ impl SessionStore {
                         ).await?;
                     }
                 }
-                self.conn.execute(
+                transaction.execute(
                     "INSERT INTO memory_sources (scope, path, current_sha256, updated_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(scope, path) DO UPDATE SET
@@ -1034,13 +1091,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = index_memory {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back AHEAD memory indexing")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(Some(content_sha256))
@@ -1249,6 +1306,19 @@ impl SessionStore {
         })
     }
 
+    pub fn is_session_archived(&self, session_id: &str) -> Result<bool> {
+        self.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM archived_sessions WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    }
+
     pub fn archive_session(&self, session_id: &str) -> Result<()> {
         let archived_at = chrono::Utc::now().to_rfc3339();
         let changed = self.block_on(async {
@@ -1321,6 +1391,7 @@ impl SessionStore {
                     "DELETE FROM conversation_summaries WHERE session_id = ?1",
                     "DELETE FROM conversation_messages WHERE session_id = ?1",
                     "DELETE FROM harness_runtime_state WHERE session_id = ?1",
+                    "DELETE FROM prediction_context_versions WHERE session_id = ?1",
                     "DELETE FROM harness_bindings WHERE session_id = ?1",
                     "DELETE FROM harness_turn_requests WHERE session_id = ?1",
                     "DELETE FROM turn_instruction_sources WHERE session_id = ?1",
@@ -1382,6 +1453,73 @@ impl SessionStore {
                 comments.push(serde_json::from_str(&row.get::<String>(0)?)?);
             }
             Ok(comments)
+        })
+    }
+
+    pub fn record_prediction_acceptance(
+        &self,
+        acceptance: &PredictionAcceptance,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(acceptance)?;
+        self.block_on(async {
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            let mut rows = transaction
+                .query(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id = ?1",
+                    params![acceptance.session_id.clone()],
+                )
+                .await?;
+            let sequence: i64 = rows
+                .next()
+                .await?
+                .context("Missing event sequence")?
+                .get(0)?;
+            drop(rows);
+            transaction
+                .execute(
+                    "INSERT INTO session_events
+                     (id, session_id, sequence, request_id, event_type, payload_json, actor_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'prediction_acceptance', ?5, ?6, ?7)",
+                    params![
+                        acceptance.id.clone(),
+                        acceptance.session_id.clone(),
+                        sequence + 1,
+                        acceptance.binding.request_id.clone(),
+                        payload,
+                        acceptance.actor_id.clone(),
+                        acceptance.accepted_at.clone(),
+                    ],
+                )
+                .await?;
+            transaction.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    pub fn list_prediction_acceptances(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PredictionAcceptance>> {
+        self.purge_expired_archives()?;
+        self.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT payload_json FROM session_events
+                     WHERE session_id = ?1 AND event_type = 'prediction_acceptance'
+                     ORDER BY sequence",
+                    params![session_id],
+                )
+                .await?;
+            let mut acceptances = Vec::new();
+            while let Some(row) = rows.next().await? {
+                acceptances.push(serde_json::from_str(&row.get::<String>(0)?)?);
+            }
+            Ok(acceptances)
         })
     }
 
@@ -1845,16 +1983,18 @@ impl SessionStore {
             bail!("session title cannot be empty");
         }
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
-            self.conn.execute(
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            transaction.execute(
                 "UPDATE sessions SET title = ?1, revision = revision + 1 WHERE id = ?2",
                 params![title.to_string(), session_id],
             ).await?;
-            self.conn.execute(
+            transaction.execute(
                 "UPDATE session_tasks SET title = ?1 WHERE session_id = ?2",
                 params![title.to_string(), session_id],
             ).await?;
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })
     }
@@ -1866,16 +2006,17 @@ impl SessionStore {
         new_phase: WorkflowPhase,
     ) -> Result<WorkflowState> {
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
 
-            let mut rows = self.conn.query(
+            let mut rows = transaction.query(
                 "SELECT revision, definition_version, primary_work_item_json, current_artifact_ids_json, approvals_json
                  FROM workflow_state WHERE session_id = ?1",
                 params![session_id],
             ).await?;
 
             let Some(row) = rows.next().await? else {
-                self.conn.execute("ROLLBACK", ()).await?;
                 bail!("Workflow state not found for session: {}", session_id);
             };
 
@@ -1886,18 +2027,17 @@ impl SessionStore {
             let approvals_json: String = row.get(4)?;
 
             if (cur_rev.cast_unsigned()) != expected_revision {
-                self.conn.execute("ROLLBACK", ()).await?;
                 bail!("Revision mismatch: expected {}, found {}", expected_revision, cur_rev);
             }
 
             let next_rev = cur_rev + 1;
 
-            self.conn.execute(
+            transaction.execute(
                 "UPDATE workflow_state SET revision = ?1, phase_id = ?2, phase_title = ?3, phase_visit = ?4 WHERE session_id = ?5",
                 params![next_rev, new_phase.id.clone(), new_phase.title.clone(), i64::from(new_phase.visit), session_id],
             ).await?;
 
-            self.conn.execute(
+            transaction.execute(
                 "UPDATE sessions SET revision = revision + 1 WHERE id = ?1",
                 params![session_id],
             ).await?;
@@ -1906,7 +2046,8 @@ impl SessionStore {
             let current_artifact_ids = serde_json::from_str(&artifacts_json)?;
             let approvals = serde_json::from_str(&approvals_json)?;
 
-            self.conn.execute("COMMIT", ()).await?;
+            drop(rows);
+            transaction.commit().await?;
 
             Ok(WorkflowState {
                 revision: next_rev.cast_unsigned(),
@@ -2169,24 +2310,47 @@ impl SessionStore {
     }
 
     pub fn list_work_items(&self, session_id: &str) -> Result<Vec<WorkItem>> {
+        self.work_items(session_id, None)
+    }
+
+    pub(crate) fn prediction_work_items(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<WorkItem>> {
+        self.work_items(session_id, Some(max_bytes))
+    }
+
+    fn work_items(
+        &self,
+        session_id: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<WorkItem>> {
         self.block_on(async {
             let mut rows = self.conn.query(
-                "SELECT id, session_id, title, status, position, created_by, created_at, closed_at
+                "SELECT id, session_id, length(title), title, status, position, created_by, created_at, closed_at
                  FROM work_items WHERE session_id = ?1 ORDER BY position ASC",
                 params![session_id],
             ).await?;
             let mut out = Vec::new();
+            let mut projected_bytes = 0usize;
             while let Some(row) = rows.next().await? {
-                let status_raw: String = row.get(3)?;
+                let title_bytes = usize::try_from(row.get::<i64>(2)?)?;
+                projected_bytes = projected_bytes.saturating_add(title_bytes).saturating_add(32);
+                if let Some(max_bytes) = max_bytes {
+                    anyhow::ensure!(projected_bytes <= max_bytes,
+                        "Prediction durable work exceeds its context budget; no required context was dropped");
+                }
+                let status_raw: String = row.get(4)?;
                 out.push(WorkItem {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
-                    title: row.get(2)?,
+                    title: row.get(3)?,
                     status: Self::parse_work_item_status(&status_raw)?,
-                    position: row.get(4)?,
-                    created_by: row.get(5)?,
-                    created_at: row.get(6)?,
-                    closed_at: row.get(7)?,
+                    position: row.get(5)?,
+                    created_by: row.get(6)?,
+                    created_at: row.get(7)?,
+                    closed_at: row.get(8)?,
                 });
             }
             Ok(out)
@@ -2322,6 +2486,32 @@ impl SessionStore {
         item_id: &str,
         limit: Option<usize>,
     ) -> Result<Vec<WorkItemEvent>> {
+        self.work_item_context_events(item_id, limit, false, None)
+    }
+
+    pub(crate) fn prediction_work_item_events(
+        &self,
+        item_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<WorkItemEvent>> {
+        self.work_item_context_events(item_id, Some(4), true, Some(max_bytes))
+    }
+
+    pub(crate) fn compact_prediction_work_item_events(
+        &self,
+        item_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<WorkItemEvent>> {
+        self.work_item_context_events(item_id, Some(1), true, Some(max_bytes))
+    }
+
+    fn work_item_context_events(
+        &self,
+        item_id: &str,
+        limit: Option<usize>,
+        keep_constraints: bool,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<WorkItemEvent>> {
         let limit = limit
             .map(i64::try_from)
             .transpose()
@@ -2329,22 +2519,32 @@ impl SessionStore {
             .unwrap_or(-1);
         self.block_on(async {
             let mut rows = self.conn.query(
-                "SELECT id, item_id, session_id, kind, body_markdown, actor_id, anchor_id, artifact_id, created_at
-                 FROM work_item_events WHERE item_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
-                params![item_id, limit],
+                "SELECT id, item_id, session_id, kind, length(body_markdown), body_markdown, actor_id, anchor_id, artifact_id, created_at
+                 FROM work_item_events WHERE item_id = ?1 AND
+                   (?2 < 0 OR (?3 AND kind IN ('decision', 'invariant', 'constraint')) OR id IN
+                     (SELECT id FROM work_item_events WHERE item_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2))
+                 ORDER BY created_at DESC, id DESC",
+                params![item_id, limit, keep_constraints],
             ).await?;
             let mut out = Vec::new();
+            let mut projected_bytes = 0usize;
             while let Some(row) = rows.next().await? {
+                let body_bytes = usize::try_from(row.get::<i64>(4)?)?;
+                projected_bytes = projected_bytes.saturating_add(body_bytes).saturating_add(48);
+                if let Some(max_bytes) = max_bytes {
+                    anyhow::ensure!(projected_bytes <= max_bytes,
+                        "Prediction durable work exceeds its context budget; no required context was dropped");
+                }
                 out.push(WorkItemEvent {
                     id: row.get(0)?,
                     item_id: row.get(1)?,
                     session_id: row.get(2)?,
                     kind: row.get(3)?,
-                    body_markdown: row.get(4)?,
-                    actor_id: row.get(5)?,
-                    anchor_id: row.get(6)?,
-                    artifact_id: row.get(7)?,
-                    created_at: row.get(8)?,
+                    body_markdown: row.get(5)?,
+                    actor_id: row.get(6)?,
+                    anchor_id: row.get(7)?,
+                    artifact_id: row.get(8)?,
+                    created_at: row.get(9)?,
                 });
             }
             out.reverse();
@@ -2485,23 +2685,48 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<ConversationSummary>> {
+        self.conversation_summaries(session_id, -1, None)
+    }
+
+    pub(crate) fn prediction_summaries(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        self.conversation_summaries(session_id, 4, Some(max_bytes))
+    }
+
+    fn conversation_summaries(
+        &self,
+        session_id: &str,
+        limit: i64,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<ConversationSummary>> {
         self.block_on(async {
             let mut rows = self.conn.query(
-                "SELECT id, session_id, phase, summary_markdown, message_id_range, created_at
-                 FROM conversation_summaries WHERE session_id = ?1 ORDER BY created_at ASC",
-                params![session_id],
+                "SELECT id, session_id, length(phase) + length(summary_markdown), phase, summary_markdown, message_id_range, created_at
+                 FROM conversation_summaries WHERE session_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+                params![session_id, limit],
             ).await?;
             let mut out = Vec::new();
+            let mut projected_bytes = 0usize;
             while let Some(row) = rows.next().await? {
+                let summary_bytes = usize::try_from(row.get::<i64>(2)?)?;
+                projected_bytes = projected_bytes.saturating_add(summary_bytes).saturating_add(32);
+                if let Some(max_bytes) = max_bytes {
+                    anyhow::ensure!(projected_bytes <= max_bytes,
+                        "Prediction summary exceeds its context budget; no required context was dropped");
+                }
                 out.push(ConversationSummary {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
-                    phase: row.get(2)?,
-                    summary_markdown: row.get(3)?,
-                    message_id_range: row.get(4)?,
-                    created_at: row.get(5)?,
+                    phase: row.get(3)?,
+                    summary_markdown: row.get(4)?,
+                    message_id_range: row.get(5)?,
+                    created_at: row.get(6)?,
                 });
             }
+            out.reverse();
             Ok(out)
         })
     }
@@ -2622,6 +2847,10 @@ impl SessionStore {
 
     /// Appends or replaces one durable conversation message.
     pub fn upsert_message(&self, message: &ConversationMessage) -> Result<()> {
+        anyhow::ensure!(
+            message.voice_timing.is_none(),
+            "Voice transcript timing must use the voice transcript store path"
+        );
         self.block_on(async {
             self.conn.execute(
                 "INSERT INTO conversation_messages
@@ -2650,6 +2879,132 @@ impl SessionStore {
             .and_modify(|sequence| *sequence = (*sequence).max(message.sequence))
             .or_insert(message.sequence);
         Ok(())
+    }
+
+    /// Persists a voice message and its provider-relative timing in one event.
+    pub fn upsert_voice_transcript(
+        &self,
+        message: &ConversationMessage,
+    ) -> Result<()> {
+        let timing = message
+            .voice_timing
+            .as_ref()
+            .context("Voice transcript timing is required")?;
+        let event_id = format!("voice-transcript-timing-{}", message.id);
+        let payload = serde_json::to_string(&serde_json::json!({
+            "message_id": message.id,
+            "timing": timing,
+        }))?;
+        self.block_on(async {
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO conversation_messages
+                        (id, session_id, turn_id, sequence, role, actor_id, content, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(id) DO UPDATE SET
+                        content = excluded.content,
+                        status = excluded.status",
+                    params![
+                        message.id.clone(),
+                        message.session_id.clone(),
+                        message.turn_id.clone(),
+                        message.sequence,
+                        message.role.clone(),
+                        message.actor_id.clone(),
+                        message.content.clone(),
+                        message.status.clone(),
+                        message.created_at.clone(),
+                    ],
+                )
+                .await?;
+            let mut rows = transaction
+                .query(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id = ?1",
+                    params![message.session_id.clone()],
+                )
+                .await?;
+            let sequence = rows
+                .next()
+                .await?
+                .context("Missing session event sequence")?
+                .get::<i64>(0)?
+                .saturating_add(1);
+            drop(rows);
+            transaction
+                .execute(
+                    "INSERT INTO session_events
+                        (id, session_id, sequence, request_id, event_type, payload_json, actor_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'voice_transcript_timing', ?5, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
+                    params![
+                        event_id,
+                        message.session_id.clone(),
+                        sequence,
+                        message.id.clone(),
+                        payload,
+                        message.actor_id.clone(),
+                        message.created_at.clone(),
+                    ],
+                )
+                .await?;
+            transaction.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        self.message_sequences
+            .lock()
+            .entry(message.session_id.clone())
+            .and_modify(|sequence| *sequence = (*sequence).max(message.sequence))
+            .or_insert(message.sequence);
+        Ok(())
+    }
+
+    pub fn get_message(&self, id: &str) -> Result<Option<ConversationMessage>> {
+        self.block_on(async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT message.id, message.session_id, message.turn_id,
+                        message.sequence, message.role, message.actor_id,
+                        message.content, message.status, message.created_at,
+                        json_extract(timing.payload_json, '$.timing.call_id'),
+                        json_extract(timing.payload_json, '$.timing.start_ms'),
+                        json_extract(timing.payload_json, '$.timing.end_ms')
+                 FROM conversation_messages AS message
+                 LEFT JOIN session_events AS timing
+                   ON timing.id = 'voice-transcript-timing-' || message.id
+                  AND timing.event_type = 'voice_transcript_timing'
+                 WHERE message.id = ?1",
+                    params![id],
+                )
+                .await?;
+            let message = match rows.next().await? {
+                Some(row) => {
+                    let voice_timing = voice_transcript_timing_from_columns(
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    )?;
+                    Some(ConversationMessage {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        turn_id: row.get(2)?,
+                        sequence: row.get(3)?,
+                        role: row.get(4)?,
+                        actor_id: row.get(5)?,
+                        content: row.get(6)?,
+                        status: row.get(7)?,
+                        created_at: row.get(8)?,
+                        voice_timing,
+                    })
+                }
+                None => None,
+            };
+            Ok::<Option<ConversationMessage>, anyhow::Error>(message)
+        })
     }
 
     pub fn has_human_only_messages(&self, session_id: &str) -> Result<bool> {
@@ -2730,6 +3085,124 @@ impl SessionStore {
         })
     }
 
+    pub(crate) fn prediction_agent_plan(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<AgentPlanEntry>>> {
+        self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT length(CAST(json_extract(state_json, '$.plan') AS BLOB)), json_extract(state_json, '$.plan')
+                 FROM harness_runtime_state WHERE session_id = ?1",
+                params![session_id.to_string()],
+            ).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(Some(Vec::new()));
+            };
+            let Some(plan_bytes) = row.get::<Option<i64>>(0)? else {
+                return Ok(Some(Vec::new()));
+            };
+            if usize::try_from(plan_bytes)? > max_bytes {
+                return Ok(None);
+            }
+            let plan_json = row.get::<String>(1)?;
+            Ok(Some(serde_json::from_str(&plan_json)?))
+        })
+    }
+
+    pub(crate) fn prediction_agent_plan_summary(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<PredictionAgentPlanSummary> {
+        self.block_on(async {
+            let mut counts = self
+                .conn
+                .query(
+                    "SELECT json_extract(step.value, '$.status'), count(*)
+                     FROM harness_runtime_state,
+                          json_each(harness_runtime_state.state_json, '$.plan') AS step
+                     WHERE harness_runtime_state.session_id = ?1
+                     GROUP BY json_extract(step.value, '$.status')",
+                    params![session_id.to_string()],
+                )
+                .await?;
+            let mut summary = PredictionAgentPlanSummary::default();
+            while let Some(row) = counts.next().await? {
+                let status = row
+                    .get::<Option<String>>(0)?
+                    .unwrap_or_else(|| "unknown".to_string())
+                    .to_ascii_lowercase();
+                summary.status_counts.insert(status, usize::try_from(row.get::<i64>(1)?)?);
+            }
+
+            let mut selected = self
+                .conn
+                .query(
+                    "SELECT CAST(step.key AS INTEGER), length(CAST(step.value AS BLOB)), step.value
+                     FROM harness_runtime_state,
+                          json_each(harness_runtime_state.state_json, '$.plan') AS step
+                     WHERE harness_runtime_state.session_id = ?1
+                       AND (CAST(step.key AS INTEGER) = 0
+                            OR lower(json_extract(step.value, '$.status')) = 'in_progress')
+                     ORDER BY CAST(step.key AS INTEGER)",
+                    params![session_id.to_string()],
+                )
+                .await?;
+            let mut selected_bytes = 0usize;
+            while let Some(row) = selected.next().await? {
+                let index = usize::try_from(row.get::<i64>(0)?)?;
+                let step_bytes = usize::try_from(row.get::<i64>(1)?)?;
+                selected_bytes = selected_bytes
+                    .saturating_add(step_bytes)
+                    .saturating_add(16);
+                anyhow::ensure!(
+                    selected_bytes <= max_bytes,
+                    "Active prediction plan summary exceeds its context budget; no active step was dropped"
+                );
+                let step_json = row.get::<String>(2)?;
+                let step: AgentPlanEntry = serde_json::from_str(&step_json)?;
+                if index == 0 {
+                    summary.opening_step = Some(step.clone());
+                }
+                if step.status.eq_ignore_ascii_case("in_progress") {
+                    summary.active_steps.push(step);
+                }
+            }
+
+            let opening_is_next = summary
+                .opening_step
+                .as_ref()
+                .is_some_and(|step| step.status.eq_ignore_ascii_case("pending"));
+            if summary.active_steps.is_empty() && !opening_is_next {
+                let mut next = self
+                    .conn
+                    .query(
+                        "SELECT length(CAST(step.value AS BLOB)), step.value
+                         FROM harness_runtime_state,
+                              json_each(harness_runtime_state.state_json, '$.plan') AS step
+                         WHERE harness_runtime_state.session_id = ?1
+                           AND lower(json_extract(step.value, '$.status')) = 'pending'
+                         ORDER BY CAST(step.key AS INTEGER) LIMIT 1",
+                        params![session_id.to_string()],
+                    )
+                    .await?;
+                if let Some(row) = next.next().await? {
+                    let step_bytes = usize::try_from(row.get::<i64>(0)?)?;
+                    anyhow::ensure!(
+                        selected_bytes.saturating_add(step_bytes).saturating_add(16)
+                            <= max_bytes,
+                        "Next prediction plan step exceeds its context budget; no active step was dropped"
+                    );
+                    let step_json = row.get::<String>(1)?;
+                    summary.next_step = Some(serde_json::from_str(&step_json)?);
+                }
+            }
+
+            Ok(summary)
+        })
+    }
+
     pub fn set_agent_runtime_state(
         &self,
         session_id: &str,
@@ -2757,7 +3230,12 @@ impl SessionStore {
         request: &ahead_rpc::ahead::AgentTurnRequestDto,
         instruction_sources: &[InstructionFileSource],
     ) -> Result<()> {
-        let request_json = serde_json::to_string(request)?;
+        let request_json = serde_json::to_string(&SavedTurnRequest {
+            request,
+            project_instruction_sources: None,
+            skill_sources: None,
+            skill_references: None,
+        })?;
         let instruction_rows = instruction_sources
             .iter()
             .enumerate()
@@ -2772,9 +3250,12 @@ impl SessionStore {
             })
             .collect::<Result<Vec<_>>>()?;
         self.block_on(async {
-            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let result = async {
-                self.conn
+                transaction
                     .execute(
                         "INSERT INTO harness_turn_requests
                         (turn_id, session_id, request_json, created_at)
@@ -2789,7 +3270,7 @@ impl SessionStore {
                         ],
                     )
                     .await?;
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM turn_instruction_sources WHERE turn_id = ?1",
                         params![turn_id.to_string()],
@@ -2798,7 +3279,7 @@ impl SessionStore {
                 for (ordinal, source_path, content_sha256, targets_json) in
                     &instruction_rows
                 {
-                    self.conn
+                    transaction
                         .execute(
                             "INSERT INTO turn_instruction_sources
                                 (session_id, turn_id, ordinal, source_path,
@@ -2819,13 +3300,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = result {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back turn instruction provenance")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -2879,9 +3360,167 @@ impl SessionStore {
         })?;
         request_json
             .map(|json| {
-                serde_json::from_str(&json).context("parsing persisted turn request")
+                serde_json::from_str::<
+                    SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto>,
+                >(&json)
+                .map(|saved| saved.request)
+                .context("parsing persisted turn request")
             })
             .transpose()
+    }
+
+    pub fn get_project_instruction_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<ProjectInstructionSource>>> {
+        let request_json: Option<String> = self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            Ok::<_, anyhow::Error>(
+                rows.next().await?.map(|row| row.get(0)).transpose()?,
+            )
+        })?;
+        request_json
+            .map(|json| {
+                serde_json::from_str::<
+                    SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto>,
+                >(&json)
+                .map(|saved| saved.project_instruction_sources)
+                .context("parsing project instruction snapshot")
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn set_project_instruction_sources(
+        &self,
+        turn_id: &str,
+        sources: &[ProjectInstructionSource],
+    ) -> Result<()> {
+        self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            let row = rows.next().await?.context("turn request missing while saving project instructions")?;
+            let request_json: String = row.get(0)?;
+            drop(rows);
+            let mut saved: SavedTurnRequest<
+                ahead_rpc::ahead::AgentTurnRequestDto,
+            > = serde_json::from_str(&request_json)?;
+            saved.project_instruction_sources = Some(sources.to_vec());
+            let updated = self.conn.execute(
+                "UPDATE harness_turn_requests SET request_json = ?2 WHERE turn_id = ?1",
+                params![turn_id.to_string(), serde_json::to_string(&saved)?],
+            ).await?;
+            anyhow::ensure!(updated == 1, "turn request disappeared while saving project instructions");
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    pub fn get_turn_skill_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillSource>>> {
+        let request_json: Option<String> = self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            Ok::<_, anyhow::Error>(
+                rows.next().await?.map(|row| row.get(0)).transpose()?,
+            )
+        })?;
+        request_json
+            .map(|json| {
+                serde_json::from_str::<
+                    SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto>,
+                >(&json)
+                .map(|saved| saved.skill_sources)
+                .context("parsing managed-turn skill provenance")
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn set_turn_skill_sources(
+        &self,
+        turn_id: &str,
+        sources: &[TurnSkillSource],
+    ) -> Result<()> {
+        self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            let row = rows.next().await?.context("turn request missing while saving skill provenance")?;
+            let request_json: String = row.get(0)?;
+            drop(rows);
+            let mut saved: SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto> =
+                serde_json::from_str(&request_json)?;
+            saved.skill_sources = Some(sources.to_vec());
+            let updated = self.conn.execute(
+                "UPDATE harness_turn_requests SET request_json = ?2 WHERE turn_id = ?1",
+                params![turn_id.to_string(), serde_json::to_string(&saved)?],
+            ).await?;
+            anyhow::ensure!(updated == 1, "turn request disappeared while saving skill provenance");
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    pub fn append_turn_skill_reference(
+        &self,
+        turn_id: &str,
+        reference: &TurnSkillReference,
+    ) -> Result<()> {
+        self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            let row = rows.next().await?.context("turn request missing while saving skill resource provenance")?;
+            let request_json: String = row.get(0)?;
+            drop(rows);
+            let mut saved: SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto> =
+                serde_json::from_str(&request_json)?;
+            let references = saved.skill_references.get_or_insert_with(Vec::new);
+            if !references.contains(reference) {
+                references.push(reference.clone());
+            }
+            let updated = self.conn.execute(
+                "UPDATE harness_turn_requests SET request_json = ?2 WHERE turn_id = ?1",
+                params![turn_id.to_string(), serde_json::to_string(&saved)?],
+            ).await?;
+            anyhow::ensure!(updated == 1, "turn request disappeared while saving skill resource provenance");
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    pub fn get_turn_skill_references(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillReference>>> {
+        let request_json: Option<String> = self.block_on(async {
+            let mut rows = self.conn.query(
+                "SELECT request_json FROM harness_turn_requests WHERE turn_id = ?1",
+                params![turn_id.to_string()],
+            ).await?;
+            Ok::<_, anyhow::Error>(
+                rows.next().await?.map(|row| row.get(0)).transpose()?,
+            )
+        })?;
+        request_json
+            .map(|json| {
+                serde_json::from_str::<
+                    SavedTurnRequest<ahead_rpc::ahead::AgentTurnRequestDto>,
+                >(&json)
+                .map(|saved| saved.skill_references)
+                .context("parsing managed-turn skill resource provenance")
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn remove_turn_request(&self, turn_id: &str) -> Result<()> {
@@ -2945,10 +3584,12 @@ impl SessionStore {
             .as_ref()
             .map(chrono::DateTime::to_rfc3339);
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let result = async {
-                let inserted = self
-                    .conn
+                let inserted = transaction
                     .execute(
                         "INSERT INTO agent_runtime_threads
                             (thread_id, create_params_json, archived, archived_at,
@@ -2970,13 +3611,12 @@ impl SessionStore {
                     )
                     .await?;
                 if inserted == 0 {
-                    self.conn.execute("COMMIT", ()).await?;
                     return Ok::<bool, anyhow::Error>(false);
                 }
                 for (ordinal, item) in item_json.iter().enumerate() {
                     let ordinal = i64::try_from(ordinal)
                         .context("legacy rollout has too many records")?;
-                    self.conn
+                    transaction
                         .execute(
                             "INSERT INTO agent_runtime_thread_items
                                 (thread_id, ordinal, item_json)
@@ -2985,20 +3625,19 @@ impl SessionStore {
                         )
                         .await?;
                 }
-                self.conn.execute("COMMIT", ()).await?;
                 Ok(true)
             }
             .await;
             match result {
-                Ok(imported) => Ok(imported),
+                Ok(imported) => {
+                    transaction.commit().await?;
+                    Ok(imported)
+                }
                 Err(error) => {
-                    if let Err(rollback_error) =
-                        self.conn.execute("ROLLBACK", ()).await
-                    {
-                        return Err(error.context(format!(
-                            "rollback also failed: {rollback_error}"
-                        )));
-                    }
+                    transaction
+                        .rollback()
+                        .await
+                        .context("rolling back legacy native thread import")?;
                     Err(error)
                 }
             }
@@ -3019,10 +3658,13 @@ impl SessionStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let thread_id = thread_id.to_string();
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            // Reserve the writer before reading ordinals; deferred lock upgrades cannot wait.
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let result = async {
-                let mut rows = self
-                    .conn
+                let mut rows = transaction
                     .query(
                         "SELECT COALESCE(MAX(ordinal), -1)
                          FROM agent_runtime_thread_items WHERE thread_id = ?1",
@@ -3041,7 +3683,7 @@ impl SessionStore {
                     let ordinal = last_ordinal
                         .checked_add(ordinal_offset)
                         .context("native thread item ordinal overflow")?;
-                    self.conn
+                    transaction
                         .execute(
                             "INSERT INTO agent_runtime_thread_items
                                 (thread_id, ordinal, item_json)
@@ -3050,8 +3692,7 @@ impl SessionStore {
                         )
                         .await?;
                 }
-                let changed = self
-                    .conn
+                let changed = transaction
                     .execute(
                         "UPDATE agent_runtime_threads SET updated_at = ?1
                          WHERE thread_id = ?2",
@@ -3066,13 +3707,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = result {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back native thread item append")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -3086,10 +3727,12 @@ impl SessionStore {
         let patch_json = serde_json::to_string(patch)?;
         let thread_id = thread_id.to_string();
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            let transaction = self
+                .conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let result = async {
-                let mut rows = self
-                    .conn
+                let mut rows = transaction
                     .query(
                         "SELECT COALESCE(MAX(ordinal), -1)
                          FROM agent_runtime_thread_metadata WHERE thread_id = ?1",
@@ -3103,8 +3746,7 @@ impl SessionStore {
                 let ordinal = last_ordinal
                     .checked_add(1)
                     .context("native thread metadata ordinal overflow")?;
-                let changed = self
-                    .conn
+                let changed = transaction
                     .execute(
                         "INSERT INTO agent_runtime_thread_metadata
                             (thread_id, ordinal, patch_json)
@@ -3119,7 +3761,7 @@ impl SessionStore {
                     changed == 1,
                     "native thread {thread_id} was not found"
                 );
-                self.conn
+                transaction
                     .execute(
                         "UPDATE agent_runtime_threads SET updated_at = ?1
                          WHERE thread_id = ?2",
@@ -3130,13 +3772,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = result {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back native thread metadata append")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -3698,27 +4340,29 @@ impl SessionStore {
 
     pub fn delete_native_thread(&self, thread_id: &str) -> Result<()> {
         self.block_on(async {
-            self.conn.execute("BEGIN TRANSACTION", ()).await?;
+            let transaction = self.conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await?;
             let result = async {
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM agent_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
                         params![thread_id.to_string()],
                     )
                     .await?;
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM agent_runtime_thread_items WHERE thread_id = ?1",
                         params![thread_id.to_string()],
                     )
                     .await?;
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM agent_runtime_thread_metadata WHERE thread_id = ?1",
                         params![thread_id.to_string()],
                     )
                     .await?;
-                self.conn
+                transaction
                     .execute(
                         "DELETE FROM agent_runtime_threads WHERE thread_id = ?1",
                         params![thread_id.to_string()],
@@ -3728,13 +4372,13 @@ impl SessionStore {
             }
             .await;
             if let Err(error) = result {
-                self.conn
-                    .execute("ROLLBACK", ())
+                transaction
+                    .rollback()
                     .await
                     .context("rolling back native thread deletion")?;
                 return Err(error);
             }
-            self.conn.execute("COMMIT", ()).await?;
+            transaction.commit().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -3854,12 +4498,19 @@ impl SessionStore {
             let mut rows = if let Some(cursor) = before {
                 self.conn
                     .query(
-                        "SELECT id, session_id, turn_id, sequence, role, actor_id,
-                                content, status, created_at
-                         FROM conversation_messages
-                         WHERE session_id = ?1
-                           AND (sequence < ?2 OR (sequence = ?2 AND id < ?3))
-                         ORDER BY sequence DESC, id DESC LIMIT ?4",
+                        "SELECT message.id, message.session_id, message.turn_id,
+                                message.sequence, message.role, message.actor_id,
+                                message.content, message.status, message.created_at,
+                                json_extract(timing.payload_json, '$.timing.call_id'),
+                                json_extract(timing.payload_json, '$.timing.start_ms'),
+                                json_extract(timing.payload_json, '$.timing.end_ms')
+                         FROM conversation_messages AS message
+                         LEFT JOIN session_events AS timing
+                           ON timing.id = 'voice-transcript-timing-' || message.id
+                          AND timing.event_type = 'voice_transcript_timing'
+                         WHERE message.session_id = ?1
+                           AND (message.sequence < ?2 OR (message.sequence = ?2 AND message.id < ?3))
+                         ORDER BY message.sequence DESC, message.id DESC LIMIT ?4",
                         params![
                             session_id.to_string(),
                             cursor.sequence,
@@ -3871,16 +4522,29 @@ impl SessionStore {
             } else {
                 self.conn
                     .query(
-                        "SELECT id, session_id, turn_id, sequence, role, actor_id,
-                                content, status, created_at
-                         FROM conversation_messages WHERE session_id = ?1
-                         ORDER BY sequence DESC, id DESC LIMIT ?2",
+                        "SELECT message.id, message.session_id, message.turn_id,
+                                message.sequence, message.role, message.actor_id,
+                                message.content, message.status, message.created_at,
+                                json_extract(timing.payload_json, '$.timing.call_id'),
+                                json_extract(timing.payload_json, '$.timing.start_ms'),
+                                json_extract(timing.payload_json, '$.timing.end_ms')
+                         FROM conversation_messages AS message
+                         LEFT JOIN session_events AS timing
+                           ON timing.id = 'voice-transcript-timing-' || message.id
+                          AND timing.event_type = 'voice_transcript_timing'
+                         WHERE message.session_id = ?1
+                         ORDER BY message.sequence DESC, message.id DESC LIMIT ?2",
                         params![session_id.to_string(), fetch_limit],
                     )
                     .await?
             };
             let mut messages = Vec::new();
             while let Some(row) = rows.next().await? {
+                let voice_timing = voice_transcript_timing_from_columns(
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                )?;
                 messages.push(ConversationMessage {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -3891,6 +4555,7 @@ impl SessionStore {
                     content: row.get(6)?,
                     status: row.get(7)?,
                     created_at: row.get(8)?,
+                    voice_timing,
                 });
             }
             let has_older = messages.len() > limit;
@@ -3911,13 +4576,30 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<Vec<ConversationMessage>> {
         self.block_on(async {
-            let mut rows = self.conn.query(
-                "SELECT id, session_id, turn_id, sequence, role, actor_id, content, status, created_at
-                 FROM conversation_messages WHERE session_id = ?1 ORDER BY sequence ASC",
-                params![session_id.to_string()],
-            ).await?;
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT message.id, message.session_id, message.turn_id,
+                        message.sequence, message.role, message.actor_id,
+                        message.content, message.status, message.created_at,
+                        json_extract(timing.payload_json, '$.timing.call_id'),
+                        json_extract(timing.payload_json, '$.timing.start_ms'),
+                        json_extract(timing.payload_json, '$.timing.end_ms')
+                 FROM conversation_messages AS message
+                 LEFT JOIN session_events AS timing
+                   ON timing.id = 'voice-transcript-timing-' || message.id
+                  AND timing.event_type = 'voice_transcript_timing'
+                 WHERE message.session_id = ?1 ORDER BY message.sequence ASC",
+                    params![session_id.to_string()],
+                )
+                .await?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().await? {
+                let voice_timing = voice_transcript_timing_from_columns(
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                )?;
                 out.push(ConversationMessage {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -3928,6 +4610,7 @@ impl SessionStore {
                     content: row.get(6)?,
                     status: row.get(7)?,
                     created_at: row.get(8)?,
+                    voice_timing,
                 });
             }
             Ok::<Vec<ConversationMessage>, anyhow::Error>(out)
@@ -3942,14 +4625,31 @@ impl SessionStore {
     ) -> Result<Vec<ConversationMessage>> {
         let limit = i64::try_from(limit.clamp(1, 10))?;
         self.block_on(async {
-            let mut rows = self.conn.query(
-                "SELECT id, session_id, turn_id, sequence, role, actor_id, content, status, created_at
-                 FROM conversation_messages WHERE session_id = ?1 AND sequence > ?2
-                 ORDER BY sequence ASC LIMIT ?3",
-                params![session_id.to_string(), sequence, limit],
-            ).await?;
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT message.id, message.session_id, message.turn_id,
+                        message.sequence, message.role, message.actor_id,
+                        message.content, message.status, message.created_at,
+                        json_extract(timing.payload_json, '$.timing.call_id'),
+                        json_extract(timing.payload_json, '$.timing.start_ms'),
+                        json_extract(timing.payload_json, '$.timing.end_ms')
+                 FROM conversation_messages AS message
+                 LEFT JOIN session_events AS timing
+                   ON timing.id = 'voice-transcript-timing-' || message.id
+                  AND timing.event_type = 'voice_transcript_timing'
+                 WHERE message.session_id = ?1 AND message.sequence > ?2
+                 ORDER BY message.sequence ASC LIMIT ?3",
+                    params![session_id.to_string(), sequence, limit],
+                )
+                .await?;
             let mut messages = Vec::new();
             while let Some(row) = rows.next().await? {
+                let voice_timing = voice_transcript_timing_from_columns(
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                )?;
                 messages.push(ConversationMessage {
                     id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -3960,6 +4660,7 @@ impl SessionStore {
                     content: row.get(6)?,
                     status: row.get(7)?,
                     created_at: row.get(8)?,
+                    voice_timing,
                 });
             }
             Ok::<Vec<ConversationMessage>, anyhow::Error>(messages)
@@ -3971,26 +4672,46 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<Option<ConversationMessage>> {
         self.block_on(async {
-            let mut rows = self.conn.query(
-                "SELECT id, session_id, turn_id, sequence, role, actor_id, content, status, created_at
-                 FROM conversation_messages WHERE session_id = ?1 AND role = 'agent'
-                 ORDER BY sequence DESC LIMIT 1",
-                params![session_id.to_string()],
-            ).await?;
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT message.id, message.session_id, message.turn_id,
+                        message.sequence, message.role, message.actor_id,
+                        message.content, message.status, message.created_at,
+                        json_extract(timing.payload_json, '$.timing.call_id'),
+                        json_extract(timing.payload_json, '$.timing.start_ms'),
+                        json_extract(timing.payload_json, '$.timing.end_ms')
+                 FROM conversation_messages AS message
+                 LEFT JOIN session_events AS timing
+                   ON timing.id = 'voice-transcript-timing-' || message.id
+                  AND timing.event_type = 'voice_transcript_timing'
+                 WHERE message.session_id = ?1 AND message.role = 'agent'
+                 ORDER BY message.sequence DESC LIMIT 1",
+                    params![session_id.to_string()],
+                )
+                .await?;
             let Some(row) = rows.next().await? else {
                 return Ok(None);
             };
-            Ok::<Option<ConversationMessage>, anyhow::Error>(Some(ConversationMessage {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                turn_id: row.get(2)?,
-                sequence: row.get(3)?,
-                role: row.get(4)?,
-                actor_id: row.get(5)?,
-                content: row.get(6)?,
-                status: row.get(7)?,
-                created_at: row.get(8)?,
-            }))
+            let voice_timing = voice_transcript_timing_from_columns(
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+            )?;
+            Ok::<Option<ConversationMessage>, anyhow::Error>(Some(
+                ConversationMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    role: row.get(4)?,
+                    actor_id: row.get(5)?,
+                    content: row.get(6)?,
+                    status: row.get(7)?,
+                    created_at: row.get(8)?,
+                    voice_timing,
+                },
+            ))
         })
     }
 
@@ -4124,6 +4845,65 @@ impl ahead_agent::HarnessStore for SharedSessionStore {
         turn_id: &str,
     ) -> Result<Option<ahead_rpc::ahead::AgentTurnRequestDto>> {
         self.0.read().get_turn_request(turn_id)
+    }
+
+    fn list_turn_instruction_sources(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<InstructionFileSource>> {
+        self.0
+            .read()
+            .list_turn_instruction_sources(session_id, turn_id)
+    }
+
+    fn get_project_instruction_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<ProjectInstructionSource>>> {
+        self.0.read().get_project_instruction_sources(turn_id)
+    }
+
+    fn set_project_instruction_sources(
+        &self,
+        turn_id: &str,
+        sources: &[ProjectInstructionSource],
+    ) -> Result<()> {
+        self.0
+            .read()
+            .set_project_instruction_sources(turn_id, sources)
+    }
+
+    fn set_turn_skill_sources(
+        &self,
+        turn_id: &str,
+        sources: &[TurnSkillSource],
+    ) -> Result<()> {
+        self.0.read().set_turn_skill_sources(turn_id, sources)
+    }
+
+    fn get_turn_skill_sources(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillSource>>> {
+        self.0.read().get_turn_skill_sources(turn_id)
+    }
+
+    fn append_turn_skill_reference(
+        &self,
+        turn_id: &str,
+        reference: &TurnSkillReference,
+    ) -> Result<()> {
+        self.0
+            .read()
+            .append_turn_skill_reference(turn_id, reference)
+    }
+
+    fn get_turn_skill_references(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<Vec<TurnSkillReference>>> {
+        self.0.read().get_turn_skill_references(turn_id)
     }
 
     fn remove_turn_request(&self, turn_id: &str) -> Result<()> {
@@ -4309,12 +5089,128 @@ mod tests {
     use super::*;
     use ahead_rpc::ahead::{
         AgentCommand, AgentPlanEntry, AgentToolCall, AgentTurnRequestDto,
-        AgentUsage, AheadNotification, AheadRequest, HarnessKind, TurnEditorContext,
-        TurnMechanicalScope,
+        AgentUsage, AheadNotification, AheadRequest, HarnessKind, PredictionBinding,
+        PredictionModelContext, TurnEditorContext, TurnMechanicalScope,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn prediction_context_versions_follow_committed_changes_across_connections()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database_path = temporary.path().join("session.db");
+        let mut writer = SessionStore::open(&database_path)?;
+        let session = super::super::host::AheadSessionHost::in_memory()?
+            .start_work(
+                Some(WorkKind::ProductChange),
+                "Versions".into(),
+                "Track context".into(),
+                None,
+            )?;
+        writer.insert_session(&session)?;
+        let reader = SessionStore::open(&database_path)?;
+        let id = &session.session.id;
+        let mut revision = reader.prediction_context_revision(id)?;
+        assert_eq!(revision, 0);
+        let item = writer.create_work_item(id, "Keep constraints", "human")?;
+        writer.add_work_item_event(
+            &item.id,
+            id,
+            "decision",
+            "Keep the API stable",
+            "human",
+        )?;
+        writer.save_conversation_summary(id, "plan", "Current summary", "1..2")?;
+        writer.upsert_message(&ConversationMessage {
+            id: "message".into(),
+            session_id: id.clone(),
+            turn_id: "turn".into(),
+            sequence: 1,
+            role: "human".into(),
+            actor_id: "human".into(),
+            content: "hello".into(),
+            status: "complete".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            voice_timing: None,
+        })?;
+        writer.set_agent_runtime_state(id, &Default::default())?;
+        assert_eq!(reader.prediction_context_revision(id)?, revision + 5);
+        revision += 5;
+        writer.record_recent_workspace_file("unrelated.rs", 1)?;
+        assert_eq!(reader.prediction_context_revision(id)?, revision);
+        for table in [
+            "work_items",
+            "work_item_events",
+            "conversation_summaries",
+            "conversation_messages",
+            "harness_runtime_state",
+        ] {
+            writer.block_on(writer.conn.execute_batch(&format!(
+                "BEGIN; UPDATE {table} SET session_id = session_id; ROLLBACK;"
+            )))?;
+            assert_eq!(
+                reader.prediction_context_revision(id)?,
+                revision,
+                "rollback of {table}"
+            );
+            writer.block_on(writer.conn.execute_batch(&format!(
+                "UPDATE {table} SET session_id = session_id;"
+            )))?;
+            let updated = reader.prediction_context_revision(id)?;
+            assert!(updated > revision, "update of {table}");
+            writer.block_on(
+                writer.conn.execute_batch(&format!("DELETE FROM {table};")),
+            )?;
+            revision = reader.prediction_context_revision(id)?;
+            assert!(revision > updated, "delete from {table}");
+        }
+        drop(writer);
+        drop(reader);
+        let reopened = SessionStore::open(&database_path)?;
+        assert_eq!(reopened.prediction_context_revision(id)?, revision);
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_summaries_keep_latest_four_without_truncating_exports()
+    -> Result<()> {
+        let mut store = SessionStore::in_memory()?;
+        let session = super::super::host::AheadSessionHost::in_memory()?
+            .start_work(
+                Some(WorkKind::ProductChange),
+                "Summary budget".into(),
+                "Keep recent decisions".into(),
+                None,
+            )?;
+        store.insert_session(&session)?;
+        for index in 0..10 {
+            store.insert_conversation_summary_row(&ConversationSummary {
+                id: format!("summary-{index}"),
+                session_id: session.session.id.clone(),
+                phase: "plan".into(),
+                summary_markdown: format!("Plan {index}"),
+                message_id_range: "1..2".into(),
+                created_at: format!("2026-10-15T12:00:{index:02}Z"),
+            })?;
+        }
+        assert_eq!(
+            store
+                .prediction_summaries(&session.session.id, 64 * 1024)?
+                .into_iter()
+                .map(|summary| summary.summary_markdown)
+                .collect::<Vec<_>>(),
+            ["Plan 6", "Plan 7", "Plan 8", "Plan 9"]
+        );
+        assert_eq!(
+            store
+                .list_conversation_summaries(&session.session.id)?
+                .len(),
+            10
+        );
+        Ok(())
+    }
 
     #[test]
     fn agent_runtime_state_survives_file_backed_turso_reopen() -> Result<()> {
@@ -4407,6 +5303,8 @@ mod tests {
             external_agent_id: None,
             model: Some("test-model".into()),
             model_provider: Some("test-provider".into()),
+            model_context_window: Some(131_072),
+            reasoning_effort: None,
             user_message: "Inspect the source".into(),
             session_context: String::new(),
             context: TurnEditorContext {
@@ -4437,6 +5335,52 @@ mod tests {
             &request,
             &expected_sources,
         )?;
+        assert_eq!(
+            store.get_turn_skill_sources("turn-instruction-sources")?,
+            None,
+        );
+        assert_eq!(
+            store.get_turn_skill_references("turn-instruction-sources")?,
+            None,
+        );
+        assert_eq!(
+            store.get_project_instruction_sources("turn-instruction-sources")?,
+            None,
+        );
+        let project_sources = vec![ProjectInstructionSource {
+            path: std::path::PathBuf::from("/workspace/AGENTS.md"),
+            content_sha256: "b".repeat(64),
+        }];
+        store.set_project_instruction_sources(
+            "turn-instruction-sources",
+            &project_sources,
+        )?;
+        let skill_sources = vec![TurnSkillSource {
+            skill_id: format!("host-skill:project:demo:{}", "c".repeat(64)),
+            name: "demo".to_string(),
+            scope: "project".to_string(),
+            source_sha256: "d".repeat(64),
+            prompt_sha256: "e".repeat(64),
+            selected_by: "human".to_string(),
+        }];
+        store.set_turn_skill_sources("turn-instruction-sources", &skill_sources)?;
+        let skill_reference = TurnSkillReference {
+            skill_id: skill_sources[0].skill_id.clone(),
+            skill_name: "demo".to_string(),
+            scope: "project".to_string(),
+            resource_path: "references/guide.md".to_string(),
+            source_sha256: "f".repeat(64),
+            response_sha256: "a".repeat(64),
+            loaded_by: "agent".to_string(),
+        };
+        store.append_turn_skill_reference(
+            "turn-instruction-sources",
+            &skill_reference,
+        )?;
+        store.append_turn_skill_reference(
+            "turn-instruction-sources",
+            &skill_reference,
+        )?;
         drop(store);
 
         let reopened = SessionStore::open(&database_path)?;
@@ -4447,11 +5391,39 @@ mod tests {
             )?,
             expected_sources
         );
+        assert_eq!(
+            reopened.get_project_instruction_sources("turn-instruction-sources")?,
+            Some(project_sources),
+        );
+        assert_eq!(
+            reopened.get_turn_skill_sources("turn-instruction-sources")?,
+            Some(skill_sources),
+        );
+        assert_eq!(
+            reopened.get_turn_skill_references("turn-instruction-sources")?,
+            Some(vec![skill_reference]),
+        );
+        assert_eq!(
+            reopened.get_turn_request("turn-instruction-sources")?,
+            Some(request),
+        );
         reopened.remove_turn_request("turn-instruction-sources")?;
         assert!(
             reopened
                 .get_turn_request("turn-instruction-sources")?
                 .is_none()
+        );
+        assert_eq!(
+            reopened.get_project_instruction_sources("turn-instruction-sources")?,
+            None,
+        );
+        assert_eq!(
+            reopened.get_turn_skill_sources("turn-instruction-sources")?,
+            None,
+        );
+        assert_eq!(
+            reopened.get_turn_skill_references("turn-instruction-sources")?,
+            None,
         );
         assert_eq!(
             reopened.list_turn_instruction_sources(
@@ -4669,37 +5641,322 @@ mod tests {
     }
 
     #[test]
-    fn session_storage_creates_current_schema_and_reopens_without_rewriting()
-    -> Result<()> {
+    fn session_storage_creates_initial_schema_and_reopens() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("session.db");
         let store = SessionStore::open(&path)?;
-        let (application_id, version, obsolete_columns) = store.block_on(async {
+        let (sessions_table, anchors_table) = store.block_on(async {
             let mut rows = store.conn.query(
-                "SELECT application_id, user_version,
-                        (SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'mode')
-                        + (SELECT COUNT(*) FROM pragma_table_info('anchors') WHERE name = 'created_at_commit')
-                 FROM pragma_application_id, pragma_user_version",
+                "SELECT
+                        (SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sessions'),
+                        (SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'anchors')
+                ",
                 (),
             ).await?;
-            let row = rows.next().await?.context("schema header")?;
-            Ok::<_, anyhow::Error>((row.get::<i64>(0)?, row.get::<i64>(1)?, row.get::<i64>(2)?))
+            let row = rows.next().await?.context("initial schema")?;
+            Ok::<_, anyhow::Error>((row.get::<i64>(0)?, row.get::<i64>(1)?))
         })?;
-        assert_eq!(application_id, SESSION_APPLICATION_ID);
-        assert_eq!(version, SESSION_SCHEMA_VERSION);
-        assert_eq!(obsolete_columns, 0);
+        assert_eq!(sessions_table, 1);
+        assert_eq!(anchors_table, 1);
         store.record_recent_workspace_file("src/main.rs", 42)?;
         drop(store);
-        let before = fs::read(&path)?;
         let reopened = SessionStore::open(&path)?;
         assert_eq!(reopened.recent_workspace_files()?, ["src/main.rs"]);
-        drop(reopened);
-        assert_eq!(
-            fs::read(path)?,
-            before,
-            "current-schema reopen must not rewrite the database"
-        );
         Ok(())
+    }
+
+    #[test]
+    fn session_storage_failed_session_commit_rolls_back_and_allows_retry()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for operation in ["title", "workflow", "delete", "recent", "memory", "turn"]
+        {
+            let path = directory.path().join(format!("{operation}.db"));
+            let mut writer = SessionStore::open(&path)?;
+            writer.create_native_thread("retry", &serde_json::json!({}))?;
+            writer.block_on(writer.conn.execute_batch(
+                "INSERT INTO sessions VALUES
+                    ('session', 'project', 'workspace', 'product-change', 'Before',
+                     'human', '{\"kind\":\"active\"}', '{}', 1, '2026-10-15');
+                 INSERT INTO session_tasks (id, session_id, intent, work_kind, title, created_at)
+                    VALUES ('task', 'session', 'assistance', 'product-change', 'Before', '2026-10-15');
+                 INSERT INTO workflow_state VALUES
+                    ('session', 1, 'initial', 'before', 'Before', 1, NULL, '[]', '[]');
+                 PRAGMA journal_mode = DELETE;
+                 PRAGMA busy_timeout = 30;",
+            ))?;
+            let reader = SessionStore::open(&path)?;
+            reader.block_on(reader.conn.execute_batch(
+                "BEGIN; SELECT thread_id FROM agent_runtime_threads;",
+            ))?;
+            let update = |writer: &mut SessionStore| -> Result<()> {
+                match operation {
+                    "title" => writer.update_session_title("session", "After"),
+                    "workflow" => writer
+                        .advance_workflow_phase(
+                            "session",
+                            1,
+                            WorkflowPhase {
+                                id: "after".into(),
+                                title: "After".into(),
+                                visit: 1,
+                            },
+                        )
+                        .map(|_| ()),
+                    "delete" => writer.delete_native_thread("retry"),
+                    "recent" => {
+                        writer.record_recent_workspace_file("src/retry.rs", 1)
+                    }
+                    "memory" => writer
+                        .sync_memory_content(
+                            "project",
+                            &directory.path().join("MEMORY.md"),
+                            Some("memorysentinel"),
+                        )
+                        .map(|_| ()),
+                    "turn" => {
+                        let request = serde_json::from_value::<AgentTurnRequestDto>(
+                            serde_json::json!({
+                                "session_id": "session", "thread_id": "retry", "user_message": "Retry this turn",
+                                "context": {
+                                    "active_path": "src/retry.rs", "caret": { "line": 0, "col": 0 },
+                                    "file_content": "", "attached_anchor_ids": [], "attached_files": [],
+                                },
+                                "invariants": [], "expected_policy_sha256": "0".repeat(64),
+                            }),
+                        )?;
+                        writer.save_turn_request("turn", &request, &[])
+                    }
+                    _ => unreachable!("test operation"),
+                }
+            };
+            let result = update(&mut writer);
+            reader.block_on(reader.conn.execute("ROLLBACK", ()))?;
+            let error = result.expect_err("reader must block the session commit");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string().contains("locked")),
+                "{operation}: {error:#}"
+            );
+            assert!(
+                writer.conn.is_autocommit(),
+                "{operation}: failed commit left a transaction open"
+            );
+            assert_eq!(writer.session_title("session")?.as_deref(), Some("Before"));
+            assert!(writer.load_native_thread("retry")?.is_some());
+            assert!(writer.recent_workspace_files()?.is_empty());
+            assert!(writer.search_memory("memorysentinel", 10)?.is_empty());
+            assert!(writer.get_turn_request("turn")?.is_none());
+            update(&mut writer)?;
+            let reopened = SessionStore::open(&path)?;
+            match operation {
+                "title" => assert_eq!(
+                    reopened.session_title("session")?.as_deref(),
+                    Some("After")
+                ),
+                "workflow" => {
+                    let mut rows = reopened.block_on(reopened.conn.query(
+                        "SELECT revision, phase_id FROM workflow_state WHERE session_id = 'session'", (),
+                    ))?;
+                    let row = reopened
+                        .block_on(rows.next())?
+                        .context("retried workflow")?;
+                    assert_eq!(row.get::<i64>(0)?, 2);
+                    assert_eq!(row.get::<String>(1)?, "after");
+                }
+                "delete" => assert!(reopened.load_native_thread("retry")?.is_none()),
+                "recent" => {
+                    assert_eq!(reopened.recent_workspace_files()?, ["src/retry.rs"])
+                }
+                "memory" => assert_eq!(
+                    reopened.search_memory("memorysentinel", 10)?.len(),
+                    1
+                ),
+                "turn" => assert_eq!(
+                    reopened
+                        .get_turn_request("turn")?
+                        .context("retried turn")?
+                        .user_message,
+                    "Retry this turn"
+                ),
+                _ => unreachable!("test operation"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_storage_failed_history_commit_rolls_back_and_allows_retry()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for metadata in [false, true] {
+            let path = directory.path().join(format!("commit-{metadata}.db"));
+            let writer = SessionStore::open(&path)?;
+            writer.create_native_thread("retry", &serde_json::json!({}))?;
+            let reader = SessionStore::open(&path)?;
+            let timeout = writer.block_on(async {
+                let mut rows = writer.conn.query("PRAGMA busy_timeout", ()).await?;
+                Ok::<_, anyhow::Error>(
+                    rows.next().await?.context("busy timeout")?.get::<i64>(0)?,
+                )
+            })?;
+            assert_eq!(timeout, 5000);
+            writer.block_on(writer.conn.execute_batch(
+                "PRAGMA journal_mode = DELETE; PRAGMA busy_timeout = 30;",
+            ))?;
+            reader.block_on(reader.conn.execute_batch(
+                "BEGIN; SELECT thread_id FROM agent_runtime_threads;",
+            ))?;
+            let item = serde_json::json!({"retained_once": metadata});
+            let result = if metadata {
+                writer.append_native_thread_metadata("retry", &item)
+            } else {
+                writer.append_native_thread_items("retry", &[item.clone()])
+            };
+            reader.block_on(reader.conn.execute("ROLLBACK", ()))?;
+            let error = result.expect_err("reader must block the history commit");
+            assert!(error.to_string().contains("locked"), "{error:#}");
+            assert!(
+                writer.conn.is_autocommit(),
+                "failed history commit must not leave an open transaction"
+            );
+            if metadata {
+                writer.append_native_thread_metadata("retry", &item)?;
+            } else {
+                writer.append_native_thread_items("retry", &[item.clone()])?;
+            }
+            let reopened = SessionStore::open(&path)?;
+            let thread = reopened
+                .load_native_thread("retry")?
+                .context("retried thread")?;
+            if metadata {
+                assert_eq!(thread.metadata_patches, [item]);
+                assert!(thread.rollout_items.is_empty());
+            } else {
+                assert_eq!(thread.rollout_items, [item]);
+                assert!(thread.metadata_patches.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_storage_concurrent_fixture_child() -> Result<()> {
+        let Some(directory) = std::env::var_os("AHEAD_STORAGE_CONCURRENT_FIXTURE")
+        else {
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let worker = std::env::var("AHEAD_STORAGE_CONCURRENT_WORKER")?;
+        fs::write(directory.join(format!("ready-{worker}")), [])?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !directory.join("start").exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "concurrent storage fixture did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let store = SessionStore::open(directory.join("session.db"))
+            .context("opening concurrent store")?;
+        let thread_id = format!("worker-{worker}");
+        store
+            .create_native_thread(
+                &thread_id,
+                &serde_json::json!({"thread_id": thread_id}),
+            )
+            .context("creating concurrent thread")?;
+        for batch in 0..8 {
+            let item = serde_json::json!({"worker": worker, "batch": batch});
+            store
+                .append_native_thread_items(&thread_id, &[item.clone()])
+                .context("appending concurrent history")?;
+            store
+                .append_native_thread_metadata(&thread_id, &item)
+                .context("appending concurrent metadata")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_storage_concurrent_first_open_preserves_every_process_write()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let mut children = Vec::new();
+        let result = (|| -> Result<()> {
+            for worker in 0..4 {
+                let output = std::fs::File::create(
+                    directory.path().join(format!("worker-{worker}.log")),
+                )?;
+                children.push(
+                    std::process::Command::new(&executable)
+                        .args([
+                            "--exact",
+                            "ahead::store::tests::session_storage_concurrent_fixture_child",
+                            "--nocapture",
+                        ])
+                        .env("AHEAD_STORAGE_CONCURRENT_FIXTURE", directory.path())
+                        .env("AHEAD_STORAGE_CONCURRENT_WORKER", worker.to_string())
+                        .stdout(output.try_clone()?)
+                        .stderr(output)
+                        .spawn()?,
+                );
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !(0..4).all(|worker| {
+                directory.path().join(format!("ready-{worker}")).exists()
+            }) {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "concurrent storage workers did not become ready"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!directory.path().join("session.db").exists());
+            fs::write(directory.path().join("start"), [])?;
+            for (worker, child) in children.iter_mut().enumerate() {
+                let status = loop {
+                    if let Some(status) = child.try_wait()? {
+                        break status;
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "concurrent storage worker {worker} timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                anyhow::ensure!(
+                    status.success(),
+                    "concurrent storage worker {worker} failed: {}",
+                    fs::read_to_string(
+                        directory.path().join(format!("worker-{worker}.log"))
+                    )?
+                );
+            }
+            let store = SessionStore::open(directory.path().join("session.db"))?;
+            for worker in 0..4 {
+                let thread = store
+                    .load_native_thread(&format!("worker-{worker}"))?
+                    .context("concurrent process thread missing after reopen")?;
+                let expected = (0..8)
+                    .map(|batch| {
+                        serde_json::json!({"worker": worker.to_string(), "batch": batch})
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(thread.rollout_items, expected);
+                assert_eq!(thread.metadata_patches, expected);
+            }
+            Ok(())
+        })();
+        for mut child in children {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                child.wait()?;
+            }
+        }
+        result
     }
 
     #[cfg(unix)]
@@ -4824,61 +6081,50 @@ mod tests {
     }
 
     #[test]
-    fn session_storage_rejects_unsupported_files_without_modifying_them()
+    fn session_storage_preserves_existing_rows_and_creates_initial_schema()
     -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        for (application_id, version) in [
-            (0, 0),
-            (0, 1),
-            (SESSION_APPLICATION_ID, 1),
-            (SESSION_APPLICATION_ID, SESSION_SCHEMA_VERSION + 1),
-        ] {
-            let path = temporary
-                .path()
-                .join(format!("schema-{application_id}-{version}.db"));
-            runtime.block_on(async {
-                let database = Builder::new_local(&path).build().await?;
-                let connection = database.connect()?;
-                connection
-                    .execute_batch(&format!(
-                        "CREATE TABLE retained_user_data (value TEXT NOT NULL);
-                     INSERT INTO retained_user_data VALUES ('do not alter');
-                     PRAGMA application_id = {application_id};
-                     PRAGMA user_version = {version};"
-                    ))
-                    .await?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            let before = fs::read(&path)?;
-            #[cfg(unix)]
-            let before_mode = {
-                use std::os::unix::fs::PermissionsExt;
-                fs::metadata(&path)?.permissions().mode()
-            };
-            let error = SessionStore::open(&path)
-                .err()
-                .context("unsupported database was accepted")?;
-            assert!(
-                format!("{error:#}").contains("Unsupported AHEAD session database")
-            );
-            assert_eq!(
-                fs::read(&path)?,
-                before,
-                "unsupported database was modified"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                assert_eq!(
-                    fs::metadata(&path)?.permissions().mode(),
-                    before_mode,
-                    "rejected database permissions must not change"
-                );
-            }
-        }
+        let path = temporary.path().join("unversioned.db");
+        runtime.block_on(async {
+            let database = Builder::new_local(&path).build().await?;
+            let connection = database.connect()?;
+            connection
+                .execute_batch(
+                    "CREATE TABLE retained_data (value TEXT NOT NULL);
+                     INSERT INTO retained_data VALUES ('keep this row');",
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        let store = SessionStore::open(&path)?;
+        let retained_value = store.block_on(async {
+            let mut rows = store
+                .conn
+                .query("SELECT value FROM retained_data", ())
+                .await?;
+            Ok::<_, anyhow::Error>(
+                rows.next()
+                    .await?
+                    .context("retained row")?
+                    .get::<String>(0)?,
+            )
+        })?;
+        assert_eq!(retained_value, "keep this row");
+        let session_table_count = store.block_on(async {
+            let mut rows = store
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sessions'",
+                    (),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(rows.next().await?.context("schema count")?.get::<i64>(0)?)
+        })?;
+        assert_eq!(session_table_count, 1);
         Ok(())
     }
 
@@ -4892,8 +6138,9 @@ mod tests {
             !path.exists(),
             "crash fixture must be a new disposable file"
         );
-        let version: i64 = std::env::var("AHEAD_STORAGE_CRASH_VERSION")?.parse()?;
-        if version == SESSION_SCHEMA_VERSION {
+        let initialize_ahead_schema =
+            std::env::var("AHEAD_STORAGE_CRASH_INITIAL_SCHEMA")? == "1";
+        if initialize_ahead_schema {
             drop(SessionStore::open(&path)?);
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4903,17 +6150,15 @@ mod tests {
             let database = Builder::new_local(&path).build().await?;
             let connection = database.connect()?;
             connection
-                .execute_batch(&format!(
-                    "PRAGMA application_id = {SESSION_APPLICATION_ID};
-                 PRAGMA user_version = {version};
-                 PRAGMA journal_mode = DELETE;
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
                  PRAGMA synchronous = FULL;
                  CREATE TABLE crash_probe(id INTEGER PRIMARY KEY, payload BLOB);
                  INSERT INTO crash_probe VALUES (1, zeroblob(32768));
                  PRAGMA cache_size = 1;
                  BEGIN IMMEDIATE;
-                 UPDATE crash_probe SET payload = zeroblob(65536) WHERE id = 1;"
-                ))
+                 UPDATE crash_probe SET payload = zeroblob(65536) WHERE id = 1;",
+                )
                 .await?;
             // Leave the real rollback journal without running connection destructors.
             std::process::exit(0);
@@ -4923,13 +6168,13 @@ mod tests {
     }
 
     #[test]
-    fn session_storage_recovers_current_hot_journal_but_preserves_unsupported_files()
+    fn session_storage_recovers_hot_journals_with_or_without_initial_schema()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
-        for version in [1, SESSION_SCHEMA_VERSION] {
-            let path = directory
-                .path()
-                .join(format!("crashed-#{version} space.db"));
+        for (name, initialize_ahead_schema) in
+            [("unversioned", false), ("initial", true)]
+        {
+            let path = directory.path().join(format!("crashed-{name} space.db"));
             let output = std::process::Command::new(std::env::current_exe()?)
                 .args([
                     "--exact",
@@ -4937,7 +6182,10 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("AHEAD_STORAGE_CRASH_FIXTURE", &path)
-                .env("AHEAD_STORAGE_CRASH_VERSION", version.to_string())
+                .env(
+                    "AHEAD_STORAGE_CRASH_INITIAL_SCHEMA",
+                    if initialize_ahead_schema { "1" } else { "0" },
+                )
                 .output()?;
             anyhow::ensure!(
                 output.status.success(),
@@ -4947,43 +6195,27 @@ mod tests {
             );
             let journal = directory
                 .path()
-                .join(format!("crashed-#{version} space.db-journal"));
-            let before = fs::read(&path)?;
+                .join(format!("crashed-{name} space.db-journal"));
             let journal_before = fs::read(&journal)?;
             assert!(
                 journal_before.len() > 512
                     && journal_before[..8].iter().any(|byte| *byte != 0),
                 "fixture must leave a hot rollback journal"
             );
-            if version == SESSION_SCHEMA_VERSION {
-                let store = SessionStore::open(&path)?;
-                let size = store.block_on(async {
-                    let mut rows = store
-                        .conn
-                        .query(
-                            "SELECT length(payload) FROM crash_probe WHERE id = 1",
-                            (),
-                        )
-                        .await?;
-                    Ok::<_, anyhow::Error>(
-                        rows.next()
-                            .await?
-                            .context("recovered row")?
-                            .get::<i64>(0)?,
+            let store = SessionStore::open(&path)?;
+            let size = store.block_on(async {
+                let mut rows = store
+                    .conn
+                    .query(
+                        "SELECT length(payload) FROM crash_probe WHERE id = 1",
+                        (),
                     )
-                })?;
-                assert_eq!(size, 32768, "uncommitted changes must roll back");
-            } else {
-                let error = SessionStore::open(&path)
-                    .err()
-                    .context("accepted unsupported crashed store")?;
-                assert!(
-                    format!("{error:#}")
-                        .contains("Unsupported AHEAD session database")
-                );
-                assert_eq!(fs::read(&path)?, before);
-                assert_eq!(fs::read(&journal)?, journal_before);
-            }
+                    .await?;
+                Ok::<_, anyhow::Error>(
+                    rows.next().await?.context("recovered row")?.get::<i64>(0)?,
+                )
+            })?;
+            assert_eq!(size, 32768, "uncommitted changes must roll back");
         }
         Ok(())
     }
@@ -5122,6 +6354,7 @@ mod tests {
                 content: id.to_string(),
                 status: status.to_string(),
                 created_at: "2026-09-24T00:00:00Z".to_string(),
+                voice_timing: None,
             })?;
         }
 
@@ -6012,6 +7245,7 @@ mod tests {
             "AHEAD_ZED_RULES_MUST_NOT_LOAD_20260928",
         )?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         fs::write(
             workspace.path().join(".ahead/settings.toml"),
@@ -6021,19 +7255,54 @@ mod tests {
         )?;
         let model_requests = Arc::new(Mutex::new(Vec::new()));
         let captured_requests = model_requests.clone();
+        let parallel_children = Arc::new(Mutex::new(false));
+        let observed_parallel_children = parallel_children.clone();
         let child_id_for_resume = Arc::new(Mutex::new(None::<String>));
         let server_child_id = child_id_for_resume.clone();
         let model_server = std::thread::spawn(move || {
-            for response_index in 0..76 {
-                let (mut stream, _) =
-                    listener.accept().expect("accept mock model request");
+            let mut response_index = 0;
+            let mut held_child_responses =
+                Vec::<(std::net::TcpStream, String)>::new();
+            let mut parallel_deadline = None;
+            let mut parallel_window_expired = false;
+            while response_index < 77 {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            if parallel_deadline.is_some_and(|deadline| {
+                                std::time::Instant::now() >= deadline
+                            }) {
+                                for (mut held_stream, body) in
+                                    held_child_responses.drain(..)
+                                {
+                                    write!(
+                                        held_stream,
+                                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                        body.len(),
+                                        body
+                                    )
+                                    .expect("release serialized child response");
+                                }
+                                parallel_deadline = None;
+                                parallel_window_expired = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept mock model request: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted model request blocking");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("bound mock model request read");
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 8192];
-                loop {
+                let (header_end, content_length) = loop {
                     let read = stream.read(&mut buffer).expect("read model request");
-                    if read == 0 {
-                        break;
-                    }
+                    assert_ne!(read, 0, "mock model request ended before headers");
                     request.extend_from_slice(&buffer[..read]);
                     let Some(header_end) = request
                         .windows(4)
@@ -6053,64 +7322,98 @@ mod tests {
                         })
                         .unwrap_or(0);
                     if request.len() >= header_end + content_length {
-                        captured_requests.lock().push(
-                            String::from_utf8_lossy(
-                                &request[header_end..header_end + content_length],
-                            )
-                            .into_owned(),
-                        );
-                        break;
+                        break (header_end, content_length);
                     }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let request_line = headers.lines().next().unwrap_or_default();
+                if request_line.starts_with("GET /v1/models?")
+                    || request_line.starts_with("GET /v1/models ")
+                {
+                    let body = r#"{"models":[]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .expect("write mock model catalog");
+                    continue;
                 }
-                let tool_arguments = match response_index {
-                    0 => Some(
-                        serde_json::json!({
-                            "label": "Initial durable child",
-                            "message": "Remember AHEAD_TURSO_CHILD_CONTEXT_20260925"
-                        })
-                        .to_string(),
-                    ),
-                    73 => {
+                let captured_request = String::from_utf8_lossy(
+                    &request[header_end..header_end + content_length],
+                )
+                .into_owned();
+                let is_initial_child_turn = captured_request
+                    .contains("AHEAD_TURSO_CHILD_CONTEXT_A_20260925")
+                    || captured_request
+                        .contains("AHEAD_TURSO_CHILD_CONTEXT_B_20260925");
+                captured_requests.lock().push(captured_request);
+                let tool_calls = match response_index {
+                    0 => vec![
+                        (
+                            "call-ahead-turso-child-a".to_string(),
+                            "function-ahead-turso-child-a".to_string(),
+                            serde_json::json!({
+                                "label": "Initial durable child A",
+                                "message": "Remember AHEAD_TURSO_CHILD_CONTEXT_A_20260925"
+                            })
+                            .to_string(),
+                        ),
+                        (
+                            "call-ahead-turso-child-b".to_string(),
+                            "function-ahead-turso-child-b".to_string(),
+                            serde_json::json!({
+                                "label": "Initial durable child B",
+                                "message": "Remember AHEAD_TURSO_CHILD_CONTEXT_B_20260925"
+                            })
+                            .to_string(),
+                        ),
+                    ],
+                    74 => {
                         let child_thread_id = server_child_id
                             .lock()
                             .clone()
                             .expect("capture child ID before the resume request");
-                        Some(
+                        vec![(
+                            format!("call-ahead-turso-{response_index}"),
+                            format!("function-ahead-turso-{response_index}"),
                             serde_json::json!({
                                 "label": "Resume durable child",
                                 "message": "AHEAD_TURSO_CHILD_RESUME_20260925",
                                 "session_id": child_thread_id
                             })
                             .to_string(),
-                        )
+                        )]
                     }
-                    _ => None,
+                    _ => Vec::new(),
                 };
-                let events: Vec<(&str, serde_json::Value)> = if let Some(arguments) =
-                    tool_arguments
+                let events: Vec<(&str, serde_json::Value)> = if !tool_calls
+                    .is_empty()
                 {
-                    let call_id = format!("call-ahead-turso-{response_index}");
-                    let item_id = format!("function-ahead-turso-{response_index}");
-                    vec![
-                        (
+                    let mut events = Vec::new();
+                    for (output_index, (call_id, item_id, arguments)) in
+                        tool_calls.into_iter().enumerate()
+                    {
+                        events.push((
                             "response.output_item.added",
                             serde_json::json!({
                                 "type": "response.output_item.added",
-                                "output_index": 0,
+                                "output_index": output_index,
                                 "item": {
-                                    "id": item_id.clone(),
+                                    "id": item_id,
                                     "type": "function_call",
-                                    "call_id": call_id.clone(),
+                                    "call_id": call_id,
                                     "name": "spawn_agent",
                                     "arguments": ""
                                 }
                             }),
-                        ),
-                        (
+                        ));
+                        events.push((
                             "response.output_item.done",
                             serde_json::json!({
                                 "type": "response.output_item.done",
-                                "output_index": 0,
+                                "output_index": output_index,
                                 "item": {
                                     "id": item_id,
                                     "type": "function_call",
@@ -6119,18 +7422,19 @@ mod tests {
                                     "arguments": arguments
                                 }
                             }),
-                        ),
-                        (
-                            "response.completed",
-                            serde_json::json!({
-                                "type": "response.completed",
-                                "response": {
-                                    "id": format!("resp-ahead-turso-{response_index}"),
-                                    "end_turn": false
-                                }
-                            }),
-                        ),
-                    ]
+                        ));
+                    }
+                    events.push((
+                        "response.completed",
+                        serde_json::json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": format!("resp-ahead-turso-{response_index}"),
+                                "end_turn": false
+                            }
+                        }),
+                    ));
+                    events
                 } else {
                     let message_id = format!("msg-ahead-turso-{response_index}");
                     vec![
@@ -6182,19 +7486,58 @@ mod tests {
                         ),
                     ]
                 };
+                if parallel_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    for (mut held_stream, body) in held_child_responses.drain(..) {
+                        write!(
+                            held_stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .expect("release timed-out child response");
+                    }
+                    parallel_deadline = None;
+                    parallel_window_expired = true;
+                }
                 let body = events
                     .into_iter()
                     .map(|(event, payload)| {
                         format!("event: {event}\ndata: {payload}\n\n")
                     })
                     .collect::<String>();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .expect("write mock model response");
+                if is_initial_child_turn && !parallel_window_expired {
+                    held_child_responses.push((stream, body));
+                    if held_child_responses.len() == 1 {
+                        parallel_deadline = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(5),
+                        );
+                    } else {
+                        *observed_parallel_children.lock() = true;
+                        for (mut held_stream, body) in held_child_responses.drain(..)
+                        {
+                            write!(
+                                held_stream,
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .expect("release parallel child response");
+                        }
+                        parallel_deadline = None;
+                    }
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .expect("write mock model response");
+                }
+                response_index += 1;
             }
         });
         let session = super::super::host::AheadSessionHost::in_memory()?
@@ -6224,6 +7567,7 @@ mod tests {
                 content: "Hello".to_string(),
                 status: "streaming".to_string(),
                 created_at: "2026-09-23T00:00:00Z".to_string(),
+                voice_timing: None,
             })?;
             assert_eq!(
                 harness_store.append_message_delta("chat-1", " from worker")?,
@@ -6234,11 +7578,13 @@ mod tests {
         })?;
         let config =
             ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
+        let observed_events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&observed_events);
 
         let client = ahead_agent::NativeClient::spawn(
             &config,
             harness_store.clone(),
-            Arc::new(|_| {}),
+            Arc::new(move |event| sink_events.lock().push(event)),
         )?;
         let thread_id = client.new_session(
             workspace.path(),
@@ -6247,17 +7593,80 @@ mod tests {
             Some("mock"),
         )?;
         client.set_scope(&thread_id, workspace.path(), &[], true)?;
-        client.prompt(&thread_id, "AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928")?;
-        let child_thread_id = store
+        let parent_turn_id = "turn-durable-parent";
+        store.read().save_turn_request(
+            parent_turn_id,
+            &AgentTurnRequestDto {
+                session_id: session.session.id.clone(),
+                thread_id: thread_id.clone(),
+                harness: HarnessKind::Ahead,
+                external_agent_id: None,
+                model: Some("ahead-test".into()),
+                model_provider: Some("mock".into()),
+                model_context_window: None,
+                reasoning_effort: None,
+                user_message: "AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928".into(),
+                session_context: String::new(),
+                context: TurnEditorContext {
+                    active_path: "src/main.rs".into(),
+                    caret: DisplayPosition { line: 0, col: 0 },
+                    selection: None,
+                    file_content: String::new(),
+                    visible_end: None,
+                    attached_anchor_ids: Vec::new(),
+                    attached_files: Vec::new(),
+                    attached_memories: Vec::new(),
+                },
+                invariants: Vec::new(),
+                cwd: None,
+                expected_policy_sha256: session.session.policy.sha256.clone(),
+                read_only: true,
+                scope: None,
+            },
+            &[],
+        )?;
+        client.prompt_for_ahead_turn(
+            &thread_id,
+            "AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928",
+            parent_turn_id,
+            None,
+        )?;
+        let project_sources = store
             .read()
-            .list_native_agent_children(&thread_id, None)?
-            .into_iter()
-            .next()
-            .context(
-                "model-issued spawn_agent did not persist a Turso child edge",
-            )?;
+            .get_project_instruction_sources(parent_turn_id)?
+            .context("managed parent turn omitted project instruction provenance")?;
+        assert!(
+            project_sources
+                .iter()
+                .any(|source| source.path.ends_with("AGENTS.md")),
+            "managed turn did not record its project AGENTS.md source"
+        );
+        assert_eq!(
+            project_sources,
+            client.current_project_instruction_sources(&thread_id)?
+        );
+        let child_thread_ids =
+            store.read().list_native_agent_children(&thread_id, None)?;
+        let captured_requests = model_requests.lock();
+        let request_tools = captured_requests
+            .iter()
+            .map(|request| request.contains("spawn_agent"))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            child_thread_ids.len() == 2,
+            "model-issued parallel spawn_agent calls did not persist two Turso child edges: {child_thread_ids:?}; requests containing spawn_agent: {request_tools:?}; events: {:?}",
+            *observed_events.lock()
+        );
+        drop(captured_requests);
+        anyhow::ensure!(
+            *parallel_children.lock(),
+            "the model server did not observe both child turns before either response completed; harness events: {:?}",
+            *observed_events.lock()
+        );
+        let child_thread_id = child_thread_ids[0].clone();
         *child_id_for_resume.lock() = Some(child_thread_id.clone());
-        for native_thread_id in [&thread_id, &child_thread_id] {
+        for native_thread_id in [&thread_id, &child_thread_id, &child_thread_ids[1]]
+        {
             let snapshot = store
                 .read()
                 .load_native_thread(native_thread_id)?
@@ -6272,7 +7681,10 @@ mod tests {
                 &thread_id,
                 Some(ahead_agent::NativeAgentEdgeStatus::Closed),
             )?,
-            [child_thread_id.as_str()]
+            child_thread_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         );
         for turn in 0..70 {
             client.prompt(
@@ -6326,12 +7738,24 @@ mod tests {
             Some("mock"),
         )?;
         reopened.set_scope(&thread_id, workspace.path(), &[], true)?;
+        assert_eq!(
+            store
+                .read()
+                .get_project_instruction_sources(parent_turn_id)?,
+            Some(project_sources.clone())
+        );
+        assert_eq!(
+            reopened.current_project_instruction_sources(&thread_id)?,
+            project_sources,
+            "unchanged project instructions must survive native and Turso reopen"
+        );
         reopened.prompt(&thread_id, "Resume the durable child by session_id")?;
         model_server.join().expect("join mock model");
         let requests = model_requests.lock();
-        assert_eq!(requests.len(), 76);
+        assert_eq!(requests.len(), 77);
         let parent_request = &requests[0];
         let first_child_request = &requests[1];
+        let second_child_request = &requests[2];
         assert!(
             parent_request.contains("AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928"),
             "parent request omitted its private context sentinel"
@@ -6344,36 +7768,91 @@ mod tests {
             !parent_request.contains("AHEAD_ZED_RULES_MUST_NOT_LOAD_20260928"),
             "native model request loaded an editor-specific .rules file"
         );
+        let child_requests = [first_child_request, second_child_request];
+        for sentinel in [
+            "AHEAD_TURSO_CHILD_CONTEXT_A_20260925",
+            "AHEAD_TURSO_CHILD_CONTEXT_B_20260925",
+        ] {
+            assert!(
+                child_requests
+                    .iter()
+                    .any(|request| request.contains(sentinel)),
+                "parallel child requests omitted explicit delegation message {sentinel}"
+            );
+        }
+        for child_request in child_requests {
+            assert!(
+                !child_request.contains("AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928"),
+                "child request inherited parent conversation context: {child_request}"
+            );
+        }
         assert!(
-            first_child_request
-                .contains("Remember AHEAD_TURSO_CHILD_CONTEXT_20260925"),
-            "child request omitted the explicit delegation message: {}",
-            first_child_request
-        );
-        assert!(
-            !first_child_request
-                .contains("AHEAD_TURSO_PARENT_ONLY_CONTEXT_20260928"),
-            "child request inherited parent conversation context: {}",
-            first_child_request
-        );
-        assert!(
-            requests[74].contains("AHEAD_TURSO_CHILD_CONTEXT_20260925"),
+            requests[75].contains("AHEAD_TURSO_CHILD_CONTEXT_A_20260925")
+                || requests[75].contains("AHEAD_TURSO_CHILD_CONTEXT_B_20260925"),
             "resumed child model request omitted its persisted paginated context: {}",
-            requests[74]
+            requests[75]
         );
         assert!(
-            requests[74].contains("AHEAD_TURSO_CHILD_RESUME_20260925"),
+            requests[75].contains("AHEAD_TURSO_CHILD_RESUME_20260925"),
             "resumed child model request omitted the new child prompt: {}",
-            requests[74]
+            requests[75]
         );
         assert_eq!(
             store.read().list_native_agent_children(
                 &thread_id,
                 Some(ahead_agent::NativeAgentEdgeStatus::Closed),
             )?,
-            [child_thread_id.as_str()]
+            child_thread_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         );
+        drop(requests);
         reopened.shutdown();
+        drop(reopened);
+
+        store.read().set_harness_binding(
+            &session.session.id,
+            &thread_id,
+            "ahead-agent",
+        )?;
+        store.read().upsert_message(&ConversationMessage {
+            id: "retry-agent".into(),
+            session_id: session.session.id.clone(),
+            turn_id: parent_turn_id.into(),
+            sequence: 2,
+            role: "agent".into(),
+            actor_id: "ahead".into(),
+            content: "Interrupted after model turn".into(),
+            status: "failed".into(),
+            created_at: "2026-09-23T00:00:01Z".into(),
+            voice_timing: None,
+        })?;
+        let saved_request = store
+            .read()
+            .get_turn_request(parent_turn_id)?
+            .context("managed parent turn lost its retry request")?;
+        let retry_store: Arc<dyn ahead_agent::HarnessStore> =
+            Arc::new(SharedSessionStore(store));
+        let controller = ahead_agent::HarnessController::new(retry_store);
+        controller.set_workspace(workspace.path().to_path_buf());
+        assert_eq!(
+            controller.retry_request(&session.session.id, parent_turn_id)?,
+            saved_request,
+            "unchanged instructions must permit explicit retry after restart"
+        );
+        fs::write(
+            workspace.path().join("AGENTS.md"),
+            "AHEAD_CHANGED_OPEN_STANDARD_INSTRUCTIONS_20261003",
+        )?;
+        assert!(
+            controller
+                .retry_request(&session.session.id, parent_turn_id)
+                .expect_err("changed instructions must reject retry")
+                .to_string()
+                .contains("Project AGENTS.md instructions changed")
+        );
+        controller.shutdown_harness();
         Ok(())
     }
 
@@ -6398,7 +7877,8 @@ mod tests {
         let captured_requests = model_requests.clone();
         let model_server = std::thread::spawn(move || -> Result<()> {
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            for response_index in 0..4 {
+            let mut response_index = 0;
+            while response_index < 4 {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -6452,6 +7932,16 @@ mod tests {
                         )
                         .ok()
                     });
+                if String::from_utf8_lossy(&request).starts_with("GET /v1/models") {
+                    let body = r#"{"models":[]}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )?;
+                    continue;
+                }
                 let tool_names = request_body
                     .as_ref()
                     .and_then(|body| {
@@ -6622,6 +8112,7 @@ mod tests {
                     body.len(),
                     body
                 )?;
+                response_index += 1;
             }
             Ok(())
         });
@@ -6683,6 +8174,8 @@ mod tests {
                 external_agent_id: None,
                 model: Some("ahead-test".to_string()),
                 model_provider: Some("mock".to_string()),
+                model_context_window: None,
+                reasoning_effort: None,
                 user_message: "Delegate creating one file".to_string(),
                 session_context: "UNTRUSTED_CALLER_CONTEXT_MUST_NOT_REACH_MODEL"
                     .to_string(),
@@ -6809,290 +8302,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rollouts_import_into_turso_before_thread_restore() -> Result<()> {
-        let workspace = tempfile::tempdir()?;
-        fs::create_dir(workspace.path().join(".ahead"))?;
-        let database_path = workspace.path().join(".ahead/session.db");
-        let store = Arc::new(parking_lot::RwLock::new(SessionStore::open(
-            &database_path,
-        )?));
-        let config =
-            ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
-        let client = ahead_agent::NativeClient::spawn(
-            &config,
-            Arc::new(SharedSessionStore(store.clone())),
-            Arc::new(|_| {}),
-        )?;
-
-        for directory in ["sessions", "archived_sessions"] {
-            for history_mode in ["legacy", "paginated"] {
-                for compressed in [false, true] {
-                    let thread_id = uuid::Uuid::new_v4().to_string();
-                    let rollout_dir = workspace
-                        .path()
-                        .join(".ahead/runtime")
-                        .join(directory)
-                        .join("2025/01/03");
-                    fs::create_dir_all(&rollout_dir)?;
-                    let rollout_path = rollout_dir.join(format!(
-                        "rollout-2025-01-03T12-00-00-{thread_id}.jsonl"
-                    ));
-                    let meta = serde_json::json!({
-                        "timestamp": "2025-01-03T12:00:00Z",
-                        "type": "session_meta",
-                        "payload": {
-                            "session_id": thread_id,
-                            "id": thread_id,
-                            "timestamp": "2025-01-03T12:00:00Z",
-                            "cwd": workspace.path(),
-                            "originator": "ahead-test",
-                            "cli_version": "test",
-                            "source": "cli",
-                            "model_provider": "openai",
-                            "history_mode": history_mode
-                        }
-                    });
-                    let contents = format!("{meta}\n");
-                    let source_path = if compressed {
-                        rollout_path.with_extension("jsonl.zst")
-                    } else {
-                        rollout_path
-                    };
-                    let source_bytes = if compressed {
-                        zstd::stream::encode_all(contents.as_bytes(), 3)?
-                    } else {
-                        contents.into_bytes()
-                    };
-                    fs::write(&source_path, &source_bytes)?;
-
-                    client
-                        .load_session(
-                            &thread_id,
-                            workspace.path(),
-                            "read-only",
-                            None,
-                            Some("openai"),
-                        )
-                        .expect("import and resume legacy JSONL thread");
-                    let snapshot = store
-                        .read()
-                        .load_native_thread(&thread_id)?
-                        .context("legacy rollout was not imported")?;
-                    assert_eq!(snapshot.archived, directory == "archived_sessions");
-                    assert_eq!(snapshot.rollout_items.len(), 1);
-                    assert_eq!(snapshot.create_params["thread_id"], thread_id);
-                    assert_eq!(snapshot.create_params["history_mode"], history_mode);
-                    assert_eq!(fs::read(&source_path)?, source_bytes);
-                }
-            }
-        }
-        client.shutdown();
-        Ok(())
-    }
-
-    #[test]
-    fn unsafe_legacy_rollouts_are_rejected_without_modifying_sources() -> Result<()>
-    {
-        let workspace = tempfile::tempdir()?;
-        let other_workspace = tempfile::tempdir()?;
-        fs::create_dir_all(workspace.path().join(".ahead"))?;
-        let database_path = workspace.path().join(".ahead/session.db");
-        let store = Arc::new(parking_lot::RwLock::new(SessionStore::open(
-            &database_path,
-        )?));
-        let config =
-            ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
-        let client = ahead_agent::NativeClient::spawn(
-            &config,
-            Arc::new(SharedSessionStore(store.clone())),
-            Arc::new(|_| {}),
-        )?;
-
-        for invalid_case in ["ambiguous", "malformed", "out-of-scope"] {
-            let thread_id = uuid::Uuid::new_v4().to_string();
-            let cwd = if invalid_case == "out-of-scope" {
-                other_workspace.path()
-            } else {
-                workspace.path()
-            };
-            let meta = serde_json::json!({
-                "timestamp": "2025-01-03T12:00:00Z",
-                "type": "session_meta",
-                "payload": {
-                    "session_id": thread_id,
-                    "id": thread_id,
-                    "timestamp": "2025-01-03T12:00:00Z",
-                    "cwd": cwd,
-                    "originator": "ahead-test",
-                    "cli_version": "test",
-                    "source": "cli",
-                    "model_provider": "openai"
-                }
-            });
-            let mut sources = Vec::new();
-            let directories: &[&str] = if invalid_case == "ambiguous" {
-                &["sessions", "archived_sessions"]
-            } else {
-                &["sessions"]
-            };
-            for directory in directories {
-                let rollout_dir = workspace
-                    .path()
-                    .join(".ahead/runtime")
-                    .join(directory)
-                    .join("2025/01/03");
-                fs::create_dir_all(&rollout_dir)?;
-                let path = rollout_dir
-                    .join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
-                let contents = if invalid_case == "malformed" {
-                    format!("{meta}\nnot valid JSON\n")
-                } else {
-                    format!("{meta}\n")
-                };
-                fs::write(&path, &contents)?;
-                sources.push((path, contents));
-            }
-            client
-                .load_session(
-                    &thread_id,
-                    workspace.path(),
-                    "read-only",
-                    None,
-                    Some("openai"),
-                )
-                .expect_err("unsafe rollout must not be imported");
-            assert!(store.read().load_native_thread(&thread_id)?.is_none());
-            for (path, contents) in sources {
-                assert_eq!(fs::read_to_string(path)?, contents);
-            }
-        }
-        assert!(store.read().list_native_thread_headers()?.is_empty());
-        client.shutdown();
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_legacy_session_root_is_rejected_without_import() -> Result<()> {
-        let workspace = tempfile::tempdir()?;
-        fs::create_dir_all(workspace.path().join(".ahead"))?;
-        let database_path = workspace.path().join(".ahead/session.db");
-        let store = Arc::new(parking_lot::RwLock::new(SessionStore::open(
-            &database_path,
-        )?));
-        let config =
-            ahead_agent::NativeClientConfig::ahead(workspace.path().to_path_buf());
-        let client = ahead_agent::NativeClient::spawn(
-            &config,
-            Arc::new(SharedSessionStore(store.clone())),
-            Arc::new(|_| {}),
-        )?;
-
-        let thread_id = uuid::Uuid::new_v4().to_string();
-        let runtime_home = workspace.path().join(".ahead/runtime");
-        let target_directory =
-            runtime_home.join("rollout-store/sessions/2025/01/03");
-        fs::create_dir_all(&target_directory)?;
-        let source = target_directory
-            .join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
-        let meta = serde_json::json!({
-            "timestamp": "2025-01-03T12:00:00Z",
-            "type": "session_meta",
-            "payload": {
-                "session_id": thread_id,
-                "id": thread_id,
-                "timestamp": "2025-01-03T12:00:00Z",
-                "cwd": workspace.path(),
-                "originator": "ahead-test",
-                "cli_version": "test",
-                "source": "cli",
-                "model_provider": "openai"
-            }
-        });
-        let contents = format!("{meta}\n");
-        fs::write(&source, &contents)?;
-        std::os::unix::fs::symlink(
-            runtime_home.join("rollout-store/sessions"),
-            runtime_home.join("sessions"),
-        )?;
-
-        let error = client
-            .load_session(
-                &thread_id,
-                workspace.path(),
-                "read-only",
-                None,
-                Some("openai"),
-            )
-            .expect_err("symlinked legacy session root must be rejected");
-        assert!(format!("{error:#}").contains("must not be symlinks"));
-        assert!(store.read().load_native_thread(&thread_id)?.is_none());
-        assert_eq!(fs::read_to_string(source)?, contents);
-        client.shutdown();
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_native_thread_import_is_atomic_and_idempotent() -> Result<()> {
-        let store = SessionStore::in_memory()?;
-        let created_at =
-            chrono::DateTime::parse_from_rfc3339("2025-01-03T12:00:00Z")?
-                .with_timezone(&chrono::Utc);
-        let updated_at = created_at + chrono::Duration::minutes(5);
-        let import = LegacyNativeThreadImport {
-            thread_id: "legacy-thread".into(),
-            create_params: serde_json::json!({
-                "thread_id": "legacy-thread",
-                "history_mode": "legacy"
-            }),
-            rollout_items: vec![
-                serde_json::json!({"type": "user_message", "text": "hello"}),
-                serde_json::json!({"type": "assistant_message", "text": "hi"}),
-            ],
-            created_at: created_at.clone(),
-            updated_at: updated_at.clone(),
-            archived_at: Some(updated_at),
-        };
-        store.block_on(async {
-            store
-                .conn
-                .execute(
-                    "CREATE TRIGGER reject_legacy_import_item
-                     BEFORE INSERT ON agent_runtime_thread_items
-                     WHEN NEW.ordinal = 1
-                     BEGIN SELECT RAISE(ABORT, 'injected import failure'); END",
-                    (),
-                )
-                .await?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-        assert!(store.import_legacy_native_thread(&import).is_err());
-        assert!(store.load_native_thread("legacy-thread")?.is_none());
-
-        store.block_on(async {
-            store
-                .conn
-                .execute("DROP TRIGGER reject_legacy_import_item", ())
-                .await?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-        assert!(store.import_legacy_native_thread(&import)?);
-        assert!(!store.import_legacy_native_thread(&import)?);
-        let snapshot = store
-            .load_native_thread("legacy-thread")?
-            .context("imported native thread missing")?;
-        assert_eq!(snapshot.rollout_items, import.rollout_items);
-        assert!(snapshot.archived);
-        assert_eq!(snapshot.archived_at, import.archived_at);
-        let header = store
-            .load_native_thread_header("legacy-thread")?
-            .context("imported native thread header missing")?;
-        assert_eq!(header.created_at, Some(import.created_at));
-        assert_eq!(header.updated_at, Some(import.updated_at));
-        Ok(())
-    }
-
-    #[test]
     fn native_thread_replay_history_roundtrips_in_turso() -> Result<()> {
         let store = SessionStore::in_memory()?;
         let thread_id = "native-thread-1";
@@ -7131,6 +8340,62 @@ mod tests {
         assert!(store.load_native_thread(thread_id)?.is_none());
         assert!(store.list_native_thread_headers()?.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_native_thread_import_is_atomic_and_idempotent() -> Result<()> {
+        let store = SessionStore::in_memory()?;
+        let created_at =
+            chrono::DateTime::parse_from_rfc3339("2025-01-03T12:00:00Z")?
+                .with_timezone(&chrono::Utc);
+        let updated_at = created_at + chrono::Duration::minutes(5);
+        let import = LegacyNativeThreadImport {
+            thread_id: "legacy-thread".into(),
+            create_params: serde_json::json!({
+                "thread_id": "legacy-thread",
+                "history_mode": "legacy"
+            }),
+            rollout_items: vec![
+                serde_json::json!({"type": "user_message", "text": "hello"}),
+                serde_json::json!({"type": "assistant_message", "text": "hi"}),
+            ],
+            created_at,
+            updated_at,
+            archived_at: Some(updated_at),
+        };
+
+        store.block_on(async {
+            store
+                .conn
+                .execute(
+                    "CREATE TRIGGER reject_legacy_import_item
+                     BEFORE INSERT ON agent_runtime_thread_items
+                     WHEN NEW.ordinal = 1
+                     BEGIN SELECT RAISE(ABORT, 'injected import failure'); END",
+                    (),
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert!(store.import_legacy_native_thread(&import).is_err());
+        assert!(store.load_native_thread("legacy-thread")?.is_none());
+
+        store.block_on(async {
+            store
+                .conn
+                .execute("DROP TRIGGER reject_legacy_import_item", ())
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert!(store.import_legacy_native_thread(&import)?);
+        assert!(!store.import_legacy_native_thread(&import)?);
+        let snapshot = store
+            .load_native_thread("legacy-thread")?
+            .context("imported native thread missing")?;
+        assert_eq!(snapshot.rollout_items, import.rollout_items);
+        assert!(snapshot.archived);
+        assert_eq!(snapshot.archived_at, import.archived_at);
         Ok(())
     }
 
@@ -7330,6 +8595,61 @@ mod tests {
     }
 
     #[test]
+    fn voice_transcript_provider_offsets_survive_store_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let database_path = temp.path().join("session.db");
+        let store = SessionStore::open(&database_path)?;
+        store.block_on(async {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions
+                        (id, project_id, worktree_id, work_kind, title, owner_id,
+                         lifecycle_json, policy_json, revision, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        "session-voice",
+                        "project",
+                        "worktree",
+                        "product_change",
+                        "Explain code",
+                        "owner",
+                        "{}",
+                        "{}",
+                        1,
+                        "2026-10-07T00:00:00Z",
+                    ],
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        let message = ConversationMessage {
+            id: "voice-segment-1".into(),
+            session_id: "session-voice".into(),
+            turn_id: "voice:call-1".into(),
+            sequence: 1,
+            role: "human".into(),
+            actor_id: "owner".into(),
+            content: "Explain this function".into(),
+            status: "complete".into(),
+            created_at: "2026-10-07T00:00:01Z".into(),
+            voice_timing: Some(VoiceTranscriptTiming {
+                call_id: "call-1".into(),
+                start_ms: 120,
+                end_ms: 740,
+            }),
+        };
+        store.upsert_voice_transcript(&message)?;
+        drop(store);
+
+        let reopened = SessionStore::open(&database_path)?;
+        assert_eq!(reopened.get_message(&message.id)?, Some(message.clone()));
+        assert_eq!(reopened.list_messages(&message.session_id)?, vec![message]);
+        Ok(())
+    }
+
+    #[test]
     fn test_turso_session_store_crud() -> Result<()> {
         let mut store = SessionStore::in_memory()?;
 
@@ -7440,6 +8760,8 @@ mod tests {
             external_agent_id: None,
             model: Some("test-model".into()),
             model_provider: Some("test-provider".into()),
+            model_context_window: Some(131_072),
+            reasoning_effort: None,
             user_message: "Retry this turn".into(),
             session_context: "Objective: preserve parser semantics".into(),
             context: TurnEditorContext {
@@ -7679,6 +9001,7 @@ mod tests {
             content: "Follow up on the parser".into(),
             status: "complete".into(),
             created_at: "2026-09-20T12:00:00Z".into(),
+            voice_timing: None,
         })?;
         let listed = store.list_sessions()?;
         assert_eq!(listed.len(), 2);
@@ -7707,6 +9030,7 @@ mod tests {
             store.list_code_comments(&newer.session.id)?,
             vec![comment.clone()]
         );
+        assert!(store.list_code_comments("sess-turso-1")?.is_empty());
         let resolved =
             store.resolve_code_comment(&newer.session.id, &comment.id, "dev-42")?;
         assert!(resolved.resolved_at.is_some());
@@ -7719,6 +9043,41 @@ mod tests {
             store.resolve_code_comment(&newer.session.id, &comment.id, "other")?,
             resolved
         );
+        let acceptance = PredictionAcceptance {
+            id: "prediction-acceptance-1".into(),
+            session_id: newer.session.id.clone(),
+            actor_id: "dev-42".into(),
+            path: "src/parser.rs".into(),
+            range: DisplayRange {
+                start: DisplayPosition { line: 2, col: 4 },
+                end: DisplayPosition { line: 2, col: 18 },
+            },
+            binding: PredictionBinding {
+                version: 1,
+                request_id: "prediction-request-1".into(),
+                context_sha256: "b".repeat(64),
+                target_revision: 7,
+            },
+            model_context: Some(PredictionModelContext {
+                provider_id: "test-provider".into(),
+                model_id: "test-model".into(),
+                context_window: Some(32_768),
+            }),
+            accepted_text_sha256: "c".repeat(64),
+            accepted_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.record_prediction_acceptance(&acceptance)?;
+        assert_eq!(
+            store.list_prediction_acceptances(&newer.session.id)?,
+            vec![acceptance]
+        );
+        assert!(
+            store
+                .list_prediction_acceptances("sess-turso-1")?
+                .is_empty()
+        );
+        store.set_agent_runtime_state(&newer.session.id, &Default::default())?;
+        assert!(store.prediction_context_revision(&newer.session.id)? > 0);
         store.archive_session(&newer.session.id)?;
         store.archive_session("sess-turso-1")?;
         assert!(store.list_sessions()?.is_empty());
@@ -7731,7 +9090,13 @@ mod tests {
         ))?;
         store.list_sessions()?;
         assert!(store.get_session(&newer.session.id)?.is_none());
+        assert_eq!(store.prediction_context_revision(&newer.session.id)?, 0);
         assert!(store.list_code_comments(&newer.session.id)?.is_empty());
+        assert!(
+            store
+                .list_prediction_acceptances(&newer.session.id)?
+                .is_empty()
+        );
         assert!(store.get_session("sess-turso-1")?.is_some());
 
         Ok(())

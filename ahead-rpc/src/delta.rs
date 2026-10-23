@@ -6,6 +6,8 @@
 //! panic. App and proxy ship as one binary pair, so no wire versioning is
 //! needed.
 
+use std::ops::Range;
+
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 
@@ -172,6 +174,85 @@ impl AheadDelta {
         }
     }
 
+    /// Represents this delta as one LSP-compatible replacement spanning its
+    /// first through last edit. Returns `None` for malformed or mismatched
+    /// snapshots so callers can fall back to a full-document sync.
+    pub fn contiguous_replacement(
+        &self,
+        base: &Rope,
+        updated: &Rope,
+    ) -> Option<(Range<usize>, String)> {
+        if self.base_len != base.len() {
+            return None;
+        }
+
+        let mut base_offset = 0_usize;
+        let mut updated_offset = 0_usize;
+        let mut changed_base_start = None;
+        let mut replacement_start = None;
+        let mut replacement_end = 0_usize;
+        let mut changed_base_end = 0_usize;
+
+        for operation in &self.ops {
+            match operation {
+                DeltaOp::Retain(length) => {
+                    base_offset = base_offset.checked_add(*length)?;
+                    updated_offset = updated_offset.checked_add(*length)?;
+                    if base_offset > base.len() || updated_offset > updated.len() {
+                        return None;
+                    }
+                }
+                DeltaOp::Insert(text) => {
+                    changed_base_start.get_or_insert(base_offset);
+                    replacement_start.get_or_insert(updated_offset);
+                    updated_offset = updated_offset.checked_add(text.len())?;
+                    if updated_offset > updated.len() {
+                        return None;
+                    }
+                    replacement_end = updated_offset;
+                    changed_base_end = base_offset;
+                }
+                DeltaOp::Delete(length) => {
+                    changed_base_start.get_or_insert(base_offset);
+                    replacement_start.get_or_insert(updated_offset);
+                    base_offset = base_offset.checked_add(*length)?;
+                    if base_offset > base.len() {
+                        return None;
+                    }
+                    replacement_end = updated_offset;
+                    changed_base_end = base_offset;
+                }
+            }
+        }
+
+        let Some(replacement_start) = replacement_start else {
+            return None;
+        };
+        let Some(changed_base_start) = changed_base_start else {
+            return None;
+        };
+        let (summary_start, summary_end) = self.summary();
+        let final_updated_offset =
+            updated_offset.checked_add(base.len().checked_sub(base_offset)?)?;
+        if final_updated_offset != updated.len()
+            || changed_base_start != summary_start
+            || changed_base_end != summary_end
+            || !is_char_boundary(base, summary_start)
+            || !is_char_boundary(base, changed_base_end)
+            || !is_char_boundary(updated, replacement_start)
+            || !is_char_boundary(updated, replacement_end)
+        {
+            return None;
+        }
+
+        Some((
+            summary_start..summary_end,
+            updated
+                .slice(replacement_start..replacement_end)
+                .to_string(),
+        ))
+    }
+
     /// Returns the inserted text when the delta is a single insertion.
     pub fn as_simple_insert(&self) -> Option<&str> {
         if self.ops.len() == 3 {
@@ -215,6 +296,10 @@ impl AheadDelta {
         }
         seen_delete
     }
+}
+
+fn is_char_boundary(text: &Rope, offset: usize) -> bool {
+    text.try_slice(offset..offset).is_ok()
 }
 
 fn floor_boundary(text: &str, mut index: usize) -> usize {
@@ -341,5 +426,65 @@ mod tests {
         );
         assert_eq!(complex.as_simple_insert(), None);
         assert!(!complex.is_simple_delete());
+    }
+
+    #[test]
+    fn contiguous_replacement_covers_selection_and_multiple_edits() {
+        let base = rope("a🙂bcdef");
+        let selection_replacement = AheadDelta::new(
+            base.len(),
+            vec![
+                DeltaOp::Retain(1),
+                DeltaOp::Delete("🙂b".len()),
+                DeltaOp::Insert("🦀".into()),
+                DeltaOp::Retain("cdef".len()),
+            ],
+        );
+        let updated = selection_replacement.apply(&base);
+        assert_eq!(
+            selection_replacement.contiguous_replacement(&base, &updated),
+            Some((1..6, "🦀".into()))
+        );
+
+        let base = rope("abcdef");
+        let multiple_edits = AheadDelta::new(
+            base.len(),
+            vec![
+                DeltaOp::Retain(1),
+                DeltaOp::Insert("X".into()),
+                DeltaOp::Retain(2),
+                DeltaOp::Delete(1),
+                DeltaOp::Insert("Y".into()),
+                DeltaOp::Retain(2),
+            ],
+        );
+        let updated = multiple_edits.apply(&base);
+        assert_eq!(updated.to_string(), "aXbcYef");
+        assert_eq!(
+            multiple_edits.contiguous_replacement(&base, &updated),
+            Some((1..4, "XbcY".into()))
+        );
+    }
+
+    #[test]
+    fn contiguous_replacement_rejects_malformed_or_mismatched_snapshots() {
+        let base = rope("café");
+        let split_character = AheadDelta::new(
+            base.len(),
+            vec![DeltaOp::Retain(4), DeltaOp::Insert("!".into())],
+        );
+        let updated = split_character.apply(&base);
+        assert!(
+            split_character
+                .contiguous_replacement(&base, &updated)
+                .is_none()
+        );
+
+        let valid = AheadDelta::new(base.len(), vec![DeltaOp::Insert("!".into())]);
+        assert!(
+            valid
+                .contiguous_replacement(&base, &rope("different"))
+                .is_none()
+        );
     }
 }

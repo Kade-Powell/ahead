@@ -3,6 +3,39 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GitWorkspaceStatus {
+    pub branch: String,
+    pub branches: Vec<String>,
+    pub branch_has_upstream: bool,
+    pub remotes: Vec<String>,
+    pub repository_dirty: bool,
+    pub repository_has_conflicts: bool,
+    pub files: Vec<GitStatusFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitCommitSummary {
+    pub id: String,
+    pub author: String,
+    pub timestamp: i64,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitPatch {
+    pub id: String,
+    pub patch: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStatusFile {
+    pub path: String,
+    pub state: String,
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct GitFileState {
     pub hunks: Vec<DiffHunk>,
     pub blame: Vec<BlameHunk>,

@@ -449,6 +449,10 @@ impl DapClient {
                             }
                         }
                     }
+                } else if let Some(thread_id) = stopped.thread_id {
+                    if let Ok(frames) = self.dap_rpc.stack_trace(thread_id) {
+                        stack_frames.insert(thread_id, frames.stack_frames);
+                    }
                 }
 
                 let current_thread = stopped.thread_id.or_else(|| {
@@ -1846,9 +1850,16 @@ mod tests {
         client
             .handle_host_event(&DapEvent::Stopped(stopped), token)
             .expect("delayed metadata");
+        let unexpected = rpc.core_rpc.rx().try_recv();
         assert!(
-            rpc.core_rpc.rx().try_recv().is_err(),
-            "stale stack response must not revive a stop"
+            unexpected.is_err(),
+            "stale stack response must not revive a stop: {}",
+            match &unexpected {
+                Ok(ahead_rpc::core::CoreRpc::Notification(notification)) =>
+                    format!("{notification:?}"),
+                Ok(_) => "unexpected core request".to_string(),
+                Err(error) => format!("{error:?}"),
+            }
         );
     }
 

@@ -5,10 +5,12 @@
 //! used for external ACP agents. ACP is not involved in this path.
 
 use std::{
-    collections::HashMap,
     collections::hash_map::DefaultHasher,
+    collections::{HashMap, HashSet},
+    fs::File,
     hash::Hash,
     hash::Hasher,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -20,7 +22,8 @@ use std::{
 use ahead_agent_skills::{HostSkillsLoadInput, HostSkillsSnapshot};
 use ahead_core::search::WorkspaceFileIndex;
 use ahead_rpc::ahead::{
-    AgentBufferSnapshot, AgentPresentationAction, AgentSkill, AgentSkillCatalog,
+    AgentBufferSnapshot, AgentBufferSymbol, AgentPresentationAction,
+    AgentReasoningEffort, AgentReasoningOptions, AgentSkill, AgentSkillCatalog,
     AgentSkillSource, validate_agent_buffer_snapshots,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -28,6 +31,7 @@ use codex_config::types::OtelExporterKind;
 use codex_core::{CodexThread, StartThreadOptions, ThreadManager};
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::{
     ThreadId,
     approvals::{ElicitationAction, ElicitationRequest, ElicitationRequestEvent},
@@ -42,6 +46,7 @@ use codex_protocol::{
         APPROVAL_KIND_KEY, APPROVAL_KIND_MCP_TOOL_CALL, PERSIST_KEY,
         PERSIST_SESSION, TOOL_PARAMS_KEY,
     },
+    openai_models::ReasoningEffort,
     plan_tool::StepStatus,
     protocol::{
         AskForApproval, EventMsg, FileChange, Op, ReviewDecision, SessionSource,
@@ -55,12 +60,14 @@ use codex_protocol::{
     turn_input::{StartIfIdleSubmission, TurnInputRequest},
     user_input::UserInput,
 };
-use codex_rollout::{RolloutItem, RolloutRecorder};
+use codex_rollout::{RolloutItem, decode_rollout_line, persisted_rollout_items};
 use codex_thread_store::{
     CreateThreadParams, ReadThreadParams, ThreadPersistenceMetadata, ThreadStore,
 };
 use codex_utils_absolute_path::AbsolutePathBuf;
+use futures::stream::{FuturesOrdered, StreamExt};
 use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Builder, Runtime};
@@ -70,28 +77,30 @@ use tokio::task::JoinSet;
 use crate::editor_tools::{
     AHEAD_CLEAR_PRESENTATION_TOOL, AHEAD_MOVE_CODE_POINTER_TOOL,
     AHEAD_PRESENT_CODE_TOOL, AHEAD_READ_EDITOR_BUFFER_TOOL, AHEAD_SPEAK_TEXT_TOOL,
-    AHEAD_STOP_SPEAKING_TOOL, parse_presentation_action,
-    presentation_tool_definitions,
+    AHEAD_STOP_SPEAKING_TOOL, format_read_editor_buffer, parse_presentation_action,
+    presentation_tool_definitions, read_editor_buffer_path,
 };
 use crate::instructions::EmptyUserInstructionsProvider;
 use crate::mcp_form::McpForm;
 use crate::{
-    acp_client::{
-        HarnessEvent, HarnessFileChange, HarnessPlanEntry, HarnessSink,
-        HarnessUserInputOption, HarnessUserInputQuestion,
+    events::{
+        HarnessEvent, HarnessFileChange, HarnessPatchPreview, HarnessPlanEntry,
+        HarnessSink, HarnessUserInputOption, HarnessUserInputQuestion,
     },
     runtime_support::{
         AgentScope, McpServerPolicy, file_change_allowed, mcp_servers_for_workspace,
         path_is_allowed, permission_profile, prepare_runtime_home,
         runtime_config_from_sources,
     },
-    store::{HarnessStore, LegacyNativeThreadImport},
+    store::{HarnessStore, LegacyNativeThreadImport, ProjectInstructionSource},
     turso_agent_graph_store::TursoAgentGraphStore,
     turso_thread_store::TursoThreadStore,
 };
+use codex_utils_path_uri::PathUri;
 
 const MAX_LEGACY_ROLLOUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LEGACY_ROLLOUT_RECORDS: usize = 200_000;
+const MAX_LEGACY_ROLLOUT_WINDOW_LOG: u32 = 26;
 
 fn validate_legacy_rollout_directories(root: &Path, path: &Path) -> Result<()> {
     let relative_path = path
@@ -113,10 +122,160 @@ fn validate_legacy_rollout_directories(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn legacy_rollout_candidates(
+    runtime_root: &Path,
+    thread_id: &str,
+) -> Result<Vec<(PathBuf, bool)>> {
+    let mut candidates = Vec::new();
+    for (directory, archived) in [("sessions", false), ("archived_sessions", true)] {
+        let directory = runtime_root.join(directory);
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context("inspecting legacy rollout directory");
+            }
+        };
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "legacy AHEAD rollout directories must not be symlinks"
+        );
+        for entry in walkdir::WalkDir::new(&directory).follow_links(false) {
+            let entry = entry.context("searching legacy AHEAD rollouts")?;
+            let name = entry.file_name().to_string_lossy();
+            if !name.contains(thread_id)
+                || !(name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+            {
+                continue;
+            }
+            let file_type = entry.file_type();
+            if file_type.is_file() || file_type.is_symlink() {
+                candidates.push((entry.into_path(), archived));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn read_legacy_rollout_items(path: &Path, file: File) -> Result<Vec<RolloutItem>> {
+    let reader: Box<dyn Read> = if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+    {
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .context("opening compressed legacy AHEAD rollout")?;
+        decoder
+            .window_log_max(MAX_LEGACY_ROLLOUT_WINDOW_LOG)
+            .context("limiting legacy AHEAD rollout decompression window")?;
+        Box::new(decoder)
+    } else {
+        Box::new(file)
+    };
+    let mut decompressed = Vec::new();
+    reader
+        .take(MAX_LEGACY_ROLLOUT_BYTES + 1)
+        .read_to_end(&mut decompressed)
+        .context("reading legacy AHEAD rollout")?;
+    anyhow::ensure!(
+        decompressed.len() as u64 <= MAX_LEGACY_ROLLOUT_BYTES,
+        "legacy AHEAD rollout exceeds the {} MiB decompressed import limit",
+        MAX_LEGACY_ROLLOUT_BYTES / (1024 * 1024)
+    );
+
+    let mut items = Vec::new();
+    for (index, line) in decompressed.split(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        anyhow::ensure!(
+            items.len() < MAX_LEGACY_ROLLOUT_RECORDS,
+            "legacy AHEAD rollout exceeds the {MAX_LEGACY_ROLLOUT_RECORDS} record import limit"
+        );
+        let mut value: Value = serde_json::from_slice(line).with_context(|| {
+            format!("parsing legacy AHEAD rollout record {}", index + 1)
+        })?;
+        if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            continue;
+        }
+        let line = decode_rollout_line(value).with_context(|| {
+            format!("decoding legacy AHEAD rollout record {}", index + 1)
+        })?;
+        items.push(line.item);
+    }
+    anyhow::ensure!(!items.is_empty(), "legacy AHEAD rollout is empty");
+    Ok(items)
+}
+
+fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response_item") => {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("ghost_snapshot")
+        }
+        Some("compacted") => {
+            let Some(payload) =
+                value.get_mut("payload").and_then(Value::as_object_mut)
+            else {
+                return false;
+            };
+            let Some(replacement_history) =
+                payload.get("replacement_history").and_then(Value::as_array)
+            else {
+                return false;
+            };
+            let remove = replacement_history
+                .iter()
+                .map(|item| {
+                    item.get("type").and_then(Value::as_str)
+                        == Some("ghost_snapshot")
+                })
+                .collect::<Vec<_>>();
+            if !remove.contains(&true) {
+                return false;
+            }
+            match payload.get("replacement_history_metadata") {
+                None => {}
+                Some(Value::Array(metadata)) if metadata.len() == remove.len() => {}
+                Some(_) => return false,
+            }
+            let Some(replacement_history) = payload
+                .get_mut("replacement_history")
+                .and_then(Value::as_array_mut)
+            else {
+                return false;
+            };
+            retain_unmarked_entries(replacement_history, &remove);
+            if let Some(metadata) = payload
+                .get_mut("replacement_history_metadata")
+                .and_then(Value::as_array_mut)
+            {
+                retain_unmarked_entries(metadata, &remove);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn retain_unmarked_entries(entries: &mut Vec<Value>, remove: &[bool]) {
+    let mut index = 0;
+    entries.retain(|_| {
+        let retain = !remove[index];
+        index += 1;
+        retain
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeClientConfig {
     pub cwd: PathBuf,
     pub file_index: Option<Arc<WorkspaceFileIndex>>,
+    pub model: Option<String>,
+    pub model_provider: Option<String>,
 }
 
 impl NativeClientConfig {
@@ -124,7 +283,19 @@ impl NativeClientConfig {
         Self {
             cwd,
             file_index: None,
+            model: None,
+            model_provider: None,
         }
+    }
+
+    pub fn with_model_selection(
+        mut self,
+        model: Option<&str>,
+        model_provider: Option<&str>,
+    ) -> Self {
+        self.model = model.map(str::to_string);
+        self.model_provider = model_provider.map(str::to_string);
+        self
     }
 
     pub fn with_file_index(mut self, file_index: Arc<WorkspaceFileIndex>) -> Self {
@@ -150,6 +321,23 @@ fn provider_fingerprint(config: &codex_core::config::Config) -> Result<[u8; 32]>
     digest.update([0]);
     digest.update(provider);
     Ok(digest.finalize().into())
+}
+
+fn local_project_instruction_sources(
+    sources: Vec<(PathUri, String)>,
+) -> Result<Vec<ProjectInstructionSource>> {
+    sources
+        .into_iter()
+        .map(|(path, content_sha256)| {
+            Ok(ProjectInstructionSource {
+                path: path
+                    .to_abs_path()
+                    .context("project instructions must belong to this host")?
+                    .to_path_buf(),
+                content_sha256,
+            })
+        })
+        .collect()
 }
 
 type UserInputAnswers = HashMap<String, Vec<String>>;
@@ -364,6 +552,7 @@ fn test_sandbox_helper_executable(current_exe: PathBuf) -> Result<PathBuf> {
 pub struct NativeClient {
     runtime: Runtime,
     manager: Arc<ThreadManager>,
+    model_manager_provider_fingerprint: [u8; 32],
     store: Arc<dyn HarnessStore>,
     thread_store: Arc<TursoThreadStore>,
     runtime_home: PathBuf,
@@ -396,10 +585,12 @@ impl NativeClient {
         let initial_config = runtime.block_on(Self::build_config(
             &runtime_home,
             &config.cwd,
-            None,
-            None,
+            config.model.as_deref(),
+            config.model_provider.as_deref(),
             McpServerPolicy::Disabled,
         ))?;
+        let model_manager_provider_fingerprint =
+            provider_fingerprint(&initial_config)?;
         let thread_store = Arc::new(TursoThreadStore::new(store.clone()));
         let manager = Arc::new(
             runtime
@@ -416,6 +607,7 @@ impl NativeClient {
         Ok(Self {
             runtime,
             manager,
+            model_manager_provider_fingerprint,
             store,
             thread_store,
             runtime_home,
@@ -446,10 +638,10 @@ impl NativeClient {
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-        let codex_self_exe = std::env::current_exe()
+        let ahead_self_exe = std::env::current_exe()
             .context("failed to resolve the AHEAD proxy executable")?;
         #[cfg(any(test, feature = "test-support"))]
-        let codex_self_exe = test_sandbox_helper_executable(codex_self_exe)?;
+        let ahead_self_exe = test_sandbox_helper_executable(ahead_self_exe)?;
         let overrides = codex_core::config::ConfigOverrides {
             model: model
                 .filter(|value| !value.trim().is_empty())
@@ -464,7 +656,7 @@ impl NativeClient {
                 .map(str::to_string),
             // The proxy binary exposes only Core's two sandbox helper modes;
             // it does not restore the deleted Codex CLI surface.
-            codex_self_exe: Some(codex_self_exe),
+            ahead_self_exe: Some(ahead_self_exe),
             ..Default::default()
         };
         let mut config = codex_core::config::ConfigBuilder::default()
@@ -473,12 +665,9 @@ impl NativeClient {
             .harness_overrides(overrides)
             .loader_overrides(codex_core::config::LoaderOverrides {
                 ignore_managed_requirements: true,
-                ignore_managed_config_layers: true,
                 // AHEAD provider settings arrive in memory; never reload a stale runtime file.
                 ignore_user_config: true,
-                ignore_project_config: true,
-                ignore_system_config: true,
-                ignore_user_and_project_exec_policy_rules: true,
+                ignore_user_exec_policy_rules: true,
                 ..Default::default()
             })
             .build()
@@ -498,6 +687,14 @@ impl NativeClient {
                 )
             })?;
         }
+        config
+            .features
+            .enable(Feature::Mcp20260728)
+            .context("AHEAD could not enable the current MCP protocol")?;
+        config
+            .features
+            .enable(Feature::ApplyPatchStreamingEvents)
+            .context("AHEAD could not enable streamed patch previews")?;
         config.memories.generate_memories = false;
         config.memories.use_memories = false;
         config.memories.dedicated_tools = false;
@@ -511,7 +708,8 @@ impl NativeClient {
             .take()
             .into_iter()
             .collect::<Vec<_>>();
-        developer_instructions.push(AHEAD_PATH_INSTRUCTION_PREFLIGHT.to_string());
+        developer_instructions
+            .push(AHEAD_MANAGED_DEVELOPER_INSTRUCTIONS.to_string());
         config.developer_instructions = Some(developer_instructions.join("\n\n"));
         Ok(config)
     }
@@ -595,6 +793,46 @@ impl NativeClient {
         })
     }
 
+    pub fn reasoning_options(
+        &self,
+        cwd: &Path,
+        model: &str,
+        model_provider: Option<&str>,
+    ) -> Result<AgentReasoningOptions> {
+        let config = self.runtime.block_on(Self::build_config(
+            &self.runtime_home,
+            cwd,
+            Some(model),
+            model_provider,
+            McpServerPolicy::Disabled,
+        ))?;
+        let models_manager = self.manager.get_models_manager();
+        let models_config = config.to_models_manager_config();
+        let model_info = self.runtime.block_on(async {
+            models_manager
+                .raw_model_catalog(
+                    RefreshStrategy::OnlineIfUncached,
+                    config.http_client_factory(),
+                )
+                .await;
+            models_manager.get_model_info(model, &models_config).await
+        });
+
+        Ok(AgentReasoningOptions {
+            default_effort: model_info
+                .default_reasoning_level
+                .map(|effort| effort.as_str().to_string()),
+            supported_efforts: model_info
+                .supported_reasoning_levels
+                .into_iter()
+                .map(|preset| AgentReasoningEffort {
+                    value: preset.effort.as_str().to_string(),
+                    description: preset.description,
+                })
+                .collect(),
+        })
+    }
+
     fn prompt_user_input(
         &self,
         settings: &SessionSettings,
@@ -618,7 +856,7 @@ impl NativeClient {
             settings.model_provider.as_deref(),
         )?;
         let outcome = snapshot.outcome();
-        let Some(skill) = resolve_slash_skill(
+        let skill = resolve_slash_skill(
             outcome
                 .skills
                 .iter()
@@ -627,9 +865,7 @@ impl NativeClient {
                     (skill.name.as_str(), agent_skill_source(skill.scope), skill)
                 }),
             skill_name,
-        ) else {
-            return Ok(plain_text());
-        };
+        )?;
         let mut inputs = vec![UserInput::Skill {
             name: skill.name.clone(),
             path: skill.path_to_skills_md.to_path_buf(),
@@ -768,43 +1004,26 @@ impl NativeClient {
             return Ok(());
         }
 
-        let (active, archived) = self.runtime.block_on(async {
-            let active = codex_rollout::find_thread_path_by_id_str(
-                &self.runtime_home,
-                &thread_id_text,
-            )
-            .await
-            .context("searching legacy AHEAD session rollouts")?;
-            let archived = codex_rollout::find_archived_thread_path_by_id_str(
-                &self.runtime_home,
-                &thread_id_text,
-            )
-            .await
-            .context("searching archived AHEAD session rollouts")?;
-            Ok::<_, anyhow::Error>((active, archived))
-        })?;
-        let (path, is_archived) = match (active, archived) {
-            (None, None) => return Ok(()),
-            (Some(_), Some(_)) => {
-                bail!(
-                    "legacy AHEAD thread {thread_id} has both active and archived rollout files"
-                )
-            }
-            (Some(path), None) => (path, false),
-            (None, Some(path)) => (path, true),
+        let runtime_root = self
+            .runtime_home
+            .canonicalize()
+            .context("resolving AHEAD runtime session root")?;
+        let mut candidates =
+            legacy_rollout_candidates(&runtime_root, &thread_id_text)?;
+        anyhow::ensure!(
+            candidates.len() <= 1,
+            "legacy AHEAD thread {thread_id} has multiple rollout files"
+        );
+        let Some((path, is_archived)) = candidates.pop() else {
+            return Ok(());
         };
-
-        validate_legacy_rollout_directories(&self.runtime_home, &path)?;
+        validate_legacy_rollout_directories(&runtime_root, &path)?;
         let before = std::fs::symlink_metadata(&path)
             .context("inspecting legacy AHEAD rollout")?;
         anyhow::ensure!(
             before.file_type().is_file(),
             "legacy AHEAD rollout must be a regular file"
         );
-        let runtime_root = self
-            .runtime_home
-            .canonicalize()
-            .context("resolving AHEAD runtime session root")?;
         let canonical_path = path
             .canonicalize()
             .context("resolving legacy AHEAD rollout path")?;
@@ -812,13 +1031,12 @@ impl NativeClient {
             canonical_path.starts_with(&runtime_root),
             "legacy AHEAD rollout is outside the runtime session root"
         );
+        let filename = canonical_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .context("legacy AHEAD rollout filename is not valid UTF-8")?;
         anyhow::ensure!(
-            canonical_path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(
-                    |name| name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
-                ),
+            filename.ends_with(".jsonl") || filename.ends_with(".jsonl.zst"),
             "legacy AHEAD rollout must be JSONL"
         );
         anyhow::ensure!(
@@ -834,8 +1052,8 @@ impl NativeClient {
             ahead_core::secure_fs::open_canonical_regular_file(&canonical_path)
                 .context("opening legacy AHEAD rollout without following links")?;
         #[cfg(not(unix))]
-        let opened_file = std::fs::File::open(&canonical_path)
-            .context("opening legacy AHEAD rollout")?;
+        let opened_file =
+            File::open(&canonical_path).context("opening legacy AHEAD rollout")?;
         let opened_before = opened_file
             .metadata()
             .context("inspecting opened legacy AHEAD rollout")?;
@@ -857,37 +1075,20 @@ impl NativeClient {
         let opened_for_recheck = opened_file
             .try_clone()
             .context("retaining legacy AHEAD rollout for verification")?;
-        let (items, loaded_thread_id, parse_errors) = self
-            .runtime
-            .block_on(RolloutRecorder::load_rollout_items_from_file_with_limits(
-                opened_file,
-                &canonical_path,
-                MAX_LEGACY_ROLLOUT_BYTES,
-                MAX_LEGACY_ROLLOUT_RECORDS,
-            ))
-            .context("reading legacy AHEAD rollout")?;
-        anyhow::ensure!(
-            parse_errors == 0,
-            "legacy AHEAD rollout contains {parse_errors} malformed or unsupported records"
-        );
-        anyhow::ensure!(
-            items.len() <= MAX_LEGACY_ROLLOUT_RECORDS,
-            "legacy AHEAD rollout exceeds the {MAX_LEGACY_ROLLOUT_RECORDS} record import limit"
-        );
-        anyhow::ensure!(
-            loaded_thread_id == Some(thread_id),
-            "legacy AHEAD rollout metadata does not match thread {thread_id}"
-        );
-        let meta = items.iter().find_map(|item| match item {
+        let items = read_legacy_rollout_items(&canonical_path, opened_file)?;
+        let Some(meta) = items.iter().find_map(|item| match item {
             RolloutItem::SessionMeta(line) => Some(&line.meta),
             _ => None,
-        });
-        let Some(meta) = meta else {
+        }) else {
             bail!("legacy AHEAD rollout has no session metadata")
         };
         anyhow::ensure!(
             meta.id == thread_id,
             "legacy AHEAD session metadata does not match thread {thread_id}"
+        );
+        anyhow::ensure!(
+            meta.cwd.is_absolute(),
+            "legacy AHEAD workspace metadata must be an absolute path"
         );
         let expected_cwd = cwd
             .canonicalize()
@@ -901,10 +1102,9 @@ impl NativeClient {
             "legacy AHEAD rollout belongs to a different workspace"
         );
 
-        validate_legacy_rollout_directories(&self.runtime_home, &path)?;
+        validate_legacy_rollout_directories(&runtime_root, &path)?;
         let after = std::fs::symlink_metadata(&path)
             .context("rechecking legacy AHEAD rollout")?;
-        let canonical_after = path.canonicalize().ok();
         let opened_after = opened_for_recheck
             .metadata()
             .context("rechecking opened legacy AHEAD rollout")?;
@@ -914,7 +1114,8 @@ impl NativeClient {
                 && after.modified().ok() == Some(before_modified)
                 && opened_after.len() == before.len()
                 && opened_after.modified().ok() == Some(before_modified)
-                && canonical_after.as_deref() == Some(canonical_path.as_path()),
+                && path.canonicalize().ok().as_deref()
+                    == Some(canonical_path.as_path()),
             "legacy AHEAD rollout changed while it was being imported"
         );
         #[cfg(unix)]
@@ -926,6 +1127,7 @@ impl NativeClient {
                 "legacy AHEAD rollout changed while it was being imported"
             );
         }
+
         let created_at = chrono::DateTime::parse_from_rfc3339(&meta.timestamp)
             .context("parsing legacy AHEAD session creation time")?
             .with_timezone(&chrono::Utc);
@@ -939,7 +1141,6 @@ impl NativeClient {
         let create_params = CreateThreadParams {
             session_id: meta.session_id,
             thread_id,
-            extra_config: None,
             forked_from_id: meta.forked_from_id,
             parent_thread_id: meta.parent_thread_id,
             source: meta.source.clone(),
@@ -947,7 +1148,6 @@ impl NativeClient {
             originator: meta.originator.clone(),
             base_instructions: meta.base_instructions.clone().unwrap_or_default(),
             dynamic_tools: meta.dynamic_tools.clone().unwrap_or_default(),
-            selected_capability_roots: meta.selected_capability_roots.clone(),
             multi_agent_version: meta.multi_agent_version,
             history_mode: meta.history_mode,
             history_base: meta.history_base,
@@ -967,11 +1167,10 @@ impl NativeClient {
                 memory_mode,
             },
         };
-        let rollout_items =
-            codex_rollout::persisted_rollout_items(&items, meta.history_mode)
-                .into_iter()
-                .map(serde_json::to_value)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rollout_items = persisted_rollout_items(&items, meta.history_mode)
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         self.store
             .import_legacy_native_thread(LegacyNativeThreadImport {
                 thread_id: thread_id_text,
@@ -1090,6 +1289,50 @@ impl NativeClient {
     }
 
     pub fn prompt(&self, thread_id: &str, text: &str) -> Result<String> {
+        self.prompt_inner(thread_id, text, None, None, None)
+    }
+
+    pub fn prompt_for_ahead_turn(
+        &self,
+        thread_id: &str,
+        text: &str,
+        ahead_turn_id: &str,
+        model_context_window: Option<u32>,
+    ) -> Result<String> {
+        self.prompt_inner(
+            thread_id,
+            text,
+            Some(ahead_turn_id),
+            Some(model_context_window),
+            None,
+        )
+    }
+
+    pub fn prompt_for_ahead_turn_with_reasoning(
+        &self,
+        thread_id: &str,
+        text: &str,
+        ahead_turn_id: &str,
+        model_context_window: Option<u32>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String> {
+        self.prompt_inner(
+            thread_id,
+            text,
+            Some(ahead_turn_id),
+            Some(model_context_window),
+            reasoning_effort,
+        )
+    }
+
+    fn prompt_inner(
+        &self,
+        thread_id: &str,
+        text: &str,
+        ahead_turn_id: Option<&str>,
+        model_context_window: Option<Option<u32>>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String> {
         anyhow::ensure!(self.is_running(), "AHEAD agent is shutting down");
         self.ensure_thread_history_healthy(thread_id)?;
         let thread =
@@ -1122,30 +1365,122 @@ impl NativeClient {
         let scope = self.scopes.lock().get(thread_id).cloned();
         let permission_profile =
             permission_profile(&settings.mode_id, &settings.cwd, scope.as_ref())?;
+        let effort = reasoning_effort
+            .map(|effort| {
+                effort.parse::<ReasoningEffort>().map_err(|error| {
+                    anyhow!("invalid reasoning effort `{effort}`: {error}")
+                })
+            })
+            .transpose()?;
         let thread_settings = ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::OnRequest),
             permission_profile: Some(permission_profile),
             model: settings.model.clone(),
+            model_context_window: model_context_window.map(|context_window| {
+                context_window.and_then(std::num::NonZeroU32::new)
+            }),
+            // The composer always sends its selection. An unset selection
+            // explicitly clears a stale override and follows model defaults.
+            effort: Some(effort),
             ..Default::default()
         };
         let request = TurnInputRequest::user_input(user_input)
             .with_thread_settings(thread_settings);
         self.runtime.block_on(async {
-            match thread.start_turn_if_idle(request).await? {
-                StartIfIdleSubmission::Started { .. } => {}
+            let core_turn_id = match thread.start_turn_if_idle(request).await? {
+                StartIfIdleSubmission::Started { turn_id } => turn_id,
                 StartIfIdleSubmission::NotSubmitted { reason } => {
                     bail!("AHEAD agent did not start the turn: {reason:?}");
                 }
-            }
-            Box::pin(self.consume_turn(
+            };
+            // Preserve the exact instructions used by this turn before a slow
+            // model request can be interrupted by an app or process restart.
+            let instruction_snapshot = ahead_turn_id.map(|ahead_turn_id| {
+                let ahead_turn_id = ahead_turn_id.to_string();
+                let core_turn_id = core_turn_id.clone();
+                let thread = thread.clone();
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Some(sources) = thread
+                            .project_instruction_source_hashes_for_turn(
+                                &core_turn_id,
+                            )
+                            .await
+                        {
+                            let sources =
+                                local_project_instruction_sources(sources)?;
+                            store.set_project_instruction_sources(
+                                &ahead_turn_id,
+                                &sources,
+                            )?;
+                            return Ok::<_, anyhow::Error>(sources);
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+            });
+            let result = Box::pin(self.consume_turn(
                 thread_id,
                 thread_id,
                 &thread,
                 &settings.mode_id,
                 false,
+                ahead_turn_id,
             ))
-            .await
+            .await;
+            let captured_instruction_sources =
+                if let Some(instruction_snapshot) = instruction_snapshot {
+                    if !instruction_snapshot.is_finished() {
+                        instruction_snapshot.abort();
+                    }
+                    match instruction_snapshot.await {
+                        Ok(sources) => Some(sources?),
+                        Err(error) if error.is_cancelled() => None,
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    None
+                };
+            if let Some(ahead_turn_id) = ahead_turn_id {
+                if captured_instruction_sources.is_none() {
+                    match thread
+                        .project_instruction_source_hashes_for_turn(&core_turn_id)
+                        .await
+                    {
+                        Some(sources) => {
+                            self.store.set_project_instruction_sources(
+                                ahead_turn_id,
+                                &local_project_instruction_sources(sources)?,
+                            )?;
+                        }
+                        None if result.is_ok() => {
+                            bail!("managed turn completed without an AGENTS.md provenance snapshot")
+                        }
+                        None => {}
+                    }
+                }
+            }
+            result
         })
+    }
+
+    pub fn current_project_instruction_sources(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<ProjectInstructionSource>> {
+        let thread =
+            self.threads
+                .lock()
+                .get(thread_id)
+                .cloned()
+                .with_context(|| {
+                    format!("AHEAD agent thread `{thread_id}` is not loaded")
+                })?;
+        let sources = self
+            .runtime
+            .block_on(thread.refresh_project_instruction_source_hashes())?;
+        local_project_instruction_sources(sources)
     }
 
     /// Detects whether a loaded thread's next selection needs a fresh runtime.
@@ -1172,6 +1507,24 @@ impl NativeClient {
             != settings.loaded_provider_fingerprint)
     }
 
+    /// Whether this runtime's shared model catalog was initialized for the requested provider.
+    pub fn configured_for_provider(
+        &self,
+        cwd: &Path,
+        model: Option<&str>,
+        model_provider: Option<&str>,
+    ) -> Result<bool> {
+        let current_config = self.runtime.block_on(Self::build_config(
+            &self.runtime_home,
+            cwd,
+            model,
+            model_provider,
+            McpServerPolicy::Disabled,
+        ))?;
+        Ok(provider_fingerprint(&current_config)?
+            == self.model_manager_provider_fingerprint)
+    }
+
     async fn consume_turn(
         &self,
         acp_session_id: &str,
@@ -1179,6 +1532,7 @@ impl NativeClient {
         thread: &Arc<CodexThread>,
         mode_id: &str,
         return_agent_message: bool,
+        ahead_turn_id: Option<&str>,
     ) -> Result<String> {
         let thread_id = acp_session_id;
         let is_child_thread = runtime_thread_id != acp_session_id;
@@ -1194,6 +1548,8 @@ impl NativeClient {
             sink: self.sink.clone(),
         };
         let mut input_responses = JoinSet::<Result<()>>::new();
+        let mut dynamic_tool_calls = FuturesOrdered::new();
+        let mut turn_skill_resource_ids = HashSet::new();
         loop {
             let event = tokio::select! {
                 event = thread.next_event() => event?,
@@ -1201,6 +1557,40 @@ impl NativeClient {
                     if let Some(completed) = completed {
                         completed.context("AHEAD agent input responder failed")??;
                     }
+                    continue;
+                }
+                completed = dynamic_tool_calls.next(), if !dynamic_tool_calls.is_empty() => {
+                    let (call_id, tool, is_subagent_tool, result):
+                        (String, String, bool, Option<Result<String>>) = completed
+                            .context("AHEAD dynamic tool queue ended unexpectedly")??;
+                    let success = result.as_ref().is_some_and(|result| result.is_ok());
+                    let response_text = match result {
+                        Some(Ok(text)) => text,
+                        Some(Err(error)) => error.to_string(),
+                        None => "AHEAD has no registered dynamic client tool for this request".to_string(),
+                    };
+                    if !is_subagent_tool {
+                        self.tool_event(
+                            thread_id,
+                            call_id.clone(),
+                            tool,
+                            if success { "completed" } else { "failed" },
+                            "dynamicToolCall",
+                        );
+                    }
+                    thread
+                        .submit(Op::DynamicToolResponse {
+                            id: call_id,
+                            response: DynamicToolResponse {
+                                content_items: vec![
+                                    DynamicToolCallOutputContentItem::InputText {
+                                        text: response_text,
+                                    },
+                                ],
+                                success,
+                            },
+                        })
+                        .await?;
                     continue;
                 }
             };
@@ -1277,6 +1667,41 @@ impl NativeClient {
                         });
                     }
                 }
+                EventMsg::SkillContextLoaded(event) => {
+                    turn_skill_resource_ids.extend(
+                        event.skills.iter().map(|skill| skill.skill_id.clone()),
+                    );
+                    if let Some(ahead_turn_id) = ahead_turn_id {
+                        let sources = event
+                            .skills
+                            .into_iter()
+                            .map(|skill| crate::TurnSkillSource {
+                                skill_id: skill.skill_id,
+                                name: skill.name,
+                                scope: skill.scope,
+                                source_sha256: skill.source_sha256,
+                                prompt_sha256: skill.prompt_sha256,
+                                selected_by: skill.selected_by,
+                            })
+                            .collect::<Vec<_>>();
+                        if let Err(error) = self
+                            .store
+                            .set_turn_skill_sources(ahead_turn_id, &sources)
+                        {
+                            if let Err(interrupt_error) =
+                                thread.submit(Op::Interrupt).await
+                            {
+                                tracing::warn!(
+                                    %interrupt_error,
+                                    "failed to interrupt managed turn after skill provenance persistence failed"
+                                );
+                            }
+                            return Err(error.context(
+                                "persisting managed-turn skill provenance",
+                            ));
+                        }
+                    }
+                }
                 EventMsg::AuthRecoveryStarted(event)
                 | EventMsg::AuthRecoveryCompleted(event) => {
                     if !is_child_thread {
@@ -1289,13 +1714,13 @@ impl NativeClient {
                         });
                     }
                 }
-                EventMsg::ModelReroute(event) => {
+                EventMsg::ModelMismatch(event) => {
                     if !is_child_thread {
                         (self.sink)(HarnessEvent::AgentThought {
                             acp_session_id: thread_id.to_string(),
                             text: format!(
-                                "\nModel rerouted from {} to {} ({:?}).\n",
-                                event.from_model, event.to_model, event.reason
+                                "\nModel endpoint reported {} for a request configured as {}.\n",
+                                event.reported_model, event.requested_model
                             ),
                         });
                     }
@@ -1429,6 +1854,16 @@ impl NativeClient {
                         "in_progress",
                         "fileChange",
                     );
+                }
+                EventMsg::PatchApplyUpdated(event) => {
+                    let preview =
+                        bounded_patch_preview(event.call_id, event.changes);
+                    if !preview.changes.is_empty() {
+                        (self.sink)(HarnessEvent::PatchApplyProgress {
+                            acp_session_id: thread_id.to_string(),
+                            preview,
+                        });
+                    }
                 }
                 EventMsg::PatchApplyEnd(event) => {
                     let status = if event.success { "completed" } else { "failed" };
@@ -1591,116 +2026,91 @@ impl NativeClient {
                     let call_id = event.call_id;
                     let tool = event.tool;
                     let is_subagent_tool = tool == AHEAD_SPAWN_AGENT_TOOL;
-                    let result = match tool.as_str() {
-                        AHEAD_READ_EDITOR_BUFFER_TOOL => Some(
-                            self.read_editor_buffer(
-                                runtime_thread_id,
-                                thread_id,
-                                event.arguments,
-                            )
-                            .await,
-                        ),
-                        AHEAD_FILE_SEARCH_TOOL => {
-                            let settings = self
-                                .settings
-                                .lock()
-                                .get(runtime_thread_id)
-                                .cloned()
-                                .with_context(|| {
-                                    format!("AHEAD agent settings for `{runtime_thread_id}` are missing")
-                                })?;
-                            let scope =
-                                self.scopes.lock().get(runtime_thread_id).cloned();
-                            Some(
-                                self.file_search(
+                    let arguments = event.arguments;
+                    let turn_skill_resource_ids = turn_skill_resource_ids.clone();
+                    dynamic_tool_calls.push_back(Box::pin(async move {
+                        let result = match tool.as_str() {
+                            AHEAD_READ_EDITOR_BUFFER_TOOL => Some(
+                                self.read_editor_buffer(
+                                    runtime_thread_id,
                                     thread_id,
-                                    &settings,
-                                    scope.as_ref(),
-                                    event.arguments,
+                                    arguments,
                                 )
                                 .await,
-                            )
-                        }
-                        AHEAD_SKILL_RESOURCE_READ_TOOL => {
-                            let settings = self
-                                .settings
-                                .lock()
-                                .get(runtime_thread_id)
-                                .cloned()
-                                .with_context(|| {
-                                    format!("AHEAD agent settings for `{runtime_thread_id}` are missing")
-                                })?;
-                            Some(
-                                Box::pin(self.read_skill_resource(
-                                    &settings,
-                                    event.arguments,
-                                ))
-                                .await,
-                            )
-                        }
-                        AHEAD_PRESENT_CODE_TOOL
-                        | AHEAD_MOVE_CODE_POINTER_TOOL
-                        | AHEAD_CLEAR_PRESENTATION_TOOL
-                        | AHEAD_SPEAK_TEXT_TOOL
-                        | AHEAD_STOP_SPEAKING_TOOL => {
-                            match self.presentation_action(
-                                runtime_thread_id,
-                                &tool,
-                                event.arguments,
-                            ) {
-                                Ok(action) => Some(
-                                    self.request_editor_presentation(
-                                        thread_id, action,
+                            ),
+                            AHEAD_FILE_SEARCH_TOOL => {
+                                let settings = self
+                                    .settings
+                                    .lock()
+                                    .get(runtime_thread_id)
+                                    .cloned()
+                                    .with_context(|| {
+                                        format!("AHEAD agent settings for `{runtime_thread_id}` are missing")
+                                    })?;
+                                let scope =
+                                    self.scopes.lock().get(runtime_thread_id).cloned();
+                                Some(
+                                    self.file_search(
+                                        thread_id,
+                                        &settings,
+                                        scope.as_ref(),
+                                        arguments,
                                     )
                                     .await,
-                                ),
-                                Err(error) => Some(Err(error)),
+                                )
                             }
-                        }
-                        AHEAD_SPAWN_AGENT_TOOL => Some(
-                            Box::pin(self.handle_spawn_agent_tool(
-                                runtime_thread_id,
-                                thread_id,
-                                mode_id,
-                                call_id.clone(),
-                                event.arguments,
-                            ))
-                            .await,
-                        ),
-                        _ => None,
-                    };
-                    let success =
-                        result.as_ref().is_some_and(|result| result.is_ok());
-                    let response_text = match result {
-                        Some(Ok(text)) => text,
-                        Some(Err(error)) => error.to_string(),
-                        None => {
-                            "AHEAD has no registered dynamic client tool for this request"
-                                .to_string()
-                        }
-                    };
-                    if !is_subagent_tool {
-                        self.tool_event(
-                            thread_id,
-                            call_id.clone(),
-                            tool,
-                            if success { "completed" } else { "failed" },
-                            "dynamicToolCall",
-                        );
-                    }
-                    thread
-                        .submit(Op::DynamicToolResponse {
-                            id: call_id,
-                            response: DynamicToolResponse {
-                                content_items: vec![
-                                    DynamicToolCallOutputContentItem::InputText {
-                                        text: response_text,
-                                    },
-                                ],
-                                success,
-                            },
-                        })
-                        .await?;
+                            AHEAD_SKILL_RESOURCE_READ_TOOL => {
+                                let settings = self
+                                    .settings
+                                    .lock()
+                                    .get(runtime_thread_id)
+                                    .cloned()
+                                    .with_context(|| {
+                                        format!("AHEAD agent settings for `{runtime_thread_id}` are missing")
+                                    })?;
+                                Some(
+                                    Box::pin(self.read_skill_resource(
+                                        &settings,
+                                        ahead_turn_id,
+                                        arguments,
+                                        &turn_skill_resource_ids,
+                                    ))
+                                    .await,
+                                )
+                            }
+                            AHEAD_PRESENT_CODE_TOOL
+                            | AHEAD_MOVE_CODE_POINTER_TOOL
+                            | AHEAD_CLEAR_PRESENTATION_TOOL
+                            | AHEAD_SPEAK_TEXT_TOOL
+                            | AHEAD_STOP_SPEAKING_TOOL => {
+                                match self.presentation_action(
+                                    runtime_thread_id,
+                                    &tool,
+                                    arguments,
+                                ) {
+                                    Ok(action) => Some(
+                                        self.request_editor_presentation(
+                                            thread_id, action,
+                                        )
+                                        .await,
+                                    ),
+                                    Err(error) => Some(Err(error)),
+                                }
+                            }
+                            AHEAD_SPAWN_AGENT_TOOL => Some(
+                                Box::pin(self.handle_spawn_agent_tool(
+                                    runtime_thread_id,
+                                    thread_id,
+                                    mode_id,
+                                    call_id.clone(),
+                                    arguments,
+                                ))
+                                .await,
+                            ),
+                            _ => None,
+                        };
+                        Ok::<_, anyhow::Error>((call_id, tool, is_subagent_tool, result))
+                    }));
                 }
                 EventMsg::RequestPermissions(event) => {
                     thread
@@ -1709,7 +2119,6 @@ impl NativeClient {
                             response: RequestPermissionsResponse {
                                 permissions: RequestPermissionProfile::default(),
                                 scope: PermissionGrantScope::Turn,
-                                strict_auto_review: false,
                             },
                         })
                         .await?;
@@ -1745,8 +2154,13 @@ impl NativeClient {
                     } else {
                         None
                     };
-                    if approval.is_none() && form.is_none() && url_question.is_none()
-                    {
+                    let questions = if let Some((_, question)) = &approval {
+                        vec![question.clone()]
+                    } else if let Some((_, questions)) = &form {
+                        questions.clone()
+                    } else if let Some(question) = &url_question {
+                        vec![question.clone()]
+                    } else {
                         thread
                             .submit(Op::ResolveElicitation {
                                 server_name: event.server_name,
@@ -1757,13 +2171,6 @@ impl NativeClient {
                             })
                             .await?;
                         continue;
-                    }
-                    let questions = if let Some((_, question)) = &approval {
-                        vec![question.clone()]
-                    } else if let Some((_, questions)) = &form {
-                        questions.clone()
-                    } else {
-                        vec![url_question.clone().expect("URL was checked above")]
                     };
                     let is_url = url_question.is_some();
                     let (sender, receiver) = oneshot::channel();
@@ -1827,8 +2234,11 @@ impl NativeClient {
                                 }
                             },
                             (Ok(answers), None, false) => {
-                                let request_id = &approval.as_ref().expect("approval was checked above").0;
-                                match answers.get(request_id).map(Vec::as_slice) {
+                                match approval
+                                    .as_ref()
+                                    .and_then(|(request_id, _)| answers.get(request_id))
+                                    .map(Vec::as_slice)
+                                {
                                     Some([answer]) if answer == "Allow" => {
                                         (ElicitationAction::Accept, None, None)
                                     }
@@ -1866,6 +2276,10 @@ impl NativeClient {
                     terminal_error = Some(event.message);
                 }
                 EventMsg::TurnComplete(event) => {
+                    anyhow::ensure!(
+                        dynamic_tool_calls.is_empty(),
+                        "AHEAD agent turn completed with pending dynamic client tools"
+                    );
                     if let Some(error) = event.error {
                         bail!("{}", error.message);
                     }
@@ -1885,6 +2299,11 @@ impl NativeClient {
                     });
                 }
                 EventMsg::TurnAborted(event) => {
+                    while let Some(result) = dynamic_tool_calls.next().await {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "AHEAD dynamic tool failed during interrupted-turn cleanup");
+                        }
+                    }
                     bail!("turn aborted: {:?}", event.reason);
                 }
                 EventMsg::ShutdownComplete => {
@@ -1935,14 +2354,20 @@ impl NativeClient {
             "in_progress",
             "subagent",
         );
-        let result = Box::pin(self.run_subagent_turn(
-            parent_thread_id,
-            acp_session_id,
-            mode_id,
-            &label,
-            arguments,
-        ))
-        .await;
+        let result = match serde_json::from_value::<SpawnAgentToolInput>(arguments) {
+            Ok(input) => {
+                Box::pin(self.run_subagent_turn(
+                    parent_thread_id,
+                    acp_session_id,
+                    mode_id,
+                    input,
+                ))
+                .await
+            }
+            Err(error) => {
+                Err(anyhow!("invalid AHEAD spawn_agent arguments: {error}"))
+            }
+        };
         self.tool_event(
             acp_session_id,
             call_id,
@@ -1962,16 +2387,17 @@ impl NativeClient {
         parent_thread_id: &str,
         acp_session_id: &str,
         mode_id: &str,
-        label: &str,
-        arguments: Value,
+        input: SpawnAgentToolInput,
     ) -> Result<String> {
+        let SpawnAgentToolInput {
+            label,
+            message,
+            session_id,
+        } = input;
         let admission = self.thread_admission.read().await;
         anyhow::ensure!(self.is_running(), "AHEAD agent is shutting down");
-        let message = arguments
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty() && message.len() <= 65_536)
-            .context("AHEAD spawn_agent requires a message of at most 64 KiB")?;
+        validate_spawn_agent_input(&label, &message)?;
+        let label = label.trim();
         let parent_id = ThreadId::from_string(parent_thread_id)
             .map_err(|error| anyhow!("invalid AHEAD parent thread ID: {error}"))?;
         let parent_depth = self
@@ -2004,27 +2430,25 @@ impl NativeClient {
         )
         .await?;
 
-        let child_session_id = match arguments.get("session_id") {
-            Some(value) => {
-                let child_session_id = value
-                    .as_str()
-                    .filter(|session_id| !session_id.trim().is_empty())
-                    .context(
-                        "AHEAD spawn_agent session_id must be a non-empty string",
-                    )?;
+        let is_resuming = session_id.is_some();
+        let child_session_id = match session_id {
+            Some(child_session_id) => {
                 let children = self
                     .store
-                    .list_native_agent_children(parent_thread_id, None)?;
+                    .list_native_agent_children(parent_thread_id, None)
+                    .map_err(|error| {
+                        subagent_tool_error(&child_session_id, error)
+                    })?;
                 anyhow::ensure!(
-                    children.iter().any(|child| child == child_session_id),
+                    children.iter().any(|child| child == &child_session_id),
                     "AHEAD can resume only a direct child of the current thread"
                 );
-                let parsed_child_id = ThreadId::from_string(child_session_id)
+                let parsed_child_id = ThreadId::from_string(&child_session_id)
                     .map_err(|error| {
                         anyhow!("invalid AHEAD child thread ID: {error}")
                     })?;
                 let child = if let Some(child) =
-                    self.threads.lock().get(child_session_id).cloned()
+                    self.threads.lock().get(&child_session_id).cloned()
                 {
                     child
                 } else {
@@ -2039,10 +2463,8 @@ impl NativeClient {
                     })?
                     .thread
                 };
-                self.threads
-                    .lock()
-                    .insert(child_session_id.to_string(), child);
-                child_session_id.to_string()
+                self.threads.lock().insert(child_session_id.clone(), child);
+                child_session_id
             }
             None => {
                 let options = StartThreadOptions {
@@ -2052,7 +2474,6 @@ impl NativeClient {
                             depth: i32::from(child_depth),
                             agent_path: None,
                             agent_nickname: Some(label.to_string()),
-                            agent_role: None,
                         },
                     )),
                     dynamic_tools: ahead_dynamic_tools(false),
@@ -2089,12 +2510,22 @@ impl NativeClient {
             .lock()
             .get(&child_session_id)
             .cloned()
-            .context("AHEAD child thread was not registered")?;
-        self.ensure_thread_history_healthy(&child_session_id)?;
-        self.store.set_native_agent_edge_status(
-            &child_session_id,
-            crate::NativeAgentEdgeStatus::Open,
-        )?;
+            .ok_or_else(|| {
+                subagent_tool_error(
+                    &child_session_id,
+                    "AHEAD child thread was not registered",
+                )
+            })?;
+        self.ensure_thread_history_healthy(&child_session_id)
+            .map_err(|error| subagent_tool_error(&child_session_id, error))?;
+        if is_resuming {
+            self.store
+                .set_native_agent_edge_status(
+                    &child_session_id,
+                    crate::NativeAgentEdgeStatus::Open,
+                )
+                .map_err(|error| subagent_tool_error(&child_session_id, error))?;
+        }
         drop(admission);
         let turn_result = async {
             let child_scope = self.scopes.lock().get(&child_session_id).cloned();
@@ -2123,6 +2554,7 @@ impl NativeClient {
                 &child,
                 mode_id,
                 true,
+                None,
             ))
             .await
         }
@@ -2132,15 +2564,26 @@ impl NativeClient {
             crate::NativeAgentEdgeStatus::Closed,
         ) {
             return match turn_result {
-                Ok(_) => Err(anyhow!(
-                    "AHEAD subagent finished but its Turso edge could not be closed: {error}"
+                Ok(_) => Err(subagent_tool_error(
+                    &child_session_id,
+                    format!(
+                        "AHEAD subagent finished but its Turso edge could not be closed: {error}"
+                    ),
                 )),
-                Err(turn_error) => Err(anyhow!(
-                    "AHEAD subagent turn failed: {turn_error}; its Turso edge also could not be closed: {error}"
+                Err(turn_error) => Err(subagent_tool_error(
+                    &child_session_id,
+                    format!(
+                        "AHEAD subagent turn failed: {turn_error}; its Turso edge also could not be closed: {error}"
+                    ),
                 )),
             };
         }
-        let output = turn_result?;
+        let output = turn_result.map_err(|error| {
+            subagent_tool_error(
+                &child_session_id,
+                format!("AHEAD subagent turn failed: {error}"),
+            )
+        })?;
         Ok(json!({ "session_id": child_session_id, "output": output }).to_string())
     }
 
@@ -2273,7 +2716,9 @@ impl NativeClient {
         self.runtime.block_on(async {
             thread.submit(Op::Compact).await?;
             Box::pin(
-                self.consume_turn(thread_id, thread_id, &thread, &mode_id, false),
+                self.consume_turn(
+                    thread_id, thread_id, &thread, &mode_id, false, None,
+                ),
             )
             .await
         })
@@ -2400,6 +2845,7 @@ impl NativeClient {
     async fn current_buffer_snapshots(
         &self,
         thread_id: &str,
+        include_document_symbols: bool,
     ) -> Result<Vec<AgentBufferSnapshot>> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let key = (thread_id.to_string(), request_id.clone());
@@ -2412,6 +2858,7 @@ impl NativeClient {
         (self.sink)(HarnessEvent::BufferSnapshotsRequested {
             acp_session_id: thread_id.to_string(),
             request_id,
+            include_document_symbols,
         });
         let result = tokio::time::timeout(Duration::from_secs(10), receiver).await;
         self.pending_buffer_snapshots.lock().remove(&key);
@@ -2429,26 +2876,6 @@ impl NativeClient {
         acp_session_id: &str,
         arguments: Value,
     ) -> Result<String> {
-        let path = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .context("AHEAD read_editor_buffer requires a worktree-relative path")?;
-        anyhow::ensure!(path.len() <= 512, "AHEAD editor path is too long");
-        let relative = Path::new(path);
-        anyhow::ensure!(
-            !relative.is_absolute()
-                && relative.components().all(|component| matches!(
-                    component,
-                    std::path::Component::Normal(_)
-                )),
-            "AHEAD editor path must stay inside the worktree"
-        );
-        anyhow::ensure!(
-            !ahead_core::search::is_private_file(relative),
-            "AHEAD cannot read a private editor buffer"
-        );
-
         let settings =
             self.settings
                 .lock()
@@ -2462,33 +2889,13 @@ impl NativeClient {
             .as_ref()
             .map(|scope| scope.workspace.as_path())
             .unwrap_or(settings.cwd.as_path());
-        anyhow::ensure!(
-            ahead_core::search::resolve_open_buffer_path(workspace, relative)
-                .is_some(),
-            "AHEAD editor path is not a safe file in the worktree"
-        );
-        if let Some(scope) = scope.as_ref() {
-            anyhow::ensure!(
-                path_is_allowed(path, &scope.allowed_paths, workspace),
-                "AHEAD editor path is outside this session's file scope"
-            );
-        }
-
-        let buffers = self.current_buffer_snapshots(acp_session_id).await?;
-        let buffer = buffers
-            .iter()
-            .find(|buffer| Path::new(&buffer.path) == relative)
-            .with_context(|| {
-                format!("`{path}` is not currently open in the AHEAD editor")
-            })?;
-        anyhow::ensure!(
-            buffer.content.len() <= 262_144,
-            "AHEAD editor buffer is larger than 256 KiB; use file_search for a focused excerpt"
-        );
-        Ok(format!(
-            "Unsaved editor buffer `{path}`:\n{}",
-            buffer.content
-        ))
+        let relative = read_editor_buffer_path(
+            &arguments,
+            workspace,
+            scope.as_ref().map(|scope| scope.allowed_paths.as_slice()),
+        )?;
+        let buffers = self.current_buffer_snapshots(acp_session_id, false).await?;
+        format_read_editor_buffer(&relative, &buffers)
     }
 
     fn presentation_action(
@@ -2604,19 +3011,28 @@ impl NativeClient {
                     .context("AHEAD file_search include_pattern must be a string")
             })
             .transpose()?;
+        let exclude_pattern = arguments
+            .get("exclude_pattern")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("AHEAD file_search exclude_pattern must be a string")
+            })
+            .transpose()?;
         let path_filter = ahead_core::search::WorkspacePathFilter::new(
             &workspace,
             include_pattern,
-            None,
+            exclude_pattern,
         )?;
         let allowed_paths = scope.map(|scope| scope.allowed_paths.clone());
-        let snapshots = self.current_buffer_snapshots(acp_session_id).await?;
-        let overrides =
+        let snapshots = self.current_buffer_snapshots(acp_session_id, true).await?;
+        let (overrides, symbol_context) =
             open_buffer_overrides(&workspace, allowed_paths.as_deref(), snapshots);
         let query_fingerprint = file_search_query_fingerprint(
             &workspace,
             &options,
             include_pattern,
+            exclude_pattern,
             allowed_paths.as_deref(),
             &overrides,
         );
@@ -2630,14 +3046,16 @@ impl NativeClient {
             .file_index
             .clone()
             .filter(|index| index.workspace() == workspace);
+        let display_workspace = workspace.clone();
         let keep_running = Arc::new(AtomicBool::new(true));
+        let snapshot_keep_running = keep_running.clone();
         let cancellation = SearchCancellation(keep_running.clone());
         let (search_revision, results) = tokio::task::spawn_blocking(move || {
             let (search_revision, indexed_files) = match search_index.as_ref() {
                 Some(index) => {
                     let (search_revision, files) = index
-                        .snapshot_with_search_revision_while(|| {
-                            keep_running.load(Ordering::Relaxed)
+                        .snapshot_with_search_revision_while(move || {
+                            snapshot_keep_running.load(Ordering::Relaxed)
                         })
                         .map(|(_, revision, files)| (revision, files))
                         .ok_or(ahead_core::search::FileSearchError::Cancelled)?;
@@ -2677,7 +3095,7 @@ impl NativeClient {
                 paths,
                 &overrides,
                 &options,
-                || keep_running.load(Ordering::Relaxed),
+                move || keep_running.load(Ordering::Relaxed),
             )?;
             ensure!(
                 search_index
@@ -2700,24 +3118,32 @@ impl NativeClient {
             )?;
         }
 
-        Ok(format_file_search_results(
+        format_file_search_results(
+            &display_workspace,
             results,
             offset,
             search_revision,
             &query_fingerprint,
-        ))
+            &symbol_context,
+        )
     }
 
     async fn read_skill_resource(
         &self,
         settings: &SessionSettings,
+        ahead_turn_id: Option<&str>,
         arguments: Value,
+        turn_skill_resource_ids: &HashSet<String>,
     ) -> Result<String> {
         let package = arguments
             .get("package")
             .and_then(Value::as_str)
             .context("skill resource package must be a string")?;
         validate_skill_handle("package", package)?;
+        ensure!(
+            turn_skill_resource_ids.contains(package),
+            "host skill resource was not selected for this turn"
+        );
         let resource = match arguments.get("resource") {
             Some(value) => {
                 let resource =
@@ -2745,11 +3171,38 @@ impl NativeClient {
             false,
         ))
         .await?;
-        let contents = snapshot
+        let read = snapshot
             .read_package_resource(package, resource)
             .await
             .map_err(|_| anyhow!("host skill resource could not be read"))?;
-        page_skill_resource_result(resource.unwrap_or(package), &contents, cursor)
+        let response = page_skill_resource_result(
+            resource.unwrap_or(package),
+            &read.contents,
+            cursor,
+        )?;
+        if let (Some(ahead_turn_id), Some(resource_path)) =
+            (ahead_turn_id, read.relative_path.as_deref())
+        {
+            self.store.append_turn_skill_reference(
+                ahead_turn_id,
+                &crate::TurnSkillReference {
+                    skill_id: read.skill_id,
+                    skill_name: read.skill_name,
+                    scope: read.scope,
+                    resource_path: resource_path.to_string(),
+                    source_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(read.contents.as_bytes())
+                    ),
+                    response_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(response.as_bytes())
+                    ),
+                    loaded_by: "agent".to_string(),
+                },
+            )?;
+        }
+        Ok(response)
     }
 }
 
@@ -2767,7 +3220,61 @@ const AHEAD_SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const AGENT_SEARCH_PAGE_SIZE: usize = 20;
 const MAX_AGENT_SEARCH_OFFSET: usize = 5_000;
 const MAX_AGENT_SEARCH_CURSOR_BYTES: usize = 192;
+// ponytail: cap repeated LSP ancestry at eight levels to bound result tokens; raise only if real projects need deeper context.
+const MAX_AGENT_SEARCH_SYMBOL_CONTEXT_DEPTH: usize = 8;
 const MAX_SKILL_HANDLE_BYTES: usize = 2_048;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnAgentToolInput {
+    label: String,
+    message: String,
+    #[serde(default, deserialize_with = "deserialize_agent_session_id")]
+    session_id: Option<String>,
+}
+
+fn validate_spawn_agent_input(label: &str, message: &str) -> Result<()> {
+    anyhow::ensure!(
+        !label.trim().is_empty() && label.chars().count() <= 80,
+        "AHEAD spawn_agent requires a label of at most 80 characters"
+    );
+    anyhow::ensure!(
+        !message.trim().is_empty() && message.chars().count() <= 65_536,
+        "AHEAD spawn_agent requires a message of at most 65,536 characters"
+    );
+    Ok(())
+}
+
+fn deserialize_agent_session_id<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if value
+        .as_str()
+        .is_some_and(|session_id| session_id.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn subagent_tool_error(
+    session_id: &str,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "{}",
+        json!({"session_id": session_id, "error": error.to_string()})
+    )
+}
+
 const MAX_SKILL_RESOURCE_PAGE_BYTES: usize = 48 * 1024;
 const MAX_SUBAGENT_DEPTH: u8 = 1;
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 32_768;
@@ -2789,11 +3296,12 @@ fn file_search_query_fingerprint(
     workspace: &Path,
     options: &ahead_core::search::FileSearchOptions,
     include_pattern: Option<&str>,
+    exclude_pattern: Option<&str>,
     allowed_paths: Option<&[String]>,
     overrides: &HashMap<PathBuf, String>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"AHEAD file_search query v1");
+    hasher.update(b"AHEAD file_search query v2");
     update_search_hash(&mut hasher, workspace.to_string_lossy().as_bytes());
     update_search_hash(&mut hasher, options.pattern.as_bytes());
     hasher.update([
@@ -2802,6 +3310,13 @@ fn file_search_query_fingerprint(
         u8::from(options.is_regex),
     ]);
     match include_pattern {
+        Some(pattern) => {
+            hasher.update([1]);
+            update_search_hash(&mut hasher, pattern.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match exclude_pattern {
         Some(pattern) => {
             hasher.update([1]);
             update_search_hash(&mut hasher, pattern.as_bytes());
@@ -3095,12 +3610,18 @@ fn skill_matches_slash_invocation(
 fn resolve_slash_skill<'a, T>(
     skills: impl Iterator<Item = (&'a str, AgentSkillSource, &'a T)>,
     invocation: &str,
-) -> Option<&'a T> {
+) -> Result<&'a T> {
     let mut matches = skills.filter(|(name, source, _)| {
         skill_matches_slash_invocation(name, *source, invocation)
     });
-    let matched_skill = matches.next()?;
-    matches.next().is_none().then_some(matched_skill.2)
+    let matched_skill = matches.next().with_context(|| {
+        format!("Skill /{invocation} is unavailable; choose a current skill from the / menu")
+    })?;
+    ensure!(
+        matches.next().is_none(),
+        "Skill /{invocation} is ambiguous; choose a source-qualified skill from the / menu"
+    );
+    Ok(matched_skill.2)
 }
 
 fn is_native_slash_command(name: &str) -> bool {
@@ -3120,31 +3641,44 @@ fn open_buffer_overrides(
     workspace: &Path,
     allowed_paths: Option<&[String]>,
     snapshots: Vec<AgentBufferSnapshot>,
-) -> HashMap<PathBuf, String> {
-    snapshots
-        .into_iter()
-        .filter_map(|snapshot| {
-            let relative = Path::new(&snapshot.path);
-            if ahead_core::search::is_private_file(relative)
-                || allowed_paths.is_some_and(|allowed| {
-                    !path_is_allowed(&snapshot.path, allowed, workspace)
-                })
-            {
-                return None;
-            }
-            let path =
-                ahead_core::search::resolve_open_buffer_path(workspace, relative)?;
-            Some((path, snapshot.content))
-        })
-        .collect()
+) -> (
+    HashMap<PathBuf, String>,
+    HashMap<PathBuf, Vec<AgentBufferSymbol>>,
+) {
+    let mut contents = HashMap::new();
+    let mut symbols_by_path = HashMap::new();
+    for snapshot in snapshots {
+        let relative = Path::new(&snapshot.path);
+        if ahead_core::search::is_private_file(relative)
+            || allowed_paths.is_some_and(|allowed| {
+                !path_is_allowed(&snapshot.path, allowed, workspace)
+            })
+        {
+            continue;
+        }
+        let Some(path) =
+            ahead_core::search::resolve_open_buffer_path(workspace, relative)
+        else {
+            continue;
+        };
+        contents.insert(path.clone(), snapshot.content);
+        if !snapshot.symbols.is_empty() {
+            symbols_by_path.insert(path, snapshot.symbols);
+        } else {
+            symbols_by_path.remove(&path);
+        }
+    }
+    (contents, symbols_by_path)
 }
 
 fn format_file_search_results(
+    workspace: &Path,
     results: Vec<(PathBuf, Vec<ahead_core::search::FileSearchMatch>)>,
     offset: usize,
     search_revision: u64,
     query_fingerprint: &str,
-) -> String {
+    symbol_context: &HashMap<PathBuf, Vec<AgentBufferSymbol>>,
+) -> Result<String> {
     let mut output = String::new();
     let mut match_index = 0;
     let mut shown = 0;
@@ -3161,7 +3695,17 @@ fn format_file_search_results(
                 break;
             }
             if !wrote_path {
-                output.push_str(&format!("\n{}", path.display()));
+                let relative = path.strip_prefix(workspace).context(
+                    "AHEAD file_search result was outside the active workspace",
+                )?;
+                ensure!(
+                    relative.components().all(|component| matches!(
+                        component,
+                        std::path::Component::Normal(_)
+                    )),
+                    "AHEAD file_search result was outside the active workspace"
+                );
+                output.push_str(&format!("\n{}", relative.display()));
                 wrote_path = true;
             }
             let location = if line_match.end_line == line_match.line {
@@ -3175,10 +3719,51 @@ fn format_file_search_results(
                     line_match.end
                 )
             };
-            output.push_str(&format!(
-                "\n  {location} {}",
-                line_match.line_content.trim_end()
-            ));
+            let mut symbols = u32::try_from(line_match.line)
+                .ok()
+                .and_then(|line| {
+                    symbol_context.get(path).map(|symbols| {
+                        symbols
+                            .iter()
+                            .filter(|symbol| {
+                                symbol.start_line <= line && line < symbol.end_line
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default();
+            symbols.sort_by_key(|symbol| {
+                (
+                    symbol.depth,
+                    symbol.end_line.saturating_sub(symbol.start_line),
+                )
+            });
+            symbols.dedup_by_key(|symbol| symbol.depth);
+            let omitted_symbols = symbols
+                .len()
+                .saturating_sub(MAX_AGENT_SEARCH_SYMBOL_CONTEXT_DEPTH);
+            symbols.drain(..omitted_symbols);
+            if symbols.is_empty() {
+                output.push_str(&format!(
+                    "\n  {location} {}",
+                    line_match.line_content.trim_end()
+                ));
+            } else {
+                output.push_str(&format!(
+                    "\n  {location} {}  (in ",
+                    line_match.line_content.trim_end()
+                ));
+                if omitted_symbols > 0 {
+                    output.push_str("… › ");
+                }
+                for (index, symbol) in symbols.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str(" › ");
+                    }
+                    output.push_str(&symbol.name);
+                }
+                output.push(')');
+            }
             match_index += 1;
             shown += 1;
         }
@@ -3187,11 +3772,11 @@ fn format_file_search_results(
         }
     }
     if shown == 0 {
-        return if offset == 0 {
+        return Ok(if offset == 0 {
             "No matches found".to_string()
         } else {
             format!("No matches at offset {offset}")
-        };
+        });
     }
     if has_more {
         let next_offset = offset + AGENT_SEARCH_PAGE_SIZE;
@@ -3211,44 +3796,41 @@ fn format_file_search_results(
             );
         }
     }
-    output
+    Ok(output)
 }
 
 const AHEAD_DISABLED_FEATURES: &[Feature] = &[
-    Feature::Chronicle,
     Feature::CodeMode,
-    Feature::CodeModeHost,
     Feature::CodeModeInterrupt,
     Feature::CodeModeOnly,
     Feature::CodeModePrewarm,
     Feature::Collab,
-    Feature::CodexHooks,
-    Feature::EnableMcpApps,
-    Feature::ExecutorCapabilityDiscovery,
-    Feature::ExternalAgentMemoryImport,
-    Feature::Mcp20260728,
     Feature::MemoryTool,
     Feature::MultiAgentV2,
-    Feature::NetworkProxy,
     Feature::RespectSystemProxy,
-    Feature::StandaloneWebSearch,
     Feature::WebSearchCached,
     Feature::WebSearchRequest,
 ];
 
-const AHEAD_PATH_INSTRUCTION_PREFLIGHT: &str = "For concrete task target paths, inspect applicable `AGENTS.md` files from the active workspace root through each target's parent directory (or the target directory itself when it is a directory) before choosing additional project skills or taking side-effecting actions. Read only those ancestor files, outer to inner, and apply the nearest file when instructions conflict. Do not recursively scan unrelated subtrees. If targets become clear only through exploration, keep that exploration read-only and check their instruction ancestry before editing or executing code there. This model guidance does not replace AHEAD's host-enforced workspace and permission boundaries.";
+const AHEAD_MANAGED_DEVELOPER_INSTRUCTIONS: &str = concat!(
+    "For concrete task target paths, inspect applicable `AGENTS.md` files from the active workspace root through each target's parent directory (or the target directory itself when it is a directory) before choosing additional project skills or taking side-effecting actions. ",
+    "Read only those ancestor files, outer to inner, and apply the nearest file when instructions conflict. Do not recursively scan unrelated subtrees. If targets become clear only through exploration, keep that exploration read-only and check its instruction ancestry before editing. ",
+    "For any requested project-file change, call the `apply_patch` tool so AHEAD can attribute it. Shell writes are blocked and cannot be attributed; do not try them. Use AHEAD file tools to inspect source, and reserve `exec_command` for requested builds, tests, and other terminal commands that do not edit project files. Do not use MCP filesystem tools to bypass patch attribution. ",
+    "This model guidance does not replace AHEAD's host-enforced workspace and permission boundaries."
+);
 
 fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
     let mut tools = vec![
         DynamicToolSpec::Function(DynamicToolFunctionSpec {
             name: AHEAD_FILE_SEARCH_TOOL.to_string(),
-            description: "Search file contents and live unsaved editor buffers in the current AHEAD worktree with editor ignore and private-file rules. Use include_pattern to restrict paths with a glob such as src/**/*.rs; do not put a path in pattern. Results are paginated with 20 matches per page; continue with the exact cursor returned by the previous page. If the cursor is stale, restart without a cursor."
+            description: "Search file contents and live unsaved editor buffers in the current AHEAD worktree with editor ignore and private-file rules. Result paths are worktree-relative and can be passed to read_editor_buffer. Use include_pattern and exclude_pattern for optional comma-separated path globs, for example include src/**/*.rs and exclude src/generated/**; do not put paths in pattern. Results are paginated with 20 matches per page; continue with the exact cursor returned by the previous page. If the cursor is stale, restart without a cursor."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
-                    "include_pattern": { "type": "string", "description": "Optional glob for worktree-relative paths, e.g. src/**/*.rs, or paths prefixed by the worktree root name." },
+                    "include_pattern": { "type": "string", "description": "Optional comma-separated globs for worktree-relative paths, e.g. src/**/*.rs or docs/**, or paths prefixed by the worktree root name." },
+                    "exclude_pattern": { "type": "string", "description": "Optional comma-separated globs for worktree-relative paths to exclude, e.g. src/generated/**, target/**. Exclusions take precedence over include_pattern." },
                     "case_sensitive": { "type": "boolean", "default": false },
                     "whole_word": { "type": "boolean", "default": false },
                     "is_regex": { "type": "boolean", "default": false },
@@ -3257,11 +3839,12 @@ fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
                 "required": ["pattern"],
                 "additionalProperties": false
             }),
+            supports_parallel_tool_calls: true,
             defer_loading: false,
         }),
         DynamicToolSpec::Function(DynamicToolFunctionSpec {
             name: AHEAD_SKILL_RESOURCE_READ_TOOL.to_string(),
-            description: "Read a selected host skill's SKILL.md or one package-relative reference. Use the opaque package handle from that skill's <resource_access>; omit resource for its SKILL.md, or pass <package>/<relative-path>. Absolute paths and paths outside the skill package are rejected. Continue with next_cursor when a page is returned.".to_string(),
+            description: "Read a host skill selected for the current turn. Use the opaque package handle from that skill's <resource_access>; omit resource for its SKILL.md, or pass <package>/<relative-path>. Skills not loaded into this turn, absolute paths, and paths outside the skill package are rejected. Continue with next_cursor when a page is returned.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -3272,23 +3855,25 @@ fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
                 "required": ["package"],
                 "additionalProperties": false
             }),
+            supports_parallel_tool_calls: true,
             defer_loading: false,
         }),
     ];
     if include_spawn_agent {
         tools.push(DynamicToolSpec::Function(DynamicToolFunctionSpec {
             name: AHEAD_SPAWN_AGENT_TOOL.to_string(),
-            description: "Delegate a well-scoped task to a separate AHEAD-managed agent thread. The child does not inherit the conversation; include the relevant paths, requirements and constraints in message. Use session_id to continue a previous child. AHEAD keeps the child within the same workspace, permission profile and editor context.".to_string(),
+            description: "Delegate a well-scoped task to a separate AHEAD-managed agent thread. The child does not inherit the conversation; include all relevant paths, requirements and constraints in message. Avoid trivial or overlapping delegation. Use session_id to continue a previous child and send only new instructions; its prior context is retained. AHEAD keeps the child within the same workspace, permission profile and editor context.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "label": { "type": "string", "minLength": 1, "maxLength": 80 },
                     "message": { "type": "string", "minLength": 1, "maxLength": 65536 },
-                    "session_id": { "type": "string", "minLength": 1 }
+                    "session_id": { "type": ["string", "null"] }
                 },
                 "required": ["label", "message"],
                 "additionalProperties": false
             }),
+            supports_parallel_tool_calls: true,
             defer_loading: false,
         }));
     }
@@ -3298,6 +3883,7 @@ fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
                 name,
                 description,
                 input_schema,
+                supports_parallel_tool_calls: false,
                 defer_loading: false,
             })
         },
@@ -3308,10 +3894,12 @@ fn ahead_dynamic_tools(include_spawn_agent: bool) -> Vec<DynamicToolSpec> {
 fn file_changes(changes: HashMap<PathBuf, FileChange>) -> Vec<HarnessFileChange> {
     changes
         .into_iter()
-        .map(|(path, change)| HarnessFileChange {
-            path: path.to_string_lossy().into_owned(),
-            diff: match change {
-                FileChange::Update { unified_diff, .. } => unified_diff,
+        .map(|(path, change)| {
+            let (path, diff) = match change {
+                FileChange::Update {
+                    unified_diff,
+                    move_path,
+                } => (move_path.unwrap_or(path), unified_diff),
                 FileChange::Add { content } => {
                     let line_count = content.lines().count().max(1);
                     let added = content
@@ -3319,7 +3907,7 @@ fn file_changes(changes: HashMap<PathBuf, FileChange>) -> Vec<HarnessFileChange>
                         .map(|line| format!("+{line}"))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    format!("@@ -0,0 +1,{line_count} @@\n{added}")
+                    (path, format!("@@ -0,0 +1,{line_count} @@\n{added}"))
                 }
                 FileChange::Delete { content } => {
                     let line_count = content.lines().count().max(1);
@@ -3328,16 +3916,299 @@ fn file_changes(changes: HashMap<PathBuf, FileChange>) -> Vec<HarnessFileChange>
                         .map(|line| format!("-{line}"))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    format!("@@ -1,{line_count} +0,0 @@\n{deleted}")
+                    (path, format!("@@ -1,{line_count} +0,0 @@\n{deleted}"))
                 }
-            },
+            };
+            HarnessFileChange {
+                path: path.to_string_lossy().into_owned(),
+                diff,
+            }
         })
         .collect()
+}
+
+fn bounded_patch_preview(
+    call_id: String,
+    changes: HashMap<PathBuf, FileChange>,
+) -> HarnessPatchPreview {
+    const MAX_FILES: usize = 8;
+    const MAX_PATH_CHARS: usize = 256;
+    const MAX_DIFF_CHARS_PER_FILE: usize = 2_000;
+
+    fn take_chars(value: &str, limit: usize) -> (String, bool) {
+        let mut chars = value.chars();
+        let value = chars.by_ref().take(limit).collect();
+        (value, chars.next().is_some())
+    }
+
+    fn add_content_diff(
+        content: &str,
+        prefix: &str,
+        header: String,
+        limit: usize,
+    ) -> (String, bool) {
+        let (mut diff, header_truncated) = take_chars(&header, limit);
+        let mut remaining = limit.saturating_sub(diff.chars().count());
+        let mut truncated = header_truncated;
+        let mut lines = content.lines().peekable();
+        while let Some(line) = lines.next() {
+            let (bounded_prefix, prefix_truncated) = take_chars(prefix, remaining);
+            remaining -= bounded_prefix.chars().count();
+            diff.push_str(&bounded_prefix);
+            truncated |= prefix_truncated;
+            if truncated {
+                break;
+            }
+            let (bounded_line, line_truncated) = take_chars(line, remaining);
+            remaining -= bounded_line.chars().count();
+            diff.push_str(&bounded_line);
+            truncated |= line_truncated;
+            if truncated {
+                break;
+            }
+            if lines.peek().is_some() {
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                diff.push('\n');
+                remaining -= 1;
+            }
+        }
+        truncated |= lines.peek().is_some();
+        (diff, truncated)
+    }
+
+    fn bounded_diff(change: &FileChange, limit: usize) -> (String, bool) {
+        match change {
+            FileChange::Update { unified_diff, .. } => {
+                take_chars(unified_diff, limit)
+            }
+            FileChange::Add { content } => add_content_diff(
+                content,
+                "+",
+                format!("@@ -0,0 +1,{} @@\n", content.lines().count().max(1)),
+                limit,
+            ),
+            FileChange::Delete { content } => add_content_diff(
+                content,
+                "-",
+                format!("@@ -1,{} +0,0 @@\n", content.lines().count().max(1)),
+                limit,
+            ),
+        }
+    }
+
+    let mut changes = changes.into_iter().collect::<Vec<_>>();
+    changes.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut truncated = changes.len() > MAX_FILES;
+    let changes = changes
+        .into_iter()
+        .take(MAX_FILES)
+        .map(|(path, change)| {
+            let path = match &change {
+                FileChange::Update { move_path, .. } => {
+                    move_path.as_ref().unwrap_or(&path)
+                }
+                FileChange::Add { .. } | FileChange::Delete { .. } => &path,
+            };
+            let (path, path_truncated) =
+                take_chars(&path.to_string_lossy(), MAX_PATH_CHARS);
+            let (diff, diff_truncated) =
+                bounded_diff(&change, MAX_DIFF_CHARS_PER_FILE);
+            truncated |= path_truncated || diff_truncated;
+            HarnessFileChange { path, diff }
+        })
+        .collect();
+    HarnessPatchPreview {
+        call_id,
+        changes,
+        truncated,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_rollout_reader_accepts_plain_and_compressed_jsonl() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let item =
+            RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta: Default::default(),
+                git: None,
+            });
+        let line = codex_rollout::RolloutLine {
+            timestamp: "2025-01-03T12:00:00Z".to_string(),
+            ordinal: None,
+            item,
+        };
+        let content = format!("{}\n", serde_json::to_string(&line)?);
+        let plain_path = temporary.path().join("rollout-plain.jsonl");
+        std::fs::write(&plain_path, &content)?;
+        assert!(matches!(
+            read_legacy_rollout_items(&plain_path, File::open(&plain_path)?,)?
+                .as_slice(),
+            [RolloutItem::SessionMeta(_)]
+        ));
+
+        let compressed_path = temporary.path().join("rollout-compressed.jsonl.zst");
+        let compressed =
+            zstd::stream::encode_all(std::io::Cursor::new(content.as_bytes()), 1)?;
+        std::fs::write(&compressed_path, compressed)?;
+        assert!(matches!(
+            read_legacy_rollout_items(
+                &compressed_path,
+                File::open(&compressed_path)?,
+            )?
+            .as_slice(),
+            [RolloutItem::SessionMeta(_)]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_rollout_import_checks_workspace_and_keeps_turso_authoritative()
+    -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let other_workspace = tempfile::tempdir()?;
+        let thread_id_text = "9fcb24bb-b6b1-4a4d-ae16-3a8f93e5d401";
+        let thread_id = ThreadId::from_string(thread_id_text)?;
+        let session_directory =
+            workspace.path().join(".ahead/runtime/sessions/2025/01/03");
+        std::fs::create_dir_all(&session_directory)?;
+        let rollout_path =
+            session_directory.join(format!("rollout-{thread_id_text}.jsonl"));
+        let mut meta = codex_protocol::protocol::SessionMeta::default();
+        meta.id = thread_id;
+        meta.session_id = thread_id.into();
+        meta.timestamp = "2025-01-03T12:00:00Z".to_string();
+        meta.cwd = workspace.path().to_path_buf();
+        meta.model_provider = Some("mock".to_string());
+        let line = codex_rollout::RolloutLine {
+            timestamp: meta.timestamp.clone(),
+            ordinal: Some(0),
+            item: RolloutItem::SessionMeta(
+                codex_protocol::protocol::SessionMetaLine { meta, git: None },
+            ),
+        };
+        let source = format!("{}\n", serde_json::to_string(&line)?);
+        std::fs::write(&rollout_path, &source)?;
+
+        let store = Arc::new(TestHarnessStore::default());
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            store.clone(),
+            Arc::new(|_| {}),
+        )?;
+        assert!(
+            client
+                .import_legacy_thread_if_missing(
+                    thread_id,
+                    other_workspace.path(),
+                    "mock",
+                )
+                .is_err()
+        );
+        assert!(store.load_native_thread(thread_id_text)?.is_none());
+        assert_eq!(std::fs::read_to_string(&rollout_path)?, source);
+
+        client.import_legacy_thread_if_missing(
+            thread_id,
+            workspace.path(),
+            "mock",
+        )?;
+        let imported = store
+            .load_native_thread(thread_id_text)?
+            .context("legacy thread was not imported")?;
+        assert_eq!(imported.create_params["thread_id"], thread_id_text);
+        assert_eq!(imported.rollout_items.len(), 1);
+        assert!(!imported.archived);
+        assert_eq!(std::fs::read_to_string(&rollout_path)?, source);
+        client.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_rollout_lookup_requires_one_active_or_archived_candidate() -> Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let thread_id = "9fcb24bb-b6b1-4a4d-ae16-3a8f93e5d401";
+        let active = temporary
+            .path()
+            .join("sessions/2025/01/03")
+            .join(format!("rollout-{thread_id}.jsonl"));
+        std::fs::create_dir_all(active.parent().context("active parent")?)?;
+        std::fs::write(&active, "")?;
+        let candidates = legacy_rollout_candidates(temporary.path(), thread_id)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], (active, false));
+
+        let archived = temporary
+            .path()
+            .join("archived_sessions")
+            .join(format!("rollout-{thread_id}.jsonl.zst"));
+        std::fs::create_dir_all(archived.parent().context("archive parent")?)?;
+        std::fs::write(&archived, "")?;
+        assert_eq!(
+            legacy_rollout_candidates(temporary.path(), thread_id)?.len(),
+            2,
+            "active/archive ambiguity must not select a source implicitly"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_rollout_lookup_rejects_a_symlinked_session_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let target = temporary.path().join("real-sessions");
+        std::fs::create_dir(&target)?;
+        symlink(&target, temporary.path().join("sessions"))?;
+        assert!(
+            legacy_rollout_candidates(
+                temporary.path(),
+                "9fcb24bb-b6b1-4a4d-ae16-3a8f93e5d401"
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_rollout_reader_strips_ghost_snapshots_without_shifting_metadata() {
+        let mut response_item = json!({
+            "type": "response_item",
+            "payload": {"type": "ghost_snapshot"}
+        });
+        assert!(strip_legacy_ghost_snapshot_rollout_line(&mut response_item));
+
+        let mut compacted = json!({
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {"type": "ghost_snapshot"},
+                    {"type": "message"}
+                ],
+                "replacement_history_metadata": [
+                    {"source": "ghost"},
+                    {"source": "message"}
+                ]
+            }
+        });
+        assert!(!strip_legacy_ghost_snapshot_rollout_line(&mut compacted));
+        assert_eq!(
+            compacted["payload"]["replacement_history"],
+            json!([{"type": "message"}])
+        );
+        assert_eq!(
+            compacted["payload"]["replacement_history_metadata"],
+            json!([{"source": "message"}])
+        );
+    }
 
     #[test]
     fn completed_turn_removes_only_its_own_pending_inputs() {
@@ -3646,14 +4517,72 @@ mod tests {
             "approval denied"
         );
     }
+    use ahead_agent_graph_store::{AgentGraphStore, ThreadSpawnEdgeStatus};
     use ahead_rpc::ahead::{
         AgentRuntimeState, AgentTurnRequestDto, CodeAnchor, ConversationMessage,
         TaskIntent,
     };
-    use codex_agent_graph_store::{AgentGraphStore, ThreadSpawnEdgeStatus};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicUsize;
+
+    fn accept_model_post(
+        listener: &TcpListener,
+    ) -> (TcpStream, Vec<u8>, usize, usize) {
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept mock model");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound mock model read");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut buffer).expect("read mock request");
+                assert_ne!(read, 0, "mock request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + content_length {
+                    break (header_end, content_length);
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let request_line = headers.lines().next().unwrap_or_default();
+            if request_line.starts_with("GET /v1/models?")
+                || request_line.starts_with("GET /v1/models ")
+            {
+                let body = r#"{"models":[]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write mock model catalog");
+                continue;
+            }
+            assert!(
+                content_length > 0,
+                "expected a model Responses POST: {headers}"
+            );
+            return (stream, request, header_end, content_length);
+        }
+    }
 
     #[test]
     fn subagent_output_limit_preserves_utf8_and_marks_truncation() {
@@ -3735,14 +4664,27 @@ mod tests {
             ("review", AgentSkillSource::Project, &project),
         ];
 
-        assert_eq!(resolve_slash_skill(skills.into_iter(), "review"), None);
-        assert_eq!(
-            resolve_slash_skill(skills.into_iter(), "user:review"),
-            Some(&user)
+        assert!(
+            resolve_slash_skill(skills.into_iter(), "review")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
         );
         assert_eq!(
-            resolve_slash_skill(skills.into_iter(), "project:review"),
-            Some(&project)
+            resolve_slash_skill(skills.into_iter(), "user:review")
+                .expect("user skill"),
+            &user
+        );
+        assert_eq!(
+            resolve_slash_skill(skills.into_iter(), "project:review")
+                .expect("project skill"),
+            &project
+        );
+        assert!(
+            resolve_slash_skill(skills.into_iter(), "project:missing")
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
         );
     }
 
@@ -3835,9 +4777,64 @@ mod tests {
                 .get("offset")
                 .is_none()
         );
+        assert!(
+            file_search.input_schema["properties"]
+                .get("exclude_pattern")
+                .is_some()
+        );
         assert!(!child_tools.iter().any(|tool| {
             matches!(tool, DynamicToolSpec::Function(spec) if spec.name == AHEAD_SPAWN_AGENT_TOOL)
         }));
+    }
+
+    #[test]
+    fn spawn_agent_session_id_matches_zed_optional_input_behavior() {
+        for session_id in [Value::Null, json!(""), json!(" \t")] {
+            let input = serde_json::from_value::<SpawnAgentToolInput>(json!({
+                "label": "Inspect",
+                "message": "Check the implementation",
+                "session_id": session_id,
+            }))
+            .expect("blank session IDs start a new child");
+            assert_eq!(input.session_id, None);
+        }
+
+        let input = serde_json::from_value::<SpawnAgentToolInput>(json!({
+            "label": "Inspect",
+            "message": "Continue the investigation",
+            "session_id": "child-session",
+        }))
+        .expect("valid session ID resumes a child");
+        assert_eq!(input.session_id.as_deref(), Some("child-session"));
+        assert!(
+            serde_json::from_value::<SpawnAgentToolInput>(json!({
+                "label": "Inspect",
+                "message": "Continue the investigation",
+                "session_id": 42,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spawn_agent_limits_match_schema_character_counts() {
+        assert!(validate_spawn_agent_input(&"é".repeat(80), "Inspect").is_ok());
+        assert!(validate_spawn_agent_input(&"é".repeat(81), "Inspect").is_err());
+        assert!(validate_spawn_agent_input("Inspect", &"界".repeat(65_536)).is_ok());
+        assert!(
+            validate_spawn_agent_input("Inspect", &"界".repeat(65_537)).is_err()
+        );
+        assert!(validate_spawn_agent_input(" ", "Inspect").is_err());
+        assert!(validate_spawn_agent_input("Inspect", " \t").is_err());
+    }
+
+    #[test]
+    fn failed_spawn_agent_tool_response_keeps_child_session_id() {
+        let response = subagent_tool_error("child-session", "turn cancelled");
+        let response: Value = serde_json::from_str(&response.to_string())
+            .expect("failed child result is valid JSON");
+        assert_eq!(response["session_id"], "child-session");
+        assert_eq!(response["error"], "turn cancelled");
     }
 
     #[test]
@@ -3916,8 +4913,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_disables_unmanaged_mcp_telemetry_and_includes_path_preflight()
-    {
+    fn native_agent_ignores_runtime_mcp_and_telemetry_with_path_preflight() {
         let temporary = tempfile::tempdir().expect("create runtime home");
         let runtime_home = temporary.path().join("runtime");
         let workspace = temporary.path().join("workspace");
@@ -3932,7 +4928,17 @@ mod tests {
         .expect("write project memory");
         std::fs::write(
             runtime_home.join("config.toml"),
-            "[mcp_servers.unmanaged]\ncommand = \"echo\"\nargs = [\"must not launch\"]\n[otel]\nexporter = \"statsig\"\ntrace_exporter = \"statsig\"\nmetrics_exporter = \"statsig\"\nlog_user_prompt = true\n",
+            r#"
+[mcp_servers.unmanaged]
+command = "echo"
+args = ["must not launch"]
+
+[otel]
+exporter = { otlp-http = { endpoint = "https://runtime.invalid/logs", protocol = "json" } }
+trace_exporter = { otlp-http = { endpoint = "https://runtime.invalid/traces", protocol = "json" } }
+metrics_exporter = { otlp-http = { endpoint = "https://runtime.invalid/metrics", protocol = "json" } }
+log_user_prompt = true
+"#,
         )
         .expect("write runtime-home MCP config");
 
@@ -3948,22 +4954,14 @@ mod tests {
                         cwd: Some(workspace.clone()),
                         ..Default::default()
                     })
-                    .loader_overrides(codex_core::config::LoaderOverrides {
-                        ignore_project_config: true,
-                        ignore_system_config: true,
-                        ..Default::default()
-                    })
                     .build(),
             )
             .expect("load retained runtime config");
-        assert_eq!(retained_config.otel.exporter, OtelExporterKind::Statsig);
-        assert_eq!(
-            retained_config.otel.trace_exporter,
-            OtelExporterKind::Statsig
-        );
-        assert_eq!(
+        assert_ne!(retained_config.otel.exporter, OtelExporterKind::None);
+        assert_ne!(retained_config.otel.trace_exporter, OtelExporterKind::None);
+        assert_ne!(
             retained_config.otel.metrics_exporter,
-            OtelExporterKind::Statsig
+            OtelExporterKind::None
         );
         assert!(retained_config.otel.log_user_prompt);
         let config = runtime
@@ -3974,7 +4972,7 @@ mod tests {
                 None,
                 McpServerPolicy::Disabled,
             ))
-            .expect("build managed config");
+            .expect("build native agent config");
 
         assert!(config.mcp_servers.get().is_empty());
         assert_eq!(config.otel.exporter, OtelExporterKind::None);
@@ -3990,12 +4988,25 @@ mod tests {
             "managed MCP advertises only the reviewed form and URL modes"
         );
         assert!(!config.features.enabled(Feature::Collab));
-        assert!(!config.features.enabled(Feature::CodexHooks));
         assert!(!config.features.enabled(Feature::MultiAgentV2));
+        assert!(config.features.enabled(Feature::Mcp20260728));
+        assert!(config.features.enabled(Feature::ApplyPatchStreamingEvents));
+        assert_eq!(
+            config.mcp_protocol_mode(),
+            codex_mcp::McpProtocolMode::V20260728
+        );
+        assert!(config.features.enabled(Feature::CodeModeHost));
         assert!(config.features.enabled(Feature::ToolCallMcpElicitation));
         let instructions =
             config.developer_instructions.as_deref().unwrap_or_default();
-        assert!(instructions.contains(AHEAD_PATH_INSTRUCTION_PREFLIGHT));
+        assert!(instructions.contains(AHEAD_MANAGED_DEVELOPER_INSTRUCTIONS));
+        assert!(instructions.contains(
+            "For any requested project-file change, call the `apply_patch` tool so AHEAD can attribute it."
+        ));
+        assert!(
+            instructions
+                .contains("Shell writes are blocked and cannot be attributed")
+        );
         assert!(!instructions.contains("AGENTS.override.md"));
         assert!(!instructions.contains("project-memory-only-on-explicit-selection"));
 
@@ -4004,6 +5015,17 @@ mod tests {
         assert!(
             servers.is_empty(),
             "managed sessions must not gain undeclared MCP servers"
+        );
+    }
+
+    #[test]
+    fn retired_on_failure_approval_policy_is_not_accepted() {
+        assert!(
+            toml::from_str::<codex_config::config_toml::ConfigToml>(
+                "approval_policy = \"on-failure\""
+            )
+            .is_err(),
+            "retired approval policy must not deserialize"
         );
     }
 
@@ -4018,8 +5040,6 @@ mod tests {
             .expect("AHEAD settings directory");
         std::fs::write(runtime_home.join("config.toml"), "invalid = [")
             .expect("stale runtime config");
-        std::fs::write(runtime_home.join("managed_config.toml"), "invalid = [")
-            .expect("stale managed config");
         std::fs::write(
             workspace.join(".ahead/settings.toml"),
             "[ai]\nactive_connection = 'Local'\n[[ai.connections]]\nname = 'Local'\nprovider_id = 'local'\nbase_url = 'https://local.example/v1'\nmodel = 'test-model'\napi_key = 'private-token'\n",
@@ -4058,10 +5078,57 @@ mod tests {
                 "AHEAD must not inherit packaged Codex setting {retired_key}"
             );
         }
-        assert!(
-            config
-                .config_layer_stack
-                .ignore_user_and_project_exec_policy_rules()
+        assert!(config.config_layer_stack.ignore_user_exec_policy_rules());
+    }
+
+    #[test]
+    fn managed_model_manager_config_uses_the_selected_connection() {
+        let temporary = tempfile::tempdir().expect("disposable workspace");
+        let runtime_home = temporary.path().join("runtime");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&runtime_home).expect("runtime home");
+        std::fs::create_dir_all(workspace.join(".ahead"))
+            .expect("workspace settings directory");
+        std::fs::write(
+            workspace.join(".ahead/settings.toml"),
+            "[ai]\nactive_connection = 'First'\n[[ai.connections]]\nname = 'First'\nprovider_id = 'first'\nbase_url = 'https://first.example/v1'\nmodel = 'first-model'\n[[ai.connections]]\nname = 'Second'\nprovider_id = 'second'\nbase_url = 'https://second.example/v1'\nmodel = 'second-model'\n",
+        )
+        .expect("write provider settings");
+
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        let default_config = runtime
+            .block_on(NativeClient::build_config(
+                &runtime_home,
+                &workspace,
+                None,
+                None,
+                McpServerPolicy::Disabled,
+            ))
+            .expect("build active provider config");
+        let selected_config = runtime
+            .block_on(NativeClient::build_config(
+                &runtime_home,
+                &workspace,
+                Some("second-model"),
+                Some("second"),
+                McpServerPolicy::Disabled,
+            ))
+            .expect("build selected provider config");
+
+        assert_eq!(default_config.model_provider_id, "first");
+        assert_eq!(selected_config.model_provider_id, "second");
+        assert_eq!(
+            selected_config.model_provider.base_url.as_deref(),
+            Some("https://second.example/v1")
+        );
+        assert_ne!(
+            provider_fingerprint(&default_config)
+                .expect("default provider fingerprint"),
+            provider_fingerprint(&selected_config)
+                .expect("selected provider fingerprint")
         );
     }
 
@@ -4115,7 +5182,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_loads_only_opted_in_mcp_with_human_review() {
+    fn workspace_config_loads_only_opted_in_mcp_with_human_review() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let runtime_home = temporary.path().join("runtime");
         let workspace = temporary.path().join("workspace");
@@ -4209,41 +5276,8 @@ mod tests {
         let model_requests = captured_requests.clone();
         let model_server = std::thread::spawn(move || {
             for turn in 0..10 {
-                let (mut stream, _) =
-                    listener.accept().expect("accept model request");
-                stream
-                    .set_nonblocking(false)
-                    .expect("blocking model socket");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .expect("bound model read");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                let (header_end, content_length) = loop {
-                    let read = stream.read(&mut buffer).expect("read model request");
-                    assert_ne!(read, 0, "model request ended before its body");
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .expect("model request content length");
-                    if request.len() >= header_end + content_length {
-                        break (header_end, content_length);
-                    }
-                };
+                let (mut stream, request, header_end, content_length) =
+                    accept_model_post(&listener);
                 model_requests.lock().push(
                     serde_json::from_slice::<Value>(
                         &request[header_end..header_end + content_length],
@@ -4370,9 +5404,13 @@ mod tests {
             };
             assert_eq!(questions.len(), 1);
             assert_eq!(questions[0].header, "Approve MCP tool?");
-            assert!(questions[0].question.starts_with(
-                "Allow the echo MCP server to run tool \"echo\"?\nArguments: "
-            ));
+            assert!(
+                questions[0].question.starts_with(
+                    "Allow the echo MCP server to run tool \"echo\"?\nArguments: "
+                ),
+                "unexpected MCP approval question: {:?}",
+                questions[0].question
+            );
             assert!(
                 questions[0]
                     .options
@@ -4497,6 +5535,27 @@ mod tests {
                 serde_json::from_str::<Value>(line).expect("MCP arguments JSON")
             })
             .collect::<Vec<_>>();
+        let mut request_ids = calls
+            .iter()
+            .map(|call| {
+                call["request_id"]
+                    .as_u64()
+                    .expect("MCP trace records the JSON-RPC request id")
+            })
+            .collect::<Vec<_>>();
+        let recorded_calls = request_ids.len();
+        request_ids.sort_unstable();
+        request_ids.dedup();
+        assert_eq!(
+            request_ids.len(),
+            recorded_calls,
+            "each MCP request keeps its own JSON-RPC id"
+        );
+        for call in &mut calls {
+            call.as_object_mut()
+                .expect("MCP trace entry is an object")
+                .remove("request_id");
+        }
         calls.sort_by_key(|value| {
             value["params"]["arguments"]["text"]
                 .as_str()
@@ -4561,7 +5620,7 @@ mod tests {
     }
 
     #[test]
-    fn native_mcp_projection_preserves_server_owned_credentials() {
+    fn native_mcp_projection_preserves_stdio_environment() {
         let temporary = tempfile::tempdir().expect("runtime home and workspace");
         let runtime = Builder::new_multi_thread()
             .enable_all()
@@ -4578,33 +5637,25 @@ mod tests {
             .expect("build managed config");
         let manager = codex_core::McpManager::new();
 
-        for credentials in [
-            json!({ "bearer_token_env_var": "AHEAD_TEST_MCP_TOKEN" }),
-            json!({ "http_headers": { "Authorization": "Bearer test-only" } }),
-            json!({ "env_http_headers": { "Authorization": "AHEAD_TEST_MCP_AUTH" } }),
-            json!({ "oauth": { "client_id": "test-client" }, "scopes": ["read"] }),
-        ] {
-            let mut declaration = json!({ "url": "https://mcp.example.test" });
-            declaration
-                .as_object_mut()
-                .expect("MCP declaration object")
-                .extend(credentials.as_object().expect("credential object").clone());
-            let server: codex_config::McpServerConfig =
-                serde_json::from_value(declaration.clone())
-                    .expect("parse explicit MCP credentials");
-            config
-                .mcp_servers
-                .set(HashMap::from([("docs".to_string(), server.clone())]))
-                .expect("set runtime test server");
-            let effective = runtime.block_on(manager.effective_servers(&config));
-            assert_eq!(effective["docs"].config(), &server);
-            let serialized = serde_json::to_value(effective["docs"].config())
-                .expect("serialize server configuration");
-            for (name, value) in declaration.as_object().expect("declaration object")
-            {
-                assert_eq!(&serialized[name], value);
-            }
-            assert!(serialized.get("auth").is_none());
+        let declaration = json!({
+            "command": "ahead-test-mcp",
+            "args": ["--stdio"],
+            "env": { "AHEAD_TEST_MCP_TOKEN": "test-only" },
+            "env_vars": ["AHEAD_TEST_MCP_AUTH"],
+        });
+        let server: codex_config::McpServerConfig =
+            serde_json::from_value(declaration.clone())
+                .expect("parse stdio MCP config");
+        config
+            .mcp_servers
+            .set(HashMap::from([("docs".to_string(), server.clone())]))
+            .expect("set runtime test server");
+        let effective = runtime.block_on(manager.effective_servers(&config));
+        assert_eq!(effective["docs"].config(), &server);
+        let serialized = serde_json::to_value(effective["docs"].config())
+            .expect("serialize server configuration");
+        for (name, value) in declaration.as_object().expect("declaration object") {
+            assert_eq!(&serialized[name], value);
         }
     }
 
@@ -4639,11 +5690,13 @@ mod tests {
         .map(|(path, content)| AgentBufferSnapshot {
             path: path.to_string(),
             content: content.to_string(),
+            symbols: Vec::new(),
         })
         .collect();
-        let overrides =
+        let (overrides, symbols) =
             open_buffer_overrides(&workspace, Some(&["src".to_string()]), snapshots);
         assert_eq!(overrides.len(), 1);
+        assert!(symbols.is_empty());
         assert_eq!(
             overrides.get(&workspace.join("src/live.rs")),
             Some(&"unsaved".to_string())
@@ -4666,19 +5719,26 @@ mod tests {
 
         std::fs::create_dir_all(workspace.join(".ahead"))
             .expect("create private settings directory");
-        let private_overrides = open_buffer_overrides(
+        let (private_overrides, private_symbols) = open_buffer_overrides(
             &workspace,
             None,
             vec![AgentBufferSnapshot {
                 path: ".ahead/settings.toml".to_string(),
                 content: "api_key = 'secret'".to_string(),
+                symbols: vec![AgentBufferSymbol {
+                    name: "private_setting".into(),
+                    start_line: 0,
+                    end_line: 1,
+                    depth: 0,
+                }],
             }],
         );
         assert!(private_overrides.is_empty());
+        assert!(private_symbols.is_empty());
     }
 
     #[test]
-    fn buffer_snapshot_request_round_trips_through_native_client() {
+    fn buffer_snapshot_and_file_search_requests_round_trip_through_native_client() {
         let temporary = tempfile::tempdir().expect("create workspace");
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let client = Arc::new(
@@ -4695,7 +5755,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             requester
                 .runtime
-                .block_on(requester.current_buffer_snapshots("thread"))
+                .block_on(requester.current_buffer_snapshots("thread", false))
         });
         let event = event_receiver
             .recv_timeout(Duration::from_secs(5))
@@ -4703,11 +5763,13 @@ mod tests {
         let HarnessEvent::BufferSnapshotsRequested {
             acp_session_id,
             request_id,
+            include_document_symbols,
         } = event
         else {
             panic!("expected buffer snapshot request");
         };
         assert_eq!(acp_session_id, "thread");
+        assert!(!include_document_symbols);
         assert!(
             client
                 .answer_buffer_snapshots("other", &request_id, Vec::new(), None)
@@ -4716,6 +5778,7 @@ mod tests {
         let buffers = vec![AgentBufferSnapshot {
             path: "src/live.rs".into(),
             content: "unsaved".into(),
+            symbols: Vec::new(),
         }];
         client
             .answer_buffer_snapshots("thread", &request_id, buffers.clone(), None)
@@ -4732,7 +5795,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             requester
                 .runtime
-                .block_on(requester.current_buffer_snapshots("thread"))
+                .block_on(requester.current_buffer_snapshots("thread", false))
         });
         let event = event_receiver
             .recv_timeout(Duration::from_secs(5))
@@ -4762,6 +5825,16 @@ mod tests {
             .expect("create source directory");
         std::fs::write(&source, "UNSAVED_SEARCH_MARKER disk-only")
             .expect("write saved source");
+        let second_source = temporary.path().join("src/other.rs");
+        std::fs::write(&second_source, "UNSAVED_SEARCH_MARKER disk-only")
+            .expect("write second saved source");
+        std::fs::create_dir_all(temporary.path().join("src/generated"))
+            .expect("create excluded generated directory");
+        std::fs::write(
+            temporary.path().join("src/generated/artifact.rs"),
+            "UNSAVED_SEARCH_MARKER generated-only",
+        )
+        .expect("write excluded generated source");
         let requester = client.clone();
         let workspace = temporary.path().to_path_buf();
         let worker = std::thread::spawn(move || {
@@ -4775,36 +5848,134 @@ mod tests {
                     loaded_provider_fingerprint: [0; 32],
                 },
                 None,
-                json!({"pattern": "UNSAVED_SEARCH_MARKER"}),
+                json!({
+                    "pattern": "UNSAVED_SEARCH_MARKER",
+                    "include_pattern": "src/**/*.rs",
+                    "exclude_pattern": "src/generated/**"
+                }),
             ))
         });
         let event = event_receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("receive file search buffer request");
-        let HarnessEvent::BufferSnapshotsRequested { request_id, .. } = event else {
+        let HarnessEvent::BufferSnapshotsRequested {
+            request_id,
+            include_document_symbols,
+            ..
+        } = event
+        else {
             panic!("expected file search buffer request");
         };
+        assert!(include_document_symbols);
         client
             .answer_buffer_snapshots(
                 "thread",
                 &request_id,
-                vec![AgentBufferSnapshot {
-                    path: "src/live.rs".into(),
-                    content: "UNSAVED_SEARCH_MARKER editor-only".into(),
-                }],
+                vec![
+                    AgentBufferSnapshot {
+                        path: "src/live.rs".into(),
+                        content: "UNSAVED_SEARCH_MARKER editor-only first-tab"
+                            .into(),
+                        symbols: Vec::new(),
+                    },
+                    AgentBufferSnapshot {
+                        path: "src/other.rs".into(),
+                        content: "UNSAVED_SEARCH_MARKER editor-only second-tab"
+                            .into(),
+                        symbols: Vec::new(),
+                    },
+                ],
                 None,
             )
             .expect("answer file search buffer request");
         let result = worker
             .join()
             .expect("join file search worker")
-            .expect("search unsaved buffer");
+            .expect("search unsaved buffers");
         assert!(result.contains("src/live.rs"), "{result}");
+        assert!(result.contains("src/other.rs"), "{result}");
         assert!(
-            result.contains("UNSAVED_SEARCH_MARKER editor-only"),
+            result.contains("UNSAVED_SEARCH_MARKER editor-only first-tab"),
             "{result}"
         );
+        assert!(
+            result.contains("UNSAVED_SEARCH_MARKER editor-only second-tab"),
+            "{result}"
+        );
+        assert!(!result.contains("generated-only"), "{result}");
         assert!(!result.contains("disk-only"), "{result}");
+
+        for index in 0..256 {
+            std::fs::write(
+                temporary.path().join(format!("src/load-{index:03}.rs")),
+                "unrelated source\n",
+            )
+            .expect("write concurrent search workload");
+        }
+        let concurrent_searches = ["agent-one", "agent-two"]
+            .into_iter()
+            .map(|acp_session_id| {
+                let requester = client.clone();
+                let session_id = acp_session_id.to_string();
+                let worker_session_id = session_id.clone();
+                let settings = SessionSettings {
+                    cwd: temporary.path().to_path_buf(),
+                    mode_id: "read-only".into(),
+                    model: None,
+                    model_provider: None,
+                    loaded_provider_fingerprint: [0; 32],
+                };
+                let worker = std::thread::spawn(move || {
+                    requester.runtime.block_on(requester.file_search(
+                        &worker_session_id,
+                        &settings,
+                        None,
+                        json!({"pattern": "UNSAVED_SEARCH_MARKER"}),
+                    ))
+                });
+                (session_id, worker)
+            })
+            .collect::<Vec<_>>();
+        let mut search_requests = Vec::with_capacity(concurrent_searches.len());
+        for _ in 0..concurrent_searches.len() {
+            let event = event_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("receive concurrent file search snapshot request");
+            let HarnessEvent::BufferSnapshotsRequested {
+                acp_session_id,
+                request_id,
+                include_document_symbols,
+            } = event
+            else {
+                panic!("expected concurrent file search buffer request");
+            };
+            assert!(include_document_symbols);
+            search_requests.push((acp_session_id, request_id));
+        }
+        assert!(
+            search_requests
+                .iter()
+                .any(|(session, _)| session == "agent-one")
+        );
+        assert!(
+            search_requests
+                .iter()
+                .any(|(session, _)| session == "agent-two")
+        );
+        for (session_id, request_id) in search_requests {
+            client
+                .answer_buffer_snapshots(&session_id, &request_id, Vec::new(), None)
+                .expect("answer concurrent file search snapshot request");
+        }
+        for (session_id, worker) in concurrent_searches {
+            let result = worker
+                .join()
+                .expect("join concurrent file search")
+                .expect("independent managed search must complete");
+            assert!(result.contains("src/live.rs"), "{session_id}: {result}");
+            assert!(result.contains("src/other.rs"), "{session_id}: {result}");
+            assert!(result.contains("disk-only"), "{session_id}: {result}");
+        }
         client.shutdown();
     }
 
@@ -4854,38 +6025,7 @@ mod tests {
         .expect("configure local model and MCP server");
         let model_server = std::thread::spawn(move || {
             for turn in 0..3 {
-                let (mut stream, _) =
-                    listener.accept().expect("accept model request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .expect("bound model read");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                loop {
-                    let read = stream.read(&mut buffer).expect("read model request");
-                    assert_ne!(read, 0, "model request ended before its body");
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .expect("model request content length");
-                    if request.len() >= header_end + content_length {
-                        break;
-                    }
-                }
+                let (mut stream, _, _, _) = accept_model_post(&listener);
                 let events = match turn {
                     0 => vec![
                         json!({"type":"response.output_item.added","output_index":0,"item":{"id":"form-search","type":"tool_search_call","call_id":"form-search","execution":"client","arguments":{"query":tool_name,"limit":1}}}),
@@ -5058,6 +6198,10 @@ mod tests {
     #[test]
     fn managed_model_file_search_uses_live_editor_buffer() {
         let workspace = tempfile::tempdir().expect("disposable workspace");
+        let agents_doc = "AHEAD_PROJECT_PROVENANCE_20261003";
+        let agents_path = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_path, agents_doc)
+            .expect("write project instructions");
         std::fs::create_dir_all(workspace.path().join(".ahead"))
             .expect("create private settings directory");
         std::fs::create_dir_all(workspace.path().join("src"))
@@ -5071,6 +6215,8 @@ mod tests {
         let address = listener.local_addr().expect("mock model address");
         let (model_request_sender, model_request_receiver) =
             std::sync::mpsc::channel();
+        let (release_first_response, first_response_released) =
+            std::sync::mpsc::channel();
         std::fs::write(
             workspace.path().join(".ahead/settings.toml"),
             format!(
@@ -5081,38 +6227,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for turn in 0..2 {
-                let (mut stream, _) =
-                    listener.accept().expect("accept model request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .expect("bound model read");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                let (header_end, content_length) = loop {
-                    let read = stream.read(&mut buffer).expect("read model request");
-                    assert_ne!(read, 0, "model request ended before its body");
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .expect("model request content length");
-                    if request.len() >= header_end + content_length {
-                        break (header_end, content_length);
-                    }
-                };
+                let (mut stream, request, header_end, content_length) =
+                    accept_model_post(&listener);
                 requests.push(
                     serde_json::from_slice::<Value>(
                         &request[header_end..header_end + content_length],
@@ -5122,6 +6238,11 @@ mod tests {
                 model_request_sender
                     .send(turn)
                     .expect("record model request");
+                if turn == 0 {
+                    first_response_released
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release first model response");
+                }
                 let events = if turn == 0 {
                     vec![
                         json!({"type":"response.output_item.added","output_index":0,"item":{"id":"search-call","type":"function_call","call_id":"search-call","name":"file_search","arguments":""}}),
@@ -5156,10 +6277,11 @@ mod tests {
         });
 
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(TestHarnessStore::default());
         let client = Arc::new(
             NativeClient::spawn(
                 &NativeClientConfig::ahead(workspace.path().to_path_buf()),
-                Arc::new(TestHarnessStore::default()),
+                store.clone(),
                 Arc::new(move |event| {
                     if let HarnessEvent::BufferSnapshotsRequested { .. } = event {
                         event_sender.send(event).expect("send buffer request");
@@ -5180,10 +6302,42 @@ mod tests {
         let prompt_thread_id = thread_id.clone();
         let (prompt_sender, prompt_receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            drop(prompt_sender.send(
-                prompt_client.prompt(&prompt_thread_id, "Search for SEARCH_MARKER"),
-            ));
+            drop(prompt_sender.send(prompt_client.prompt_for_ahead_turn(
+                &prompt_thread_id,
+                "Search for SEARCH_MARKER",
+                "turn-file-search",
+                None,
+            )));
         });
+        assert_eq!(
+            model_request_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("managed turn did not reach the model"),
+            0,
+        );
+        let snapshot_started = std::time::Instant::now();
+        let saved_sources = loop {
+            match store.get_project_instruction_sources("turn-file-search") {
+                Ok(Some(sources)) => break sources,
+                Ok(None) if snapshot_started.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    panic!(
+                        "managed turn did not persist instructions while streaming"
+                    )
+                }
+                Err(error) => panic!("read in-flight instruction snapshot: {error}"),
+            }
+        };
+        assert_eq!(saved_sources.len(), 1);
+        assert_eq!(
+            saved_sources[0].content_sha256,
+            format!("{:x}", Sha256::digest(agents_doc.as_bytes())),
+        );
+        release_first_response
+            .send(())
+            .expect("release first model response");
         let HarnessEvent::BufferSnapshotsRequested { request_id, .. } =
             event_receiver
                 .recv_timeout(Duration::from_secs(10))
@@ -5205,10 +6359,12 @@ mod tests {
                     AgentBufferSnapshot {
                         path: "src/live.rs".into(),
                         content: "SEARCH_MARKER editor-only".into(),
+                        symbols: Vec::new(),
                     },
                     AgentBufferSnapshot {
                         path: ".ahead/settings.toml".into(),
                         content: "SEARCH_MARKER private-only".into(),
+                        symbols: Vec::new(),
                     },
                 ],
                 None,
@@ -5219,6 +6375,32 @@ mod tests {
             .expect("managed search turn timed out")
             .expect("complete managed search turn");
         let requests = server.join().expect("join local model server");
+        assert!(requests[0].to_string().contains(agents_doc));
+        assert_eq!(
+            saved_sources[0]
+                .path
+                .canonicalize()
+                .expect("saved source path"),
+            agents_path.canonicalize().expect("expected source path"),
+        );
+        assert_eq!(
+            saved_sources[0].content_sha256,
+            format!("{:x}", Sha256::digest(agents_doc.as_bytes())),
+        );
+        assert_eq!(
+            client
+                .current_project_instruction_sources(&thread_id)
+                .expect("refresh unchanged project instructions"),
+            saved_sources,
+        );
+        std::fs::write(&agents_path, "AHEAD_PROJECT_PROVENANCE_CHANGED_20261003")
+            .expect("change project instructions");
+        assert_ne!(
+            client
+                .current_project_instruction_sources(&thread_id)
+                .expect("refresh changed project instructions"),
+            saved_sources,
+        );
         assert!(
             requests[0]["tools"]
                 .as_array()
@@ -5235,7 +6417,109 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_window_override_resets_to_startup_value() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        std::fs::create_dir_all(workspace.path().join(".ahead"))
+            .expect("create private settings directory");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = listener.local_addr().expect("mock model address");
+        std::fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\n"
+            ),
+        )
+        .expect("configure local model");
+        let model_server = std::thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut stream, _, _, _) = accept_model_post(&listener);
+                let events = vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"id":format!("context-message-{turn}"),"type":"message","role":"assistant","content":[]}}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":{"id":format!("context-message-{turn}"),"type":"message","role":"assistant","content":[{"type":"output_text","text":"Context window turn complete"}]}}),
+                    json!({"type":"response.completed","response":{"id":format!("context-response-{turn}"),"end_turn":true}}),
+                ];
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+            }
+        });
+
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            Arc::new(TestHarnessStore::default()),
+            Arc::new(|_| {}),
+        )
+        .expect("start managed agent");
+        let thread_id = client
+            .new_session(
+                workspace.path(),
+                "read-only",
+                Some("gpt-5.5"),
+                Some("mock"),
+            )
+            .expect("create managed session");
+        let thread = client
+            .threads
+            .lock()
+            .get(&thread_id)
+            .cloned()
+            .expect("loaded runtime thread");
+        let startup_context_window = client
+            .runtime
+            .block_on(thread.restorable_thread_settings())
+            .model_context_window;
+
+        client
+            .prompt_for_ahead_turn(
+                &thread_id,
+                "Use the selected model context window",
+                "turn-context-window",
+                Some(120_000),
+            )
+            .expect("managed turn with model context override");
+        assert_eq!(
+            client
+                .runtime
+                .block_on(thread.restorable_thread_settings())
+                .model_context_window,
+            Some(Some(std::num::NonZeroU32::new(120_000).expect("nonzero"))),
+        );
+
+        client
+            .prompt_for_ahead_turn(
+                &thread_id,
+                "Clear the selected model context window",
+                "turn-context-window-reset",
+                None,
+            )
+            .expect("managed turn clearing the model context override");
+        assert_eq!(
+            client
+                .runtime
+                .block_on(thread.restorable_thread_settings())
+                .model_context_window,
+            startup_context_window,
+        );
+        model_server.join().expect("join local model server");
+        client.shutdown();
+    }
+
+    #[test]
     fn file_search_pages_matches_without_silent_truncation() {
+        let workspace = Path::new("/workspace");
         let matches = (0..23)
             .map(|line| ahead_core::search::FileSearchMatch {
                 line,
@@ -5246,13 +6530,22 @@ mod tests {
                 preview_match: 0..6,
             })
             .collect::<Vec<_>>();
-        let path = PathBuf::from("src/lib.rs");
+        let path = workspace.join("src/lib.rs");
         let results = vec![(path.clone(), matches.clone())];
         let query_fingerprint = "a".repeat(64);
 
-        let first =
-            format_file_search_results(results.clone(), 0, 7, &query_fingerprint);
+        let first = format_file_search_results(
+            workspace,
+            results.clone(),
+            0,
+            7,
+            &query_fingerprint,
+            &std::collections::HashMap::new(),
+        )
+        .expect("format first page");
         assert_eq!(first.matches("  ").count(), AGENT_SEARCH_PAGE_SIZE);
+        assert!(first.contains("\nsrc/lib.rs"));
+        assert!(!first.contains("/workspace"));
         assert!(first.contains("1:0-2:6 needle"));
         let encoded_cursor = first
             .split_once("cursor `")
@@ -5291,13 +6584,154 @@ mod tests {
         );
 
         let second = format_file_search_results(
+            workspace,
             vec![(path, matches)],
             AGENT_SEARCH_PAGE_SIZE,
             7,
             &query_fingerprint,
-        );
+            &std::collections::HashMap::new(),
+        )
+        .expect("format second page");
         assert_eq!(second.matches("  ").count(), 3);
         assert!(!second.contains("More matches available"));
+        assert!(
+            format_file_search_results(
+                workspace,
+                vec![(PathBuf::from("/outside/lib.rs"), results[0].1.clone())],
+                0,
+                7,
+                &query_fingerprint,
+                &std::collections::HashMap::new(),
+            )
+            .expect_err("out-of-workspace result must fail closed")
+            .to_string()
+            .contains("outside the active workspace")
+        );
+        assert!(
+            format_file_search_results(
+                workspace,
+                vec![(
+                    PathBuf::from("/workspace/../outside/lib.rs"),
+                    results[0].1.clone()
+                )],
+                0,
+                7,
+                &query_fingerprint,
+                &std::collections::HashMap::new(),
+            )
+            .expect_err("parent components must not appear in results")
+            .to_string()
+            .contains("outside the active workspace")
+        );
+    }
+
+    #[test]
+    fn file_search_results_add_open_buffer_symbol_hierarchy() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("src/lib.rs");
+        let matches = vec![ahead_core::search::FileSearchMatch {
+            line: 4,
+            start: 4,
+            end_line: 4,
+            end: 10,
+            line_content: "    needle()".into(),
+            preview_match: 4..10,
+        }];
+        let symbols = std::collections::HashMap::from([(
+            path.clone(),
+            vec![
+                AgentBufferSymbol {
+                    name: "outer".into(),
+                    start_line: 0,
+                    end_line: 20,
+                    depth: 0,
+                },
+                AgentBufferSymbol {
+                    name: "nested_fn".into(),
+                    start_line: 2,
+                    end_line: 9,
+                    depth: 1,
+                },
+            ],
+        )]);
+
+        let output = format_file_search_results(
+            workspace.path(),
+            vec![(path.clone(), matches.clone())],
+            0,
+            1,
+            &"a".repeat(64),
+            &symbols,
+        )
+        .expect("format search result");
+
+        assert!(
+            output.contains("needle()  (in outer › nested_fn)"),
+            "{output}"
+        );
+
+        let flat_symbols = vec![
+            AgentBufferSymbol {
+                name: "flat_file".into(),
+                start_line: 0,
+                end_line: 20,
+                depth: 0,
+            },
+            AgentBufferSymbol {
+                name: "flat_fn".into(),
+                start_line: 2,
+                end_line: 9,
+                depth: 0,
+            },
+        ];
+        let flat_output = format_file_search_results(
+            workspace.path(),
+            vec![(path.clone(), matches.clone())],
+            0,
+            1,
+            &"a".repeat(64),
+            &std::collections::HashMap::from([(path.clone(), flat_symbols)]),
+        )
+        .expect("format flat search result");
+        assert!(flat_output.contains("(in flat_fn)"), "{flat_output}");
+        assert!(!flat_output.contains("flat_file"), "{flat_output}");
+
+        let deep_symbols = (0..MAX_AGENT_SEARCH_SYMBOL_CONTEXT_DEPTH + 2)
+            .map(|depth| AgentBufferSymbol {
+                name: format!("level_{depth}"),
+                start_line: 0,
+                end_line: 20,
+                depth: depth as u16,
+            })
+            .collect();
+        let deep_output = format_file_search_results(
+            workspace.path(),
+            vec![(
+                workspace.path().join("src/lib.rs"),
+                vec![ahead_core::search::FileSearchMatch {
+                    line: 4,
+                    start: 4,
+                    end_line: 4,
+                    end: 10,
+                    line_content: "    needle()".into(),
+                    preview_match: 4..10,
+                }],
+            )],
+            0,
+            1,
+            &"a".repeat(64),
+            &std::collections::HashMap::from([(
+                workspace.path().join("src/lib.rs"),
+                deep_symbols,
+            )]),
+        )
+        .expect("format bounded search result");
+        assert!(
+            deep_output.contains("in … › level_2 › level_3"),
+            "{deep_output}"
+        );
+        assert!(deep_output.contains("level_9)"), "{deep_output}");
+        assert!(!deep_output.contains("level_1"), "{deep_output}");
     }
 
     #[test]
@@ -5318,8 +6752,21 @@ mod tests {
             workspace,
             &options,
             Some("src/**/*.rs"),
+            Some("src/generated/**"),
             Some(&["src".to_string()]),
             &buffers,
+        );
+
+        assert_ne!(
+            original,
+            file_search_query_fingerprint(
+                workspace,
+                &options,
+                Some("src/**/*.rs"),
+                Some("src/vendor/**"),
+                Some(&["src".to_string()]),
+                &buffers,
+            )
         );
 
         buffers.insert(
@@ -5332,6 +6779,7 @@ mod tests {
                 workspace,
                 &options,
                 Some("src/**/*.rs"),
+                Some("src/generated/**"),
                 Some(&["src".to_string()]),
                 &buffers,
             )
@@ -5344,6 +6792,7 @@ mod tests {
                 workspace,
                 &options,
                 Some("src/**/*.rs"),
+                Some("src/generated/**"),
                 Some(&["src".to_string()]),
                 &buffers,
             )
@@ -5380,38 +6829,14 @@ mod tests {
         )
     }
 
-    #[test]
-    fn bounded_legacy_rollout_loader_enforces_byte_and_record_limits() -> Result<()>
-    {
-        let directory = tempfile::tempdir()?;
-        let bytes_path = directory.path().join("bytes.jsonl");
-        std::fs::write(&bytes_path, "oversized\n")?;
-        let runtime = Builder::new_current_thread().enable_all().build()?;
-        let bytes_error = runtime
-            .block_on(RolloutRecorder::load_rollout_items_with_limits(
-                &bytes_path,
-                4,
-                10,
-            ))
-            .expect_err("oversized line must fail before parsing");
-        assert!(bytes_error.to_string().contains("byte limit"));
-
-        let records_path = directory.path().join("records.jsonl");
-        std::fs::write(&records_path, "{}\n{}\n")?;
-        let records_error = runtime
-            .block_on(RolloutRecorder::load_rollout_items_with_limits(
-                &records_path,
-                16,
-                1,
-            ))
-            .expect_err("record limit must stop rollout loading");
-        assert!(records_error.to_string().contains("record import limit"));
-        Ok(())
-    }
-
     #[derive(Default)]
     struct TestHarnessStore {
         agent_runtime_states: Mutex<HashMap<String, AgentRuntimeState>>,
+        project_instruction_sources:
+            Mutex<HashMap<String, Vec<crate::ProjectInstructionSource>>>,
+        turn_skill_sources: Mutex<HashMap<String, Vec<crate::TurnSkillSource>>>,
+        turn_skill_references:
+            Mutex<HashMap<String, Vec<crate::TurnSkillReference>>>,
         native_threads: Mutex<HashMap<String, crate::NativeThreadSnapshot>>,
         fail_native_append: AtomicBool,
         fail_native_metadata_append: AtomicBool,
@@ -5487,6 +6912,74 @@ mod tests {
             Ok(None)
         }
 
+        fn list_turn_instruction_sources(
+            &self,
+            _session_id: &str,
+            _turn_id: &str,
+        ) -> Result<Vec<crate::InstructionFileSource>> {
+            Ok(Vec::new())
+        }
+
+        fn get_project_instruction_sources(
+            &self,
+            turn_id: &str,
+        ) -> Result<Option<Vec<crate::ProjectInstructionSource>>> {
+            Ok(self
+                .project_instruction_sources
+                .lock()
+                .get(turn_id)
+                .cloned())
+        }
+
+        fn set_project_instruction_sources(
+            &self,
+            turn_id: &str,
+            sources: &[crate::ProjectInstructionSource],
+        ) -> Result<()> {
+            self.project_instruction_sources
+                .lock()
+                .insert(turn_id.to_string(), sources.to_vec());
+            Ok(())
+        }
+
+        fn set_turn_skill_sources(
+            &self,
+            turn_id: &str,
+            sources: &[crate::TurnSkillSource],
+        ) -> Result<()> {
+            self.turn_skill_sources
+                .lock()
+                .insert(turn_id.to_string(), sources.to_vec());
+            Ok(())
+        }
+
+        fn get_turn_skill_sources(
+            &self,
+            turn_id: &str,
+        ) -> Result<Option<Vec<crate::TurnSkillSource>>> {
+            Ok(self.turn_skill_sources.lock().get(turn_id).cloned())
+        }
+
+        fn append_turn_skill_reference(
+            &self,
+            turn_id: &str,
+            reference: &crate::TurnSkillReference,
+        ) -> Result<()> {
+            let mut references = self.turn_skill_references.lock();
+            let turn_references = references.entry(turn_id.to_string()).or_default();
+            if !turn_references.contains(reference) {
+                turn_references.push(reference.clone());
+            }
+            Ok(())
+        }
+
+        fn get_turn_skill_references(
+            &self,
+            turn_id: &str,
+        ) -> Result<Option<Vec<crate::TurnSkillReference>>> {
+            Ok(self.turn_skill_references.lock().get(turn_id).cloned())
+        }
+
         fn remove_turn_request(&self, _turn_id: &str) -> Result<()> {
             Ok(())
         }
@@ -5547,6 +7040,27 @@ mod tests {
             );
             anyhow::ensure!(previous.is_none(), "duplicate test thread {thread_id}");
             Ok(())
+        }
+
+        fn import_legacy_native_thread(
+            &self,
+            import: LegacyNativeThreadImport,
+        ) -> Result<bool> {
+            let mut threads = self.native_threads.lock();
+            if threads.contains_key(&import.thread_id) {
+                return Ok(false);
+            }
+            threads.insert(
+                import.thread_id,
+                crate::NativeThreadSnapshot {
+                    create_params: import.create_params,
+                    metadata_patches: Vec::new(),
+                    rollout_items: import.rollout_items,
+                    archived: import.archived_at.is_some(),
+                    archived_at: import.archived_at,
+                },
+            );
+            Ok(true)
         }
 
         fn append_native_thread_items(
@@ -5890,74 +7404,16 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_rejects_unsupported_feature_thread_sources() {
-        let temporary = tempfile::tempdir().expect("create workspace");
-        let store = Arc::new(TestHarnessStore::default());
-        let native_config =
-            NativeClientConfig::ahead(temporary.path().to_path_buf());
-        let client =
-            NativeClient::spawn(&native_config, store.clone(), Arc::new(|_| {}))
-                .expect("start native client");
-        let config = client
-            .runtime
-            .block_on(NativeClient::build_config(
-                &client.runtime_home,
-                temporary.path(),
-                None,
-                None,
-                McpServerPolicy::Disabled,
-            ))
-            .expect("load native config");
-        let mut options = StartThreadOptions::new(config);
-        options.thread_source =
-            Some(codex_protocol::protocol::ThreadSource::Feature(
-                "background-review".to_string(),
-            ));
-        let error = client
-            .runtime
-            .block_on(client.manager.start_thread(options))
-            .err()
-            .expect("feature source must not create a managed thread");
-        assert!(
-            error
-                .to_string()
-                .contains("Feature thread sources are not supported by AHEAD")
-        );
-        let thread_id = client
-            .new_session(temporary.path(), "agent", None, None)
-            .expect("create ordinary managed thread");
-        client.shutdown();
+    fn thread_source_deserialization_rejects_unknown_labels() {
+        use codex_protocol::protocol::ThreadSource;
 
-        store
-            .native_threads
-            .lock()
-            .get_mut(&thread_id)
-            .expect("persisted managed thread")
-            .create_params["thread_source"] = json!("background-review");
-        let fresh = NativeClient::spawn(&native_config, store, Arc::new(|_| {}))
-            .expect("restart native client");
-        let config = fresh
-            .runtime
-            .block_on(NativeClient::build_config(
-                &fresh.runtime_home,
-                temporary.path(),
-                None,
-                None,
-                McpServerPolicy::Disabled,
-            ))
-            .expect("load restore config");
-        let thread_id = ThreadId::from_string(&thread_id).expect("stored thread id");
-        let error = fresh
-            .runtime
-            .block_on(fresh.manager.resume_thread_by_id(thread_id, config))
-            .err()
-            .expect("feature source must not restore as a managed thread");
-        assert!(
-            error
-                .to_string()
-                .contains("Feature thread sources are not supported by AHEAD")
+        assert_eq!(
+            serde_json::from_str::<ThreadSource>("\"user\"").expect("known source"),
+            ThreadSource::User
         );
-        fresh.shutdown();
+        assert!(
+            serde_json::from_str::<ThreadSource>("\"background-review\"").is_err()
+        );
     }
 
     #[test]
@@ -6003,6 +7459,54 @@ mod tests {
             snapshot.rollout_items,
             vec![serde_json::to_value(item).expect("encode item")]
         );
+    }
+
+    #[test]
+    fn managed_thread_appends_durable_history_without_rollout_files() {
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let store = Arc::new(TestHarnessStore::default());
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            store.clone(),
+            Arc::new(|_| {}),
+        )
+        .expect("start native client");
+        let thread_id = client
+            .new_session(workspace.path(), "agent", None, None)
+            .expect("create native thread");
+        let thread = client
+            .threads
+            .lock()
+            .get(&thread_id)
+            .cloned()
+            .expect("loaded managed thread");
+
+        client
+            .runtime
+            .block_on(thread.inject_response_items(vec![
+                codex_protocol::models::ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: "Turso owns managed replay".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ]))
+            .expect("append through the managed runtime");
+
+        let snapshot = store
+            .load_native_thread(&thread_id)
+            .expect("read durable thread")
+            .expect("managed thread remains durable");
+        assert!(
+            snapshot.rollout_items.iter().any(|item| {
+                item.to_string().contains("Turso owns managed replay")
+            })
+        );
+        client.shutdown();
+        assert!(!client.runtime_home.join("sessions").exists());
     }
 
     #[test]
@@ -6305,16 +7809,13 @@ mod tests {
                         codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                     permission_profile: None,
                     active_permission_profile: None,
-                    network: None,
                     file_system_sandbox_policy: None,
                     model: "test-model".to_string(),
                     comp_hash: None,
                     personality: None,
                     collaboration_mode: None,
                     multi_agent_version: None,
-                    multi_agent_mode: None,
                     realtime_active: None,
-                    cyber_access_program: None,
                     effort: None,
                     summary: codex_protocol::config_types::ReasoningSummary::Auto,
                 },
@@ -6529,7 +8030,6 @@ mod tests {
                                 depth: 1,
                                 agent_path: None,
                                 agent_nickname: None,
-                                agent_role: None,
                             },
                         )),
                         dynamic_tools: ahead_dynamic_tools(false),
@@ -6545,6 +8045,24 @@ mod tests {
                 .dynamic_tools_for_resume(child_id)
                 .expect("read child metadata");
             assert!(is_subagent);
+            for expected in [
+                AHEAD_FILE_SEARCH_TOOL,
+                AHEAD_SKILL_RESOURCE_READ_TOOL,
+                AHEAD_READ_EDITOR_BUFFER_TOOL,
+                AHEAD_PRESENT_CODE_TOOL,
+                AHEAD_MOVE_CODE_POINTER_TOOL,
+                AHEAD_CLEAR_PRESENTATION_TOOL,
+                AHEAD_SPEAK_TEXT_TOOL,
+                AHEAD_STOP_SPEAKING_TOOL,
+            ] {
+                assert!(
+                    tools.iter().any(|tool| matches!(
+                        tool,
+                        DynamicToolSpec::Function(spec) if spec.name == expected
+                    )),
+                    "child thread is missing AHEAD tool {expected}"
+                );
+            }
             assert!(!tools.iter().any(|tool| {
                 matches!(tool, DynamicToolSpec::Function(spec) if spec.name == AHEAD_SPAWN_AGENT_TOOL)
             }));
@@ -6598,6 +8116,13 @@ mod tests {
                     content: "one\ntwo".to_string(),
                 },
             ),
+            (
+                PathBuf::from("old.rs"),
+                FileChange::Update {
+                    unified_diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
+                    move_path: Some(PathBuf::from("new.rs")),
+                },
+            ),
         ]);
         let changes = file_changes(changes);
         assert!(changes.iter().any(|change| {
@@ -6605,6 +8130,32 @@ mod tests {
         }));
         assert!(changes.iter().any(|change| {
             change.path == "README.md" && change.diff.starts_with("@@ -0,0 +1,2 @@")
+        }));
+        assert!(changes.iter().any(|change| change.path == "new.rs"));
+    }
+
+    #[test]
+    fn patch_previews_are_bounded_without_splitting_utf8() {
+        let preview = bounded_patch_preview(
+            "call-1".into(),
+            (0..9)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("{}-{index}.rs", "é".repeat(300))),
+                        FileChange::Add {
+                            content: "界".repeat(2_100),
+                        },
+                    )
+                })
+                .collect(),
+        );
+
+        assert_eq!(preview.call_id, "call-1");
+        assert_eq!(preview.changes.len(), 8);
+        assert!(preview.truncated);
+        assert!(preview.changes.iter().all(|change| {
+            change.path.chars().count() <= 256
+                && change.diff.chars().count() <= 2_000
         }));
     }
 
@@ -6680,7 +8231,7 @@ mod tests {
         assert!(
             client
                 .runtime
-                .block_on(client.current_buffer_snapshots("thread"))
+                .block_on(client.current_buffer_snapshots("thread", false))
                 .is_err()
         );
         assert!(client.pending_buffer_snapshots.lock().is_empty());
@@ -6715,36 +8266,6 @@ mod tests {
         let bytes_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model_bytes_seen = bytes_seen.clone();
         let model_server = std::thread::spawn(move || {
-            let read_request = |stream: &mut TcpStream| {
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                loop {
-                    let read = stream.read(&mut buffer).expect("read model request");
-                    assert_ne!(read, 0, "model request ended before its body");
-                    model_bytes_seen.fetch_add(read, Ordering::SeqCst);
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + content_length {
-                        return;
-                    }
-                }
-            };
             let write_response =
                 |stream: &mut TcpStream, events: Vec<(&str, serde_json::Value)>| {
                     let body = events
@@ -6762,10 +8283,10 @@ mod tests {
                 .map(|_| ())
                 };
 
-            let (mut parent_stream, _) =
-                listener.accept().expect("accept parent model request");
+            let (mut parent_stream, parent_request, _, _) =
+                accept_model_post(&listener);
             model_connections_seen.fetch_add(1, Ordering::SeqCst);
-            read_request(&mut parent_stream);
+            model_bytes_seen.fetch_add(parent_request.len(), Ordering::SeqCst);
             model_requests_seen.fetch_add(1, Ordering::SeqCst);
             let call_id = "call-ahead-cancel-child";
             let item_id = "function-ahead-cancel-child";
@@ -6820,11 +8341,9 @@ mod tests {
             .expect("write parent model response");
             drop(parent_stream);
 
-            let (mut child_stream, _) = listener
-                .accept()
-                .expect("accept active child model request");
+            let (child_stream, child_request, _, _) = accept_model_post(&listener);
             model_connections_seen.fetch_add(1, Ordering::SeqCst);
-            read_request(&mut child_stream);
+            model_bytes_seen.fetch_add(child_request.len(), Ordering::SeqCst);
             model_requests_seen.fetch_add(1, Ordering::SeqCst);
             child_active_sender
                 .send(())
@@ -6976,53 +8495,71 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_streams_code_mode_only_without_unavailable_host_tools() {
+    fn native_agent_advertises_and_dispatches_ahead_dynamic_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
         let address = listener.local_addr().expect("mock model address");
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..2 {
-                let (mut stream, _) =
-                    listener.accept().expect("accept model request");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                loop {
-                    let read = stream.read(&mut buffer).expect("read model request");
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4)
-                    else {
-                        continue;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
+            for turn in 0..4 {
+                let (mut stream, request, header_end, content_length) =
+                    accept_model_post(&listener);
+                let model_request = serde_json::from_slice::<Value>(
+                    &request[header_end..header_end + content_length],
+                )
+                .expect("model request JSON");
+                let events = if turn == 0 {
+                    let resource_access = model_request["input"]
+                        .as_array()
+                        .expect("model input messages")
+                        .iter()
+                        .filter_map(|item| item["content"].as_array())
+                        .flatten()
+                        .filter_map(|content| content["text"].as_str())
+                        .find_map(|text| {
+                            let metadata = text
+                                .split_once("<resource_access>")?
+                                .1
+                                .split_once("</resource_access>")?
+                                .0;
+                            serde_json::from_str::<Value>(metadata).ok()
                         })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + content_length {
-                        break;
-                    }
-                }
-                let body = concat!(
-                    "event: response.output_item.added\n",
-                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
-                    "event: response.output_text.delta\n",
-                    "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-ahead-test\",\"output_index\":0,\"content_index\":0,\"delta\":\"PONG\"}\n\n",
-                    "event: response.output_item.done\n",
-                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-ahead-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"PONG\"}]}}\n\n",
-                    "event: response.completed\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ahead-test\",\"end_turn\":true}}\n\n"
-                );
+                        .expect("selected skill resource locator");
+                    let package = resource_access["package"]
+                        .as_str()
+                        .expect("opaque skill package handle");
+                    let unselected_arguments = json!({
+                        "package": "host-skill:project:not-selected:00000000"
+                    })
+                    .to_string();
+                    let arguments = json!({
+                        "package": package,
+                        "resource": format!("{package}/references/guide.md")
+                    })
+                    .to_string();
+                    vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"unselected-skill-resource-call","type":"function_call","call_id":"unselected-skill-resource-call","name":"skill_resource_read","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"unselected-skill-resource-call","type":"function_call","call_id":"unselected-skill-resource-call","name":"skill_resource_read","arguments":unselected_arguments}}),
+                        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"skill-resource-call","type":"function_call","call_id":"skill-resource-call","name":"skill_resource_read","arguments":""}}),
+                        json!({"type":"response.output_item.done","output_index":1,"item":{"id":"skill-resource-call","type":"function_call","call_id":"skill-resource-call","name":"skill_resource_read","arguments":arguments}}),
+                        json!({"type":"response.completed","response":{"id":"resp-ahead-skill-call","end_turn":false}}),
+                    ]
+                } else {
+                    vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"msg-ahead-test","type":"message","role":"assistant","content":[]}}),
+                        json!({"type":"response.output_text.delta","item_id":"msg-ahead-test","output_index":0,"content_index":0,"delta":"PONG"}),
+                        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"msg-ahead-test","type":"message","role":"assistant","content":[{"type":"output_text","text":"PONG"}]}}),
+                        json!({"type":"response.completed","response":{"id":"resp-ahead-test","end_turn":true}}),
+                    ]
+                };
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -7030,11 +8567,6 @@ mod tests {
                     body
                 )
                 .expect("write model response");
-                let header_end = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .expect("model request headers")
-                    + 4;
                 let authorization = String::from_utf8_lossy(&request[..header_end])
                     .lines()
                     .find_map(|line| {
@@ -7042,11 +8574,7 @@ mod tests {
                         name.eq_ignore_ascii_case("authorization")
                             .then(|| value.trim().to_string())
                     });
-                requests.push((
-                    authorization,
-                    serde_json::from_slice::<Value>(&request[header_end..])
-                        .expect("model request JSON"),
-                ));
+                requests.push((authorization, model_request));
             }
             requests
         });
@@ -7058,17 +8586,22 @@ mod tests {
         std::fs::write(
             workspace.join(".ahead/settings.toml"),
             format!(
-                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.6-sol\"\napi_key = \"ahead-test-key\"\n"
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\napi_key = \"ahead-test-key\"\n"
             ),
         )
         .expect("write test model config");
         let skill_directory = workspace.join(".agents/skills/calendar");
-        std::fs::create_dir_all(&skill_directory).expect("create project skill");
+        let reference_directory = skill_directory.join("references");
+        std::fs::create_dir_all(&reference_directory)
+            .expect("create project skill references");
         std::fs::write(
             skill_directory.join("SKILL.md"),
             "---\nname: calendar\ndescription: Exercise project skill injection\n---\nAHEAD_PROJECT_SKILL_BODY_SENTINEL\n",
         )
         .expect("write project skill");
+        let reference_contents = "Calendar reference for nested provenance.\n";
+        std::fs::write(reference_directory.join("guide.md"), reference_contents)
+            .expect("write nested skill reference");
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(TestHarnessStore::default());
@@ -7082,7 +8615,7 @@ mod tests {
             .expect("spawn native client"),
         );
         let thread_id = client
-            .new_session(&workspace, "read-only", Some("gpt-5.6-sol"), Some("mock"))
+            .new_session(&workspace, "read-only", Some("gpt-5.5"), Some("mock"))
             .expect("create native session");
         client
             .set_scope(&thread_id, &workspace, &[], false)
@@ -7091,9 +8624,12 @@ mod tests {
         let prompt_client = client.clone();
         let prompt_thread_id = thread_id.clone();
         std::thread::spawn(move || {
-            drop(prompt_sender.send(
-                prompt_client.prompt(&prompt_thread_id, "/calendar Reply PONG"),
-            ));
+            drop(prompt_sender.send(prompt_client.prompt_for_ahead_turn(
+                &prompt_thread_id,
+                "/calendar Reply PONG",
+                "ahead-turn-skill-provenance",
+                None,
+            )));
         });
         let prompt_result =
             prompt_receiver.recv_timeout(std::time::Duration::from_secs(10));
@@ -7105,6 +8641,57 @@ mod tests {
         prompt_result
             .expect("native turn timed out")
             .expect("run native turn");
+
+        let skill_sources = store
+            .get_turn_skill_sources("ahead-turn-skill-provenance")
+            .expect("load managed skill provenance")
+            .expect("managed skill provenance was persisted");
+        assert_eq!(skill_sources.len(), 1);
+        assert_eq!(skill_sources[0].name, "calendar");
+        assert_eq!(skill_sources[0].scope, "project");
+        assert_eq!(skill_sources[0].selected_by, "human");
+        assert!(
+            skill_sources[0]
+                .skill_id
+                .starts_with("host-skill:project:calendar:")
+        );
+        assert!(
+            !skill_sources[0]
+                .skill_id
+                .contains(workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            skill_sources[0].source_sha256,
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    std::fs::read(skill_directory.join("SKILL.md"))
+                        .expect("read project skill")
+                )
+            )
+        );
+        let resource = format!("{}/references/guide.md", skill_sources[0].skill_id);
+        let expected_response =
+            page_skill_resource_result(&resource, reference_contents, None)
+                .expect("build expected nested resource response");
+        let references = store
+            .get_turn_skill_references("ahead-turn-skill-provenance")
+            .expect("load nested skill resource provenance")
+            .expect("nested skill resource provenance was persisted");
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].skill_name, "calendar");
+        assert_eq!(references[0].scope, "project");
+        assert_eq!(references[0].resource_path, "references/guide.md");
+        assert_eq!(references[0].loaded_by, "agent");
+        assert_eq!(
+            references[0].source_sha256,
+            format!("{:x}", Sha256::digest(reference_contents.as_bytes()))
+        );
+        assert_eq!(
+            references[0].response_sha256,
+            format!("{:x}", Sha256::digest(expected_response.as_bytes()))
+        );
+        assert!(!expected_response.contains(workspace.to_string_lossy().as_ref()));
 
         assert!(events.lock().iter().any(|event| {
             matches!(event, HarnessEvent::AgentDelta { text, .. } if text == "PONG")
@@ -7124,6 +8711,33 @@ mod tests {
         compact_result
             .expect("native compaction timed out")
             .expect("run native compaction");
+        let fallback_thread_id = client
+            .new_session(
+                &workspace,
+                "read-only",
+                Some("ahead-test-unknown-model"),
+                Some("mock"),
+            )
+            .expect("create unknown-model session");
+        let (fallback_sender, fallback_receiver) = std::sync::mpsc::channel();
+        let fallback_client = client.clone();
+        let fallback_prompt_thread_id = fallback_thread_id.clone();
+        std::thread::spawn(move || {
+            drop(fallback_sender.send(fallback_client.prompt(
+                &fallback_prompt_thread_id,
+                "Answer PONG using the unknown-model fallback.",
+            )));
+        });
+        let fallback_result =
+            fallback_receiver.recv_timeout(Duration::from_secs(10));
+        if fallback_result.is_err() {
+            client
+                .cancel(&fallback_thread_id)
+                .expect("cancel timed out unknown-model turn");
+        }
+        fallback_result
+            .expect("unknown-model turn timed out")
+            .expect("run unknown-model turn");
         let snapshot = store
             .load_native_thread(&thread_id)
             .expect("load persisted test thread")
@@ -7151,7 +8765,7 @@ mod tests {
             "AHEAD must not persist hosted Apps instruction state"
         );
         let requests = server.join().expect("join mock model");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 4);
         let (authorization, request) = &requests[0];
         assert_eq!(authorization.as_deref(), Some("Bearer ahead-test-key"));
         let input = request["input"].as_array().expect("model input messages");
@@ -7167,6 +8781,38 @@ mod tests {
                 .any(|text| text.contains("AHEAD_PROJECT_SKILL_BODY_SENTINEL")),
             "the selected project skill body must reach the native model request"
         );
+        let skill_prompt = texts
+            .iter()
+            .find(|text| text.contains("AHEAD_PROJECT_SKILL_BODY_SENTINEL"))
+            .expect("find injected skill prompt");
+        assert_eq!(
+            skill_sources[0].prompt_sha256,
+            format!("{:x}", Sha256::digest(skill_prompt.as_bytes()))
+        );
+        assert!(
+            requests[1]
+                .1
+                .to_string()
+                .contains("Calendar reference for nested provenance."),
+            "the native skill-resource result must reach the model's follow-up request"
+        );
+        assert!(
+            requests[1]
+                .1
+                .to_string()
+                .contains("host skill resource was not selected for this turn"),
+            "the host must deny resource reads for skills not selected in this turn"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains(
+                "This model guidance does not replace AHEAD's host-enforced workspace and permission boundaries."
+            )),
+            "the direct model request must retain AHEAD's host-boundary guidance"
+        );
+        assert!(
+            !request.to_string().contains("Codex CLI"),
+            "catalog model request must not contain Codex CLI instructions"
+        );
         assert!(texts.iter().any(|text| text.contains("Reply PONG")));
         assert!(
             texts
@@ -7174,9 +8820,9 @@ mod tests {
                 .all(|text| !text.contains("<apps_instructions>")),
             "AHEAD must not inject hosted Apps instructions"
         );
-        assert_eq!(request["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(request["model"].as_str(), Some("gpt-5.5"));
         assert!(
-            requests[1].1["input"]
+            requests[2].1["input"]
                 .as_array()
                 .expect("compaction input")
                 .iter()
@@ -7185,18 +8831,46 @@ mod tests {
                     .contains("CONTEXT CHECKPOINT COMPACTION")),
             "manual compaction should make a model request with its summary prompt"
         );
-        let tool_names = request
-            .get("tools")
-            .map(|tools| tools.as_array().expect("model tools must be an array"))
+        assert!(
+            requests[3].1.to_string().contains(
+                "You are AHEAD, an AI coding agent integrated into the AHEAD editor."
+            ),
+            "unknown model instructions must use AHEAD's default on the first request; model={:?}, instructions={:?}",
+            requests[3].1["model"],
+            requests[3].1["instructions"]
+        );
+        assert!(
+            !requests[3].1.to_string().contains("Codex CLI"),
+            "unknown model request must not contain Codex CLI instructions"
+        );
+        let tool_names = request["tools"]
+            .as_array()
             .into_iter()
             .flatten()
+            .chain(
+                request["input"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "additional_tools")
+                    .filter_map(|item| item["tools"].as_array())
+                    .flatten(),
+            )
+            .flat_map(|tool| {
+                std::iter::once(tool)
+                    .chain(tool["tools"].as_array().into_iter().flatten())
+            })
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(
             !tool_names
                 .iter()
                 .any(|name| matches!(*name, "exec" | "wait")),
-            "CodeModeOnly must not advertise tools without its host: {tool_names:?}"
+            "the direct AHEAD harness must not advertise an unavailable Code Mode host: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"skill_resource_read"),
+            "the managed runtime must advertise AHEAD's selected-skill reader; names={tool_names:?}; request={request:#?}"
         );
         client.shutdown();
         drop(client);
@@ -7211,7 +8885,7 @@ mod tests {
                 &thread_id,
                 &workspace,
                 "read-only",
-                Some("gpt-5.6-sol"),
+                Some("gpt-5.5"),
                 Some("mock"),
             )
             .expect("resume native thread from harness store");

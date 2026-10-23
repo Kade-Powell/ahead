@@ -11,6 +11,7 @@
 
         <Feature Id="ProductFeature" Title="ConsoleApp" Level="1">
             <ComponentRef Id="AheadExe"/>
+            <ComponentRef Id="AheadAskpass"/>
             <ComponentRef Id="AheadShortcut"/>
             <ComponentRef Id="ModifyPathEnv"/>
             <ComponentRef Id="ContextMenu"/>
@@ -30,6 +31,9 @@
         <DirectoryRef Id="AheadProgramFiles">
             <Component Id="AheadExe" Guid="*">
                 <File Id="AheadExeFile" Source=".\target\release-lto\ahead.exe" Name="ahead.exe" KeyPath="yes"/>
+            </Component>
+            <Component Id="AheadAskpass" Guid="*">
+                <File Id="AheadAskpassFile" Source=".\target\release-lto\ahead-askpass.exe" Name="ahead-askpass.exe" KeyPath="yes"/>
             </Component>
         </DirectoryRef>
 

@@ -42,7 +42,806 @@
 - Keep the comparison honest: Zed's team size and maturity exceed ours;
   adopt ideas at our pace, gated by the GPUI acceptance gates.
 
+## Current reference baseline
+
+- Checked 2026-10-04: the clean `../zed` checkout is at
+  `418f89714891f9d8105a3e92e60b9a7a5084d232` (2026-09-21). Feature links
+  below use this immutable revision. The extension WIT copy records its
+  provenance and Apache-2.0 terms in `ahead-extension-host/NOTICE`; individual
+  source imports retain their applicable notices. Zed's mixed-license source
+  boundary and the outstanding clean-room obligation are recorded in
+  [Decision 0006](decisions/0006-dependency-replacement-and-zed-reuse-correction.md)
+  and `TODO.md`.
+
 ## Review log
+
+- 2026-10-13: checked AHEAD's `FileWatcher` against Zed's OS watcher boundary
+  in `crates/fs/src/fs_watcher.rs`. Both route native `notify` events through a
+  tokenized watcher layer. Added a regression that creates a settings-like
+  file under a filtered non-recursive watch and waits for the native event to
+  reach AHEAD's path/token queue; the focused proxy test passed. The restricted
+  sandbox itself returned `EMFILE` when registering a watch, while the same
+  temporary-directory probe and Rust test worked with local filesystem-event
+  access. A second regression edits a real temporary workspace
+  `.ahead/config.toml` and confirms the event reaches the catalog's
+  `RefreshWorkspaceConfigurations` queue. Alongside the installed HTML-server
+  refresh smoke, this covers both sides of watcher-to-server refresh, though
+  not in one live end-to-end scenario or in rendered editor behavior.
+
+- 2026-10-13: compared AHEAD's project-search worker scheduling with Zed's
+  shared background executor in `crates/project/src/project_search.rs`. To
+  avoid per-request thread multiplication under concurrent agent searches,
+  AHEAD now uses one bounded Rayon pool per proxy process while retaining
+  per-query cancellation, ordering and result limits. The source-current search
+  suite passes 40 tests. A synthetic 10,000-file profile caps search workers at
+  13 instead of up to 104 for eight simultaneous requests, with similar but
+  slightly noisier/slower high-concurrency latency; mixed editor/agent
+  responsiveness still needs validation.
+
+- 2026-10-13: added a core regression that runs eight independent workspace
+  searches concurrently through the shared pool; all return their complete
+  256-file match sets, and the current search suite passes 41 tests. An
+  eight-request probe through one proxy `global_search` channel was canceled by
+  that endpoint's latest-query-wins behavior, so it is not a valid proxy for
+  independent agent searches. A focused `NativeClient::file_search` test now
+  runs two separate ACP session requests concurrently and verifies each gets
+  its own editor snapshot and complete results. This validates the managed
+  tool boundary without a provider, not model-issued parallel calls or mixed
+  editor/agent performance; that broader load check remains open.
+
+- 2026-10-13: reran the 10,000-file search smoke against the current integrated
+  binary with an in-process ripgrep comparison. Indexing took 5.08s; AHEAD's
+  no-hit scans took 468/490ms versus ripgrep's 403/369ms. AHEAD returned its
+  5,000-result cap in 278ms versus ripgrep's 473ms to count all 10,000 matches;
+  those last figures do different work. This single run is not a stable
+  benchmark: it identifies cold indexing and no-hit latency for follow-up, not
+  an overall performance win.
+
+- 2026-10-13: a fresh integrated-binary run on the same disposable 10,000-file
+  fixture indexed in 544ms, with 391/380ms cold/warm no-hit scans and 226ms to
+  return the capped 5,000 matches. Same-process ripgrep measured 367/408ms for
+  no-hit scans and 441ms to count all matches. This was one cache-sensitive,
+  sequential sample, and capped results differ from a full count; it is not a
+  general speedup claim. The smoke removed its temporary workspace and profile.
+
+- 2026-10-14: the current integrated binary passed the same 10,000-file smoke
+  with same-process ripgrep comparison. Indexing took 4.888s; AHEAD no-hit
+  scans took 430/393ms and returning the 5,000-result cap took 254ms. Ripgrep
+  measured 414/422ms for no-hit scans and 451ms to count all 10,000 matches.
+  This is a single cache-sensitive sequential sample, and capped results versus
+  a full count are not equivalent work; it is not a broad speedup claim.
+
+- 2026-10-14, 21:37 EDT: repeated the 10,000-file comparison against the
+  integrated binary rebuilt at 21:16. Indexing took 709ms; AHEAD no-hit scans
+  took 494/503ms versus ripgrep's 325/325ms. AHEAD returned its 5,000-result
+  cap in 367ms, while ripgrep counted all 10,000 matches in 367ms; those are
+  different workloads. This sample shows AHEAD's no-hit path about 1.5x slower
+  in this fixture, so optimize/profile that path before claiming parity. The
+  cache-sensitive single run is diagnostic, not a general performance result.
+
+- 2026-10-14, 22:00 EDT: repeated the same fixture against the 21:16 integrated
+  binary. Indexing took 885ms; AHEAD no-hit scans took 447/547ms versus
+  ripgrep's 326/341ms. AHEAD returned its 5,000-result cap in 333ms, while
+  ripgrep counted all 10,000 matches in 372ms; these are not equivalent hit
+  workloads. The inconsistent cold/warm ordering reinforces that these
+  sequential timings are diagnostic only; no-hit latency remains a profiling
+  target, not a demonstrated regression or parity claim. The smoke cleaned up
+  its disposable workspace and profile.
+
+- 2026-10-14: updated the 10,000-file smoke to warm both searchers, then
+  alternate execution order over five paired no-hit samples and report
+  medians. Against the same integrated binary, indexing took 298ms; AHEAD's
+  median no-hit scan was 484ms versus ripgrep's 342ms. AHEAD returned its
+  5,000-result cap in 250ms, while ripgrep counted all 10,000 hot matches in
+  458ms, which is different work. The paired median confirms a repeatable
+  no-hit profiling target in this fixture, not a general performance claim.
+  The smoke removed its disposable workspace and profile.
+
+- 2026-10-14: enabled grep-regex's candidate-line prefilter for ordinary
+  single-line literal queries, while retaining multiline matching for regexes
+  and literal patterns containing CR/LF. The source-current integrated binary
+  passed the 10,000-file smoke, including a new multiline-literal regression.
+  Five alternating no-hit samples measured 458ms median for AHEAD versus
+  ripgrep's 338ms; the prior paired run was 484ms versus 342ms. This is a
+  modest directional change, not a controlled before/after result, and the
+  no-hit gap remains. AHEAD returned its 5,000-result cap in 730ms while
+  ripgrep counted all 10,000 hot matches in 410ms, which is different work.
+  Indexing took 5.154s in this cache-sensitive run; continue profiling rather
+  than claiming broad search parity.
+
+- 2026-10-13: changed the cached workspace-index cold walk to the pinned
+  `ignore` crate's parallel walker, preserving ignore rules, cancellation and
+  sorted results; the lazy iterator used by interactive searches is unchanged.
+  All 40 `ahead-core` search tests pass. Five alternating samples on a
+  synthetic 10,000-small-file tree compared the old serial index walk with the
+  new parallel cached index: median 71ms versus 55ms, with identical ordered
+  file paths. The fixture was OS-cache-warm and this is one local run, so it
+  does not establish broad-workspace startup improvement. The earlier
+  lazy-listing comparison did unequal work and was discarded. The integrated
+  app compiled, then macOS again aborted before rendering at HIServices
+  initialization. Re-run the broader disposable workspace smoke before
+  claiming a general indexing win.
+
+- 2026-10-13: repeated the isolated managed Code Mode and file-attribution
+  smokes against the freshly rebuilt binary. Search/cancellation, retry after
+  Turso reopen, project `.agents/skills/` body loading, applicable `AGENTS.md`
+  hierarchy, edit-to-CodeAnchor persistence, staged Git attribution and clean
+  shutdown passed with loopback-only mock providers. These tests do not verify
+  native rendering or an authenticated provider turn.
+
+- 2026-10-13: the integrated `target/debug/ahead` binary rebuilt by the shared
+  `just dev` loop passed a disposable live Zed language-extension/LSP smoke.
+  With `AHEAD_LSP_INSTALL_MISSING=1` and
+  `AHEAD_LSP_INSTALL_ZED_HTML=1`, AHEAD queried Zed's public extension catalog,
+  installed HTML 0.3.2 into the fixture's isolated data home, and received the
+  `div` completion for `<di`. The same run acquired Vtsls and BasedPyright into
+  that isolated cache and passed TypeScript, JavaScript and Python completion,
+  definition, diagnostics/repair, semantic tokens, TypeScript import fixes and
+  auto-import, close/reopen, restart recovery, and graceful shutdown. Fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-aKhGzu`.
+  It used no model credentials or provider calls. This exercises the live
+  catalog-to-install-to-server boundary, not the rendered extension gallery or
+  editor completion insertion path. Native app startup still aborts before
+  drawing with the macOS HIServices XPC signal 6. The 11:11 EDT crash report
+  (`ahead-2026-10-13-111131.ips`) places the abort in AppKit/LaunchServices
+  registration during GPUI's `NSApplication` initialization, before AHEAD
+  renders; there is no AHEAD-owned frame in the failing stack.
+
+- 2026-10-13: repeated the managed language-server matrix against the latest
+  integrated build, with fresh acquisition enabled. Vtsls and BasedPyright
+  installed into the disposable project's cache; AHEAD also installed HTML
+  0.3.2 from Zed's live catalog. TypeScript, JavaScript, Python and Rust passed
+  completion/navigation, diagnostics and repair, semantic tokens, import
+  actions, Rust formatting/rename, restart recovery and graceful shutdown.
+  Fixture: `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-T8mhdS`.
+  This is current proxy/catalog/server evidence, not rendered completion UI or
+  extension-provided grammar highlighting.
+
+- 2026-10-13: a fresh managed-acquisition rerun against the current integrated
+  binary failed before the first TypeScript diagnostics because npm DNS returned
+  `ENOTFOUND`. Seeding a new disposable fixture from the previously verified
+  LSP cache restored the full TypeScript/JavaScript/Python/Rust matrix without
+  downloads. Completion, navigation, diagnostics/repair, semantic tokens,
+  TypeScript import actions, Rust formatting/rename, restart recovery and
+  graceful shutdown passed. New fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-mi9Ybz`.
+  This is cache-seeded proxy/server evidence; fresh npm acquisition and native
+  editor rendering remain unverified in this run.
+
+- 2026-10-13: reran the cache-seeded Rust/TypeScript/JavaScript/Python LSP
+  matrix against the shared-loop binary rebuilt at 17:49, using the previously
+  verified Zed/Vtsls/BasedPyright/Rust Analyzer cache. Completion, definitions,
+  diagnostics/repair, semantic tokens, TypeScript import fixes/resolve, Rust
+  formatting and cross-file rename, close/reopen, unsaved-buffer restart
+  recovery and graceful shutdown all passed. The same binary passed all four
+  fake-LSP shutdown modes. Disposable fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-OyDqHe`.
+  This follows Zed's installed-server lifecycle at the proxy boundary; rendered
+  editor insertion and extension-gallery UI remain separate gates.
+
+- 2026-10-14: fresh managed acquisition against the current integrated binary
+  passed the Rust/TypeScript/JavaScript/Python smoke after scoped npm access;
+  package lifecycle scripts were disabled and all caches/data stayed in the
+  disposable fixture. Coverage includes completion, navigation, semantic
+  tokens, diagnostics/repair, Rust formatting/rename, restart recovery and
+  graceful shutdown. A second disposable run fetched Zed's live extension
+  catalog, installed HTML 0.3.2 and verified HTML completion alongside the
+  TypeScript/JavaScript/Python flows. Fixtures:
+  `ahead-lsp-smoke-k0kZUx` and `ahead-lsp-smoke-UJ5Ols`. The sandboxed npm
+  attempt still failed with `ENOTFOUND`; the scoped registry run succeeded.
+  This confirms proxy, managed acquisition and catalog/install behavior, not
+  rendered editor completion or extension-gallery appearance.
+
+- 2026-10-13: the latest serial `ahead-extension-host --lib` suite passed 37
+  tests with 2 ignored when ephemeral loopback was enabled for in-process
+  fixtures. The latest edits also fixed the fixture HTTP server to read a
+  bounded full request header instead of assuming one TCP read receives it all.
+  At that point (2026-10-13), Zed's extension grammar/query assets were parsed
+  only by the host-side asset reader; the production editor/proxy path was
+  added the next day and is recorded below. Restarted
+  `just dev` against the disposable project at
+  `/private/tmp/ahead-dev-smoke.7T4vXa/project`; the integrated build passed in
+  21.54s, then macOS aborted before drawing at HIServices XPC initialization
+  (signal 6). After a scoped rustfmt check, that watcher rebuilt the current
+  source in 14.32s and encountered the same pre-render abort. Watcher session
+  90764 remains active. Native UI appearance and extension-provided syntax
+  coloring remain unverified.
+
+- 2026-10-15: compared the shipped path with Zed's
+  `crates/language/src/language_registry.rs::get_or_load_grammar`,
+  `crates/language/src/syntax_map.rs`, and
+  `crates/language/src/language.rs::build_highlight_map`. AHEAD now parses
+  installed grammar/query assets in the proxy's extension host and applies
+  returned capture ranges as themed editor decorations with stale-response
+  fencing; unlike Zed, it uses a separate parser boundary rather than registering
+  grammars in the shared language registry. Source-level route and freshness
+  tests exist, but rendered colors remain unverified. The opt-in live HTML
+  extension smoke could not resolve `api.zed.dev` (`ENOTFOUND`) and stopped
+  before installing anything.
+
+- 2026-10-12 storage-scope update: because AHEAD is pre-production, managed
+  sessions use one initial Turso schema and do not carry old rollout-file
+  compatibility. Removed the one-time JSONL importer, its path-discovery and
+  bounded-reader modules, Turso import transaction API and compatibility-only
+  tests. Thread resume now depends on the current Turso thread record. Schema
+  version checks and migration machinery remain deferred; runtime history
+  types and replay policy required by the native agent loop remain. Reaffirmed
+  2026-10-13: pre-production database work is limited to the one working initial
+  Turso schema; formal schema checks/versioning wait until production readiness.
+
+- 2026-10-20 scope clarification: retain one narrowly bounded exception to
+  Turso-only resume. If the requested thread has no Turso header, AHEAD may
+  import exactly one matching rollout from that workspace's configured runtime
+  home. Validate the thread ID and canonical workspace; reject active/archive
+  ambiguity, symlinks and out-of-root paths; bound plain and compressed input;
+  atomically persist the header and ordered replay rows in Turso; and leave the
+  source untouched. This is not a live file fallback or schema compatibility
+  layer; do not add version checks or migrations.
+
+- 2026-10-12: compared AHEAD's live Pi ACP install/turn with Zed's pinned
+  `crates/project/src/agent_registry_store.rs` and
+  `crates/agent_ui/src/agent_registry_ui.rs`. Zed opens the registry gallery
+  from cached agents, then refreshes the official ACP registry; AHEAD follows
+  the same cache-and-refresh/install shape while intentionally filtering to Pi,
+  Codex and Claude Code. The current official Pi registry item installs
+  `pi-acp@0.0.34`, not the Pi CLI. Upstream `pi-acp` starts a separate `pi`
+  executable in RPC mode and requires Pi v0.81.0+ already on `PATH`. AHEAD's
+  authenticated smoke passed using the host's Pi v0.87.1, which announced v1.2.0
+  as an update. AHEAD now checks `pi --version` when resolving an installed Pi
+  session, before installing or launching the cached ACP bridge, and gives
+  install/update guidance if the CLI is missing, fails, is unparsable or is
+  older than v0.81.0. The focused adapter tests cover a missing CLI, the
+  minimum accepted version and a rejected older version. Bridge installation
+  alone is still not presented as installing Pi. This follows Zed's separation
+  between registry adapter installation and agent launch configuration in
+  `crates/agent_servers/src/acp.rs`; no Zed source was copied for this check.
+
+- 2026-10-13: followed Zed's ACP configuration path in
+  `crates/agent_ui/src/conversation_view.rs` and
+  `crates/agent_ui/src/config_options.rs`: session config options take priority
+  over separate model/mode selectors and changes go back through
+  `set_config_option`. AHEAD uses the same ACP option-first path. The isolated
+  `curated_acp_session_model_options_offline` test verified Pi's synthetic
+  offline catalog and Claude Code's native model choices, including selection
+  updates without a provider turn. Codex first gated `session/new` on
+  authentication; with a synthetic API key, the test invoked its advertised
+  ACP `authenticate` method, then created a session and changed the model
+  option. This verifies the option/auth handshake, not a real provider login
+  or model turn.
+
+- Later on 2026-10-09: the freshly rebuilt `target/debug/ahead` binary (15:00:37)
+  passed `AHEAD_LSP_INSTALL_MISSING=1 rtk node tests/lsp-smoke.mjs` across
+  TypeScript, JavaScript, Python and Rust. AHEAD acquired the servers into the
+  isolated disposable fixture, then verified completion, navigation,
+  diagnostics/repair and semantic tokens; TypeScript quick-fix/auto-import,
+  Rust formatting/hover/signature help/references/cross-file rename,
+  close/reopen, unsaved-buffer recovery after restart and graceful shutdown
+  passed as well. The fixture and package cache remain at
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-jDE6ah`;
+  no user project data or model credentials were sent. This is live
+  proxy/server evidence, not rendered popup/navigation/Problems-view evidence.
+
+- 2026-10-09: queried Zed's public extension catalog read-only while comparing
+  AHEAD's install path with `crates/extension_host/src/extension_host.rs`.
+  Separate `provides=language-servers` and `provides=icon-themes` filters
+  returned 414 and 32 entries; the combined CSV filter returned only 2, while
+  the unfiltered catalog returned 1,000. The combined filter is an intersection,
+  so AHEAD's two filtered requests are needed to build the intended union; do
+  not combine them or fetch unrelated extension categories. Metadata only: no
+  package download, installation, or rendered AHEAD gallery was tested.
+
+- Later on 2026-10-09: the current `target/debug/ahead` binary (12:42) passed
+  `AHEAD_LSP_INSTALL_MISSING=1 AHEAD_LSP_INSTALL_ZED_HTML=1 rtk node
+  tests/lsp-smoke.mjs`. AHEAD acquired Vtsls, BasedPyright and Rust Analyzer
+  into the smoke's isolated temporary homes, then installed HTML 0.3.2 from the
+  live Zed catalog using the install/download path compared with
+  `crates/extension_host/src/extension_host.rs`. HTML completion and the full
+  Rust/TypeScript/JavaScript/Python matrix passed, including TypeScript
+  quick-fix/auto-import, unsaved-buffer recovery after server restart and
+  graceful shutdown. The fixture/cache remain at
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-mz6z4G`;
+  no global package cache or model credentials were used. This is real-server
+  proxy evidence, not native popup/Problems-view verification.
+
+- 2026-10-09: added `tests/agent-openrouter-smoke.mjs` and ran it against the
+  12:42 AHEAD binary with the user-provided OpenRouter connection. One managed
+  turn completed through OpenRouter's documented Responses endpoint, exposed a
+  streaming conversation row, and used Code Mode `file_search` to return a
+  randomly generated fixture value absent from the prompt. The test isolated
+  the trusted workspace, Turso data/runtime/user homes and private provider
+  settings under one temporary directory, then removed it. The API key was
+  written only to a mode-0600 temporary settings file and was not passed to the
+  proxy through its environment. The prompt and search result were synthetic;
+  no source or personal project data was sent. OpenRouter's [Responses API
+  documentation](https://openrouter.ai/docs/api/api-reference/responses/create-responses)
+  and [free-model page](https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b%3Afree)
+  confirm the endpoint, tool-call support and provider data-use notice. This is
+  authenticated managed-runtime evidence, not rendered chat, provider-side
+  cancellation/resume or general model compatibility proof.
+
+- 2026-10-08: compared the completion popup with the pinned Zed implementation
+  after feedback that its list obscured too much code. AHEAD's
+  `rank_completions` fuzzy-ranks matching labels/filter text and keeps the top
+  eight; the current regression asserts both ordering and the cap. Zed's
+  `crates/editor/src/code_context_menus.rs::CompletionsMenu` renders its full
+  filtered candidate set through GPUI's `uniform_list` and honors the editor's
+  completion-scrollbar setting instead of truncating it. AHEAD keeps the
+  requested compact eight-item cap at that review. The cached 15:18 app test binary passed
+  the four-test focused completion filter and the above-caret popup-render
+  regression; it includes the cap test but predates later `CodePanel` edits.
+  After a newer screenshot showed eight rows were still visually dense, the
+  source cap and regression were tightened to five, with fuzzy score preceding
+  preselect and server sort keys. The cached test evidence predates this change;
+  native rendering remains unverified while the desktop is locked.
+
+- 2026-10-07: rechecked managed CodeAnchor persistence and commit attribution
+  against current existing binaries. `tests/agent-file-attribution-smoke.mjs`
+  used a loopback-only model mock to apply a Code Mode patch and read the
+  matching session/actor/path/quote anchor back from Turso. The 22:24 GPUI test
+  runner passed the agent-anchor gutter projection test; the 18:43 proxy runner
+  passed the dispatcher GitCommit regression for AHEAD author, human committer,
+  multi-session trailers, matching-row cleanup and stale-anchor retention.
+  These are fresh managed/proxy/GPUI checks, not a single current rendered
+  gutter-to-commit run; the desktop is locked.
+
+- 2026-10-07: the `target/debug/ahead` binary built at 22:31 passed the managed
+  Code Mode smoke (delegated search, streamed tool result/continuation,
+  cancellation with a pending editor snapshot, Turso reopen, explicit retry and
+  clean shutdown) and the shutdown smoke (explicit shutdown, stdin EOF and
+  SIGKILL recovery with partial response/provenance retained and no automatic
+  replay). Current proxy tests also passed memory-index revision/safety and
+  file-backed reopen, and the GPUI composer test attached a selected project
+  `@memory` excerpt without starting a turn. These used temporary homes and
+  loopback-only mocks, with no Cargo build or authenticated provider. The
+  desktop remains locked, so this does not establish rendered chat behavior.
+
+- 2026-10-07 22:55 ET: the cached `ahead-agent` test runner (17:03, newer than
+  every file under `ahead-agent/`) passed 164 tests serially; 3 were ignored.
+  Coverage includes retained native tools, ACP lifecycle/configuration, MCP,
+  instruction loading, file-search symbol context, cancellation, Turso history
+  and CodeAnchor attribution. The existing app runner (22:24, newer than
+  `extensions_panel.rs`) passed all 7 extension-gallery tests: Zed query
+  construction, capability/API filtering, offline installed entries and mocked
+  install/reload dispatch. No live catalog request, package download, Cargo
+  build or provider request occurred. Workspace metadata still resolves to one
+  root with 68 members and no nested runtime workspace. Native rendering remains
+  unverified while the desktop is locked.
+
+- 2026-10-07 22:58 ET: the ignored ACP install regression passed using two
+  locally packed npm archives with `npm --offline`; both installed generations
+  launched and returned their expected version, without network or provider
+  access. The same source-current app test runner passed all 50
+  `session_panel::tests` and 14 `threads_panel::tests`, covering GPUI ACP model
+  options and catalog/install error state. This does not verify native OS-level
+  installation of Pi/Codex/Claude Code or an authenticated external turn.
+
+- 2026-10-07 23:04 ET: the new fresh-workspace Settings loader regression passed,
+  and the focused Settings and terminal app suites passed 29 tests each. The
+  terminal checks route platform clipboard shortcuts through the GPUI key
+  handler into a disposable shell PTY and verify copied output via the test
+  clipboard. This follows Zed's `crates/terminal_view/src/terminal_view.rs`
+  split between clipboard-aware Paste, text-only Paste Text, and Copy, plus
+  platform-specific key handling; AHEAD's corresponding paths are in
+  `ahead-app/src/terminal_panel.rs`. `just dev` rebuilt the app for the
+  approved disposable project in 11.53s, but macOS aborted before rendering
+  because the desktop session is locked and `hiservices-xpcservice` is
+  unavailable. The simulated clipboard is not evidence of native OS clipboard
+  or context-menu behavior, and the Settings test is not rendered first-open
+  acceptance.
+
+- 2026-10-07 23:07 ET: `just verify` passed offline in the user-approved
+  disposable Rust/TypeScript/JavaScript/Python project: 1 Rust test, 2
+  TypeScript/JavaScript tests and 1 Python test. Its `.ahead/` directory
+  already exists, so this is fixture verification, not first-open editor setup.
+  The new fresh-workspace Settings loader regression covers file creation, but
+  native initialization remains unverified while the desktop cannot render.
+
+- 2026-10-07 23:12 ET: the current `target/debug/ahead` binary (rebuilt by
+  `just dev` at 23:09) passed the real-server `tests/lsp-smoke.mjs` matrix with
+  Zed-cached Vtsls, BasedPyright and Rust Analyzer, without downloads or model
+  calls. TypeScript, JavaScript, Python and Rust passed proxy-level completion,
+  navigation, diagnostics/repair and supported edits; restart recovery and
+  graceful shutdown also passed. The companion `tests/lsp-shutdown-smoke.mjs`
+  passed explicit shutdown, stdin EOF, initialization disconnect and
+  unresponsive-server cleanup. These are headless proxy/server checks, not
+  rendered editor behavior.
+
+- 2026-10-07 23:14 ET: the same current binary passed
+  `tests/agent-code-mode-smoke.mjs` with a temporary project and a `127.0.0.1`
+  mock model. Delegated `file_search`, Code Mode execution/continuation,
+  cancellation while awaiting an editor snapshot, Turso reopen/retry and
+  shutdown all passed. No external provider was contacted; this is managed
+  runtime evidence, not rendered chat or authenticated-provider acceptance.
+
+- 2026-10-07 23:27 ET: the source-current app test runner built at 23:26:14
+  (newer than `terminal_panel.rs` at 23:25:34) passed all 30 `terminal` tests.
+  The new GPUI `control_c_interrupts_the_foreground_pty_process` regression
+  sends Ctrl-C through the focused terminal and confirms a foreground `sleep`
+  exits with status 130 and the shell continues. This mirrors Zed's explicit
+  Linux `ctrl-c` -> `terminal::SendKeystroke` binding in
+  `../zed/assets/keymaps/default-linux.json`. Clipboard-to-PTY paste, output
+  copyback and interactive TUI mouse reports passed in the same test group.
+  The shared `just dev` build compiled in 9.91s, then macOS aborted before
+  rendering with the locked desktop's `hiservices-xpcservice` error; its
+  watcher remains on the disposable project. Native OS clipboard and menu
+  behavior remain unverified.
+
+- 2026-10-07 23:29 ET: after pausing the shared watcher, the focused
+  `shell_osc52_copy_reaches_the_gpui_clipboard` GPUI test passed. It sends an
+  OSC 52 clipboard-write request from `/bin/sh`, exercises AHEAD's terminal
+  event pump, and reads the decoded text back from GPUI's clipboard. This
+  follows Zed's `ClipboardStore` handling in
+  `../zed/crates/terminal/src/terminal.rs`. The rebuilt app test runner passed
+  all 31 `terminal` tests, including keyboard clipboard round-trip, shell
+  interrupt, and interactive mouse reporting. Restarted the same disposable
+  `just dev` command; it rebuilt in 10.52s, then macOS aborted before rendering
+  with the locked desktop's `hiservices-xpcservice` error. Its watcher remains
+  active. Native desktop clipboard/menu rendering remains unverified.
+
+- 2026-10-07 23:32 ET: `tests/lsp-smoke.mjs` passed against the `target/debug/ahead`
+  binary rebuilt at 23:30:25, newer than the proxy/catalog/editor LSP sources.
+  Existing cached Vtsls and BasedPyright packages plus the cached Rust Analyzer
+  were supplied explicitly; no package download or provider call occurred.
+  TypeScript, JavaScript, Python and Rust completion/navigation/diagnostics,
+  TS quick-fix/auto-import, Rust formatting/cross-file rename, unsaved-buffer
+  replay after server restart, and graceful shutdown passed in a fresh
+  disposable project. This follows Zed's versioned buffer/server lifecycle in
+  `../zed/crates/project/src/lsp_store.rs`; it is proxy/server evidence, not
+  rendered popup or editor insertion acceptance. Fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-dbvif7`.
+
+- 2026-10-07 23:50 ET: normal editor changes now cross the app/proxy boundary
+  as minimal UTF-8-byte `AheadDelta` splices; opening, reloading and recovering
+  still use full snapshots. The proxy validates the base byte length, advances
+  its own buffer revision and forwards the edit to LSP. This follows Zed's
+  versioned per-server buffer snapshots and `edits_since` path in
+  `../zed/crates/project/src/lsp_store.rs::on_buffer_edited`. Focused app
+  delta-generation/resync tests and proxy apply/stale-base tests passed. The
+  freshly rebuilt `target/debug/ahead` at 23:49:46 passed
+  `tests/lsp-smoke.mjs` for TypeScript, JavaScript, Python and Rust through the
+  incremental notification path, including diagnostics, completion, navigation,
+  formatting, rename, close/reopen and server restart. Existing cached language
+  servers were used; the smoke made no downloads or provider calls. This is
+  real-server protocol evidence, not rendered editor popup/insertion acceptance.
+  Disposable fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-qRlPic`.
+
+- 2026-10-06: `tests/agent-file-attribution-smoke.mjs` passed a headless
+  managed turn where a scripted local Responses provider used Code Mode `exec`
+  to invoke nested `tools.apply_patch`; the file changed and its CodeAnchor was
+  read back from Turso with the expected session, actor, path and quote. This
+  used the existing `target/debug/ahead` binary, which predates a later
+  `native_client.rs` edit, so it is not current-source acceptance or proof of
+  the rendered gutter-to-commit flow. Zed keeps structured buffer edits in
+  `crates/agent/src/tools/edit_session.rs::agent_edit_buffer` separate from
+  terminal execution in `crates/agent/src/tools/terminal_tool.rs`; AHEAD still
+  needs exact-delta attribution for supported shell/MCP/generator writes if
+  those effects are to receive anchors. See the actionable gap in `TODO.md`.
+
+- 2026-10-08: wired the existing proxy semantic-token route into CodePanel's
+  independent gpui-kit decoration collection. Requests are debounced and
+  rejected when the editor generation, path, or byte length has changed;
+  standard LSP token names map to the active gpui-kit syntax theme. Three
+  focused tests passed for type/scope mapping, UTF-8/malformed ranges, and the
+  proxy request/response route. The rebuilt app binary also passed semantic
+  token requests from Zed-cached Vtsls for TypeScript/JavaScript, BasedPyright
+  and Rust Analyzer through `tests/lsp-smoke.mjs`, with no downloads or model
+  calls. This borrows Zed's stale-result discipline in
+  `../zed/crates/editor/src/semantic_tokens.rs` while keeping AHEAD's existing
+  LSP proxy as the provider boundary. `just dev` compiled the current app, but
+  macOS aborted before rendering on the locked desktop's invalid
+  `hiservices-xpcservice` connection, so rendered semantic coloring remains
+  unverified.
+
+- 2026-10-08: reran the source-matched app terminal suite; all 31
+  terminal-filtered tests passed. The GPUI shortcut-to-clipboard-to-PTY paste
+  test executes a pasted command exactly once in disposable `/bin/sh`, then
+  copies the output back through GPUI's clipboard. OSC 52, Ctrl-C and
+  interactive TUI mouse reports also pass. This follows Zed's clipboard and
+  platform-key routing in `../zed/crates/terminal_view/src/terminal_view.rs`;
+  native OS clipboard and context-menu behavior remain unverified because the
+  locked desktop aborts AHEAD before rendering.
+
+- 2026-10-06: the exact shared `just dev` build passed
+`tests/lsp-smoke.mjs` against Zed's already-installed Vtsls, BasedPyright and
+Rust Analyzer binaries; a command-scoped `PATH`/Rust Analyzer override
+avoided downloads. TypeScript passed completion, definition, diagnostics,
+quick-fix and resolved auto-import; JavaScript shared Vtsls; Python passed
+completion, definition and diagnostics/repair; Rust passed completion,
+definition, hover, signature help, references, cross-file rename edits,
+formatting and diagnostics/repair. All three servers restarted with unsaved
+snapshots and shut down cleanly. This is current-source proxy/protocol
+evidence, not rendered completion acceptance or native workspace-edit
+application. The `just dev` binary compiled, but its GUI launch aborted with
+macOS `hiservices-xpcservice` while the desktop was locked.
+
+- 2026-10-07: revalidated the language-server protocol smoke against
+`target/debug/ahead` rebuilt by the 22:31 shared `just dev` loop. One combined
+TypeScript/JavaScript, Python and Rust run passed in a disposable workspace
+using Zed-cached Vtsls, BasedPyright and Rust Analyzer. Checks covered
+completion, navigation, diagnostics/repair, TypeScript import resolution,
+formatting and rename where supported, unsaved-snapshot recovery across restart,
+and graceful shutdown. No servers were installed and no provider was contacted.
+This is fresh proxy/protocol evidence only; rendered editor insertion,
+diagnostics UI and native workspace-trust interaction remain unverified while
+macOS is locked. Workspace: `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-MwcTIE`.
+
+- 2026-10-06: re-ran `tests/editor-recovery-smoke.mjs` against the current
+  shared-dev `target/debug/ahead` binary. Acknowledged Unicode edits survived
+  SIGKILL; a second process could not steal a live owner's recovery rows;
+  explicit discard and stale-revision fencing survived restart; and the new
+  and reopened Turso database remained owner-only (`0600`). The disposable
+  project is retained at
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-recovery-smoke-LAJVHw`.
+  This verifies the proxy/process boundary, not the rendered startup,
+  overwrite-confirmation or restore flow in GPUI.
+
+- 2026-10-06: model visibility settings now render one virtual GPUI
+  `uniform_list` grouped by provider. Provider sections start collapsed; each
+  provider's discovered and configured models are shown only when expanded,
+  and hidden IDs are saved and applied within that provider. Models stay visible
+  by default. The serial `cargo test -p ahead-app --lib model` run passed all
+  17 matching tests, including grouping/filtering, discovery metadata, stale
+  response handling, reload coalescing and repaired-config warning behavior.
+  The native visual/performance check remains open because the desktop is
+  locked; source and GPUI test evidence do not establish rendered scrolling.
+
+- 2026-10-07: rebuilt the app test target from current source and reran the
+  model settings coverage serially: all 24 settings-panel tests, all 7
+  model-picker tests and all 18 tests matching `model` passed. The test build
+  also compiled the current session-panel changes. Provider-specific hidden
+  model preferences remain independent, models show by default, and both the
+  settings rows and picker menu use virtualized lists. Native scrolling and
+  toggle interaction remain unverified while the desktop is locked.
+
+- 2026-10-07: the model-list viewport uses GPUI Base's `ScrollableMask` to
+  capture wheel input before the Settings page's virtual `List` can consume it.
+  The prior bubble-phase `on_scroll_wheel` handler was too late, and its test
+  checked only the offset within the current page item, missing movement to a
+  different item. The regression now uses a scrollable 10-item page and checks
+  both item index and item offset. This intermediate capture-phase approach
+  was replaced by the bubble-phase containment fix documented below; its rebuilt
+  regression now passes. Native verification remains open. The vertical mask
+  chained to the Settings page when the model list reached its scroll edge.
+  The Settings page header is already hidden in source through gpui-kit
+  `SettingPage::header_style(hidden)`; the screenshot's title and subtitle do
+  not come from the current SettingsPanel content. Confirm that with a rebuilt
+  native render before making another header change.
+
+- 2026-10-07: investigated the nested-scroll repro against pinned
+  `gpui-base` 0.6.6. `ScrollableMask` captures before an ancestor `List`, but
+  deliberately chains vertical wheel input at the inner scroll edge. AHEAD's
+  model settings instead need contained scrolling, so a small local boundary
+  guard supplements `ScrollableMask` and consumes that handoff. The GPUI test
+  now covers the edge; a rebuilt run and native render are still needed.
+
+- 2026-10-07 follow-up: removed the custom shifted hitbox and manual scroll
+  offset handling. The model viewport now lets `uniform_list` process the
+  wheel event, then calls `stop_propagation` in bubble phase so the Settings
+  page cannot consume the same gesture, even at either list edge. This follows
+  Zed GPUI's event ordering in `../zed/crates/gpui/src/elements/list.rs`, where
+  child scroll handlers run before the ancestor list. The rebuilt, locked,
+  offline GPUI regression passes for rows, switches, page movement, and list
+  limits. Native wheel/drag behavior remains unverified because the disposable
+  `just dev` app repeatedly aborts at macOS `com.apple.hiservices-xpcservice`
+  with “Connection Invalid” (signal 6).
+  A subsequent locked/offline rebuild from the latest `settings_panel.rs`
+  passed the nested-scroll test, all 27 Settings tests, and all 7 model-picker
+  tests; five empty-state GPUI click/hit tests also passed against that rebuilt
+  app runner. The Settings-page heading is already hidden in source. These
+  headless checks still do not verify native wheel behavior or appearance.
+- 2026-10-07: the rebuilt app test runner also passed all 44
+  `session_panel::tests`, covering model discovery/selection, provider-scoped
+  visibility, slash-command and skill filtering/insertion, composer input,
+  ACP option controls and chat rendering. The source-current extension-host
+  runner passed 26 tests (2 ignored), and its opt-in installed Proto package
+  smoke passed separately. These remain headless tests, not rendered native
+  acceptance.
+
+- 2026-10-07: ran the current app test binary directly for the slash-command
+  picker; all 10 matching GPUI tests passed. The binary is newer than
+  `session_panel.rs`; this covers typed filtering, skill metadata, mouse and
+  keyboard selection, insertion and Escape without sending. Native picker use
+  and a provider-backed skill turn remain separate checks.
+
+- 2026-10-07: a fresh copy of `tests/fixtures/editor-smoke/` at
+  `/private/tmp/ahead-editor-smoke.hmqu87/project` passed offline `just verify`
+  (Rust 1/1, TypeScript/JavaScript 2/2, Python 1/1). This proves the fixture's
+  local tests only; it has not yet been opened in AHEAD or initialized with
+  `.ahead/`.
+
+- 2026-10-07: after threading extension IDs through the restart notification,
+  the current-source extension-host suite passed 25 tests (2 ignored), the
+  proxy catalog suite passed 22 (1 ignored), and the pending-resolution
+  invalidation regression passed. A fresh no-run build compiled app, RPC,
+  proxy and extension-host tests. The full proxy suite has not been rerun after
+  this protocol change; an earlier broad run had 10 local-socket failures in
+  the restricted test environment.
+
+- 2026-10-07: dependency inspection found all 52 remaining `codex-*` packages
+  in AHEAD's normal dependency closure, so no crate-level removal is justified
+  by reachability alone. The managed runtime injects `TursoThreadStore` and
+  `TursoAgentGraphStore`; only `ahead-proxy` declares `libsql`, and production
+  Core has no rollout-file writer. The guarded JSONL reader is for legacy
+  import only. The root app and Code Mode host both exclude
+  `opentelemetry-otlp`; session event metadata and W3C trace propagation remain
+  without a Codex exporter.
+
+- 2026-10-06: the serial current `ahead-app --lib` suite passed 248 tests when
+  excluding only two shared-session integration tests, which are a separate
+  multiplayer milestone. The unfiltered run also found a lock-contention test
+  fixture that omitted the matching endpoint for its workspace API key; after
+  fixing the fixture, that test passed all five GPUI seeds. The remaining
+  shared-session failures are recorded under Multiplayer in `TODO.md`.
+
+- 2026-10-05: refreshed current-source managed-agent and live editor evidence.
+  The shared `just dev` binary was newer than the changed native-agent and
+  language-server catalog sources. `tests/agent-code-mode-smoke.mjs` passed
+  against that binary with a disposable loopback model, covering a managed
+  Code Mode `exec`, delegated project search, model continuation, cancellation,
+  retry after Turso reopen and clean shutdown. In the running GPUI app on the
+  disposable multi-language fixture, restarting language servers and invoking
+  completion produced a Rust completion menu. The terminal's `rust-analyzer`
+  is a broken rustup shim, and the AHEAD language-server cache has no managed
+  Rust Analyzer binary; the menu does not prove which executable served it or
+  that the acquisition fallback ran. A temporary Rust type error rendered
+  the expected inline diagnostic; the editor buffer was restored and the
+  fixture's tracked file remained unchanged. Vtsls reached Ready and rendered a
+  TypeScript member-completion popup for the imported `doubled` function.
+  Opening Python installed BasedPyright into AHEAD's cache; it reached Ready,
+  rendered an undefined-name diagnostic, and showed semantic Python attribute
+  completions while typing. F12 opened `arithmetic.py` at `double`, and
+  Shift+F12 showed references spanning the Python source and test files.
+  Temporary test edits were undone and the fixture was confirmed clean. AHEAD
+  now adds F2 and Editor-menu Rename Symbol, stages the new name inline after
+  `prepare_rename`, then routes the server's `WorkspaceEdit` through an
+  all-target preflight for workspace containment, open-document versions,
+  editor text, overlapping ranges and shared-buffer write policy. File/resource
+  operations are rejected before mutation; code actions remain restricted to
+  the active file. The current `just dev` app target compiled against the
+  disposable fixture. Focused rename/preflight tests could not start because
+  the macOS Data volume is full (252 MiB available; `target` is 71 GiB), and the
+  native window exposed only menu chrome to accessibility inspection, so this
+  is not rendered UI acceptance. Re-run the focused tests after safe disk
+  cleanup and verify F2/Enter/Escape plus a multi-file rename in the fixture.
+  On 2026-10-08, AHEAD's manual completion trigger was wired through the same
+  named `ShowCompletions` action and `ctrl-space` binding used by Zed's
+  `crates/editor/src/actions.rs` and default macOS/Linux keymaps. The focused
+  GPUI regression confirms one request with the active file, prefix and caret;
+  the existing null-response/retry regression confirms a returned item opens
+  the completion menu. Native keypress/rendered verification is still open:
+  Zed notes macOS may reserve Ctrl+Space, and this desktop is currently locked.
+  Shift+Alt+F invoked Vtsls document formatting and changed a temporary
+  `value*2` to `value * 2`; the test edit was restored and the TypeScript file
+  remained clean on disk. Still trace Rust executable provenance, test Rust
+  navigation, and test Python formatting with an installed formatter. The
+  Code Mode smoke uses a local mock and is not authenticated-provider or
+  multi-tool GPUI evidence.
+
+- 2026-10-05: compared the managed `spawn_agent` input/output contract with
+  pinned Zed's
+  [`SpawnAgentToolInput` and `SpawnAgentToolOutput`](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/tools/spawn_agent_tool.rs).
+  AHEAD now treats omitted, null or blank `session_id` as a new child and
+  preserves the created child ID in structured error output, allowing a later
+  retry to resume it. The existing single AHEAD tool still creates/resumes
+  through `ThreadManager` and Turso rather than exposing a parallel cohort tool
+  alias. Delegation guidance also follows Zed's self-contained/non-overlapping
+  task and concise-follow-up guidance. This follows Zed's single-tool surface;
+  Codex MultiAgentV2's separate wait/message/follow-up/interrupt/list tools are
+  not exposed as parallel aliases solely for upstream parity; their compatible
+  handler/control behavior remains a candidate to adapt if AHEAD's concurrent
+  workflows require it. The user has directed us to reuse retained Codex
+  implementations and adapt their effects to AHEAD, not rewrite equivalent
+  tools. AHEAD currently reuses Codex Core dispatch and thread execution with
+  its narrow Turso/editor-policy adapter. The
+  focused regressions and full
+  locked/offline agent-library suite pass (158 passed, 3 ignored); rendered app
+  behavior remains a separate gate.
+
+- 2026-10-05: a follow-up source trace found that AHEAD's
+  `ahead-agent/src/native_client.rs::consume_turn` awaited each dynamic client
+  tool inline, serializing multiple model-issued `spawn_agent` calls. The host
+  now uses Codex Core's in-flight `FuturesOrdered` pattern from
+  `ahead-agent-engine/core/src/session/turn.rs::try_run_sampling_request`
+  to poll calls concurrently while returning responses in request order. The
+  existing Turso spawn/resume regression now gates two child model responses
+  until both requests arrive. Formatting, diff checks and locked/offline Cargo
+  metadata pass; that test and native rendered behavior still need verification
+  through the shared development loop.
+
+- 2026-10-04: compared opening a changed file with Zed's
+  `crates/git_ui/src/git_panel.rs` (`open_selected_entry_on_click` and
+  `open_diff`). AHEAD's changed-file row now opens the file, scrolls to its
+  first changed line and expands the anchored hunk review card after Git
+  metadata loads, including when that hunk is below the initial viewport. This
+  reuses the existing editor preview instead of adding a second diff surface;
+  it is not Zed's inserted inline diff rows. The focused GPUI regression uses
+  a line-40 hunk and asserts scrolling
+  (`source_control_open_expands_first_git_hunk_after_refresh`). Native
+  rendering remains unverified while macOS is locked. Deleted-file rows still
+  reach the regular missing-file error page; a Zed-like deleted diff needs the
+  old blob from HEAD rather than a live-buffer read.
+
+- 2026-10-04: followed Zed's ACP `default_config_options` handling in
+  `../zed/crates/agent_servers/src/acp.rs` through the AHEAD composer controls.
+  A GPUI interaction regression selects a second advertised model and toggles
+  an advertised boolean option, asserting the exact ACP requests and that both
+  acknowledgements clear the pending state. This verifies the fake-proxy UI
+  path, not an installed provider or the rendered desktop app. The duplicate-
+  click regression also clicks both the rendered disabled model selector and
+  Boolean switch during a pending update and verifies that neither sends a
+  second RPC; native affordance verification remains open.
+
+- 2026-10-04: compared AHEAD's Git hunk preview with Zed's
+  `../zed/crates/editor/src/git.rs` diff-hunk renderer. AHEAD draws changed
+  rows as a continuous gutter rail; clicking a marker opens an anchored
+  old/new preview with a Copy action. The GPUI regression verifies modified
+  and deleted hunk text and clipboard output. Zed integrates hunk controls
+  with editor diff rows, while AHEAD currently overlays a preview; rendered
+  comparison is still needed before expanding the implementation.
+
+- 2026-10-04: made `tests/lsp-smoke.mjs` selectable with
+  `AHEAD_LSP_LANGUAGES`, so an available server can be tested without requiring
+  every language adapter. The Rust-only attempt found that PATH's
+  `rust-analyzer` is a rustup shim but the component is not installed; the
+  script now probes `--version` and stops before creating a fixture in that
+  case. Pointing it at the already-cached Zed Vtsls, BasedPyright and versioned
+  Rust Analyzer then passed the full TypeScript/JavaScript/Python/Rust matrix,
+  plus Rust-only, TypeScript/JavaScript-only and Python-only selections,
+  including server restart and graceful process cleanup, without downloads.
+  The tests used disposable proxy fixtures and do not verify rendered GPUI.
+
+- 2026-10-03: investigated the screenshot showing `basedpyright-langserver`
+  in Error beside a Ready HTML server, plus a `Managed by ahead-proxy` row.
+  AHEAD's Python npm-cache installer has mocked-package tests for success,
+  failed-upgrade rollback and concurrent installs, but this host could not
+  reproduce the rendered state while locked. A later rebuilt disposable app
+  confirmed the old hard-coded workspace/proxy note is absent from current
+  source and rendered UI; the latest screenshot still shows it, so verify the
+  same `just dev` process before changing presentation. The current catalog
+  passes real server names from extension resolution into the panel.
+  Pinned Zed's current Python guide treats Python as built-in and names
+  basedpyright as its primary server; its language-extension contract requires
+  an extension to resolve and return its server command. Zed's activity
+  indicator shows install and actionable health/error states rather than an
+  extension-host row. Sources: [Python support](https://github.com/zed-industries/zed/blob/main/docs/src/languages/python.md),
+  [language-extension server commands](https://github.com/zed-industries/zed/blob/main/docs/src/extensions/languages.md),
+  and `../zed/crates/activity_indicator/src/activity_indicator.rs`. Recheck
+  extension precedence and the actual AHEAD cache/command before inferring an
+  installation bug from catalog presence.
+
+- 2026-10-03: after rebuilding `ahead` from the current checkout, disposable
+  proxy smokes passed for managed Code Mode (`exec`/`wait`, delegated shared
+  file search, cancellation and retry after Turso reopen), unsaved editor
+  recovery after `SIGKILL`, all four fake-LSP shutdown modes, and all three
+  fake-DAP shutdown modes. The real TypeScript/Python/Rust LSP smoke was not
+  run: this host has `rust-analyzer` but lacks `vtsls` and
+  `basedpyright-langserver`, and offline work must not silently download
+  them. The Mac remained locked, so these are rebuilt-proxy results, not
+  rendered GPUI verification. Source comparison this pass used Zed's
+  `crates/search/src/project_search.rs` option handling and
+  `crates/extension_host/src/extension_host.rs` gallery flow; AHEAD still
+  needs its own reviewed extension feed rather than relying on Zed's service.
+  Later the same day, the four headless smokes re-passed against the existing
+  00:55 debug binary. That binary predates the latest analytics-source cleanup;
+  the post-edit core/agent compile and rendered app checks remain open while
+  the desktop is locked and the Data volume has under 200 MiB free.
+
+- Later 2026-10-03: `just dev` rebuilt the current checkout against the same
+  disposable editor workspace, but the native process again aborted before
+  showing a window with macOS `hiservices-xpcservice` `Connection invalid`
+  (signal 6). Using already-installed cached Vtsls, BasedPyright and Zed Rust
+  Analyzer binaries—without downloads—the rebuilt proxy passed
+  `tests/lsp-smoke.mjs` across TypeScript, JavaScript, Python and Rust,
+  including the Vtsls import edit/advertised command and restart recovery.
+  The same binary passed editor-recovery, LSP-shutdown and DAP-shutdown
+  smokes. These remain protocol/process evidence, not rendered editor checks.
+  The focused snippet GPUI regression now proves insertion, one-step Undo,
+  placeholder edits and Tab/Shift+Tab; the installed HTML adapter's tested
+  `<di` tag item is plain text, so it is not evidence of server-provided
+  snippet insertion. AHEAD's LSP snippet support follows Zed's
+  `crates/lsp/src/lsp.rs` capability and the LSP 3.18 grammar, without copying
+  Zed's GPL snippet crate.
 
 - 2026-10-02: compared pinned Zed's UTF-16 open test in
   `../zed/crates/editor/src/editor_tests.rs` (around line 42230) with
@@ -61,8 +860,14 @@
   `33bac128232d266bdf2eb10403b3aa855d088150665a917de0e84f79ba59b11a`
   after an attempted edit and Cmd+S on its unavailable-text card. The
   reused-preview transition is still unverified.
-  Zed-compatible, lossless UTF-16 editing remains a separate decision; no
-  Zed source was copied.
+  On 2026-10-03, the decision was resolved in favor of lossless BOM-marked
+  UTF-16LE/BE editing. Zed's `crates/language/src/file_content.rs` decodes
+  BOM-marked input and its `crates/worktree/src/worktree.rs::write_file`
+  preserves the encoding and BOM on save. AHEAD now uses a small stdlib codec
+  in `ahead-core/src/encoding.rs` and stores the detected encoding with the
+  proxy buffer; malformed UTF-16 and binary input remain rejected. Core codec,
+  proxy byte-round-trip, editor file-open, and GPUI proxy-snapshot tests pass.
+  No Zed code was copied. Native reused-preview rendering remains unverified.
 
 - 2026-10-02: compared the current Extensions panel with Zed's pinned
   `crates/extension_host/src/extension_host.rs` gallery query and
@@ -111,6 +916,14 @@
   These are process and harness checks, not native debugger, recovery or chat
   UI proof.
 
+- 2026-10-03: the existing debug binary passed the disposable DAP shutdown,
+  editor recovery, managed Code Mode and managed-agent shutdown smokes after
+  their test profiles were isolated from the normal AHEAD data/runtime/user
+  homes. The Code Mode smoke covers delegated search, cancellation and retry
+  after Turso reopen; the agent shutdown smoke retains a cancelled partial
+  answer on explicit shutdown and stdin EOF. These are current headless checks,
+  not a freshly linked app, authenticated provider or rendered GPUI pass.
+
 - 2026-10-02: the opt-in
   `installed_zed_html_extension_starts_a_real_server` test copied the
   already-installed HTML API-0.7 package into a temporary extension root,
@@ -156,6 +969,14 @@
   not rendered editor controls or a first-run language-server installer. No
   Zed source was copied.
 
+- 2026-10-03: the LSP smoke fixture now sets an isolated user data home and
+  grants language-server permission only to its disposable project, matching
+  AHEAD's current trust gate. The existing debug binary passed the full
+  Rust/TypeScript/JavaScript/Python smoke with local Zed server binaries,
+  including unsaved-buffer replay after restart and graceful shutdown
+  (`ahead-lsp-smoke-dIoaPW`). This is current proxy evidence, not a fresh
+  linked binary or rendered editor proof.
+
 - 2026-10-01: compared ACP package launch with Zed's
   `crates/project/src/agent_server_store.rs::LocalRegistryNpxAgent` at
   `418f89714891f9d8105a3e92e60b9a7a5084d232`. Zed installs a registry
@@ -182,6 +1003,14 @@
   suite passes with loopback enabled (134 passed, two ignored). This is cache
   hardening, not binary archive support or a native ACP install proof. No Zed
   source was copied.
+
+- 2026-10-20: extended the registry path to install supported binary archives
+  as well as npx agents, following Zed's registry/store separation while
+  keeping AHEAD's generation leases. Registry executable paths may be safe
+  relative names without a `./` prefix (including Windows `.exe` names), but
+  are never resolved through `PATH`. Refreshed the offline Claude ACP fallback
+  to `0.94.0`, which the live registry advertised on this date. Source
+  regressions were added but not run in this feature pass.
 
 - 2026-10-01: Zed's `crates/agent_ui/src/agent_panel.rs::load_agent_thread`
   unarchives a thread when activating it (commit
@@ -258,8 +1087,15 @@
   badge, so switching back to Explorer now refreshes it. A rebuilt-app pass
   added and removed a disposable external edit: Source Control and Explorer
   both showed the change on activation and cleared it on the next activation.
-  Event-driven status updates,
-  authenticated models, multi-session trailers and hooks/signing remain open.
+  Following Zed's `GitStoreEvent::RepositoryUpdated` / `schedule_update`
+  pattern, the active AHEAD sidebar now reacts to the proxy's debounced Git
+  generation and reads status on a background task. Headless tests cover an
+  external edit in both panels. Following Zed's project panel handling of
+  `project::Event::WorktreeUpdatedEntries`, Explorer also rebuilds its tree
+  on proxy file-set generations (not content-only edits), preserving expanded
+  folders and selection; a headless create/remove regression passes. Native
+  open-panel verification remains open. Authenticated models, multi-session
+  trailers and hooks/signing remain open.
   No Zed source was copied.
 
 - 2026-10-01: compared Zed's diff-hunk gutter and expansion in
@@ -312,6 +1148,16 @@
   proves commit metadata and anchor retention, not the rendered user-driven
   gutter-to-commit journey. No Zed source was copied.
 
+- 2026-10-02: compared Zed's `crates/agent/src/tools/edit_session.rs`
+  `agent_edit_buffer` flow, which tags a buffer edit as agent-authored in the
+  same effect cycle, with AHEAD's managed `PatchApplyEnd` event. AHEAD receives
+  a post-apply unified diff rather than Zed's buffer transaction, so its
+  CodeAnchor recorder now checks every added range against current file text
+  before attributing it; a later human rewrite cannot be relabeled as an
+  agent edit. Renames resolve to their destination, and workspace escapes are
+  rejected. Focused agent regressions pass; a rendered multi-hunk/rename
+  acceptance run is still open. No Zed source was copied.
+
 - 2026-10-02: checked Zed's staged-commit flow in
   `crates/git_ui/src/git_panel.rs::commit_changes` before fixing AHEAD's
   separate CodeAnchor attribution. The dispatcher used the first matching
@@ -328,6 +1174,17 @@
   regression failed before the fix and passes after it. Zed's path also runs
   normal Git hooks and signing; AHEAD still bypasses both, so release parity
   remains open in `TODO.md`. No Zed source was copied.
+
+- 2026-10-04: followed Zed's scoped `git_status_args` in
+  `crates/git/src/repository.rs` and clickable Git rows in
+  `crates/git_ui/src/git_panel.rs`. AHEAD now limits status and `Stage All` to
+  the opened folder inside a parent repository, keeps returned paths relative
+  to that folder, and opens a changed file from its keyboard-accessible row
+  button so the existing editor gutter preview is reachable. Per-file
+  stage/unstage remains on the proxy worker and validates the current status
+  before applying literal paths. Focused proxy and GPUI tests pass; native
+  rendering remains unverified while the Mac is locked. No Zed source was
+  copied.
 
 - 2026-10-02: compared Zed's acknowledged commit lifecycle in
   `crates/git_ui/src/git_panel.rs` (`commit_changes`, staged-change check,
@@ -1400,8 +2257,10 @@
   files untouched. It rejects malformed, symlinked, out-of-root,
   cross-workspace and active/archive-ambiguous sources; it adds no schema
   migration or live JSONL fallback. Focused plain/compressed, archive/history,
-  rejection and rollback tests are present but remain unrun until the shared
-  Cargo loop is available. See `TODO.md` and
+  rejection and rollback tests pass. On 2026-10-06, the corrected unsafe-source
+  assertion was rerun with the locked/offline `ahead-proxy --lib legacy_`
+  filter: all four tests passed. The Windows stable-handle identity branch
+  still requires its Windows CI compile/run result. See `TODO.md` and
   `ahead-agent-standards.md#filesystem-placement` for the current contract.
 
 - 2026-09-30: reviewed `crates/agent/src/thread_store.rs::load_thread`
@@ -1650,6 +2509,10 @@
   a relevant open buffer in another subtree, plus editor-only prediction
   before any session exists. Both inspect actual loopback provider requests;
   native typing, insertion and undo remain separate acceptance checks.
+- 2026-10-03: the persisted-session FIM regression also asserts that a sibling
+  `AGENTS.md` outside the active-file/open-buffer ancestry is omitted from the
+  actual provider prompt. The focused host test passes with local loopback
+  access; this proves context scope, not rendered editor behavior.
 - 2026-09-22: `ahead-extension-host/wit/since_v0.8.0/` records the Apache-2.0
   Zed extension WIT contract at pinned commit
   `418f89714891f9d8105a3e92e60b9a7a5084d232`. The AHEAD host is independent
@@ -1703,10 +2566,20 @@
   AHEAD now retains one Wasm guest/store per extension and worktree and
   serializes calls with a per-guest async lock. The installed-package probes
   exercise separate Tokio runtimes and assert a single instantiation across
-  command and multiple configuration calls. Hot extension upgrades still
-  need targeted invalidation or proxy restart. Language-server startup and
-  live refresh in a native window remain unverified; keep the smoke on
-  disposable copies, not the user's Zed installation.
+  command and multiple configuration calls. Following Zed's modified-extension
+  reload boundary, AHEAD now carries the installed extension ID with the
+  restart notification and evicts only that package's cached guest sessions;
+  a manual restart clears all guests. Restart generations reject pending
+  startup resolutions from the previous extension set. The focused host and
+  proxy regressions pass. Language-server startup and live refresh in a native
+  window remain unverified; keep the smoke on disposable copies, not the user's
+  Zed installation.
+- 2026-10-07: reran the opt-in package smoke against the locally installed Zed
+  Proto extension after fixing its archive fixture to include the declared
+  `grammars/proto.wasm`. The source-current extension-host test binary passed
+  loopback download, AHEAD install/discovery, Wasm command and initialization
+  callbacks, and repeated changed workspace-settings reads. No registry or
+  provider was contacted; native gallery activation remains unverified.
 - 2026-10-01: Zed's `crates/extension_host/src/headless_host.rs` loads each
   extension independently and retains failures for reporting. AHEAD's
   discovery had aborted the entire installed-adapter list on one malformed
@@ -1727,9 +2600,11 @@
   changed worktree or unsaved buffer cannot silently shift later pages.
   `crates/file_finder/` uses a
   separate ranked path picker. AHEAD's shared `ahead-core::search` matcher is
-  independent code, not an imported Zed file. It now accepts compiled
-  include/exclude globs for panel content search and an include glob for
-  native-agent search. The panel caches a proxy-owned path snapshot across
+  independent code, not an imported Zed file. It accepts compiled
+  include/exclude globs for panel content search and native-agent search.
+  Managed `file_search` renders worktree-relative result paths, as
+  Zed's agent grep renders project paths, while keeping AHEAD's revision-bound
+  cursor validation. The panel caches a proxy-owned path snapshot across
   queries, and simultaneous cold callers share its initial walk, but AHEAD
   still scans candidate file contents serially and lacks Zed's incremental
   worktree index, candidate pipeline and full query controls. AHEAD's `Cmd+P`
@@ -1739,6 +2614,19 @@
   large-worktree responsiveness remain unverified. See the search item in
   `TODO.md`;
   do not describe the current matcher as Zed-equivalent.
+- 2026-10-07: rechecked Zed's `crates/agent/src/tools/grep_tool.rs`, which
+  adds containing-symbol context from parsed open buffers. AHEAD now uses its
+  existing LSP `GetDocumentSymbols` RPC as best-effort context for managed
+  `file_search` only: at most 16 open buffers, a 300 ms collection deadline,
+  bounded symbol labels, and matching-line fallback. This does not reproduce
+  Zed's in-process syntax-tree ancestors. New focused tests and a native
+  LSP-backed Rust/TypeScript/Python smoke still need execution.
+- 2026-10-07 23:09 ET: a locked/offline Cargo build ran all three current
+  `ahead-agent` `native_client::tests::file_search` tests successfully. They
+  cover paged cursor/path safety, query and unsaved-buffer fingerprinting, and
+  flat/nested/deep LSP symbol ancestry formatting. This closes the uncompiled
+  formatter regression only; native LSP-backed search output and Zed-equivalent
+  syntax-tree context remain open.
 - 2026-09-29: pinned Zed `crates/project/src/project_search.rs` reads matches
   through its worktree/file abstraction. AHEAD's shared matcher now requires
   the selected workspace for disk search, uses no-follow handle-relative reads
@@ -1769,6 +2657,30 @@
   `crates/search/src/project_search.rs` without importing Zed's view code.
   Aligned the regex matcher's line-anchor and CRLF behavior with Zed's
   `crates/project/src/search.rs` so `^`/`$` act on lines, not whole files.
+- 2026-10-03: ran the disposable `ahead-core/examples/search_profile.rs`
+  pre-parallel baseline twice (10,000 files, 10 matches): path indexing took
+  88-120 ms;
+  sorted search passes were 1,512/2,803/24,657 ms and 1,574/2,826/27,384 ms.
+  The >24-second outlier repeated, but the harness sorts its timings, so its
+  pass order is unknown. Pinned Zed uses `max(num_cpus - 1, 1)` scan workers;
+  this shared-machine synthetic result was too noisy to assess concurrency;
+  native large-worktree latency also remains open.
+- 2026-10-03: after comparing Zed's bounded candidate worker pool in
+  `../zed/crates/project/src/project_search.rs`, AHEAD now scans with up to
+  four scoped workers and a bounded in-flight/reorder window. Regression tests
+  prove stable input order, the global cap and first-match cancellation (at
+  most four file paths consumed). The same 10,000-file harness measured a
+  101-ms index and sorted search passes of 656/690/9,150 ms (690-ms median)
+  versus the pre-parallel 2,826-ms median. This is preliminary, not a stable
+  speedup: shared load and the 9.15-second outlier require controlled
+  profiling. No Zed code was copied.
+- 2026-10-06: Explorer now consumes the same workspace-file generation signal
+  as project search, refreshing external create/delete changes while preserving
+  expansion and selection. Direct execution of the current app test binary
+  passed `nested_and_empty_directories_remain_expandable` and
+  `external_file_set_changes_refresh_tree_without_resetting_state`. These
+  headless checks do not establish live watcher delivery or rendered refresh;
+  verify those in the disposable editor project.
 - 2026-09-24: followed pinned
   `crates/agent_ui/src/thread_metadata_store.rs` for metadata-first sidebar
   ordering by recent activity. AHEAD derives `updated_at` from indexed Turso
@@ -1818,6 +2730,15 @@
   re-resolved the install and saved model default; the selected model was
   advertised again. This verifies the ACP client exchange and empty-session
   restore, not provider inference, conversation replay or GPUI rendering.
+- 2026-10-02: compared Zed's `crates/agent_ui/src/config_options.rs`
+  selectors with AHEAD's ACP option picker. AHEAD now disables the picker
+  while an option update is pending and serializes ACP option requests through
+  response publication and default persistence, so a delayed response cannot
+  overwrite a later choice. The out-of-order ACP fixture and duplicate-click
+  GPUI test pass; the offline root `ahead` executable builds, and the complete
+  `ahead-agent` and `ahead-app` library suites pass with local mock-server
+  access. A locked Mac still prevents rendered picker verification, and no
+  provider inference is claimed.
 - 2026-10-02: Zed's ACP `open_or_create_session` keeps the load RPC in an
   asynchronous task. AHEAD's proxy already routes `AgentSessionPrepare` to a
   background worker; a focused proxy regression now holds the session host
@@ -1833,6 +2754,108 @@
   `ahead-core` suite passes (27 tests). This is AHEAD-owned code, not copied
   Zed code; whole-file fallback memory use and binary detection beyond NUL
   bytes remain open.
+
+- 2026-10-14: compared Rust Analyzer resolution against Zed's
+  `crates/languages/src/rust.rs`: try the workspace's `rustup` selection,
+  validate a runnable `PATH` server, then use a managed official-release cache.
+  AHEAD's `ahead-proxy/src/plugin/catalog.rs` follows that fallback and checks
+  bounded downloads plus GitHub's release digest when available. On the rebuilt
+  disposable app, the managed Rust-only smoke acquired Rust Analyzer into its
+  temporary data home and passed formatting, completion, navigation, semantic
+  tokens, hover/signature help, references, cross-file rename, diagnostics and
+  repair, restart/reopen and graceful shutdown. No global toolchain was
+  modified. The same build passed cached TypeScript/JavaScript/Python LSP
+  checks and the mocked managed-turn plus CodeAnchor-to-staged-commit smokes.
+  Native editor insertion/rendering and authenticated-provider behavior remain
+  separate acceptance gates.
+
+- 2026-10-14 follow-up: the current `just dev` build passed the disposable
+  managed Code Mode smoke for delegated `file_search`, streaming, cancellation,
+  retry after Turso reopen and shutdown. With scoped network access, the live
+  LSP acquisition smoke fetched the Zed catalog, installed HTML extension
+  0.3.2, and acquired Vtsls, BasedPyright and Rust Analyzer into its temporary
+  project cache. TypeScript, JavaScript, Python and Rust passed completion,
+  navigation, diagnostics/repair, semantic tokens, supported formatting and
+  rename, close/reopen and server-restart recovery. All four fake-server LSP
+  shutdown modes passed too. The 240 MiB smoke fixture and shutdown fixture
+  were removed after verifying the installed package paths; no global server
+  or toolchain was changed. This verifies real-server proxy/install behavior,
+  not the Extensions UI or rendered editor interactions. The app child still
+  aborts before rendering during macOS HIServices initialization, and no
+  authenticated provider turn ran because `OPENROUTER_API_KEY` was absent from
+  the test process environment. After stopping the shared watcher, the same
+  disposable project's documented `just verify` passed offline with an
+  isolated fixture `target/`: Rust 1/1, TypeScript/JavaScript 2/2 and Python
+  1/1. The same isolated watcher restarted as session 46782 and rebuilt the
+  integrated app in 2.64s; its child then exited before drawing on the macOS
+  HIServices XPC signal 6. The watcher remains live. Against that current
+  `target/debug/ahead` (13:08), reran both local-fake managed-agent smokes:
+  Code Mode search/stream/cancel/retry/shutdown passed, and the file-attribution
+  path persisted a session CodeAnchor through staged commit, author/committer
+  metadata, session trailer and anchor cleanup. This exercises the managed
+  effect path but does not replace authenticated-provider acceptance.
+
+- Fresh clean-build recheck (2026-10-14, 13:47): after the user-requested
+  `cargo clean`, the shared `just dev` loop rebuilt `ahead` and the Code Mode
+  host from scratch in 12m22s. Compilation passed; the app child again aborted
+  before its first frame with the macOS HIServices XPC signal 6. Against that
+  fresh binary, the local-fake Code Mode and CodeAnchor-to-staged-commit smokes
+  passed, as did the Turso-backed editor recovery smoke. The live Zed catalog
+  installed HTML 0.3.2 into a disposable cache, and Vtsls, BasedPyright and
+  Rust Analyzer passed the TypeScript/JavaScript/Python/Rust LSP matrix,
+  including HTML completion, TypeScript auto-import, Rust formatting and
+  cross-file rename. This is fresh proxy/runtime acceptance; the editor's
+  rendered popup/install interactions and authenticated-provider behavior
+  remain unverified.
+  The fresh source-current serial `ahead-app --lib` suite passed 321 tests;
+  two multiplayer/session-invite tests failed because the child UI did not
+  expose its invite-JSON prompt. These collaboration tests remain with the
+  separately tracked collaboration work, not the core editor release gate.
+
+- 2026-10-14, 21:26 EDT: the integrated binary rebuilt at 21:16 passed the
+  cache-seeded `tests/lsp-smoke.mjs` for TypeScript, JavaScript and Python.
+  Completion (including typed Python signature help), definitions, diagnostics
+  and repair, semantic tokens, TypeScript import/auto-import actions,
+  close/reopen, server restart recovery and graceful shutdown passed without
+  downloads or model calls. Fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-PDywjc`.
+  Rust was not included because the current `rust-analyzer` PATH entry is a
+  rustup shim whose selected stable toolchain lacks the component.
+
+- 2026-10-14, 21:27 EDT: the same integrated binary passed the disposable
+  Turso editor-recovery smoke: acknowledged Unicode text survived proxy
+  termination, live-owner protection held, explicit discard and stale-write
+  fencing survived restart, and the database remained owner-only. Fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-recovery-smoke-mXQ02o`.
+  This verifies the storage/proxy boundary, not the rendered recovery UI.
+
+- 2026-10-14, 21:29 EDT: a current-binary Code Mode smoke could not start in
+  this restricted shell because Node's ephemeral `127.0.0.1` mock bind returned
+  `EPERM`, before the AHEAD proxy was spawned. This is an execution-environment
+  limitation, not a smoke result; managed search/cancel/retry needs a runner
+  with local-loopback access.
+
+- 2026-10-14, 21:31 EDT: reran the full cache-seeded Rust, TypeScript,
+  JavaScript and Python LSP matrix against the integrated binary. Rust Analyzer
+  1.98.1 was already installed in a non-default Rust toolchain, so the test
+  used its explicit binary path; no tools were installed. Rust passed
+  formatting, completion, definition, semantic tokens, hover, signature help,
+  references, cross-file rename, unsaved diagnostics/repair, close/reopen,
+  server restart recovery and graceful shutdown. TypeScript/JavaScript and
+  Python passed in the same run, including typed Python completion/signature
+  help and TypeScript import/auto-import. Fixture:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-noQj81`.
+  This closes current proxy/LSP protocol coverage, not native editor
+  insertion/rendering or first-run project bootstrap.
+
+- 2026-10-14, 21:34 EDT: the source-matched app test runner built at 20:09
+  passed 330 tests with the two separate-process collaboration tests filtered
+  (their local sockets/UI prompt are unavailable in this environment). The
+  run includes editor/session/settings, terminal/PTY, search/Git and extension
+  gallery coverage. All 14 focused terminal-panel tests also passed, including
+  VTE output, input/shortcut routing, mouse reporting, scroll behavior and
+  shell-safe path paste. These are headless GPUI/unit checks, not native input
+  or rendering verification.
 
 ## Archived agent audit recovery (2026-09-30)
 
@@ -1991,6 +3014,44 @@ was stopped afterward.
 No model response, tool call, host worker or authenticated provider was
 exercised: the loopback endpoint was intentionally unavailable. The host
 bundle and provider-backed safety check remain open in `TODO.md`.
+
+## Code Mode sidecar source and protocol check (2026-10-02)
+
+The historical missing-host observation above remains valid for that build.
+The pinned Codex `rust-v0.152.0` stdio host and V8 runtime are now distilled
+into AHEAD-owned crates in the root Cargo workspace. The Deno release lacks
+the sandbox-enabled V8 150.4.0 archive; the matching OpenAI release provided
+the macOS arm64 archive and Rust binding, and both matched its published
+SHA-256 hashes. The 13 host and 68 runtime tests pass, including the linked
+V8-sandbox check. An AHEAD-owned process test launched the new sidecar through
+the retained client, executed JavaScript, delegated one tool call with exact
+JSON arguments, and received the tool result.
+
+This is protocol-level evidence, not a GPUI or authenticated-model
+observation. `just dev` and release recipes now build/place the sibling host,
+but a combined editor/host debug build was stopped while still compiling when
+free disk fell below 1 GiB. Native CodeModeOnly request/tool behavior and the
+signed bundle are still open in `TODO.md`. Zed's direct-tool request assembly
+remains the primary editor reference; the sidecar is retained specifically for
+models whose pinned Codex tool contract requires Code Mode.
+
+A later 2026-10-02 pass recovered space by removing only the rebuildable
+incremental compiler cache. A combined locked/offline `cargo check` and
+`cargo build` of `ahead` and `ahead-code-mode-host` now pass. The host's 13
+tests, runtime's 68 tests, and delegated-tool stdio smoke pass again. Review
+then found AHEAD's managed configuration still disabled `CodeModeHost`, so the
+sidecar was unreachable despite packaging. That override is removed; a
+managed-config regression and the complete `ahead-agent` library suite pass
+(148 passed, three ignored), and the rebuilt binary names the AHEAD host in
+its missing-host warning. The desktop was locked, so these results still do
+not prove a GPUI CodeModeOnly turn, tool effect, or signed-bundle launch.
+The unused copied gRPC client and proto generator have since been removed;
+no product caller used them. The remaining Code Mode client/protocol tests pass
+(68), as do the 13 host tests, 68 V8 runtime tests, and delegated-tool stdio
+smoke after that removal. The combined locked/offline editor-and-host check
+and binary build also pass after the prune. Generated compiler caches and
+duplicate test executables were removed to keep the disk from filling; all
+are rebuildable.
 
 ## Hosted Apps file-upload removal (2026-10-01)
 
@@ -2302,7 +3363,7 @@ regressions. Zed does not use this AHEAD-specific editor socket bridge; its
 project-owned MCP server handoff remains the architectural reference. Native
 ACP, overload and cancellation races at the new limits remain open.
 
-## Display-bound windows and combinable search options (2026-10-01)
+## Display-bound windows and search modes (2026-10-01)
 
 Zed's `crates/workspace/src/workspace.rs` leaves `window_bounds` unset for a
 new workspace and lets GPUI choose display-aware defaults. AHEAD's fixed
@@ -2311,13 +3372,20 @@ clickable region on the disposable native smoke display. AHEAD now uses
 `TitleBar::window_options()` without overriding the bounds. Rebuilt native
 verification of the new size and wizard completion is still pending.
 
-Zed's `crates/search/src/search.rs::SearchOptions::build_query` treats case,
+At `../zed` commit `418f89714891f9d8105a3e92e60b9a7a5084d232`,
+`crates/search/src/search.rs::SearchOptions::build_query` treats case,
 whole-word and regex as independent options; regex selects the query parser,
-while the other two refine its matching. AHEAD's panel toggles and shared
-matcher already use the same combinable semantics, so no exclusivity change
-is needed. The native disposable project confirmed a live-buffer Git rail
-click opens the hunk review card without turning that line into a breakpoint;
-the card still overlays code instead of expanding editor rows as Zed does.
+while the other two refine its matching. In response to the user's feedback
+that these looked like mutually exclusive search types, AHEAD's panel now
+selects one of Text, Word or Regex, with Case as a separate modifier. This is
+an intentional UI departure from Zed's combinable toggles; the shared matcher
+still supports combined options for other callers. A GPUI regression covers
+mode switching and Case independence; rerun it in the shared Cargo loop. In
+the rebuilt disposable native app, selecting Word then Regex left only the
+latest mode active, while Case stayed independently selectable. The same
+native project confirmed a live-buffer Git rail click opens the hunk review
+card without turning that line into a breakpoint; the card still overlays
+code instead of expanding editor rows as Zed does.
 
 ## Terminal reference-test recording (2026-10-01)
 
@@ -2491,18 +3559,36 @@ offline. A rebuilt native first-open check remains pending because macOS is
 locked; this is source/test evidence, not a rendered-app claim.
 
 The next AHEAD language-extension first-open gate is catalog responsiveness.
-`PluginCatalog::handle_did_open_text_document` calls `ensure_lsp_server`
-synchronously; an installed extension's command resolution uses a current-
-thread runtime. Before the child-wait change, it could reach a blocking npm
-`.output()` in `ahead-extension-host/src/host.rs`. Zed instead awaits
-`crates/extension_host/src/wasm_host/wit/since_v0_8_0.rs` through its async
-`crates/node_runtime/src/node_runtime.rs::npm_install_packages` path. AHEAD
-now bounds its permitted process and npm children with Tokio async output,
-a 120-second deadline and `kill_on_drop`; a hung-child regression and all 21
-active extension-host library tests pass. It still needs an off-catalog,
-cancellable acquisition with stale-result rejection and unsaved-document
-replay; the current synchronous route has not been shown responsive in a
-native first-open run.
+Zed's `crates/project/src/lsp_store.rs::get_language_server_binary` returns a
+pending task, then starts the server after acquisition. AHEAD previously ran
+installed-extension command resolution inside `ensure_lsp_server` on the
+catalog thread, where it could wait on npm. The catalog now runs resolution in
+a worker, posts a generation-fenced result, and replays the latest unsaved
+Rope snapshot when that server starts. A late result after document close is
+discarded; startup rechecks workspace trust. The focused regressions and all
+17 active catalog tests pass. The opt-in test also copied the locally
+installed Zed HTML extension into an isolated temporary project and observed
+a successful real HTML-server handshake through the new async route. This is
+headless integration evidence, not native first-open UI proof. Document-open
+no longer synchronously rescans installed extensions: the catalog is refreshed
+at startup and after explicit install/update restarts, keeping package scans
+and the install lock off the `didOpen` path. A filesystem edit made outside the
+gallery requires Restart Language Servers. The extension host's child
+timeout/cancellation/reaping behavior is recorded below; startup and restart
+discovery are still synchronous.
+The first opt-in run exposed an AHEAD trust-path bug: macOS's `/var` parent
+alias made the secure directory opener reject a valid temporary data home.
+`workspace_trust::trust_path` now canonicalizes that path only after rejecting
+a symlinked config-directory leaf. A focused Unix regression covers both
+parent-alias acceptance and leaf rejection; the real HTML test passes again
+using the original `/var` path and an isolated data home.
+The extension host runs npm/process children with Tokio async pipes and a
+120-second deadline. Timeout and caller cancellation kill and wait for the
+child, with Unix regressions covering both paths. Zed's pinned
+`crates/extension_host/src/wasm_host/wit/since_v0_8_0.rs::run_command` awaits
+`command.output()`; AHEAD preserves its output contract while adding explicit
+cleanup for the editor's cancellable install/shutdown lifecycle. No Zed source
+was copied.
 
 Normal managed-MCP declaration and opt-in reads now use that same shared
 reader instead of a second path/size/symlink implementation. The Unix
@@ -2589,9 +3675,9 @@ Zed code was copied.
 Zed's `crates/project/src/lsp_store.rs::get_language_server_binary` can wait
 for worktree trust before resolving and starting a local language-server
 binary. Its BasedPyright and Vtsls adapters check existing binaries and use
-cached npm packages before downloading. AHEAD still launches its built-in
-Rust Analyzer, BasedPyright, and Vtsls commands from PATH, and it has no
-worktree-trust gate. When the BasedPyright or Vtsls executable is absent from
+cached npm packages before downloading. AHEAD now gates language-server
+startup on workspace trust. Its built-in Rust Analyzer, BasedPyright, and Vtsls
+commands still prefer PATH. When the BasedPyright or Vtsls executable is absent from
 PATH, AHEAD can now start a complete package from its own
 `cache/language-servers/` directory using system Node. It does not execute an
 opened project's `node_modules`. Managed acquisition still needs to populate
@@ -2623,10 +3709,41 @@ the focused regression. This rejects malformed caches, not a package that
 starts and then fails at runtime. The rebuilt disposable macOS app reused both
 real public-npm packages: BasedPyright and Vtsls rendered Ready after opening
 Python and JavaScript respectively (the latter via Quick Open).
-Zed runs npm through its async Node runtime. AHEAD's retained system-npm path
-now polls its child with a 120-second total deadline and signals cancellation
-on proxy shutdown, waiting briefly for the installer to stop. A fake-npm
-shutdown regression verifies that an active child exits before publication;
+On 2026-10-07, the headless LSP smoke gained a default-off
+`AHEAD_LSP_INSTALL_MISSING=1` mode to exercise this real cache-miss path without
+changing its offline default. Separate disposable runs installed BasedPyright
+1.40.2 and Vtsls 0.3.0 through AHEAD's npm installer (lifecycle scripts
+disabled). Python passed completion, definition, diagnostics/repair,
+close/reopen, restart and graceful shutdown. TypeScript passed completion,
+definition, diagnostics, quick fix, resolved auto-import and restart; JavaScript
+shared the Vtsls process and passed completion, definition and diagnostics. The
+installer caches and all AHEAD homes remained inside each fixture. The first
+Python run exposed a readiness race in the smoke, now fixed by waiting for the
+server's Ready/error status before requesting completions. This closes the
+headless acquisition/protocol gate, not the current native UI gate; the latter
+remains blocked by the repeated macOS XPC launch error.
+A combined offline run reused those fixture-local npm caches with the cached
+Zed Rust Analyzer and passed Rust, TypeScript, JavaScript and Python in one
+project, including the Rust navigation/format/rename path and server restart.
+The exact `target/debug/ahead` binary postdates the relevant proxy/RPC sources.
+The passing fixture remains at
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-g84nPb`.
+Zed runs npm through its async Node runtime and directs it to a runtime-owned
+cache in `crates/node_runtime/src/node_runtime.rs::build_npm_command_args`.
+AHEAD prefers system Node.js/npm and directs installation to
+`cache/language-servers/npm-cache`, rather than inheriting a potentially
+unwritable user-global cache. When system Node or npm is unavailable, the
+extension host and built-in LSP installer share an AHEAD-owned on-demand
+runtime: it selects the newest LTS from the official Node index, verifies the
+archive against that release's SHA-256 manifest, then atomically publishes a
+bounded extraction into `cache/node-runtime/`. Valid cached runtimes are used
+offline; a failed online update falls back to a valid cached copy. Unit tests
+cover LTS parsing, checksum selection, archive extraction and publication; they
+do not yet prove a real clean-PATH network install or Windows launch behavior.
+No Zed source was copied for this boundary. The installer also polls its child
+with a 120-second total deadline and signals cancellation on proxy shutdown,
+waiting briefly for the installer to stop. The existing fake-npm shutdown
+regression verified that an active child exits before publication;
 the rebuilt disposable macOS app also quit with fake npm active, leaving no
 child process or cache entry. Windows still needs a live pass.
 The first run also exposed stale health rows after restart. Restart now clears
@@ -2634,6 +3751,16 @@ old server statuses before replay, while the toolbar and panel distinguish a
 server still starting from one that failed. Focused proxy and app regressions
 pass. In the rebuilt disposable app, switching from Python to JavaScript left
 only Vtsls Ready in the panel and the toolbar also reported ready.
+For BasedPyright/Vtsls packages launched from AHEAD's cache, the npm `latest`
+lookup now starts only after that exact managed server reports Ready. If a
+newer version exists, the existing staged publisher installs it and then asks
+the dispatcher to restart servers. The currently running server remains Ready
+during this background refresh; a failed refresh preserves the existing cache
+and does not overwrite healthy status with an install error. PATH-selected
+binaries and installed extension servers do not trigger registry requests or
+cache restarts, and the check never fetches Node solely to query npm. This
+follows Zed's installable npm adapter lifecycle while keeping AHEAD's
+editor-owned cache and workspace-trust boundary.
 Zed's `LanguageServerStatus` belongs to a real server id; AHEAD now likewise
 routes installed-extension discovery failures separately from language-server
 health. The panel shows them as an unboxed "Extension issues" list, and each
@@ -2657,7 +3784,1082 @@ outside the project; the Language Servers panel grants and revokes it. The
 catalog checks before invoking an extension or starting an npm install, and
 `LspClient::process` checks again before spawn. Two core store tests and a
 proxy untrusted-launch regression pass; proxy and app library checks pass.
+The app GPUI test fixture now uses the panel's workspace-aware constructor,
+and `cargo check --locked --offline -p ahead-app --tests -j1` passes. Its
+permission copy now names language servers specifically, rather than claiming
+that the entire workspace is trusted or restricted.
 This is source/protocol evidence, not a rebuilt native trust journey. AHEAD's
-restricted coverage is still narrower than Zed's: project settings, MCP
-startup, other project-driven processes, and a first-open prompt remain open.
+user-level store now distinguishes undecided, allowed and blocked projects;
+the editor defers a first-open language-server choice until its window exists,
+and records either button so an explicit block is not prompted again. Focused
+store tests and the app test-target check pass. AHEAD's restricted coverage
+is still narrower than Zed's: project settings, MCP startup and other
+project-driven processes remain open.
 Windows ACL/reparse safety and native Linux behavior are also unverified.
+The 2026-10-02 `just dev` binary linked for a disposable smoke project, but
+two launches exited with signal 6 and a macOS `com.apple.hiservices-xpcservice`
+connection-invalid error before a window appeared. The second launch used
+`RUST_BACKTRACE=full` and produced no Rust stack. This did not verify the
+Allow/Block interaction.
+
+On 2026-10-03, a cold `ahead-app --lib` run compiled but two collaboration
+tests could not bind loopback listeners in the restricted sandbox. With
+loopback access, one of those tests still required the debug `ahead` sandbox
+helper removed by `cargo clean`. After building that binary and isolating
+`AHEAD_DATA_HOME`, `AHEAD_HOME` and `AHEAD_USER_HOME` under `/private/tmp`, the
+full app library suite passed: 204 tests, 0 failures. `just test-all` and CI
+now build the debug helper first. This does not establish rendered UI or
+provider-backed agent behavior; the Mac remained locked for this pass. A
+separate locked offline `ahead-agent --lib` run passed 149 tests, with three
+opt-in tests ignored, using isolated temporary homes and loopback mock
+services. The full `ahead-proxy --lib` run passed 225 tests, with one ignored.
+An initial proxy run had three legacy/reopen failures because the test command
+overrode `AHEAD_HOME`, moving the runtime away from each temporary workspace's
+`.ahead/runtime`; rerunning without that override passed. `just test-all` now
+uses temporary app/user homes and clears any inherited `AHEAD_HOME`.
+The fresh offline `tests/lsp-smoke.mjs` fixture passed Rust, TypeScript,
+JavaScript and Python server behavior, including restart and graceful cleanup,
+using locally installed Zed language-server binaries. The first attempt
+resolved `rust-analyzer` to a rustup shim without the component and failed
+before Rust diagnostics; a temporary PATH alias to Zed's standalone binary
+made the same smoke pass. This is proxy/LSP evidence, not rendered-editor proof.
+The fresh debug binary also passed disposable proxy-process smokes for managed
+agent shutdown/EOF/SIGKILL with Turso reopen, all three DAP adapter shutdown
+modes, all four LSP shutdown modes, and editor recovery/permissions. These do
+not replace native window interaction or authenticated-provider acceptance.
+The offline `just test-all` recipe then passed in full after the pinned Code
+Mode V8 archive was restored and hash-checked by the repository setup script.
+It built the debug sandbox helper, isolated app/user homes, ran the grouped
+AHEAD package tests and the new focused API target. `cargo fmt --all -- --check`
+and `git diff --check` passed. Credential-requiring ACP/native cases remained
+ignored; no rendered window was available because the Mac was locked.
+The fresh `target/debug/ahead` and sibling Code Mode host then passed the
+disposable loopback `tests/agent-code-mode-smoke.mjs`: delegated file search,
+cell output, cancellation, Turso reopen, explicit retry and shutdown.
+
+On 2026-10-05, AHEAD's Rust Analyzer resolver was updated against Zed's
+`crates/languages/src/rust.rs::rustup_rust_analyzer_for_worktree` and
+`LspInstaller::check_if_user_installed`: for a workspace containing
+`rust-toolchain.toml` or `rust-toolchain`, run `rustup which rust-analyzer`
+from that worktree, validate the selected binary, then fall back to PATH and
+AHEAD's managed cache/download. Unix regression coverage uses a fake rustup
+executable for both override-file names. The rustup lookup now uses the
+existing cancellable, three-second child-probe lifecycle; a Unix regression
+exercises cancellation of a stalled lookup through the shared kill-and-wait
+helper. `rustfmt --check` and `git diff --check` pass. Available `ahead_proxy`
+test binaries predate this source, so these focused Cargo tests remain unrun.
+The live disposable AHEAD window showed BasedPyright Ready and Problems
+(0); that is native Python-server health evidence, not proof of Rust toolchain
+selection.
+
+On 2026-10-03, AHEAD's LSP completion client began advertising snippet support
+after adding a clean-room parser for the supported subset of the
+[LSP 3.18 snippet syntax](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/):
+numbered tabstops, nested defaults, choices and escapes, plus caret placement
+and Tab/Shift+Tab navigation.
+Completion insertion remains one bounded editor replacement. This is not yet
+Zed parity: gpui-kit exposes one selection, so repeated placeholder ranges do
+not update together; choice alternatives and variable transforms are not
+implemented. Those cases fail closed where unsupported. No code was copied
+from Zed's GPL-3.0-or-later `crates/snippet`. Retest the installed HTML server
+and native completion/Undo behavior in the disposable editor project. The
+focused GPUI regression verifies insertion, one-step Undo, placeholder editing,
+Tab/Shift+Tab, final-caret exit and restored native indentation; the proxy
+`snippetSupport` capability test passes. The full app-library suite now passes
+220 tests with loopback enabled; an earlier sandboxed attempt could not bind
+its two collaboration mock servers. The opt-in real-extension proxy smoke was
+then extended and passed against the installed Zed HTML adapter and its
+matching bundled server: the project setting enabled embedded-CSS validation,
+which reported an unknown CSS property; completion at `<di` returned the
+`html` tag, formatting unformatted markup returned multiline edits, and rename
+changed both paired tag names. These are independent checks—HTML tag items are
+plain text; the GPUI test exercises snippet parsing and placeholder
+navigation. The first probe exposed that AHEAD returned `null` for an
+unconfigured `css` section; the HTML server passed that value to the CSS
+validator and panicked. AHEAD now returns an empty object for a missing named
+configuration section, and the real-server regression passes. The test also
+requires isolated temporary `AHEAD_DATA_HOME` and `AHEAD_USER_HOME`; the latter
+now controls the shared user-home resolver rather than silently leaving
+extension settings tied to the machine account. The server dynamically registers
+`workspace/didChangeWorkspaceFolders`. AHEAD currently owns one immutable root
+per app/proxy, so there is no supported root-change workflow to notify. Defer
+folder deltas until multi-root support exists; then mirror Zed's
+`LanguageServer::set_workspace_folders`. The smoke also turns embedded-CSS
+validation off through the catalog's workspace-configuration refresh path and
+observes the warning clear without restarting the server. This does not verify
+the native filesystem-watcher-to-editor journey. Rendered native editor
+insertion/Undo remains unverified.
+
+## Fresh native smoke after `cargo clean` (2026-10-05)
+
+The shared `just dev` app opened the disposable multi-language fixture. In the
+rendered Settings panel, the loopback-only OpenAI-compatible fixture passed the
+endpoint check, exposed `gpt-5.5` through model discovery, and completed a
+text-only managed-agent turn with `AHEAD_TEXT_SMOKE_OK`. This exercises the
+native settings and managed request/response path with a deterministic fake
+provider; it is not evidence of real-provider quality, tool execution or MCP
+approval. No MCP process was approved or launched.
+
+The rendered Language Servers panel showed Rust Analyzer exiting with status
+1. PATH resolves to a rustup shim for which the Rust Analyzer component is not
+installed; a standalone binary already cached by Zed runs successfully. In
+`../zed/crates/languages/src/rust.rs`, `RustLspAdapter::check_if_user_installed`
+executes `--help` and declines a broken PATH candidate so Zed can install its
+managed release. AHEAD's `ahead-proxy/src/plugin/catalog.rs::ensure_lsp_server`
+currently trusts `which::which` and starts the broken shim. AHEAD still needs
+the equivalent executable validation and managed Rust Analyzer fallback before
+native Rust diagnostics/completion can pass.
+
+In this same app session, opening the TypeScript smoke file installed Vtsls in
+AHEAD's cache and the panel reached `Ready`. An unsaved unused-binding edit
+produced a Vtsls diagnostic; Undo restored the buffer and the diagnostic
+cleared. Opening `python/main.py` then left BasedPyright in error and changed
+the Rust/Vtsls statuses to `AHEAD proxy connection closed`. The shared `just
+dev` session logged EOF while reading from the proxy, and the in-app language
+server restart control could not reconnect. Python support is not verified;
+diagnose the proxy-process exit before continuing native LSP checks.
+
+Follow-up in the still-running AHEAD Dev window on the same disposable fixture:
+`Cmd+P` filtered to `python/main.py` and Enter opened it. With that editor
+focused, `Ctrl+Space` rendered a `double` suggestion through the proxy-backed
+completion path, and the Problems view showed zero issues. This confirms the
+visible completion flow in this live window, but not the Python server's
+readiness or the earlier proxy-EOF failure; inspect Language Servers and
+recheck diagnostics/navigation before marking Python LSP complete. Typing
+`/skill` filtered the grouped slash catalog to one entry; picking it inserted
+`/smoke-skill ` into the composer, and the draft was cleared without sending a
+turn. This confirms live skill discovery/filter/insertion, not source ownership,
+refresh behavior or narrow-window layout.
+
+## Isolated native fixture check (2026-10-06)
+
+After the earlier UI-broker launch reused the normal profile, this check started
+the freshly built app-only `target/debug/ahead` directly with separate
+`AHEAD_DATA_HOME`, `AHEAD_USER_HOME` and `AHEAD_HOME` directories under
+`/private/tmp`, and opened a fresh copy of `tests/fixtures/editor-smoke/`.
+Before opening, the fixture had no `.ahead/`; AHEAD created `.ahead/session.db`
+with mode `0600`. The three external profile directories remained empty, so
+the AHEAD data/runtime/user homes were isolated from the normal profile. No
+provider request or extension download occurred.
+
+Rendered checks: Rust, Python and TypeScript files opened with their language
+identifiers; Cmd+P filtered to and opened the TypeScript path; a temporary
+Python edit showed the modified dot inline beside the tab filename and Undo
+restored the clean state; a breakpoint could be added and removed; and the
+embedded PTY returned the fixture path for `pwd`. The source file was not saved
+with the temporary edit. This is native UI evidence for these paths only.
+
+The workspace trust prompt was kept blocked because starting language servers
+allows project-selected commands to run with user permissions. Thus this did
+not verify live completion/diagnostics/navigation or authorize server installs.
+The app-only build omitted `ahead-code-mode-host`; the managed Code Mode smoke
+cannot be counted until the exact `just dev` package set and pinned V8 helper
+are rebuilt. The terminal did read the user's zsh startup file and reported
+missing `zoxide` and `starship`; `pwd` still succeeded. Shell startup isolation
+remains a separate check.
+
+The disposable project was then initialized as a local Git repository. Clicking
+a single-line Python change marker opened an in-editor hunk with removed and
+added source lines and a `Copy change diff` control; copying and pasting into a
+blank editor line produced the unified hunk text. A second adjacent two-line
+change rendered as one continuous gutter rail; its preview showed both removed
+and added lines, and Copy pasted the complete unified hunk. Both temporary
+pastes were undone, the source was restored, and the disposable Git worktree is
+clean. This verifies the rendered adjacent-change appearance and copy flow, not
+discontiguous changes within one hunk or the final screenshot guide.
+
+Source Control was also opened in this isolated project. Three temporary long,
+nested untracked paths showed responsive ellipses; status markers, individual
+stage checkboxes, `Stage All` and `Commit Staged` stayed visible at the pane's
+current narrow layout. The temporary files were removed and the panel returned
+to `Changes (0)`.
+
+The current Language Servers panel showed the workspace-level “Language servers
+blocked” state and explained that servers will not start for this
+project. The obsolete `Managed by ahead-proxy` note was absent, so the older
+screen capture is stale rather than evidence of current panel state. The `Allow`
+action was intentionally not activated; native server startup remains pending
+explicit trust and local server availability.
+
+In the local managed chat, typing `/skill` filtered to the fixture's
+`/smoke-skill`. Down selected it and Enter inserted `/smoke-skill ` without
+sending; Escape closed the picker and kept the draft. The draft was cleared,
+the context counter remained `0.0k`, and no provider turn was made. Native
+Up-navigation and provider-backed skill execution remain unverified.
+
+## External file updates in open buffers (2026-10-06)
+
+At `../zed` commit `418f89714891f9d8105a3e92e60b9a7a5084d232`,
+`crates/project/src/buffer_store.rs::local_worktree_entry_changed`
+updates the open buffer's `File`; `crates/language/src/buffer.rs::file_updated`
+emits `BufferEvent::ReloadNeeded` when the buffer is clean, and
+`crates/project/src/project.rs` reloads that buffer. This is the reference
+behavior: route the changed worktree entry to its buffer, reload clean content,
+and retain locally edited content rather than replacing it.
+
+AHEAD now carries changed paths on `CoreNotification::WorkspaceFileChange`.
+`CodePanel` reads only the affected file on a background executor, compares it
+to the saved hash, reloads a clean buffer while rebasing the selection through
+unchanged prefix/suffix text, then syncs the editor snapshot and refreshes Git
+metadata/anchors. Dirty buffers remain unchanged and are marked for explicit
+overwrite review on Save. The focused GPUI tests pass for clean reload/caret
+rebasing and dirty-buffer retention; the proxy test confirms the file watcher
+delivers the changed path. On 2026-10-06, a rebuilt isolated native app showed
+an external edit in a clean open Python buffer. A second disk edit did not
+replace the locally dirty buffer; Cmd+S showed the changed-file warning, and
+Cancel preserved the local draft and newer disk contents. This check used
+only a disposable fixture. In a separate clean Python buffer, inserting a line
+above the caret on disk reloaded the file and rebased the caret through its
+unchanged suffix. Workspace language-server trust remained blocked, and no
+model/provider request was made. Native ignored-file/deletion behavior,
+external rename handling and rapid-write races remain unverified.
+
+The proxy also has a distinct open-buffer notification for paths that are not
+in workspace search results (for example, ignored generated files). AHEAD
+routes that event to a buffer-only subscriber rather than fanning it out as a
+workspace change, which would unnecessarily reload Settings and model choices.
+A focused GPUI regression verifies that the editor reads current disk contents
+even when an event carries an older text payload; a routing regression verifies
+that workspace subscribers do not receive the open-buffer-only event. This
+path has automated coverage but has not yet been exercised with a native
+ignored file.
+
+Zed's `language::Buffer::file_updated` also updates the buffer's file handle
+when a worktree entry changes, and emits `ReloadNeeded` only for a clean buffer
+whose replacement disk state is Present. AHEAD handles a missing open path
+conservatively: it keeps the buffer, distinguishes NotFound from other read
+errors, and tells the user that Save recreates the prior path. A GPUI test
+deletes a file with local edits, confirms the buffer survives, then cancels the
+Save prompt and verifies the path stays absent. This is automated evidence;
+native deletion UX is not yet checked. AHEAD does not yet adopt the new path for
+external renames. After this state change, all 239 serial `ahead-app --lib`
+tests passed with local loopback; the restricted run's only two failures were
+mock-server bind denials.
+
+## Session-bound comments and signature-aware completion (2026-10-14)
+
+Compared AHEAD's editor affordances with Zed at
+`../zed/crates/editor/src/completions.rs` and
+`../zed/crates/editor/src/signature_help.rs`. Zed presents provider completion
+metadata alongside ranked suggestions and provides a separate signature-help
+popover with the active parameter and its documentation. AHEAD's completion
+rows now show LSP-provided signatures/types and source context; its signature
+help is positioned above the caret and renders the active parameter's docs.
+Editor comments are bound to the active AHEAD session: session changes reload
+only that session's comments, clear-session removes gutter actions, and stale
+session IDs cannot start or save a draft. The source-matched app runner passed
+the three focused GPUI regressions for comment gating, completion details and
+signature-help placement/content. Native rendering remains unverified while
+the macOS window is unavailable.
+
+## Current automated acceptance (2026-10-15)
+
+The source-current `ahead-app` library suite passes all 336 tests serially.
+The sharing fixtures now enter invite JSON in the dedicated join field rather
+than the chat composer. Their real dispatcher/TLS threads also require
+GPUI's real-I/O parking mode, as used for external-process tests in
+`../zed/crates/editor/src/editor_tests.rs` and agent installation tests in
+`../zed/crates/project/src/agent_server_store.rs`. No production Git or
+sharing behavior was changed to satisfy the deterministic scheduler; the
+Git-refresh coalescing/stale-reply tests still run in strict mode.
+
+Task launches use a fresh focused terminal with the recipe name, following
+Zed's `TerminalPanel::spawn_task` / `spawn_in_new_terminal` boundary. A real-PTY
+GPUI regression verifies repeated launches use distinct terminals, retain the
+title through shell updates, and execute the selected hidden justfile even
+when its directory contains spaces and an apostrophe.
+
+The integrated binary passes the real Rust, TypeScript/JavaScript and Python
+LSP matrix using copied Vtsls/BasedPyright caches and the installed Rust
+Analyzer 1.98.1. This includes completion, navigation, diagnostics/repair,
+semantic tokens, import fixes, Rust formatting/signatures/references/rename,
+unsaved-buffer replay after restart, and graceful shutdown. The retained
+fixture is
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-AifXLE`.
+
+The local fake-provider attribution smoke also passes with its workspace
+under `/private/tmp`: a shell source write is denied and reported as a failed
+command, generated Cargo output succeeds, Code Mode applies the patch, and
+Turso-backed attribution survives through an AHEAD-authored/human-committed
+Git commit and anchor cleanup. Project/user memory append, search, reviewed
+replacement, stale-snapshot rejection and Turso reopen pass separately.
+All 82 `codex-sandboxing` tests also pass with real Seatbelt available,
+including `scratch_write_roots_do_not_reopen_the_active_workspace`; this
+closes the earlier unrun unit-regression gap without disabling the sandbox.
+
+These results do not qualify native rendering/bootstrap or authenticated
+provider behavior. No OpenRouter key is available in the current environment
+or checked AHEAD connection layers, so no new authenticated turn was attempted.
+The shared `just dev` process is running again on
+`/private/tmp/ahead-broad-e2e.ikS0ar/project`. CoreGraphics lists its on-screen
+windows, but accessibility reports none and targeted capture fails. macOS's
+permission probes return true for capture/accessibility, while its session
+dictionary reports the desktop is locked. Native interaction and screenshot
+acceptance require an unlocked desktop; the current capture failure is not
+evidence of a new app startup crash.
+
+The subsequent current-source agent/proxy run passes 167 agent tests and
+257 proxy tests, with five opt-in tests ignored. Rebuilding caught a missing
+test-only ACP presentation-action import and a real policy-layer mismatch:
+`TMPDIR` could make a temporary workspace writable even though Seatbelt's
+workspace carveout denied the shell effect. The managed profile now adds an
+explicit read-only workspace entry beneath the scratch grant, retaining the
+deeper generated-output write entries. Regression coverage checks source
+denial, generated output, sibling scratch access, read-only mode and canonical
+aliases under both the system temp directory and `/tmp`.
+The same shared `just dev` loop rebuilt the integrated app with this policy;
+the complete `/private/tmp` attribution smoke passed again, including real
+Seatbelt source-write denial, generated Cargo output, the Code Mode patch,
+Turso CodeAnchor and staged Git commit attribution/cleanup. The watcher was
+left running on the same approved disposable project/profile.
+
+The subsequent FIM regression run passes 167 agent tests and 258 proxy tests,
+with five opt-in tests ignored. This includes all 22 prediction tests and seven
+instruction tests. The actual outbound FIM request after Turso reopen retains
+its comment-prefixed runtime plan. Consecutive provider captures verify changed
+decisions and explicit session selection, including selecting an older session
+after a newer one was created, switching sessions, and editor-only prediction
+without another chat's objective or decisions leaking in.
+
+Following Zed's captured-buffer-snapshot boundary in
+`../zed/crates/edit_prediction/src/fim.rs` and edit interpolation in
+`../zed/crates/edit_prediction_types/src/edit_prediction_types.rs`, AHEAD now
+binds inline replies to observed session/configuration and consumed
+related-buffer revisions. The editor rechecks these before display and
+acceptance and dismisses displayed suggestions when those revisions change.
+Only the editor's explicitly selected session is sent; the host's implicit
+last-created-session fallback has been removed. Request-scoped RPC callbacks
+also remove the old arbitrary pending-file response routing.
+
+Three inline-prediction regressions cover out-of-order replies, selected-session
+changes, consumed-buffer edits and close/reopen, provider changes, disconnect,
+shutdown, acceptance-time validation and one-step undo. Unrelated unsaved edits
+retain the suggestion. Successive matching keystrokes advance the insertion
+offset, retaining the remainder instead of dismissing it after one character.
+These are automated GPUI checks, not rendered native acceptance.
+
+The inline GPUI regression also passes across 20 scheduler seeds; both adjacent
+proxy-client regressions pass in the same focused run. All 21 RPC contract
+tests pass. The shared `just dev` process then rebuilt the integrated binary
+and was left running on the same approved disposable project/profile. Fresh
+local smoke runs pass source-write denial/generated-output writes, Code Mode
+patch attribution through staged Git commit cleanup, isolated project/user
+memory with Turso reopen, and Code Mode concurrent searches, cancellation,
+retry after reopen and shutdown. These use local fake providers, not external
+model credentials.
+
+This is not yet the full authoritative `PredictionContextSnapshot` contract.
+Instruction/provider file changes are observed after the filesystem debounce,
+instructions above a nested opened workspace need watched changes, and stale
+UI-result rejection does not abort the blocking provider request. Versioned
+route/policy/scope validation, session-summary caching, generated-text provenance,
+native acceptance and authenticated-provider checks remain in `TODO.md`.
+
+### Nonblocking conversation refresh and Stop
+
+Zed's `crates/agent_ui/src/conversation_view/thread_view.rs::cancel_generation`
+stores an asynchronous cancel task instead of waiting on the foreground thread.
+AHEAD now uses asynchronous RPC callbacks for turn start/retry, cancellation
+and the active conversation refresh. The 250 ms tick mirrors notification
+caches immediately and coalesces durable reads while one refresh is pending.
+Slow history reads no longer prevent composer input or Stop from being handled.
+An accepted turn remains pending until its stream or terminal message is
+observed, including when Stop was pressed before startup finished.
+
+Session-visit generations reject late replies even after leaving a chat and
+returning to the same ID. History reads cannot overwrite newer streamed text;
+runtime snapshots seed missing caches without replacing newer plan/tool/usage
+notifications. Repeated Stop requests are suppressed while cancellation is
+pending; malformed and failed cancellation replies leave a retryable control.
+
+The existing gpui-kit `MessageScrollerState` owns scroll anchoring and tail
+following. Strict GPUI interaction tests exercise delayed history, composer
+typing, scroll-up and return-to-tail, stale history/runtime replies, cleared
+plans, Stop/Escape during startup, cancellation errors and late replies after
+chat switching. Startup and completion-before-acceptance regressions also pass
+across 20 scheduler seeds. These tests use the native component's rendered
+test tree and input events, not macOS screenshots or an authenticated model.
+
+The final `cargo test --locked --offline -p ahead-app --lib --
+--test-threads=1 --quiet` passes all 341 app tests, including the real-PTY
+Justfile task regression: each launch opens a fresh focused terminal with the
+recipe title, preserves earlier shells, and uses the declaring justfile.
+The final chat filters and late start/retry regression also pass across 20
+scheduler seeds. The shared `just dev` loop rebuilt the integrated app in
+15.5 seconds and is running on the same approved disposable project/profile.
+The rebuilt managed Code Mode smoke passes eight concurrent delegated
+searches, cancellation, retry after Turso reopen and shutdown with a local
+fake provider. Native visual and authenticated-provider acceptance remain open.
+
+### Optional rename preparation and non-Rust LSP acceptance
+
+Zed's `crates/project/src/lsp_command.rs::PrepareRename` checks that rename is
+enabled and uses `response_without_request` when no applicable server advertises
+preparation. AHEAD previously treated any `renameProvider` field as support for
+both requests, including `false`, and sent unsupported preparation requests.
+The existing proxy route now distinguishes these capabilities and returns the
+editor's existing default-word behavior for unprepared rename. Advertised
+preparation replies remain authoritative; the fallback does not replace them.
+
+A child-process regression exercises six capability forms and confirms actual
+rename requests still reach the server. The full source-current proxy suite
+passes 259 tests with one opt-in test ignored. Its first direct invocation from
+the repository root hit the path-dependent CLI fixture; the complete rerun from
+Cargo's normal `ahead-proxy` working directory passes. No test behavior was
+changed to hide that invocation error.
+
+The shared `just dev` loop rebuilt the integrated binary after an initial
+disk-full link failure. Only two generated proxy test executables from this
+work were removed; source, dependency caches and user data were retained.
+The loop is running on the same approved disposable project and profile.
+
+Against that rebuilt binary, `tests/lsp-smoke.mjs` passed with existing cached
+Vtsls and BasedPyright, without downloading packages or using credentials.
+TypeScript, JavaScript and Python declaration renames update unsaved buffers
+across files, preserve definition/hover results, pass a typed-error/repair
+cycle and leave source files unchanged on disk. Rename preparation and
+references are exercised from the call site; the cross-file rename starts at
+the declaration because an imported binding may have local-alias semantics.
+TypeScript formatting is applied and checked for idempotence; typed signatures,
+quick-fix/auto-import, close/reopen, restart with unsaved replay and graceful
+process cleanup pass too. Fixture:
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-adsDTy`.
+
+The formatting check uses an error-to-clear diagnostic transition rather than
+assuming a server repeats unchanged empty diagnostics. These are real
+proxy/server checks, not native F2, popup, per-file undo or formatting acceptance.
+Installing and routing a Python formatter alongside its analyzer remains open.
+The same rebuilt binary also passes the local managed Code Mode smoke:
+eight concurrent delegated searches, cancellation, retry after Turso reopen
+and shutdown. No external model credentials were used.
+
+### Python analyzer and formatter integration (2026-10-15)
+
+Zed's `assets/settings/default.json` selects BasedPyright plus Ruff for Python,
+with Ruff as formatter; `crates/languages/src/python.rs` resolves the Ruff
+binary and disables the analyzer's duplicate import organizer. AHEAD now uses
+that split through its existing LSP processes, capability routing, diagnostics
+and restart path. The catalog retains multiple server IDs per language and
+keys pending resolutions by server rather than suppressing a second adapter.
+Ruff prefers the project virtualenv, PATH and AHEAD's managed cache, then uses
+the same bounded download/staged publication path as Rust Analyzer. Its hover
+capability is disabled so an empty Ruff reply cannot replace a typed analyzer
+hover, following [Ruff's integration guidance](https://docs.astral.sh/ruff/editors/setup/).
+The shared first-success request helper now admits only one successful callback.
+
+The expanded proxy suite passed 265 tests with one opt-in extension test ignored
+before the final null-formatting correction. A sandboxed run failed on loopback
+and native watcher permissions; the unchanged executable passed with those
+permissions from Cargo's package working directory. Only rebuildable test
+executables and validated app/proxy incremental directories were removed to
+make room for linking; source and user data were retained.
+
+The rebuilt integrated binary downloaded Ruff 0.17.1 into disposable fixture
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-E3MyjM`.
+Its archive SHA-256 matched the release metadata and its executable passed the
+version probe. The real servers published combined Ruff and BasedPyright
+diagnostics. The smoke initially expected no diagnostics from a Python snippet
+with no import separator; Ruff correctly reported I001. The snippet and cursor
+positions are corrected without relaxing the diagnostic assertions.
+
+A direct probe also confirmed that Ruff returns LSP's valid `null` result for
+an already-formatted document. AHEAD's formatting route now normalizes that to
+an empty edit list, with a regression for null, empty/nonempty edits and errors.
+Generated app and bundle outputs were externally removed during the first
+smoke, with free disk rising from roughly 0.5 to 44 GiB. The single `just dev`
+loop completed its clean rebuild in 16m 25s and started the previously approved
+disposable project. The integrated Python smoke then passed, followed by the
+combined TypeScript/JavaScript/Python smoke against that rebuilt binary:
+Ruff formatting and idempotence, combined diagnostics, typed analyzer hover,
+unsaved cross-file rename, close/reopen, fresh processes after restart and
+graceful shutdown. The combined fixture is
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-dmACY3`.
+No downloads or credentials were needed for these reruns; the acquired servers
+were reused from disposable caches. After stopping the watcher, the one-off
+proxy test build completed in 3m 45s. The null-formatting regression passes,
+as does the full source-current proxy suite: 266 passed, zero failed, one opt-in
+test ignored (66.75s with local networking and native watcher access).
+Scoped rustfmt and whitespace checks pass. The user guides now describe the
+Python analyzer/formatter split, Ruff acquisition and the remaining limits.
+The same `just dev` command rebuilt in 16.17s after testing and is running on
+the previously approved disposable project/profile; its proxy entered the
+main loop. This confirms startup, not rendered UI acceptance.
+TODO retains native acceptance, multi-server code-action aggregation, explicit
+overlapping-server selection and watched Ruff configuration reload.
+
+### Language-server watched-file registrations (2026-10-15)
+
+Reference: Zed's `crates/project/src/lsp_store.rs::register_watcher`,
+`worktree_and_path_for_file_watcher`, unregister handling and file-event
+delivery. AHEAD uses the same ownership model: server ID plus registration
+ID, workspace-scoped unrooted globs, explicit relative-pattern bases and
+cleanup when a server unregisters, stops or restarts. The existing native
+watcher filters paths before sending events to the catalog, shares roots
+between registrations and preserves other watcher consumers. Registrations
+honor create/change/delete kinds and translate rename events. Invalid globs,
+non-file bases, traversal outside a relative base and recursive filesystem-root
+watches are rejected.
+
+The first real Ruff probe caught a macOS URI-identity bug: native events used
+`/private/var/...`, while the server's workspace URI used `/var/...`. Matching
+now uses canonical paths but notifications preserve the workspace's original
+URI spelling, or an external relative pattern's declared base URI. A regression
+covers both aliases, including deleted files. This matches the workspace lookup
+in [Ruff 0.17.1's session index](https://github.com/astral-sh/ruff/blob/0.17.1/crates/ruff_server/src/session/index.rs).
+Watcher backend errors are logged without ending subsequent event delivery.
+
+The source-current proxy suite passes 279 tests, zero failed, one opt-in
+extension test ignored. Coverage includes owner isolation, glob/kind filtering,
+rename mapping, native external-root delivery, unrelated-path filtering,
+unregister/stop cleanup, recursive-watch sharing and URI aliases. The shared
+`just dev` loop rebuilt in 17.02s and its proxy entered the main loop.
+
+The real Python smoke passes with cached BasedPyright and Ruff 0.17.1, followed
+by the combined Rust/TypeScript/JavaScript/Python smoke. Creating, editing,
+renaming and deleting `pyproject.toml`/`ruff.toml` changes actual formatting
+without replacing Ruff's process. These checks repeat after an explicit
+server restart; formatting, combined diagnostics, code actions, navigation,
+unsaved-buffer recovery and graceful shutdown still pass. No model credentials
+or downloads were needed. Retained combined fixture:
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-Bf8GhZ`.
+This is proxy/server acceptance, not rendered native UI acceptance. Native
+code-action selection/undo and explicit overlapping-server selection remain
+in `TODO.md`.
+
+### Multi-server code-action ownership (2026-10-15)
+
+Zed's `crates/project/src/lsp_store.rs::code_actions` and
+`request_filtered_lsp_locally` collect responses from multiple servers;
+`crates/project/src/project.rs::CodeAction` keeps the producing server ID.
+AHEAD now follows that ownership pattern through its existing catalog,
+RPC and client. `LspCodeAction` is the single shared shape rather than an app
+wrapper around a response-wide server ID. Empty/null replies cannot win a
+race and suppress another server's actions. A partial failure retains healthy
+actions; total failure reaches the caller. Replies have stable owner ordering,
+and same-title actions from different servers are not incorrectly deduplicated.
+Code actions use a four-second server deadline so aggregation can finish
+inside the editor's five-second wait. Other requests retain their existing
+deadline; expired requests send cancellation and ignore late replies.
+
+Four focused proxy regressions pass, followed by the full source-current
+proxy suite: 270 passed, zero failed, one opt-in ignored. The mounted editor
+regression passed 20 scheduler seeds, selecting the second server's lazy
+action, routing resolve and its command to that owner, and undoing the edit in
+one step. The full app suite passes all 341 tests. The shared `just dev` loop
+rebuilt the integrated binary in 35.32s on the same approved disposable
+project/profile and its proxy entered the main loop.
+
+The real proxy smoke passed with cached Vtsls, BasedPyright and Ruff, then
+passed with all three language stacks using Zed's existing versioned Rust
+Analyzer binary too. No downloads or model credentials were needed. Fixture:
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-NbF2BB`.
+The Python fixture explicitly enables BasedPyright's unused-import warning
+to exercise both servers' actions for the same range, before and after restart.
+Ruff returned an inline edit; its application clears both diagnostics without
+saving the buffer. This probe does not exercise Ruff's optional resolve path;
+the mounted test covers lazy resolve/command ownership. TypeScript's real
+import fix retains Vtsls ownership for its advertised command. Native menu,
+keyboard selection and undo acceptance remain open, as do explicit
+overlapping-server selection and watched Ruff configuration reload.
+
+### Ordered language-server routing (2026-10-15)
+
+Zed's `crates/project/src/lsp_store.rs::request_lsp` queries the first
+applicable server in adapter order rather than racing replies.
+`crates/language/src/language_settings.rs::language_servers` defines explicit
+server order, `!id` exclusions and `...` expansion. AHEAD now follows those
+rules through its existing catalog and server queues. Capability and document
+checks happen before sending the request; valid null/empty replies and server
+errors do not trigger another server. Optional rename preparation keeps its
+existing fallback. Code actions still aggregate enabled servers, and explicit
+owner IDs keep completion/action resolve and commands on their producing server.
+
+The shared settings layers now accept `[languages.<language>]` server lists
+and `[languages.<language>.requests]` method-to-server choices. A disabled
+feature target returns an error instead of falling back. Routing changes use
+the existing restart path with the latest unsaved documents; malformed settings
+leave the last valid routing running and report an error. Built-in Python no
+longer suppresses Ruff's advertised hover capability: analyzer-first defaults
+and explicit routes decide which server answers it.
+
+The first real routing probe exposed another macOS alias mismatch, this time
+in workspace settings detection rather than LSP watched-file URI delivery.
+The notifier now normalizes its comparison root and recognizes settings paths
+through aliases even after file deletion, without rewriting editor or LSP URIs.
+The real native watcher regression and the existing private-provider/search
+regression both pass. The full source-current proxy suite passes 285 tests,
+zero failed, one opt-in ignored (74.59s). Focused rustfmt, Node syntax and
+whitespace checks pass. No dependency was added.
+
+The same shared `just dev` loop rebuilt the integrated binary in 12.87s on
+the previously approved disposable project/profile and its proxy entered the
+main loop. The final Rust/TypeScript/JavaScript/Python smoke passes with cached
+servers: completion, typed signatures, diagnostics, formatting, rename,
+multi-server actions, watched Ruff configuration and restart. Native settings
+events also reorder Python servers, pin hover/formatting, disable/re-enable
+Ruff and replay unsaved buffers without saving source files. Retained fixture:
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-HStpx4`.
+No downloads or model credentials were used. These are proxy/server checks,
+not rendered popup, keyboard-selection or undo acceptance. Those native gates
+remain in `TODO.md`; the user guide documents the TOML configuration path.
+
+### Concurrent Turso startup and failed-commit recovery (2026-10-15)
+
+Zed's `crates/sqlez/src/connection.rs::open_with_flags` sets a five-second
+busy timeout because multiple editor instances share agent-thread storage.
+Reference checkout: `418f89714891f9d8105a3e92e60b9a7a5084d232`.
+AHEAD now applies that bounded wait to its existing Turso connection before
+initial schema creation. No schema version, migration or journal-mode change
+was added.
+
+A four-process first-open test initially failed with `database is locked`.
+Adding the timeout exposed a second failure: history appends read their next
+ordinal in a deferred transaction, then attempted a lock upgrade. They now
+reserve the writer before reading. Ten consecutive four-process runs preserve
+all eight history items and eight metadata patches per worker after reopening.
+
+Held-reader regressions then reproduced failed commits leaving the connection
+inside a transaction. The remaining eight manual session-write transactions
+now use Turso's existing transaction guard. Tests force a commit timeout for
+history, metadata, titles, workflow, thread deletion, recent files, memory
+indexing and saved turn requests. Prior data survives, the connection returns
+to autocommit, and a retry on that same connection persists after reopen.
+The tests shorten only their own timeout; production waits up to five seconds
+and still reports persistent contention rather than retrying indefinitely.
+
+All 11 focused storage tests pass. The full source-current proxy suite passes
+289 tests, zero failed, one opt-in ignored (88.14s). The shared `just dev`
+loop rebuilt the integrated binary in 17.80s and its proxy entered the main
+loop on the same approved disposable project/profile. Real proxy probes pass
+unsaved-buffer crash recovery, project/user memory isolation and reviewed
+replacement, plus managed Code Mode with concurrent search, cancellation and
+retry after Turso reopen. Explicit shutdown and stdin EOF retain the cancelled
+turn and partial answer; SIGKILL retains the answer and instruction provenance
+without automatically replaying the turn. An explicit retry starts once.
+These use disposable data and a local fake provider,
+not model credentials or native UI automation. Recovery fixture retained at
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-recovery-smoke-ryw9cP`.
+
+macOS and Windows CI now run the storage filter explicitly; Linux includes it
+in the workspace library suite. Removed CI steps referenced the deleted
+`ahead-app/portable` feature and the deleted legacy-rollout import tests.
+The YAML parses, and scoped rustfmt and whitespace checks pass. Linux/Windows
+runtime checks, Windows ACL acceptance and actionable native contention errors
+remain unverified; they are still in `TODO.md`.
+
+### Curated ACP cache repair (2026-10-15)
+
+Zed's `crates/project/src/agent_server_store.rs::LocalRegistryNpxAgent::get_command`
+runs npm installation before resolving the package executable. Reference
+checkout: `418f89714891f9d8105a3e92e60b9a7a5084d232`.
+The [live ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json)
+still supplies npm distributions for Pi, Codex and Claude Code; AHEAD's
+curated catalog remains unchanged. Platform archives and update-status UI
+remain separate work, not a reason to expose arbitrary registry agents.
+
+A new regression reproduced an install marker referring to a missing package
+generation. AHEAD returned `No such file or directory` without attempting a
+repair. Missing generations, package metadata, executables and lockfiles now
+reuse the existing install lock, private staging directory and atomic manifest
+publication. A failed repair preserves the manifest and earlier leased
+generations. Malformed manifests, executable path escapes and other I/O errors
+still fail closed; no user cache is swept or migrated. The docs now describe
+the actual lock serialization rather than claiming cached launches bypass it.
+
+Windows npm selection now uses `npm.cmd` explicitly through Rust's command
+API; no shell command string is assembled. A Windows-only regression creates
+a shim in a disposable PATH containing spaces and an ampersand. The `npx_`
+cache filter now runs explicitly in macOS/Windows CI; Windows execution is not
+verified on this host.
+
+All 18 non-opt-in adapter tests pass, followed by the full source-current
+agent suite: 169 passed, zero failed, four opt-in ignored (31.00s). The extended
+offline npm smoke passes with Node 24.15.0 and npm 11.12.1: it packs and installs
+two disposable local packages, deletes the current executable, repairs it from
+the local tarball, and runs both repaired and earlier leased versions. Its
+private npm config/cache, offline mode and disabled lifecycle scripts avoid
+registry/provider access. Scoped rustfmt, YAML parsing and whitespace checks
+pass. The same shared `just dev` loop rebuilt the integrated binary in 21.01s
+on the approved disposable project/profile. Native install/reconnect and
+authenticated external-agent turns remain open in `TODO.md`.
+
+### Live curated-agent registry and model options (2026-10-15)
+
+Rechecked Zed's `LocalRegistryNpxAgent::get_command` in
+`crates/project/src/agent_server_store.rs` and option defaults in
+`crates/agent_servers/src/acp.rs` at
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. The installer resolves the registry
+package before launching its executable; advertised session options remain
+the source of truth for model selection.
+
+AHEAD's opt-in `curated_acp_session_model_options_offline` test now waits for
+the production background registry refresh, loads its cache and verifies
+installed package provenance against the live entries. It no longer treats
+failed Codex authentication or auth-required session creation as a successful
+model check. Per-agent diagnostics report initialization and option results;
+saved defaults are checked on disk too.
+
+The final-source run passed in 32.07s. Pi `pi-acp@0.0.34`, Codex
+`@agentclientprotocol/codex-acp@2.2.2` and Claude
+`@agentclientprotocol/claude-agent-acp@0.91.0` all initialized, created sessions,
+changed an advertised model option and saved the selection. Pi exposed two
+model choices from its synthetic catalog, Codex eight and Claude five.
+Claude's fallback package now matches that tested 0.91.0 version. The run used
+temporary projects/homes/package caches, isolated npm configuration, disabled
+lifecycle scripts and synthetic keys. No model prompt was sent. Registry/npm
+access is required despite the test's historical name; the build guide now
+documents that distinction and the isolated command.
+
+All 169 non-opt-in agent library tests pass on the final source (four ignored,
+34.52s). The focused adapter suite passes 18 tests. Scoped rustfmt and
+whitespace checks pass. The shared `just dev` loop rebuilt the integrated
+binary in 14.87s on the same approved disposable project/profile; its proxy
+entered the main loop. The watcher remains running.
+
+This closes the protocol-level live-registry consumption check, not native
+install/reconnect, picker rendering, real provider authentication or model
+turns. Those remain in `TODO.md`.
+
+### FIM request cancellation and host context checks (2026-10-15)
+
+Rechecked Zed's `EditPredictionStore::cancel_pending_prediction` and
+`PendingPrediction::drop_on_cancel` in
+`crates/edit_prediction/src/edit_prediction.rs` at
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. For cancellable predictions, Zed
+drops the task and its HTTP future rather than only hiding the eventual result.
+
+AHEAD's inline fallback previously held the session-host read lock throughout
+a blocking provider call inside the LSP response callback. It now captures an
+owned context snapshot, releases the lock and runs inference on a worker.
+Before returning, the host rereads the selected session/work state, provider
+configuration and applicable instructions. A changed snapshot rejects the
+result. This check does not yet bind a versioned snapshot hash to editor
+acceptance.
+
+The three HTTP paths use the existing async reqwest dependency with a
+cancellation signal. Active or consumed-buffer edits/closure, a newer request
+for the same file, workspace replacement and shutdown drop the request or
+response-body future. Unrelated edits and identical buffer snapshots leave the
+request alone. A cancelled late LSP reply cannot launch new provider work.
+Cursor-only movement and session/mode/provider changes still need immediate
+cancellation; UI stale-result rejection remains in place for those changes.
+
+All 32 prediction-filter tests pass on the final source (0.19s; incremental
+build 19.17s). Six loopback cases stall generic OpenAI-compatible, Qwen FIM
+and Ollama calls before headers or during the response body, then verify
+prompt cancellation and socket closure before the five-second timeout.
+Dispatcher tests verify host-lock release and consumed-buffer/late-reply
+cancellation. Host tests change instructions, provider model or a durable
+decision after receiving the outbound prompt and verify rejection of the old
+completion. No external model or credentials were used. Native caret/undo,
+generated-text provenance, latency and authenticated-provider acceptance remain
+in `TODO.md`; the specification now distinguishes these gaps from the checked
+host and transport behavior.
+
+The rebuilt proxy library suite passes 293 tests, with one opt-in test ignored
+(69.06s). Scoped rustfmt and whitespace checks pass.
+The same shared `just dev` loop rebuilt the integrated binary in 22.27s on
+the approved disposable project/profile; its proxy entered the main loop.
+The watcher remains running. This is build/process evidence, not a native
+visual acceptance pass.
+
+### Editor-owned prediction cancellation (2026-10-15)
+
+The preceding transport work left cursor-only movement and route changes
+without an explicit cancellation path. Rechecked Zed's task ownership in
+`EditPredictionStore::cancel_pending_prediction` at
+`418f89714891f9d8105a3e92e60b9a7a5084d232`: dropping the editor's pending
+prediction also drops its provider future.
+
+AHEAD now stores the pending GPUI task instead of detaching it. Its request
+guard owns the RPC ID. Dropping that guard retires the local callback and sends
+`CancelInlineCompletions` for that ID; the proxy cancels only the matching job.
+Repeated cancellation and cancellation after completion are no-ops. An old
+task cannot cancel its replacement, including another request for the same
+file.
+
+Caret/selection changes, selected-session switches, observed session/mode or
+provider invalidation, Escape and existing editor request-generation changes
+drop the pending task. Unrelated session/buffer notifications leave it alone.
+The shared request-invalidation method also covers file reload/error and
+completion-acceptance transitions. Displayed ghost text clears on selection
+movement; final acceptance synchronously checks the caret and empty selection
+before editor observers run. Matching typed prefixes still retain the remaining
+suggestion.
+
+The focused final-source run passes all four app, two proxy and one RPC
+inline-prediction tests. The proxy's loopback regression now checks both buffer
+invalidation and explicit cancellation of a stalled HTTP request. The complete
+proxy suite passes 293 tests, with one opt-in ignored (76.99s), and all 22 RPC
+tests pass. These are disposable local-provider and headless GPUI checks, not
+native visual or authenticated-provider acceptance. Debounced instruction and
+provider file notifications, ancestor-instruction watching, versioned snapshot
+binding, summary caching and generated-text provenance remain in `TODO.md`.
+
+Both GPUI inline-prediction regressions also pass across 20 scheduler seeds
+(`ITERATIONS=20`; the four-test app filter finishes in 3.33s). Scoped rustfmt
+and whitespace checks pass.
+All 342 app library tests pass on the final source (53.93s), including real-PTY
+task behavior and existing completion insertion/interpolation/undo checks.
+The shared `just dev` loop rebuilt the integrated binary in 25.87s using the
+same approved disposable project/profile. Its proxy entered the main loop;
+the watcher remains running. Native rendering is not verified by that startup.
+
+### Snapshot-bound prediction acceptance (2026-10-15)
+
+Rechecked `interpolate_edits` in Zed's
+`crates/edit_prediction_types/src/edit_prediction_types.rs` at
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. It compares old/new buffer
+snapshots and retains a predicted insertion only when intervening human edits
+match its prefix. AHEAD follows that behavior for insertion suggestions and
+adds host-owned session, route, policy and instruction checks.
+
+Managed FIM replies now carry a version-1 binding through the proxy response,
+displayed suggestion and acceptance request. The binding contains a request
+identity, snapshot digest and target revision. The host retains the private
+snapshot, consumed-buffer identities/revisions and the original target's
+shared rope. There is one cached entry per path, capped at 32 entries with a
+two-minute lifetime; retained prefix/suffix strings use bounded inference
+excerpts. API keys are excluded from serialization, while private snapshot
+equality still rejects a changed credential.
+
+Tab sends asynchronous validation before insertion. The host checks the
+binding, full live target hash, caret, exact remaining suggestion, related
+buffers and a fresh session/provider/instruction snapshot. Matching typed
+prefixes remain valid; unrelated edits do not invalidate the suggestion.
+Validation consumes the binding once and does not edit or write attribution.
+After the reply, the editor rechecks its generation and local context before
+inserting. Repeated Tab cannot submit duplicate acceptance requests. Ordinary
+LSP inline replies keep their existing local acceptance path.
+
+The new session-archive regression first failed: archiving removes a session
+from the active list but does not change its stored `SessionView`. FIM
+preparation now also queries the existing Turso archive table and rejects
+archived context. No schema or migration was added.
+
+The final-source focused run passes five app, 36 proxy and one RPC tests
+(44.79s incremental build). New coverage includes changed on-disk instructions,
+provider/credential changes without notifications, archive state, reopened
+buffers, forged replacement text, expired/replayed bindings and large Unicode
+targets using bounded excerpts. A real loopback provider verifies the actual
+outbound instructions, bound reply and serialized acceptance RPC. Headless
+GPUI checks delay validation replies while typing, moving the caret, switching
+session/provider or disconnecting; valid insertion remains one undo action.
+The five-test app filter also passes across 20 scheduler seeds (14.45s).
+
+All 343 app library tests and all 22 RPC tests pass. The app suite includes the
+real-PTY Justfile regression: fresh focused terminals retain the task name and
+run the selected hidden justfile without replacing earlier shells. These are
+automated tests, not native visual or authenticated-provider acceptance.
+The full proxy suite passes 297 tests, with one opt-in test ignored (77.38s).
+Its direct runner must use the `ahead-proxy` package directory, as Cargo does;
+an earlier repository-root run failed only the existing `../Cargo.toml`
+relative-path fixture. No CLI code was changed for that invocation error.
+Summary caching, context budgets, ancestor-instruction watching, debounced UI
+invalidation, generated-text provenance and native latency/placement remain in
+`TODO.md`. Host validation and editor insertion are not one atomic transaction.
+
+Scoped rustfmt and whitespace checks pass. The same shared `just dev` loop
+rebuilt the integrated binary in 44.41s on the approved disposable
+project/profile, and its proxy entered the main loop. The watcher remains
+running. This confirms build/startup, not native rendering.
+
+### Instruction-watch invalidation (2026-10-15)
+
+Rechecked Zed's instruction watcher in
+`crates/agent_settings/src/user_agents_md.rs` and `watch_config_file` in
+`crates/settings/src/settings_file.rs` at
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. Instruction changes have their
+own notification path. AHEAD uses that separation with standard project
+`AGENTS.md` files; this does not add Zed-specific file locations or aliases.
+
+The proxy now registers filtered, non-recursive directory watches for
+instructions above a nested workspace, stopping at the same repository root
+as the loader. The existing `ahead-agent` root discovery is shared rather than
+duplicated. Directory watches handle files absent at startup and atomic
+replacement without following an old file handle. Instruction events and
+workspace/user provider settings invalidate predictions immediately. Git,
+search and language-server configuration refreshes remain debounced;
+instruction changes do not restart language servers.
+
+Workspace refreshes no longer advance the prediction configuration revision
+for every disk change. They invalidate affected open-buffer revisions only,
+leaving suggestions that consumed unrelated buffers alone. A pathless rescan
+still invalidates conservatively. The separate immediate provider signal also
+avoids invalidating a new suggestion merely because the delayed settings
+refresh arrives later.
+
+Native watcher regressions create, atomically replace and delete ancestor
+instruction files in disposable nested workspaces, including a `.git` worktree
+marker file. Synthetic event checks cover immediate delivery, search-ignored
+instructions, rename events and exclusion of unrelated ancestors/subtrees and
+non-standard instruction filenames. The client regression covers consumed
+versus unrelated buffers, older events, rescans and a delayed provider refresh.
+The existing GPUI prediction test now routes the watcher notification through
+the core channel and verifies displayed ghost text clears; unrelated workspace
+notifications preserve it.
+
+The final instruction filter passes seven agent and four proxy tests (43.55s
+incremental build). The prediction filter passes six app, 36 proxy and one RPC
+tests. These are automated filesystem/protocol/GPUI checks, not a native visual
+or authenticated-provider pass. Ancestor subscriptions are fixed at workspace
+initialization; refreshing them when a repository boundary changes remains in
+`TODO.md`, along with summary budgets, attribution and native acceptance.
+
+The final-source full library suites pass: app 344 (86.16s), proxy 299 with one
+opt-in ignored (98.32s), agent 169 with four opt-in ignored (37.72s), and RPC 22.
+The direct proxy and agent runners used their package directories. Scoped
+rustfmt and whitespace checks pass. These suites use disposable projects,
+local mock providers and real PTYs; they do not qualify an external model.
+The six-test prediction filter also passes across 20 GPUI scheduler seeds
+(`ITERATIONS=20`, 14.71s), without retries.
+The shared `just dev` loop rebuilt the integrated binary in 17.67s on the same
+approved disposable project/profile; its proxy entered the main loop. The
+watcher remains running. Native rendering is still unverified.
+
+### FIM session-context caching and size guards (2026-10-15)
+
+Rechecked `crates/edit_prediction/src/fim.rs` and
+`crates/zeta_prompt/src/zeta_prompt.rs::format_prompt_with_budget_for_format`
+in the same Zed checkout, `418f89714891f9d8105a3e92e60b9a7a5084d232`.
+Zed bounds the active excerpt and budgets formatted context. AHEAD retains
+that separation while adding required session and standard instruction text;
+it does not copy Zed's hosted prediction service or invent a replacement loop.
+
+The host now caches compact durable work text for at most eight sessions,
+64 KiB per entry. Keys include a projection-format version and a Turso source
+revision; the private prediction snapshot includes that version. Triggers on
+the five consumed work/runtime/conversation tables cover insert, update and
+delete, including another connection's writes. Revision changes roll back
+with their transaction. Unrelated sessions and editor recovery/recent-file
+writes do not invalidate the selected session's text. Workspace replacement
+clears the cache, and history expiry removes its durable version row.
+
+Cold assembly fetches only the latest four summaries, leaving full history
+and exports intact. It checks stored text lengths as rows stream from Turso,
+then decodes only the fields that enter the prompt; plan JSON is selected
+without loading unrelated runtime warnings or commands. All explicitly tagged
+decision/invariant/constraint events survive newer notes; the current plan
+stays complete. Existing human-only audience checks suppress summaries after
+a private message invalidates a previously warm cache.
+FIM formatting no longer drops invariants after the third one.
+
+The input guard covers session text, instructions, related excerpts and their
+metadata together at 64 KiB. Both generic and FIM routes also guard the final
+formatted prompt at 128 KiB, including line-comment expansion. Over-budget
+required context fails before HTTP dispatch without silent truncation or
+provider fallback. These are byte guards, not model-specific token limits;
+faithful compaction and model-aware budgets remain in `TODO.md`.
+
+The final cache, byte-budget and Turso row-reader source passed the combined
+app/proxy/agent/RPC prediction filter (50 tests; the agent crate had no matching
+tests). The shared target directory had been removed before the clean 11m46s
+build; the dev watcher was stopped and no competing AHEAD Cargo build was
+running during verification. Native and authenticated-provider acceptance
+remain open.
+
+Afterward the shared `just dev` loop rebuilt the integrated app in 2m30s. The
+link completed with the existing macOS compact-unwind warning, then the runtime
+reported `AHEAD proxy child entering mainloop`. The watcher remains active on
+the approved disposable multi-language project. This confirms build and process
+startup, not rendered-window or feature-interaction acceptance.
+
+The follow-up provider-selection regression passes 1/1: absent
+`ai.active_connection`, FIM now follows configured connection order rather than
+sorting provider IDs. Restarting the watcher after this test first failed with a
+missing `unicode_ident` `.rmeta`; `target/` was absent at inspection. A
+lock-guarded clean rebuild then passed in 11m17s and again reported the proxy
+entering its main loop. The current watcher is active on the same disposable
+project. Native rendering remains unverified.
+
+The current integrated `target/debug/ahead` passed
+`tests/agent-shutdown-smoke.mjs`: explicit shutdown, stdin EOF and SIGKILL each
+preserved partial streamed text and Turso history across reopen; a crashed turn
+was not replayed until explicit retry. This used only the loopback fake model.
+The Rust-only `tests/lsp-smoke.mjs` also passed with Zed's cached Rust Analyzer
+provided explicitly because the PATH rustup shim lacks that component. It
+covered formatting, completion, definition, semantic tokens, hover, signature
+help, references, cross-file rename, unsaved diagnostics/repair, close/reopen,
+restart and graceful server shutdown. The disposable workspace is
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-NImXD4`.
+These are proxy/protocol checks, not rendered editor or authenticated-provider
+acceptance. The TypeScript/JavaScript/Python matrix was not repeated in this
+pass; those languages last passed against the Oct 14 integrated binary.
+
+The same current proxy binary passed `tests/agent-memory-smoke.mjs` for
+project/user-scoped append, ranked search, reviewed replacement, stale-snapshot
+rejection and Turso reopen. The source-current app test runner also passed six
+focused GPUI regressions: Just task opens a fresh task-named terminal, code
+comments require an active session, completion detail shows signatures, fuzzy
+completion ranking respects the five-item cap/server order, the model picker
+searches model/provider names, and model visibility stays scoped under
+collapsible providers. These are headless interaction checks; native rendering
+and OS input remain unverified.
+
+On 2026-10-15, the integrated binary built after the managed MCP source changes
+passed `tests/agent-mcp-smoke.mjs` with a loopback model. The modern-only stdio
+fixture rejects legacy initialization and requires the 2026-07-28 discovery
+envelope and metadata. The smoke approved the tracked declaration, observed
+and answered a separate prompt for each operation, and verified one
+`tools/call`, `resources/list`, `resources/templates/list` and `resources/read`
+reached the server only after approval. Tool and resource results returned to
+the model, which completed the turn; shutdown was clean. A second phase made
+the `--form` fixture reject modern discovery, then confirmed RMCP's legacy
+initialization fallback and an approved tool call. No external model or MCP
+server was contacted. In-flight cancellation and the rendered approval UI
+remain open.
+
+Revalidated on 2026-10-16 against the current integrated binary with access
+limited to the smoke's disposable loopback model. Modern discovery/resources,
+stdio tool execution, per-call approval, model continuation, and legacy
+initialization fallback passed again. This still does not exercise in-flight
+cancellation or native approval rendering.
+
+## Model-specific reasoning controls (2026-10-19)
+
+Zed's `crates/agent_ui/src/conversation_view/thread_view.rs` builds the
+reasoning menu from the selected model's supported effort levels, restores the
+selected/default level, and saves model-specific choices through its agent
+settings. AHEAD now queries the retained model manager's
+`ModelInfo::supported_reasoning_levels` through the managed session host,
+renders only those choices, and stores a user's override by provider/model in
+`~/.ahead/settings.toml`. Unsupported saved values resolve to the model default.
+The corresponding app and settings tests were added but not run in this pass;
+the user will verify the rebuilt native behavior.
+
+## ACP Registry binary distributions (2026-10-20)
+
+Followed Zed's `AgentRegistryStore` platform selection and
+`LocalRegistryArchiveAgent` install lifecycle while keeping AHEAD's Pi, Codex
+and Claude Code catalog curated. AHEAD now prefers a checksummed binary target
+for the current platform, falls back to the registry Npx package, and reports
+registry/installed-version differences in the picker. Binary installs verify
+HTTPS archive SHA-256 before extracting ZIP, gzip-tar, bzip2-tar or raw files;
+unsafe paths, links/special files and oversized archives are rejected. Installs
+use AHEAD's locked, atomically published, leased generations. The official
+schema makes the checksum optional, but AHEAD requires it before executing a
+binary distribution. Focused tests were added but not run; native app and
+Windows installation behavior remain unverified. References:
+[Zed registry store](https://github.com/zed-industries/zed/blob/main/crates/project/src/agent_registry_store.rs),
+[Zed binary installer](https://github.com/zed-industries/zed/blob/main/crates/project/src/agent_server_store.rs),
+[ACP registry schema](https://github.com/agentclientprotocol/registry/blob/main/agent.schema.json).
+
+## Managed npm language-server updates (2026-10-20)
+
+Compared against Zed commit
+`418f89714891f9d8105a3e92e60b9a7a5084d232`. Its
+`crates/node_runtime/src/node_runtime.rs` resolves the latest npm package
+version and compares it with the installed version using
+`should_install_npm_package`; `crates/languages/src/vtsls.rs` and
+`crates/languages/src/python.rs` update only when their cached package is
+behind. AHEAD follows that lifecycle for its
+managed Vtsls and BasedPyright packages: on first use in a catalog session, a
+background `npm view` checks the configured registry's `latest` tag. A newer
+semver installs through AHEAD's existing staged/locked cache publisher, and
+the running servers restart only after publication. An offline or failed check
+leaves the cached server working. A check uses an npm/Node runtime already on
+PATH or in AHEAD's cache, so it does not download Node merely for version
+discovery. System-installed servers remain the user's package-manager concern.
+The Extensions tab surfaces installation progress, and failed managed servers
+offer a scoped cache repair action. The version parser, bounded subprocess
+output, and fake-npm lookup tests are source coverage only until run.

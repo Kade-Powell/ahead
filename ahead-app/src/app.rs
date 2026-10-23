@@ -20,7 +20,9 @@ use gpui_kit::component::dock::{
     PanelEvent, PanelStyle, panel_handle,
 };
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme, Icon, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, WindowExt, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -29,7 +31,7 @@ use sha2::Digest;
 use crate::proxy_client::{DebugTerminalEvent, EditorPresentationRequest};
 use crate::workspace_panels::{
     ActivityBar, GitPanel, JustTasksPanel, LanguageServersPanel, ProblemsPanel,
-    SearchPanel, WorkspaceView,
+    SearchPanel, SearchReplaceRequest, WorkspaceView,
 };
 
 gpui_kit::actions!(
@@ -47,6 +49,15 @@ gpui_kit::actions!(
         GoToDefinition,
         FindReferences,
         GoToImplementation,
+        GoBack,
+        GoForward,
+        RenameSymbol,
+        FormatDocument,
+        ShowCompletions,
+        ShowSignatureHelp,
+        ShowCodeActions,
+        NextSnippetTabstop,
+        PreviousSnippetTabstop,
         StartDebugging,
         StopDebugging,
         ToggleBreakpoint,
@@ -113,6 +124,215 @@ struct WindowCloseSnapshot {
     settings_generation: u64,
 }
 type RecoveryReply = async_channel::Receiver<Result<bool, String>>;
+
+#[derive(Debug)]
+struct PreparedWorkspaceDocument {
+    path: std::path::PathBuf,
+    text: String,
+    edits: Vec<lsp_types::TextEdit>,
+}
+
+fn canonical_workspace_file(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve {}: {error}", path.display()))?;
+    if !path.starts_with(workspace) {
+        return Err(format!(
+            "The language server returned a file outside the workspace: {}",
+            path.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "Workspace edit target is not a file: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn prepare_workspace_documents(
+    workspace: &std::path::Path,
+    documents: Vec<crate::code_panel::WorkspaceTextEdits>,
+    open_documents: &[lsp_types::TextDocumentItem],
+    buffers: &[crate::code_panel::WorkspaceBufferSnapshot],
+) -> Result<Vec<PreparedWorkspaceDocument>, String> {
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
+    let mut open_documents_by_path = std::collections::HashMap::new();
+    for document in open_documents {
+        let Ok(path) = document.uri.to_file_path() else {
+            continue;
+        };
+        if let Ok(path) = canonical_workspace_file(&workspace, &path) {
+            open_documents_by_path.insert(path, document);
+        }
+    }
+    let mut buffers_by_path = std::collections::HashMap::new();
+    for buffer in buffers {
+        if let Ok(path) = canonical_workspace_file(&workspace, &buffer.path) {
+            buffers_by_path.insert(path, buffer);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut prepared = Vec::with_capacity(documents.len());
+    for document in documents {
+        let path = canonical_workspace_file(&workspace, &document.path)?;
+        if !seen.insert(path.clone()) {
+            return Err(format!(
+                "The workspace edit refers to the same canonical file more than once: {}",
+                path.display()
+            ));
+        }
+        let open_document = open_documents_by_path.get(&path).copied();
+        if let Some(expected_version) = document.version {
+            let Some(open_document) = open_document else {
+                return Err(format!(
+                    "The language server's versioned document is no longer open: {}",
+                    path.display()
+                ));
+            };
+            if open_document.version != expected_version {
+                return Err(format!(
+                    "The file changed in the language server before the workspace edit could be applied: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        let buffer = buffers_by_path.get(&path).copied();
+        let text = if let Some(buffer) = buffer {
+            if !buffer.editable {
+                return Err(format!(
+                    "Workspace edit targets a read-only shared file: {}",
+                    path.display()
+                ));
+            }
+            if open_document.is_some_and(|document| document.text != buffer.text) {
+                return Err(format!(
+                    "The editor and language server have different buffer contents: {}",
+                    path.display()
+                ));
+            }
+            buffer.text.clone()
+        } else {
+            if open_document.is_some() {
+                return Err(format!(
+                    "The language server has an open buffer that AHEAD cannot safely edit: {}",
+                    path.display()
+                ));
+            }
+            std::fs::read_to_string(&path).map_err(|error| {
+                format!("Could not read {}: {error}", path.display())
+            })?
+        };
+        let selection = buffer
+            .map(|buffer| buffer.selection.clone())
+            .unwrap_or(0..0);
+        if crate::code_panel::formatting_edit(&text, &document.edits, selection)?
+            .is_some()
+        {
+            prepared.push(PreparedWorkspaceDocument {
+                path,
+                text,
+                edits: document.edits,
+            });
+        }
+    }
+    Ok(prepared)
+}
+
+#[cfg(test)]
+mod workspace_edit_tests {
+    use super::prepare_workspace_documents;
+    use crate::code_panel::{WorkspaceBufferSnapshot, WorkspaceTextEdits};
+
+    #[test]
+    fn workspace_edit_preflight_checks_versions_and_read_only_buffers() {
+        use lsp_types::{Position, Range, TextDocumentItem, TextEdit, Url};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("main.rs");
+        let text = "let item = 1;\n";
+        std::fs::write(&path, text).expect("source file");
+        let uri = Url::from_file_path(&path).expect("file URI");
+        let edits = vec![WorkspaceTextEdits {
+            path: path.clone(),
+            version: Some(5),
+            edits: vec![TextEdit {
+                range: Range::new(Position::new(0, 4), Position::new(0, 8)),
+                new_text: "value".into(),
+            }],
+        }];
+        let open_documents = vec![TextDocumentItem {
+            uri: uri.clone(),
+            language_id: "rust".into(),
+            version: 5,
+            text: text.into(),
+        }];
+        let buffers = vec![WorkspaceBufferSnapshot {
+            path: path.clone(),
+            text: text.into(),
+            selection: 0..0,
+            editable: true,
+        }];
+        let prepared = prepare_workspace_documents(
+            workspace.path(),
+            edits.clone(),
+            &open_documents,
+            &buffers,
+        )
+        .expect("fresh versioned edit");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].text, text);
+
+        let stale_documents = vec![TextDocumentItem {
+            uri,
+            language_id: "rust".into(),
+            version: 4,
+            text: text.into(),
+        }];
+        assert!(
+            prepare_workspace_documents(
+                workspace.path(),
+                edits.clone(),
+                &stale_documents,
+                &buffers,
+            )
+            .expect_err("stale document version")
+            .contains("changed in the language server")
+        );
+
+        let read_only_buffers = vec![WorkspaceBufferSnapshot {
+            editable: false,
+            ..buffers[0].clone()
+        }];
+        assert!(
+            prepare_workspace_documents(
+                workspace.path(),
+                edits,
+                &open_documents,
+                &read_only_buffers,
+            )
+            .expect_err("read-only editor")
+            .contains("read-only shared file")
+        );
+    }
+}
 
 async fn confirm_recovery_writes(
     replies: Vec<RecoveryReply>,
@@ -211,6 +431,9 @@ fn request_quit(_: &Quit, cx: &mut App) {
                 for (_, shell, _) in prepared {
                     shell.update(cx, |shell, cx| {
                         shell.window_close_authorized = true;
+                        if cfg!(debug_assertions) {
+                            eprintln!("AHEAD application quit: shutting down workspace proxy");
+                        }
                         shell.shutdown_workspace(cx);
                     });
                 }
@@ -348,15 +571,31 @@ pub(crate) enum ShellShortcut {
     Explorer,
     Search,
     SourceControl,
+    StageAllChanges,
+    CommitStagedChanges,
     Tasks,
     LanguageServers,
     Problems,
     QuickOpen,
+    OpenFileDialog,
+    OpenFolderDialog,
+    SaveActiveFile,
+    CloseEditor,
+    CloseOtherEditors,
+    CloseEditorsToLeft,
+    CloseEditorsToRight,
+    CloseAllEditors,
+    MoveEditorToOtherGroup,
+    Editor(crate::code_panel::EditorCommand),
+    NavigateBack,
+    NavigateForward,
     CommandPalette,
     NewTerminal,
     Debug,
     DebugKey(&'static str, bool),
     Agent,
+    NewAheadSession,
+    NewExternalAgent,
     ChatZoom,
     Threads,
 }
@@ -485,10 +724,24 @@ pub struct AgentWorkspacePanel {
     focus: FocusHandle,
     session: Entity<crate::session_panel::SessionPanel>,
     threads: Entity<crate::threads_panel::ThreadsPanel>,
+    _threads_observation: Subscription,
     threads_visible: bool,
     chat_zoomed: bool,
     threads_width: Pixels,
-    resize_origin: Option<(Pixels, Pixels)>,
+    resize_last_x: Option<Pixels>,
+}
+
+#[derive(Clone)]
+struct DraggedAgentThreads;
+
+impl Render for DraggedAgentThreads {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        gpui_kit::Empty
+    }
 }
 
 impl AgentWorkspacePanel {
@@ -497,14 +750,22 @@ impl AgentWorkspacePanel {
         threads: Entity<crate::threads_panel::ThreadsPanel>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let _threads_observation = cx.observe(&threads, |this, threads, cx| {
+            let setup_open = threads.read(cx).is_new_session_open();
+            if setup_open && !this.threads_visible {
+                this.threads_visible = true;
+                cx.notify();
+            }
+        });
         Self {
             focus: cx.focus_handle(),
             session,
             threads,
+            _threads_observation,
             threads_visible: true,
             chat_zoomed: false,
             threads_width: px(300.),
-            resize_origin: None,
+            resize_last_x: None,
         }
     }
 
@@ -557,22 +818,18 @@ impl Render for AgentWorkspacePanel {
             .size_full()
             .min_w_0()
             .min_h_0()
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if let Some((origin_x, origin_width)) = this.resize_origin {
-                    this.threads_width = (origin_width + origin_x
-                        - event.position.x)
-                        .max(px(160.))
-                        .min(px(520.));
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.resize_origin = None;
-                    cx.notify();
-                }),
-            )
+            .on_drag_move::<DraggedAgentThreads>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedAgentThreads>, _, cx| {
+                    if let Some(previous_x) = this.resize_last_x {
+                        this.threads_width = (this.threads_width + previous_x
+                            - event.event.position.x)
+                            .max(px(160.))
+                            .min(px(520.));
+                        this.resize_last_x = Some(event.event.position.x);
+                        cx.notify();
+                    }
+                },
+            ))
             .when(!self.chat_zoomed, |this| {
                 this.child(
                     div()
@@ -591,14 +848,16 @@ impl Render for AgentWorkspacePanel {
                             .cursor(CursorStyle::ResizeLeftRight)
                             .border_l_1()
                             .border_color(border)
+                            .id("agent-threads-splitter")
+                            .on_drag(DraggedAgentThreads, |dragged, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| dragged.clone())
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(
                                     |this, event: &MouseDownEvent, _, cx| {
-                                        this.resize_origin = Some((
-                                            event.position.x,
-                                            this.threads_width,
-                                        ));
+                                        this.resize_last_x = Some(event.position.x);
                                         cx.notify();
                                     },
                                 ),
@@ -612,6 +871,23 @@ impl Render for AgentWorkspacePanel {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn just_task_terminal_command(justfile: &str, recipe: &str, watch: bool) -> String {
+    let justfile = std::path::Path::new(justfile)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| justfile.to_string());
+    let command = format!(
+        "just --justfile {} {}",
+        shell_quote(&justfile),
+        shell_quote(recipe)
+    );
+    if watch {
+        format!("watchexec --restart --clear --shell=none -- {command}")
+    } else {
+        command
+    }
 }
 
 fn debug_terminal_command(
@@ -765,6 +1041,75 @@ fn presentation_request_matches_active_turn(
 }
 
 const MAX_RECENT_FILES: usize = 20;
+const MAX_EDITOR_NAVIGATION_HISTORY: usize = 100;
+
+#[derive(Default)]
+struct EditorNavigationHistory {
+    backward: Vec<crate::ross::OpenRequest>,
+    forward: Vec<crate::ross::OpenRequest>,
+}
+
+impl EditorNavigationHistory {
+    fn record_jump(
+        &mut self,
+        current: Option<crate::ross::OpenRequest>,
+        target: &crate::ross::OpenRequest,
+    ) {
+        let Some(current) = current else {
+            return;
+        };
+        if target.location.is_none() || same_editor_location(&current, target) {
+            return;
+        }
+        push_editor_location(&mut self.backward, current);
+        self.forward.clear();
+    }
+
+    fn go_back(
+        &mut self,
+        current: Option<crate::ross::OpenRequest>,
+    ) -> Option<crate::ross::OpenRequest> {
+        traverse_editor_history(&mut self.backward, &mut self.forward, current)
+    }
+
+    fn go_forward(
+        &mut self,
+        current: Option<crate::ross::OpenRequest>,
+    ) -> Option<crate::ross::OpenRequest> {
+        traverse_editor_history(&mut self.forward, &mut self.backward, current)
+    }
+}
+
+fn push_editor_location(
+    history: &mut Vec<crate::ross::OpenRequest>,
+    location: crate::ross::OpenRequest,
+) {
+    if history.len() == MAX_EDITOR_NAVIGATION_HISTORY {
+        history.remove(0);
+    }
+    history.push(location);
+}
+
+fn traverse_editor_history(
+    source: &mut Vec<crate::ross::OpenRequest>,
+    destination: &mut Vec<crate::ross::OpenRequest>,
+    current: Option<crate::ross::OpenRequest>,
+) -> Option<crate::ross::OpenRequest> {
+    let target = source.pop()?;
+    if let Some(current) = current
+        && !same_editor_location(&target, &current)
+    {
+        push_editor_location(destination, current);
+    }
+    Some(target)
+}
+
+fn same_editor_location(
+    left: &crate::ross::OpenRequest,
+    right: &crate::ross::OpenRequest,
+) -> bool {
+    left.path == right.path && left.location == right.location
+}
 
 fn closes_code_tab(
     action: crate::code_panel::CodeTabAction,
@@ -791,13 +1136,59 @@ enum CenterPanel {
     Help,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorGroupSide {
+    Left,
+    Right,
+}
+
+fn toggle_editor_group(
+    right_group: &mut std::collections::HashSet<u64>,
+    panel_id: u64,
+) -> EditorGroupSide {
+    if right_group.remove(&panel_id) {
+        EditorGroupSide::Left
+    } else {
+        right_group.insert(panel_id);
+        EditorGroupSide::Right
+    }
+}
+
+fn assign_editor_group(
+    right_group: &mut std::collections::HashSet<u64>,
+    left_group_id: &mut Option<u64>,
+    right_group_id: &mut Option<u64>,
+    panel_id: u64,
+    group_id: u64,
+) -> EditorGroupSide {
+    if *right_group_id == Some(group_id) {
+        right_group.insert(panel_id);
+        EditorGroupSide::Right
+    } else if *left_group_id == Some(group_id) {
+        right_group.remove(&panel_id);
+        EditorGroupSide::Left
+    } else if right_group.contains(&panel_id) {
+        *right_group_id = Some(group_id);
+        EditorGroupSide::Right
+    } else {
+        *left_group_id = Some(group_id);
+        EditorGroupSide::Left
+    }
+}
+
 pub struct Shell {
     pub area: Entity<DockArea>,
     pub focus: FocusHandle,
     pub session: Entity<crate::session_panel::SessionPanel>,
     pub threads: Entity<crate::threads_panel::ThreadsPanel>,
     pub code: Entity<crate::code_panel::CodePanel>,
+    git: Entity<GitPanel>,
     pub code_tabs: Vec<Entity<crate::code_panel::CodePanel>>,
+    right_editor_tabs: std::collections::HashSet<u64>,
+    left_editor_group_id: Option<u64>,
+    right_editor_group_id: Option<u64>,
+    active_editor_group: EditorGroupSide,
+    navigation_history: EditorNavigationHistory,
     closing_code_tabs: bool,
     restoring_buffers: bool,
     window_close_authorized: bool,
@@ -835,6 +1226,14 @@ pub struct Shell {
 }
 
 impl Shell {
+    pub(crate) fn active_terminal_context(
+        &self,
+        cx: &App,
+    ) -> Option<(String, String, bool)> {
+        let terminal = self.terminals.get(self.active_terminal)?;
+        terminal.read_with(cx, |terminal, _| terminal.agent_context())
+    }
+
     pub(crate) fn shared_terminal_text(&self, cx: &App) -> String {
         self.terminals
             .iter()
@@ -872,6 +1271,7 @@ impl Shell {
         threads: Entity<crate::threads_panel::ThreadsPanel>,
         code: Entity<crate::code_panel::CodePanel>,
         explorer: Entity<crate::explorer_panel::ExplorerPanel>,
+        git: Entity<GitPanel>,
         debug_bar: Entity<crate::debug_bar::DebugBar>,
         terminals: Vec<Entity<crate::terminal_panel::TerminalPanel>>,
         problems: Entity<ProblemsPanel>,
@@ -927,14 +1327,76 @@ impl Shell {
         });
         if let Some(proxy) = session.read(cx).proxy.as_ref() {
             let updates = proxy.subscribe_diagnostics();
+            let diagnostic_proxy = proxy.clone();
+            let activity = activity.clone();
+            let mut git_generation = diagnostic_proxy.git_generation();
             cx.spawn(async move |shell, cx| {
                 while updates.recv().await.is_ok() {
+                    let current_generation = diagnostic_proxy.git_generation();
+                    if current_generation != git_generation {
+                        git_generation = current_generation;
+                        activity.update(cx, |activity, cx| {
+                            activity.refresh_active_git_status(cx)
+                        });
+                    }
                     if shell.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
                 }
             })
             .detach();
+            if let Some(requests) = proxy.subscribe_core_requests() {
+                let request_proxy = proxy.clone();
+                cx.spawn(async move |shell, cx| {
+                    while let Ok(event) = requests.recv().await {
+                        let request_id = event.request_id;
+                        let failure_proxy = request_proxy.clone();
+                        let proxy = request_proxy.clone();
+                        let request = event.request.clone();
+                        if shell
+                            .update_in(cx, |shell, window, cx| match event.request {
+                                ahead_rpc::core::CoreRequest::ApplyWorkspaceEdit(
+                                    params,
+                                ) => shell.apply_server_workspace_edit(
+                                    event.request_id,
+                                    params,
+                                    proxy,
+                                    window,
+                                    cx,
+                                ),
+                                ahead_rpc::core::CoreRequest::GitCredentialPrompt {
+                                    prompt,
+                                    secret,
+                                } => {
+                                    shell.git.update(
+                                        cx,
+                                        |git, cx| {
+                                            git.request_git_credential(
+                                                event.request_id,
+                                                prompt,
+                                                secret,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    );
+                                }
+                            })
+                            .is_err()
+                        {
+                            failure_proxy.respond_core_request(
+                                request_id,
+                                crate::proxy_client::unavailable_core_request_response(
+                                    request,
+                                    "The editor closed before handling the request",
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
         }
         Self {
             area,
@@ -946,12 +1408,18 @@ impl Shell {
             } else {
                 vec![code.clone()]
             },
+            right_editor_tabs: std::collections::HashSet::new(),
+            left_editor_group_id: None,
+            right_editor_group_id: None,
+            active_editor_group: EditorGroupSide::Left,
+            navigation_history: EditorNavigationHistory::default(),
             recent_files,
             closing_code_tabs: false,
             restoring_buffers: false,
             window_close_authorized: false,
             code,
             explorer,
+            git,
             debug_bar,
             terminals,
             debug_terminals: std::collections::HashMap::new(),
@@ -1006,6 +1474,12 @@ impl Shell {
         code: Entity<crate::code_panel::CodePanel>,
         cx: &mut Context<Self>,
     ) {
+        self.active_editor_group =
+            if self.right_editor_tabs.contains(&code.entity_id().as_u64()) {
+                EditorGroupSide::Right
+            } else {
+                EditorGroupSide::Left
+            };
         let (path, proxy) = code.read_with(cx, |code, _| {
             (
                 std::path::PathBuf::from(code.file_path.clone()),
@@ -1029,12 +1503,9 @@ impl Shell {
         self.code = code.clone();
         self.session.update(cx, |session, cx| {
             session.code = Some(code.clone());
+            let (comment_session_id, comments) = session.code_comment_context();
             code.update(cx, |code, cx| {
-                code.set_code_comments(
-                    session.session_id.clone(),
-                    session.code_comments_snapshot(),
-                    cx,
-                );
+                code.set_code_comments(comment_session_id, comments, cx);
             });
         });
         if let Some((comment_path, line)) = self.pending_comment.as_ref()
@@ -1048,28 +1519,118 @@ impl Shell {
         });
     }
 
+    fn code_panel_added_to_group(
+        &mut self,
+        panel_id: u64,
+        group_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let mut side = assign_editor_group(
+            &mut self.right_editor_tabs,
+            &mut self.left_editor_group_id,
+            &mut self.right_editor_group_id,
+            panel_id,
+            group_id,
+        );
+        let right_count = self
+            .code_tabs
+            .iter()
+            .filter(|code| {
+                self.right_editor_tabs.contains(&code.entity_id().as_u64())
+            })
+            .count();
+        if right_count == 0 {
+            self.right_editor_group_id = None;
+        }
+        if right_count == self.code_tabs.len() && self.open_center_panels.is_empty()
+        {
+            self.right_editor_tabs.clear();
+            self.left_editor_group_id = Some(group_id);
+            self.right_editor_group_id = None;
+            self.active_editor_group = EditorGroupSide::Left;
+            side = EditorGroupSide::Left;
+        }
+        if self.code.entity_id().as_u64() == panel_id {
+            self.active_editor_group = side;
+        }
+        cx.notify();
+    }
+
     fn configure_code(
         &mut self,
         code: Entity<crate::code_panel::CodePanel>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
-        cx.subscribe(&code, |shell, _, request: &crate::ross::OpenRequest, cx| {
-            let mailbox_id = shell.explorer.read(cx).mailbox_id;
-            if let Some(location) = request.location {
-                crate::ross::request_open_at(mailbox_id, &request.path, location);
-            }
-            cx.notify();
-        })
+        cx.subscribe_in(
+            &code,
+            window,
+            |_shell,
+             code,
+             event: &crate::code_panel::CodePanelGroupChanged,
+             window,
+             cx| {
+                let panel_id = code.entity_id().as_u64();
+                let group_id = event.group_id;
+                cx.defer_in(window, move |shell, _, cx| {
+                    shell.code_panel_added_to_group(panel_id, group_id, cx);
+                });
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &code,
+            window,
+            |_shell, code, _: &crate::code_panel::CodePanelActivated, window, cx| {
+                let code = code.clone();
+                cx.defer_in(window, move |shell, _, cx| {
+                    shell.set_active_code(code, cx);
+                });
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &code,
+            window,
+            |shell, _, request: &crate::ross::OpenRequest, window, cx| {
+                shell.navigate_to_editor_location(request.clone(), window, cx);
+            },
+        )
+        .detach();
+        let applying_shell = cx.entity().downgrade();
+        let applying_code = code.clone();
+        cx.subscribe_in(
+            &code,
+            window,
+            move |_,
+                  _,
+                  request: &crate::code_panel::WorkspaceEditRequest,
+                  window,
+                  cx| {
+                if let Err(error) = applying_shell.update(cx, |shell, cx| {
+                    shell.apply_workspace_edit(
+                        applying_code.clone(),
+                        request.clone(),
+                        window,
+                        cx,
+                    );
+                }) {
+                    eprintln!("Routing workspace edit: {error}");
+                }
+            },
+        )
         .detach();
         let shell = cx.entity().downgrade();
         let shell_for_close = shell.clone();
         let shell_for_tabs = shell;
         let speech_process = self.system_speech_process.clone();
         let speech_active = self.system_speech_active.clone();
+        let voice_output_interrupt_slot =
+            self.session.read(cx).voice_output_interrupt_slot();
         let session_panel = self.session.downgrade();
-        let (session_id, comments) = self.session.read_with(cx, |session, _| {
-            (session.session_id.clone(), session.code_comments_snapshot())
-        });
+        let (session_id, comments) = self
+            .session
+            .read_with(cx, |session, _| session.code_comment_context());
         code.update(cx, |code, cx| {
             code.set_session_panel(session_panel);
             code.set_code_comments(session_id, comments, cx);
@@ -1083,6 +1644,7 @@ impl Shell {
                     shell.handle_code_tab_action(panel, action, window, cx);
                 });
             });
+            let voice_output_interrupt_slot = voice_output_interrupt_slot.clone();
             code.set_speech_interruption_handler(move || {
                 match stop_system_speech(&speech_process) {
                     Ok(_) => speech_active.store(false, Ordering::SeqCst),
@@ -1092,8 +1654,559 @@ impl Shell {
                         );
                     }
                 }
+                let interrupt_output = voice_output_interrupt_slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if let Some(interrupt_output) = interrupt_output {
+                    interrupt_output();
+                }
             });
         });
+    }
+
+    fn apply_server_workspace_edit(
+        &mut self,
+        request_id: ahead_rpc::RequestId,
+        params: lsp_types::ApplyWorkspaceEditParams,
+        proxy: Arc<crate::proxy_client::ProxyClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (source_path, generation) = self.code.read_with(cx, |code, _| {
+            (
+                std::path::PathBuf::from(&code.file_path),
+                code.buffer_generation(),
+            )
+        });
+        let (completion, result) = async_channel::bounded(1);
+        let request = crate::code_panel::WorkspaceEditRequest {
+            edit: params.edit,
+            source_path,
+            purpose: crate::code_panel::WorkspaceEditPurpose::ServerRequest {
+                label: params.label,
+            },
+            generation,
+            completion: Some(completion),
+        };
+        self.apply_workspace_edit(self.code.clone(), request, window, cx);
+        cx.background_spawn(async move {
+            let response = match result.recv().await {
+                Ok(Ok(_)) => lsp_types::ApplyWorkspaceEditResponse {
+                    applied: true,
+                    failure_reason: None,
+                    failed_change: None,
+                },
+                Ok(Err(reason)) => lsp_types::ApplyWorkspaceEditResponse {
+                    applied: false,
+                    failure_reason: Some(reason),
+                    failed_change: None,
+                },
+                Err(_) => lsp_types::ApplyWorkspaceEditResponse {
+                    applied: false,
+                    failure_reason: Some(
+                        "The editor stopped before applying the workspace edit"
+                            .into(),
+                    ),
+                    failed_change: None,
+                },
+            };
+            proxy.respond_core_request(
+                request_id,
+                ahead_rpc::core::CoreResponse::ApplyWorkspaceEdit(response),
+            );
+        })
+        .detach();
+    }
+
+    fn apply_workspace_edit(
+        &mut self,
+        source: Entity<crate::code_panel::CodePanel>,
+        request: crate::code_panel::WorkspaceEditRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (source_path, source_generation) = source.read_with(cx, |code, _| {
+            (
+                std::path::PathBuf::from(&code.file_path),
+                code.buffer_generation(),
+            )
+        });
+        if !matches!(
+            &request.purpose,
+            crate::code_panel::WorkspaceEditPurpose::ServerRequest { .. }
+        ) && (source_path != request.source_path
+            || source_generation != request.generation)
+        {
+            let message = match &request.purpose {
+                crate::code_panel::WorkspaceEditPurpose::Rename { .. } => {
+                    "Rename canceled because the source buffer changed".to_string()
+                }
+                crate::code_panel::WorkspaceEditPurpose::CodeAction { .. } => {
+                    "Code action canceled because the source buffer changed"
+                        .to_string()
+                }
+                crate::code_panel::WorkspaceEditPurpose::ServerRequest {
+                    ..
+                } => "Language server workspace edit could not be applied".into(),
+            };
+            request.complete(Err(message.clone()));
+            self.status_message = message.into();
+            cx.notify();
+            return;
+        }
+        let documents =
+            match crate::code_panel::workspace_edit_text_edits(&request.edit) {
+                Ok(documents) => documents,
+                Err(error) => {
+                    let message = match &request.purpose {
+                        crate::code_panel::WorkspaceEditPurpose::Rename {
+                            ..
+                        } => {
+                            format!("Workspace rename failed: {error}")
+                        }
+                        crate::code_panel::WorkspaceEditPurpose::CodeAction {
+                            title,
+                        } => {
+                            format!("Could not apply code action '{title}': {error}")
+                        }
+                        crate::code_panel::WorkspaceEditPurpose::ServerRequest {
+                            ..
+                        } => {
+                            format!("Language server workspace edit failed: {error}")
+                        }
+                    };
+                    request.complete(Err(error));
+                    self.status_message = message.into();
+                    cx.notify();
+                    return;
+                }
+            };
+        let Some(proxy) = self.session.read(cx).proxy.clone() else {
+            let message = match &request.purpose {
+                crate::code_panel::WorkspaceEditPurpose::Rename { .. } => {
+                    "Workspace rename failed: language services are unavailable"
+                        .to_string()
+                }
+                crate::code_panel::WorkspaceEditPurpose::CodeAction { title } => {
+                    format!(
+                        "Could not apply code action '{title}': language services are unavailable"
+                    )
+                }
+                crate::code_panel::WorkspaceEditPurpose::ServerRequest { .. } => {
+                    "Language server workspace edit failed: language services are unavailable".into()
+                }
+            };
+            request.complete(Err("Language services are unavailable".into()));
+            self.status_message = message.into();
+            cx.notify();
+            return;
+        };
+        let workspace =
+            std::path::PathBuf::from(self.explorer.read(cx).root.clone());
+        let receiver = proxy.request_open_files_content();
+        self.status_message = match &request.purpose {
+            crate::code_panel::WorkspaceEditPurpose::Rename { .. } => {
+                "Validating workspace rename…".into()
+            }
+            crate::code_panel::WorkspaceEditPurpose::CodeAction { .. } => {
+                "Validating workspace code action…".into()
+            }
+            crate::code_panel::WorkspaceEditPurpose::ServerRequest { label } => {
+                label.as_ref().map_or_else(
+                    || "Validating language server workspace edit…".into(),
+                    |label| {
+                        format!("Applying language server edit '{label}'…").into()
+                    },
+                )
+            }
+        };
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let open_documents = cx
+                .background_spawn(async move {
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|error| {
+                            format!("Waiting for open buffers: {error}")
+                        })?
+                })
+                .await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.finish_workspace_edit(
+                    source,
+                    request,
+                    documents,
+                    workspace,
+                    open_documents,
+                    window,
+                    cx,
+                );
+            }) {
+                eprintln!("Applying workspace edit: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn finish_workspace_edit(
+        &mut self,
+        source: Entity<crate::code_panel::CodePanel>,
+        request: crate::code_panel::WorkspaceEditRequest,
+        documents: Vec<crate::code_panel::WorkspaceTextEdits>,
+        workspace: std::path::PathBuf,
+        open_documents: Result<Vec<lsp_types::TextDocumentItem>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_code = self.code.clone();
+        let previous_center_panel = self.active_center_panel;
+        let result = (|| -> Result<usize, String> {
+            let open_documents = open_documents?;
+            let (source_path, source_generation) =
+                source.read_with(cx, |code, _| {
+                    (
+                        std::path::PathBuf::from(&code.file_path),
+                        code.buffer_generation(),
+                    )
+                });
+            if !matches!(
+                &request.purpose,
+                crate::code_panel::WorkspaceEditPurpose::ServerRequest { .. }
+            ) && (source_path != request.source_path
+                || source_generation != request.generation)
+            {
+                return Err(match &request.purpose {
+                    crate::code_panel::WorkspaceEditPurpose::Rename { .. } => {
+                        "Rename canceled because the source buffer changed".into()
+                    }
+                    crate::code_panel::WorkspaceEditPurpose::CodeAction {
+                        ..
+                    } => "Code action canceled because the source buffer changed"
+                        .into(),
+                    crate::code_panel::WorkspaceEditPurpose::ServerRequest {
+                        ..
+                    } => {
+                        "Language server workspace edit could not be applied".into()
+                    }
+                });
+            }
+            let buffers = self
+                .code_tabs
+                .iter()
+                .filter_map(|panel| {
+                    panel
+                        .read_with(cx, |code, cx| code.workspace_edit_snapshot(cx))
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare_workspace_documents(
+                &workspace,
+                documents,
+                &open_documents,
+                &buffers,
+            )?;
+            if prepared.is_empty() {
+                return Err(
+                    "The language server returned no effective workspace changes"
+                        .into(),
+                );
+            }
+
+            for document in &prepared {
+                let already_open = self.code_tabs.iter().any(|panel| {
+                    let path = std::path::PathBuf::from(&panel.read(cx).file_path);
+                    same_file_path(&path, &document.path)
+                });
+                if !already_open {
+                    self.open_file_request(
+                        crate::ross::OpenRequest {
+                            path: document.path.to_string_lossy().into_owned(),
+                            permanent: true,
+                            location: None,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }
+
+            let mut targets = Vec::with_capacity(prepared.len());
+            for document in prepared {
+                let panel = self
+                    .code_tabs
+                    .iter()
+                    .find(|panel| {
+                        let path =
+                            std::path::PathBuf::from(&panel.read(cx).file_path);
+                        same_file_path(&path, &document.path)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "Could not open workspace edit target {}",
+                            document.path.display()
+                        )
+                    })?;
+                let snapshot = panel
+                    .read_with(cx, |code, cx| code.workspace_edit_snapshot(cx))
+                    .map_err(|error| error.to_string())?;
+                if snapshot.text != document.text {
+                    return Err(format!(
+                        "A file changed while the workspace edit was being prepared: {}",
+                        document.path.display()
+                    ));
+                }
+                if !snapshot.editable {
+                    return Err(format!(
+                        "Workspace edit targets a read-only shared file: {}",
+                        document.path.display()
+                    ));
+                }
+                crate::code_panel::formatting_edit(
+                    &snapshot.text,
+                    &document.edits,
+                    snapshot.selection,
+                )?;
+                let preserve_code_action_request =
+                    matches!(
+                        &request.purpose,
+                        crate::code_panel::WorkspaceEditPurpose::CodeAction { .. }
+                    ) && panel.read_with(cx, |code, _| {
+                        std::path::PathBuf::from(&code.file_path)
+                            == request.source_path
+                    });
+                targets.push((
+                    panel,
+                    document.text,
+                    document.edits,
+                    preserve_code_action_request,
+                ));
+            }
+
+            for (panel, text, edits, preserve_code_action_request) in &targets {
+                panel
+                    .downgrade()
+                    .update_in(cx, |code, window, cx| {
+                        code.apply_workspace_text_edits(
+                            text,
+                            edits,
+                            *preserve_code_action_request,
+                            window,
+                            cx,
+                        )
+                    })
+                    .map_err(|error| error.to_string())??;
+            }
+            Ok(targets.len())
+        })();
+
+        self.set_active_code(previous_code, cx);
+        self.active_center_panel = previous_center_panel;
+        self.refresh_center_layout(window, cx);
+        let completion_result = result
+            .as_ref()
+            .map(|_| source.read_with(cx, |code, _| code.buffer_generation()))
+            .map_err(Clone::clone);
+        request.complete(completion_result);
+        self.status_message = match (&request.purpose, &result) {
+            (
+                crate::code_panel::WorkspaceEditPurpose::Rename {
+                    old_name,
+                    new_name,
+                },
+                Ok(count),
+            ) => format!(
+                "Renamed {old_name} to {new_name} in {count} file{}; review and save the changed tabs",
+                if *count == 1 { "" } else { "s" }
+            ),
+            (
+                crate::code_panel::WorkspaceEditPurpose::CodeAction { title },
+                Ok(count),
+            ) => format!(
+                "Applied '{title}' in {count} file{}; review and save the changed tabs",
+                if *count == 1 { "" } else { "s" }
+            ),
+            (
+                crate::code_panel::WorkspaceEditPurpose::ServerRequest { label },
+                Ok(count),
+            ) => format!(
+                "Applied language server edit{} in {count} file{}; review and save the changed tabs",
+                label
+                    .as_ref()
+                    .map_or_else(String::new, |label| format!(" '{label}'")),
+                if *count == 1 { "" } else { "s" }
+            ),
+            (crate::code_panel::WorkspaceEditPurpose::Rename { .. }, Err(error)) => {
+                format!("Workspace rename failed: {error}")
+            }
+            (
+                crate::code_panel::WorkspaceEditPurpose::CodeAction { title },
+                Err(error),
+            ) => format!("Could not apply code action '{title}': {error}"),
+            (
+                crate::code_panel::WorkspaceEditPurpose::ServerRequest { .. },
+                Err(error),
+            ) => format!("Language server workspace edit failed: {error}"),
+        };
+        cx.notify();
+    }
+
+    fn apply_search_replacements(
+        &mut self,
+        request: SearchReplaceRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let previous_code = self.code.clone();
+        let previous_center_panel = self.active_center_panel;
+        let result = (|| -> Result<(usize, usize), String> {
+            if request.files.is_empty() || request.match_count == 0 {
+                return Err("There are no search matches to replace".into());
+            }
+            let workspace =
+                std::path::PathBuf::from(self.explorer.read(cx).root.clone())
+                    .canonicalize()
+                    .map_err(|error| {
+                        format!("Could not resolve workspace root: {error}")
+                    })?;
+            let mut seen = std::collections::HashSet::new();
+            let mut match_count = 0usize;
+            let mut documents = Vec::with_capacity(request.files.len());
+            for file in request.files {
+                let path = canonical_workspace_file(&workspace, &file.path)?;
+                if !seen.insert(path.clone()) {
+                    return Err(format!(
+                        "Search replacement returned the same file more than once: {}",
+                        path.display()
+                    ));
+                }
+                if file.match_count == 0
+                    || file.original_text == file.replacement_text
+                {
+                    return Err(format!(
+                        "Search replacement returned no effective changes for {}",
+                        path.display()
+                    ));
+                }
+                match_count = match_count
+                    .checked_add(file.match_count)
+                    .ok_or("Search replacement match count overflowed")?;
+                let line = u32::try_from(
+                    file.original_text
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count(),
+                )
+                .map_err(|_| "Search replacement target has too many lines")?;
+                let raw_last_line =
+                    file.original_text.rsplit('\n').next().unwrap_or_default();
+                let last_line =
+                    raw_last_line.strip_suffix('\r').unwrap_or(raw_last_line);
+                let character = u32::try_from(last_line.encode_utf16().count())
+                    .map_err(|_| "Search replacement target line is too long")?;
+                let edit = lsp_types::TextEdit {
+                    range: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(line, character),
+                    ),
+                    new_text: file.replacement_text,
+                };
+                documents.push((path, file.original_text, edit));
+            }
+            if match_count != request.match_count {
+                return Err("Search replacement match count did not validate".into());
+            }
+
+            for (path, _, _) in &documents {
+                let already_open = self.code_tabs.iter().any(|panel| {
+                    let open_path =
+                        std::path::PathBuf::from(&panel.read(cx).file_path);
+                    same_file_path(&open_path, path)
+                });
+                if !already_open {
+                    self.open_file_request(
+                        crate::ross::OpenRequest {
+                            path: path.to_string_lossy().into_owned(),
+                            permanent: true,
+                            location: None,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }
+
+            let mut targets = Vec::with_capacity(documents.len());
+            for (path, original_text, edit) in documents {
+                let panel = self
+                    .code_tabs
+                    .iter()
+                    .find(|panel| {
+                        let open_path =
+                            std::path::PathBuf::from(&panel.read(cx).file_path);
+                        same_file_path(&open_path, &path)
+                    })
+                    .cloned()
+                    .ok_or_else(|| format!("Could not open {}", path.display()))?;
+                let snapshot = panel
+                    .read_with(cx, |code, cx| code.workspace_edit_snapshot(cx))
+                    .map_err(|error| error.to_string())?;
+                if snapshot.text != original_text {
+                    return Err(format!(
+                        "A file changed after search replacement was prepared: {}",
+                        path.display()
+                    ));
+                }
+                if !snapshot.editable {
+                    return Err(format!(
+                        "Search replacement targets a read-only shared file: {}",
+                        path.display()
+                    ));
+                }
+                crate::code_panel::formatting_edit(
+                    &snapshot.text,
+                    std::slice::from_ref(&edit),
+                    snapshot.selection,
+                )?;
+                targets.push((panel, snapshot.text, edit));
+            }
+
+            for (panel, original_text, edit) in &targets {
+                panel
+                    .update(cx, |code, cx| {
+                        code.apply_workspace_text_edits(
+                            original_text,
+                            std::slice::from_ref(edit),
+                            false,
+                            window,
+                            cx,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok((targets.len(), match_count))
+        })();
+
+        self.set_active_code(previous_code, cx);
+        self.active_center_panel = previous_center_panel;
+        self.refresh_center_layout(window, cx);
+        match result {
+            Ok((file_count, match_count)) => {
+                self.status_message = format!(
+                    "Replaced {match_count} occurrence{} in {file_count} file{}; review and save the changed tabs",
+                    if match_count == 1 { "" } else { "s" },
+                    if file_count == 1 { "" } else { "s" }
+                );
+                cx.notify();
+                Ok(())
+            }
+            Err(error) => {
+                self.status_message = format!("Replace failed: {error}");
+                cx.notify();
+                Err(error)
+            }
+        }
     }
 
     fn open_center_panel(
@@ -1134,44 +2247,91 @@ impl Shell {
         let help = self.help.clone();
         let search = self.search.clone();
         let problems = self.problems.clone();
-        let code_tabs = self.code_tabs.clone();
-        let code_count = code_tabs.len();
-        let active_code_id = self.code.entity_id();
-        let active_code_index = self
+        let left_code_tabs: Vec<_> = self
             .code_tabs
             .iter()
-            .position(|code| code.entity_id() == active_code_id)
-            .unwrap_or(0);
+            .filter(|code| {
+                !self.right_editor_tabs.contains(&code.entity_id().as_u64())
+            })
+            .cloned()
+            .collect();
+        let right_code_tabs: Vec<_> = self
+            .code_tabs
+            .iter()
+            .filter(|code| {
+                self.right_editor_tabs.contains(&code.entity_id().as_u64())
+            })
+            .cloned()
+            .collect();
+        let left_code_count = left_code_tabs.len();
+        let active_code_id = self.code.entity_id();
+        let active_is_right = right_code_tabs
+            .iter()
+            .any(|code| code.entity_id() == active_code_id);
+        let active_code_index = if active_is_right {
+            right_code_tabs
+                .iter()
+                .position(|code| code.entity_id() == active_code_id)
+                .unwrap_or(0)
+        } else {
+            left_code_tabs
+                .iter()
+                .position(|code| code.entity_id() == active_code_id)
+                .unwrap_or(0)
+        };
         self.area.update(cx, |area, cx| {
-            let mut editor_tabs = DockLayout::tabs();
-            for code in code_tabs {
-                editor_tabs = editor_tabs.panel_view(panel_handle(code), cx);
+            let mut left_tabs = DockLayout::tabs();
+            for code in left_code_tabs {
+                left_tabs = left_tabs.panel_view(panel_handle(code), cx);
             }
             for panel in &open_center_panels {
-                editor_tabs =
-                    match panel {
-                        CenterPanel::Settings => editor_tabs
-                            .panel_view(panel_handle(settings.clone()), cx),
-                        CenterPanel::Extensions => editor_tabs
-                            .panel_view(panel_handle(extensions.clone()), cx),
-                        CenterPanel::Search => {
-                            editor_tabs.panel_view(panel_handle(search.clone()), cx)
-                        }
-                        CenterPanel::Problems => editor_tabs
-                            .panel_view(panel_handle(problems.clone()), cx),
-                        CenterPanel::Help => {
-                            editor_tabs.panel_view(panel_handle(help.clone()), cx)
-                        }
-                    };
+                left_tabs = match panel {
+                    CenterPanel::Settings => {
+                        left_tabs.panel_view(panel_handle(settings.clone()), cx)
+                    }
+                    CenterPanel::Extensions => {
+                        left_tabs.panel_view(panel_handle(extensions.clone()), cx)
+                    }
+                    CenterPanel::Search => {
+                        left_tabs.panel_view(panel_handle(search.clone()), cx)
+                    }
+                    CenterPanel::Problems => {
+                        left_tabs.panel_view(panel_handle(problems.clone()), cx)
+                    }
+                    CenterPanel::Help => {
+                        left_tabs.panel_view(panel_handle(help.clone()), cx)
+                    }
+                };
             }
             let active_index = active_center_panel
                 .and_then(|panel| {
                     open_center_panels.iter().position(|open| *open == panel)
                 })
-                .map(|index| code_count + index)
-                .unwrap_or(active_code_index);
-            let editor_tabs = editor_tabs.active_index(active_index);
-            area.set_center(editor_tabs, window, cx);
+                .map(|index| left_code_count + index)
+                .unwrap_or_else(|| {
+                    if active_is_right {
+                        0
+                    } else {
+                        active_code_index
+                    }
+                });
+            left_tabs = left_tabs.active_index(active_index);
+            if right_code_tabs.is_empty() {
+                area.set_center(left_tabs, window, cx);
+            } else {
+                let mut right_tabs = DockLayout::tabs();
+                for code in right_code_tabs {
+                    right_tabs = right_tabs.panel_view(panel_handle(code), cx);
+                }
+                right_tabs = right_tabs.active_index(active_code_index);
+                area.set_center(
+                    DockLayout::h_split()
+                        .child(left_tabs, None)
+                        .child(right_tabs, None),
+                    window,
+                    cx,
+                );
+            }
         });
         cx.notify();
     }
@@ -1424,8 +2584,11 @@ impl Shell {
                         code.is_preview = true;
                         cx.notify();
                     });
-                    self.configure_code(code.clone(), cx);
+                    self.configure_code(code.clone(), window, cx);
                     self.code_tabs.push(code.clone());
+                    if self.active_editor_group == EditorGroupSide::Right {
+                        self.right_editor_tabs.insert(code.entity_id().as_u64());
+                    }
                     let buffers = self.code_tabs.clone();
                     self.session.update(cx, |session, cx| {
                         session.set_buffers(buffers.clone(), cx);
@@ -1519,6 +2682,38 @@ impl Shell {
         }
     }
 
+    fn navigate_to_editor_location(
+        &mut self,
+        request: crate::ross::OpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .code
+            .read_with(cx, |code, cx| code.navigation_request(cx));
+        self.navigation_history.record_jump(current, &request);
+        self.open_file_request(request, window, cx);
+    }
+
+    fn navigate_editor_history(
+        &mut self,
+        backward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .code
+            .read_with(cx, |code, cx| code.navigation_request(cx));
+        let destination = if backward {
+            self.navigation_history.go_back(current)
+        } else {
+            self.navigation_history.go_forward(current)
+        };
+        if let Some(destination) = destination {
+            self.open_file_request(destination, window, cx);
+        }
+    }
+
     fn open_file_request(
         &mut self,
         request: crate::ross::OpenRequest,
@@ -1528,7 +2723,12 @@ impl Shell {
         if let Some(code) = self
             .code_tabs
             .iter()
-            .find(|code| code.read(cx).file_path == request.path)
+            .find(|code| {
+                same_file_path(
+                    std::path::Path::new(&code.read(cx).file_path),
+                    std::path::Path::new(&request.path),
+                )
+            })
             .cloned()
         {
             if request.permanent {
@@ -1550,9 +2750,13 @@ impl Shell {
         let code = if request.permanent {
             None
         } else {
-            self.code_tabs
-                .iter()
-                .position(|code| code.read(cx).is_preview)
+            self.code_tabs.iter().position(|code| {
+                code.read(cx).is_preview
+                    && (self.active_editor_group == EditorGroupSide::Right)
+                        == self
+                            .right_editor_tabs
+                            .contains(&code.entity_id().as_u64())
+            })
         };
         let code = if let Some(index) = code {
             let code = self.code_tabs[index].clone();
@@ -1574,8 +2778,11 @@ impl Shell {
                 code.is_preview = !request.permanent;
                 cx.notify();
             });
-            self.configure_code(code.clone(), cx);
+            self.configure_code(code.clone(), window, cx);
             self.code_tabs.push(code.clone());
+            if self.active_editor_group == EditorGroupSide::Right {
+                self.right_editor_tabs.insert(code.entity_id().as_u64());
+            }
             let buffers = self.code_tabs.clone();
             self.session.update(cx, |session, cx| {
                 session.set_buffers(buffers.clone(), cx);
@@ -1651,8 +2858,11 @@ impl Shell {
             .with_proxy(proxy, &workspace, window, cx)
         });
         code.update(cx, |code, cx| code.start_shared_poll(window, cx));
-        self.configure_code(code.clone(), cx);
+        self.configure_code(code.clone(), window, cx);
         self.code_tabs.push(code.clone());
+        if self.active_editor_group == EditorGroupSide::Right {
+            self.right_editor_tabs.insert(code.entity_id().as_u64());
+        }
         let buffers = self.code_tabs.clone();
         self.session.update(cx, |session, cx| {
             session.set_buffers(buffers.clone(), cx);
@@ -2016,6 +3226,9 @@ impl Shell {
                     return;
                 }
                 this.window_close_authorized = true;
+                if cfg!(debug_assertions) {
+                    eprintln!("AHEAD window close: shutting down workspace proxy");
+                }
                 this.shutdown_workspace(cx);
                 window.remove_window();
             })
@@ -2034,6 +3247,16 @@ impl Shell {
             window,
             cx,
         );
+    }
+
+    fn run_active_code_tab_action(
+        &mut self,
+        action: crate::code_panel::CodeTabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = gpui_kit::component::dock::PanelId::from(self.code.entity_id());
+        self.handle_code_tab_action(panel, action, window, cx);
     }
 
     fn handle_code_tab_action(
@@ -2061,14 +3284,60 @@ impl Shell {
                 }
             };
         match action {
+            crate::code_panel::CodeTabAction::MoveToOtherEditorGroup => {
+                let right_count = self
+                    .code_tabs
+                    .iter()
+                    .filter(|code| {
+                        self.right_editor_tabs.contains(&code.entity_id().as_u64())
+                    })
+                    .count();
+                let left_count = self.code_tabs.len().saturating_sub(right_count);
+                if self.code_tabs.len() < 2 {
+                    set_status(
+                        self,
+                        "Open another file before creating a split editor group"
+                            .into(),
+                        cx,
+                    );
+                    return;
+                }
+                let moved_to = toggle_editor_group(
+                    &mut self.right_editor_tabs,
+                    self.code_tabs[index].entity_id().as_u64(),
+                );
+                if (moved_to == EditorGroupSide::Right && left_count == 1)
+                    || (moved_to == EditorGroupSide::Left && right_count == 1)
+                {
+                    self.right_editor_tabs.clear();
+                    self.right_editor_group_id = None;
+                    self.active_editor_group = EditorGroupSide::Left;
+                } else {
+                    self.active_editor_group = moved_to;
+                }
+                let code = self.code_tabs[index].clone();
+                self.set_active_code(code.clone(), cx);
+                self.show_code(window, cx);
+                let focus = code.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                return;
+            }
             crate::code_panel::CodeTabAction::CommentOnSelection => {
+                let session_id = self.session.read(cx).session_id.clone();
+                if session_id.is_none() {
+                    set_status(
+                        self,
+                        "Start an AHEAD session before commenting".to_string(),
+                        cx,
+                    );
+                    return;
+                }
                 let Some(target) =
                     self.code_tabs[index].read(cx).selected_code_comment(cx)
                 else {
                     set_status(self, "Select code to comment on".to_string(), cx);
                     return;
                 };
-                let session_id = self.session.read(cx).session_id.clone();
                 self.code_tabs[index].update(cx, |code, cx| {
                     code.begin_code_comment(target, session_id, window, cx);
                 });
@@ -2137,7 +3406,7 @@ impl Shell {
                     "git log --follow --oneline -- {}",
                     shell_quote(&relative.to_string_lossy()),
                 );
-                self.new_terminal_in(workspace, Some(command), window, cx);
+                self.new_terminal_in(workspace, Some(command), None, window, cx);
                 return;
             }
             _ => {}
@@ -2158,7 +3427,14 @@ impl Shell {
             .code_tabs
             .iter()
             .enumerate()
-            .filter(|(candidate, _)| closes_code_tab(action, index, *candidate))
+            .filter(|(candidate, code)| {
+                action == crate::code_panel::CodeTabAction::CloseAll
+                    || (self.right_editor_tabs.contains(&code.entity_id().as_u64())
+                        == self
+                            .right_editor_tabs
+                            .contains(&self.code_tabs[index].entity_id().as_u64())
+                        && closes_code_tab(action, index, *candidate))
+            })
             .map(|(_, code)| code.clone())
             .collect();
         self.closing_code_tabs = true;
@@ -2435,7 +3711,20 @@ impl Shell {
             return;
         }
         self.code_tabs[index].update(cx, |code, _| code.release_buffer());
+        self.right_editor_tabs.remove(&entity_id.as_u64());
         self.code_tabs.remove(index);
+        let right_count = self
+            .code_tabs
+            .iter()
+            .filter(|code| {
+                self.right_editor_tabs.contains(&code.entity_id().as_u64())
+            })
+            .count();
+        if right_count == 0 || right_count == self.code_tabs.len() {
+            self.right_editor_tabs.clear();
+            self.right_editor_group_id = None;
+            self.active_editor_group = EditorGroupSide::Left;
+        }
         let buffers = self.code_tabs.clone();
         self.session.update(cx, |session, cx| {
             session.set_buffers(buffers.clone(), cx);
@@ -2540,19 +3829,38 @@ impl Shell {
 
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.code.read(cx).workspace.clone();
-        self.new_terminal_in(cwd, None, window, cx);
+        self.new_terminal_in(cwd, None, None, window, cx);
     }
 
     fn new_task_terminal(
         &mut self,
         recipe: String,
         cwd: String,
+        justfile: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.new_terminal_in(
             cwd,
-            Some(format!("just {}", shell_quote(&recipe))),
+            Some(just_task_terminal_command(&justfile, &recipe, false)),
+            Some(recipe),
+            window,
+            cx,
+        );
+    }
+
+    fn watch_just_task_terminal(
+        &mut self,
+        recipe: String,
+        cwd: String,
+        justfile: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_terminal_in(
+            cwd,
+            Some(just_task_terminal_command(&justfile, &recipe, true)),
+            Some(format!("watch: {recipe}")),
             window,
             cx,
         );
@@ -2562,6 +3870,7 @@ impl Shell {
         &mut self,
         cwd: String,
         command: Option<String>,
+        title: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2570,6 +3879,11 @@ impl Shell {
         let terminal = cx.new(|cx| {
             crate::terminal_panel::TerminalPanel::new_with_cwd(terminal_id, cwd, cx)
         });
+        if let Some(title) = title {
+            terminal.update(cx, |terminal, cx| {
+                terminal.set_terminal_title(&title, cx);
+            });
+        }
         self.configure_terminal(terminal.clone(), cx);
         self.terminals.push(terminal);
         self.active_terminal = self.terminals.len() - 1;
@@ -2594,6 +3908,45 @@ impl Shell {
             .detach();
         }
         cx.notify();
+    }
+
+    pub(crate) fn open_agent_auth_terminal(
+        &mut self,
+        launch: ahead_rpc::ahead::AgentTerminalAuthLaunch,
+        exit_handler: impl Fn(
+            Option<i32>,
+            &mut Context<crate::terminal_panel::TerminalPanel>,
+        ) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let terminal_id = self.next_terminal_id;
+        self.next_terminal_id += 1;
+        let terminal = cx.new(|cx| {
+            crate::terminal_panel::TerminalPanel::new_for_agent_auth(
+                terminal_id,
+                launch,
+                exit_handler,
+                cx,
+            )
+        });
+        if terminal.read(cx).process_id().is_none() {
+            shutdown_terminal(&terminal, cx);
+            return Err("Could not start the agent sign-in terminal".to_string());
+        }
+        self.configure_terminal(terminal.clone(), cx);
+        self.terminals.push(terminal.clone());
+        self.active_terminal = self.terminals.len() - 1;
+        self.set_bottom_layout(false, window, cx);
+        self.area.update(cx, |area, cx| {
+            if !area.is_dock_open(DockPlacement::Bottom) {
+                area.toggle_dock(DockPlacement::Bottom, window, cx);
+            }
+        });
+        let focus = terminal.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        cx.notify();
+        Ok(())
     }
 
     fn start_debug_terminal_pump(
@@ -2920,12 +4273,69 @@ impl Shell {
             Explorer => self.show_left_panel(WorkspaceView::Explorer, window, cx),
             Search => self.open_center_panel(CenterPanel::Search, window, cx),
             SourceControl => self.show_left_panel(WorkspaceView::Git, window, cx),
+            StageAllChanges => {
+                self.activity.update(cx, |activity, cx| {
+                    activity.stage_all_changes(window, cx)
+                });
+                self.show_left_panel(WorkspaceView::Git, window, cx);
+            }
+            CommitStagedChanges => self.activity.update(cx, |activity, cx| {
+                activity.commit_staged_changes(window, cx)
+            }),
             Tasks => self.show_left_panel(WorkspaceView::Tasks, window, cx),
             LanguageServers => {
                 self.show_left_panel(WorkspaceView::LanguageServers, window, cx)
             }
             Problems => self.open_center_panel(CenterPanel::Problems, window, cx),
             QuickOpen => self.open_quick_open(window, cx),
+            OpenFileDialog => request_open_path(file_prompt_options(), cx),
+            OpenFolderDialog => request_open_path(workspace_prompt_options(), cx),
+            SaveActiveFile => {
+                if !self.code_tabs.is_empty() {
+                    self.code.update(cx, |code, cx| code.save(window, cx));
+                }
+            }
+            CloseEditor => {
+                if !self.code_tabs.is_empty() {
+                    self.close_code_tab(
+                        gpui_kit::component::dock::PanelId::from(
+                            self.code.entity_id(),
+                        ),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            CloseOtherEditors => self.run_active_code_tab_action(
+                crate::code_panel::CodeTabAction::CloseOthers,
+                window,
+                cx,
+            ),
+            CloseEditorsToLeft => self.run_active_code_tab_action(
+                crate::code_panel::CodeTabAction::CloseLeft,
+                window,
+                cx,
+            ),
+            CloseEditorsToRight => self.run_active_code_tab_action(
+                crate::code_panel::CodeTabAction::CloseRight,
+                window,
+                cx,
+            ),
+            CloseAllEditors => self.run_active_code_tab_action(
+                crate::code_panel::CodeTabAction::CloseAll,
+                window,
+                cx,
+            ),
+            MoveEditorToOtherGroup => self.run_active_code_tab_action(
+                crate::code_panel::CodeTabAction::MoveToOtherEditorGroup,
+                window,
+                cx,
+            ),
+            Editor(command) => self
+                .code
+                .update(cx, |code, cx| code.run_command(command, window, cx)),
+            NavigateBack => self.navigate_editor_history(true, window, cx),
+            NavigateForward => self.navigate_editor_history(false, window, cx),
             CommandPalette => self.open_command_palette(window, cx),
             NewTerminal => self.new_terminal(window, cx),
             Debug => self.show_debug(window, cx),
@@ -2954,6 +4364,16 @@ impl Shell {
                 });
                 window.focus(&focus, cx);
             }
+            NewAheadSession => self.session.update(cx, |session, cx| {
+                session.open_thread(ahead_rpc::ahead::HarnessKind::Ahead, window, cx)
+            }),
+            NewExternalAgent => self.session.update(cx, |session, cx| {
+                session.open_thread(
+                    ahead_rpc::ahead::HarnessKind::ExternalAcp,
+                    window,
+                    cx,
+                )
+            }),
             ChatZoom => self.toggle_chat_zoom(window, cx),
             Threads => {
                 let next = !self.threads_visible;
@@ -2964,15 +4384,76 @@ impl Shell {
     }
 
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_editor = !self.code_tabs.is_empty();
+        let text_editor = active_editor && self.code.read(cx).is_text_available();
+        let language_editor = text_editor
+            && self.code.read_with(cx, |code, _| {
+                code.proxy.as_ref().is_some_and(|proxy| {
+                    proxy.lsp_servers().iter().any(|server| server.is_ready())
+                })
+            });
+        let debug_proxy = self.debug_bar.read(cx).proxy.clone();
+        let debug = debug_proxy.debug();
+        let can_step_debugging = debug.state
+            == ahead_rpc::dap_types::DapSessionState::Stopped
+            && debug.thread_id.is_some();
+        let (can_commit_staged, tasks) =
+            self.activity.read_with(cx, |activity, cx| {
+                (activity.can_commit_staged(cx), activity.command_tasks(cx))
+            });
+        let active_editor_id = self.code.entity_id();
+        let active_group_is_right =
+            self.right_editor_tabs.contains(&active_editor_id.as_u64());
+        let active_group_tabs = self
+            .code_tabs
+            .iter()
+            .filter(|code| {
+                self.right_editor_tabs.contains(&code.entity_id().as_u64())
+                    == active_group_is_right
+            })
+            .collect::<Vec<_>>();
+        let active_group_index = active_group_tabs
+            .iter()
+            .position(|code| code.entity_id() == active_editor_id);
+        let context = crate::command_palette::CommandContext {
+            active_editor,
+            text_editor,
+            language_editor,
+            can_navigate_back: !self.navigation_history.backward.is_empty(),
+            can_navigate_forward: !self.navigation_history.forward.is_empty(),
+            can_start_or_continue_debugging: can_step_debugging
+                || (!debug.state.is_active()
+                    && !debug.connection_closed
+                    && !debug_proxy.stored_configs().is_empty()),
+            can_stop_debugging: debug.state.can_stop(),
+            can_step_debugging,
+            can_commit_staged,
+            can_close_other_editors: active_group_tabs.len() > 1,
+            can_close_editors_to_left: active_group_index
+                .is_some_and(|index| index > 0),
+            can_close_editors_to_right: active_group_index
+                .is_some_and(|index| index + 1 < active_group_tabs.len()),
+            can_move_editor_to_other_group: self.code_tabs.len() > 1,
+        };
         let shell = cx.weak_entity();
         crate::command_palette::open(
             Box::new(move |command, window, cx| {
-                if let Err(error) = shell.update(cx, |shell, cx| {
-                    shell.run_shell_command(command, window, cx);
-                }) {
+                let result = shell.update(cx, |shell, cx| match command {
+                    crate::command_palette::CommandAction::Shell(command) => {
+                        shell.run_shell_command(command, window, cx)
+                    }
+                    crate::command_palette::CommandAction::RunJustTask {
+                        recipe,
+                        cwd,
+                        justfile,
+                    } => shell.new_task_terminal(recipe, cwd, justfile, window, cx),
+                });
+                if let Err(error) = result {
                     eprintln!("AHEAD could not run command: {error}");
                 }
             }),
+            context,
+            tasks,
             window,
             cx,
         );
@@ -3122,6 +4603,42 @@ impl Render for Shell {
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .child(
+                                    Button::new("editor-navigation-back")
+                                        .ghost()
+                                        .icon(IconName::ArrowLeft)
+                                        .disabled(
+                                            self.navigation_history.backward.is_empty(),
+                                        )
+                                        .tooltip("Go Back (Ctrl+-)")
+                                        .on_click(cx.listener(
+                                            |this, _, window, cx| {
+                                                this.navigate_editor_history(
+                                                    true, window, cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Button::new("editor-navigation-forward")
+                                        .ghost()
+                                        .icon(IconName::ArrowRight)
+                                        .disabled(
+                                            self.navigation_history.forward.is_empty(),
+                                        )
+                                        .tooltip("Go Forward (Ctrl+_)")
+                                        .on_click(cx.listener(
+                                            |this, _, window, cx| {
+                                                this.navigate_editor_history(
+                                                    false, window, cx,
+                                                );
+                                            },
+                                        )),
+                                ),
+                        )
                         .child(
                             div()
                                 .id("ahead-brand")
@@ -3631,6 +5148,12 @@ pub fn launch() {
             cx.on_action(|_: &GoToFile, cx| {
                 request_shell_command(ShellShortcut::QuickOpen, cx);
             });
+            cx.on_action(|_: &GoBack, cx| {
+                request_shell_command(ShellShortcut::NavigateBack, cx);
+            });
+            cx.on_action(|_: &GoForward, cx| {
+                request_shell_command(ShellShortcut::NavigateForward, cx);
+            });
             cx.on_action(|_: &StartDebugging, cx| {
                 request_shell_command(ShellShortcut::DebugKey("f5", false), cx);
             });
@@ -3652,6 +5175,9 @@ pub fn launch() {
             cx.on_action(minimize_window);
             cx.on_action(zoom_window);
             cx.on_app_quit(|cx| {
+                if cfg!(debug_assertions) {
+                    eprintln!("AHEAD app-quit callback shutting down workspace proxies");
+                }
                 let executor = cx.background_executor().clone();
                 let windows = editor_windows(cx);
                 for (_, shell) in &windows {
@@ -3687,6 +5213,9 @@ pub fn launch() {
                         eprintln!("Final editor recovery flush failed: {error}");
                     }
                     for proxy in proxies {
+                        if cfg!(debug_assertions) {
+                            eprintln!("AHEAD app-quit callback stopping proxy child");
+                        }
                         proxy.shutdown();
                     }
                     wait_for_terminal_shutdowns(terminal_shutdowns, &executor).await;
@@ -3748,8 +5277,49 @@ pub fn launch() {
                     GoToFile,
                     None,
                 ),
+                KeyBinding::new("ctrl--", GoBack, None),
+                KeyBinding::new("ctrl-_", GoForward, None),
                 KeyBinding::new("f12", GoToDefinition, None),
+                KeyBinding::new("f2", RenameSymbol, Some("AHEADCodeEditor > Input")),
                 KeyBinding::new("shift-f12", FindReferences, None),
+                KeyBinding::new(
+                    "shift-alt-f",
+                    FormatDocument,
+                    Some("AHEADCodeEditor > Input"),
+                ),
+                KeyBinding::new(
+                    "ctrl-space",
+                    ShowCompletions,
+                    Some("AHEADCodeEditor > Input"),
+                ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-shift-space"
+                    } else {
+                        "ctrl-shift-space"
+                    },
+                    ShowSignatureHelp,
+                    Some("AHEADCodeEditor > Input"),
+                ),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-."
+                    } else {
+                        "ctrl-."
+                    },
+                    ShowCodeActions,
+                    Some("AHEADCodeEditor > Input"),
+                ),
+                KeyBinding::new(
+                    "tab",
+                    NextSnippetTabstop,
+                    Some("(AHEADCodeEditor && tab_action == true) > Input"),
+                ),
+                KeyBinding::new(
+                    "shift-tab",
+                    PreviousSnippetTabstop,
+                    Some("(AHEADCodeEditor && tab_action == true) > Input"),
+                ),
                 KeyBinding::new(
                     if cfg!(target_os = "macos") {
                         "cmd-f12"
@@ -3790,11 +5360,34 @@ pub fn launch() {
                         RecoverUnsavedChanges,
                     ),
                 ]),
+                Menu::new("Edit").items([
+                    MenuItem::action(
+                        "Copy",
+                        gpui_kit::component::input::Copy,
+                    ),
+                    MenuItem::action(
+                        "Paste",
+                        gpui_kit::component::input::Paste,
+                    ),
+                    MenuItem::separator(),
+                    MenuItem::action(
+                        "Select All",
+                        gpui_kit::component::input::SelectAll,
+                    ),
+                ]),
                 Menu::new("Go").items([
                     MenuItem::action("Go to File", GoToFile),
+                    MenuItem::action("Go Back", GoBack),
+                    MenuItem::action("Go Forward", GoForward),
                     MenuItem::action("Go to Definition", GoToDefinition),
                     MenuItem::action("Find All References", FindReferences),
                     MenuItem::action("Go to Implementation", GoToImplementation),
+                ]),
+                Menu::new("Editor").items([
+                    MenuItem::action("Rename Symbol", RenameSymbol),
+                    MenuItem::action("Format Document", FormatDocument),
+                    MenuItem::action("Show Signature Help", ShowSignatureHelp),
+                    MenuItem::action("Show Code Actions", ShowCodeActions),
                 ]),
                 Menu::new("Run").items([
                     MenuItem::action("Start or Continue Debugging", StartDebugging),
@@ -3935,6 +5528,9 @@ pub fn launch() {
                             cx,
                         )
                     });
+                    explorer.update(cx, |panel, cx| {
+                        panel.watch_workspace_changes(proxy.clone(), cx)
+                    });
                     let explorer_id = explorer.read(cx).mailbox_id;
                     let settings = cx.new(|cx| {
                         crate::settings_panel::SettingsPanel::new(
@@ -3954,16 +5550,6 @@ pub fn launch() {
                             window,
                             cx,
                         )
-                    });
-                    extensions.update(cx, |panel, _| {
-                        let explorer = explorer.downgrade();
-                        panel.set_icon_theme_changed_handler(move |cx| {
-                            if let Err(error) = explorer
-                                .update(cx, |panel, cx| panel.reload_icon_theme(cx))
-                            {
-                                eprintln!("Failed to refresh file icons: {error}");
-                            }
-                        });
                     });
                     let terminal = cx.new(|cx| {
                         crate::terminal_panel::TerminalPanel::new_with_cwd(
@@ -4028,6 +5614,7 @@ pub fn launch() {
                             threads.clone(),
                             code.clone(),
                             explorer.clone(),
+                            git.clone(),
                             debug_bar.clone(),
                             terminals.clone(),
                             problems.clone(),
@@ -4039,6 +5626,34 @@ pub fn launch() {
                             activity.clone(),
                             cx,
                         )
+                    });
+                    let shell_for_git = shell.downgrade();
+                    git.update(cx, |git, _| {
+                        git.set_open_file_handler(move |path, window, cx| {
+                            let path = path.to_string_lossy().into_owned();
+                            let request = crate::ross::OpenRequest {
+                                path: path.clone(),
+                                permanent: true,
+                                location: None,
+                            };
+                            if let Err(error) = shell_for_git.update(cx, |shell, cx| {
+                                shell.open_file_request(request, window, cx);
+                                if let Some(code) = shell
+                                    .code_tabs
+                                    .iter()
+                                    .find(|code| code.read(cx).file_path == path)
+                                    .cloned()
+                                {
+                                    code.update(cx, |code, cx| {
+                                        code.reveal_first_git_hunk(cx);
+                                    });
+                                }
+                            }) {
+                                eprintln!(
+                                    "AHEAD could not open changed file: {error}"
+                                );
+                            }
+                        });
                     });
                     session.update(cx, |panel, _| panel.set_shell(shell.clone()));
                     let shell_for_settings_reload = shell.downgrade();
@@ -4125,7 +5740,7 @@ pub fn launch() {
                     })
                     .detach();
                     shell.update(cx, |shell, cx| {
-                        shell.configure_code(code.clone(), cx);
+                        shell.configure_code(code.clone(), window, cx);
                         shell.restore_unsaved_buffers(window, cx);
                     });
                     let shell_for_trash = shell.downgrade();
@@ -4142,11 +5757,21 @@ pub fn launch() {
                     });
                     let shell_for_tasks = shell.downgrade();
                     tasks.update(cx, |tasks, _| {
-                        tasks.set_run_handler(move |recipe, cwd, window, cx| {
+                        tasks.set_run_handler(move |recipe, cwd, justfile, window, cx| {
                             _ = shell_for_tasks.update(cx, |shell, cx| {
-                                shell.new_task_terminal(recipe, cwd, window, cx);
+                                shell.new_task_terminal(recipe, cwd, justfile, window, cx);
                             });
                         });
+                        let shell_for_tasks = shell.downgrade();
+                        tasks.set_watch_handler(
+                            move |recipe, cwd, justfile, window, cx| {
+                                _ = shell_for_tasks.update(cx, |shell, cx| {
+                                    shell.watch_just_task_terminal(
+                                        recipe, cwd, justfile, window, cx,
+                                    );
+                                });
+                            },
+                        );
                     });
                     let shell_for_session_settings = shell.downgrade();
                     session.update(cx, |session, _| {
@@ -4195,6 +5820,18 @@ pub fn launch() {
                             });
                         });
                     });
+                    let shell_for_search_replace = shell.downgrade();
+                    search.update(cx, |search, _| {
+                        search.set_replace_handler(move |request, window, cx| {
+                            shell_for_search_replace
+                                .update(cx, |shell, cx| {
+                                    shell.apply_search_replacements(
+                                        request, window, cx,
+                                    )
+                                })
+                                .map_err(|error| error.to_string())?
+                        });
+                    });
                     let shell_for_problems = shell.downgrade();
                     problems.update(cx, |problems, _| {
                         problems.set_close_handler(move |panel, window, cx| {
@@ -4209,6 +5846,7 @@ pub fn launch() {
                     let shell_for_debug = shell.downgrade();
                     debug_bar.update(cx, |debug_bar, _| {
                         let shell_for_close = shell_for_debug.clone();
+                        let shell_for_navigation = shell_for_debug.clone();
                         debug_bar.set_close_handler(move |window, cx| {
                             _ = shell_for_debug.update(cx, |shell, cx| {
                                 shell.close_debug(window, cx);
@@ -4219,6 +5857,37 @@ pub fn launch() {
                                 shell.new_terminal(window, cx);
                             });
                         });
+                        debug_bar.set_source_navigation_handler(
+                            move |path, line, window, cx| {
+                                _ = shell_for_navigation.update(
+                                    cx,
+                                    |shell, cx| {
+                                        shell.open_file_request(
+                                            crate::ross::OpenRequest {
+                                                path,
+                                                permanent: true,
+                                                location: Some(
+                                                    crate::ross::OpenLocation {
+                                                        line: line
+                                                            .saturating_sub(1)
+                                                            as usize,
+                                                        column:
+                                                            crate::ross::OpenColumn::Character(0),
+                                                        end_line: line
+                                                            .saturating_sub(1)
+                                                            as usize,
+                                                        end_column:
+                                                            crate::ross::OpenColumn::Character(0),
+                                                    },
+                                                ),
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                );
+                            },
+                        );
                     });
                     // Center: editor tabs. Bottom utility dock: Terminal and Debug tabs.
                     shell.update(cx, |shell, cx| {
@@ -4284,6 +5953,15 @@ pub fn launch() {
                     let root = cx
                         .new(|cx| gpui_kit::component::Root::new(shell, window, cx));
                     window.focus(&shell_focus, cx);
+                    let language_servers_for_prompt = language_servers.downgrade();
+                    window.defer(cx, move |window, cx| {
+                        if let Err(error) = language_servers_for_prompt.update(
+                            cx,
+                            |panel, cx| panel.prompt_if_undecided(window, cx),
+                        ) {
+                            eprintln!("AHEAD language-server prompt was unavailable: {error}");
+                        }
+                    });
                     root
                 })
                 .expect("Failed to open AHEAD window");
@@ -4318,6 +5996,52 @@ mod shortcut_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn moving_a_tab_toggles_only_its_editor_group() {
+        let mut right_group = std::collections::HashSet::from([2_u64]);
+
+        assert_eq!(
+            super::toggle_editor_group(&mut right_group, 1),
+            super::EditorGroupSide::Right
+        );
+        assert_eq!(right_group, std::collections::HashSet::from([1, 2]));
+        assert_eq!(
+            super::toggle_editor_group(&mut right_group, 1),
+            super::EditorGroupSide::Left
+        );
+        assert_eq!(right_group, std::collections::HashSet::from([2]));
+    }
+
+    #[test]
+    fn dock_group_changes_update_tab_group_membership() {
+        let mut right_group = std::collections::HashSet::from([2_u64]);
+        let mut left_group_id = Some(10);
+        let mut right_group_id = Some(20);
+
+        assert_eq!(
+            super::assign_editor_group(
+                &mut right_group,
+                &mut left_group_id,
+                &mut right_group_id,
+                1,
+                20,
+            ),
+            super::EditorGroupSide::Right
+        );
+        assert!(right_group.contains(&1));
+        assert_eq!(
+            super::assign_editor_group(
+                &mut right_group,
+                &mut left_group_id,
+                &mut right_group_id,
+                1,
+                10,
+            ),
+            super::EditorGroupSide::Left
+        );
+        assert!(!right_group.contains(&1));
     }
 
     use super::{ShellShortcut, shell_shortcut};
@@ -4362,6 +6086,65 @@ mod shortcut_tests {
             shell_shortcut("`", !cfg!(target_os = "macos"), true, false, false),
             Some(ShellShortcut::ToggleBottom)
         );
+    }
+}
+
+#[cfg(test)]
+mod just_task_terminal_command_tests {
+    use super::just_task_terminal_command;
+
+    #[test]
+    fn watched_tasks_use_watchexec_without_changing_direct_runs() {
+        let justfile = "/workspace/task's directory/.justfile";
+
+        assert_eq!(
+            just_task_terminal_command(justfile, "test's recipe", false),
+            "just --justfile '.justfile' 'test'\\''s recipe'"
+        );
+        assert_eq!(
+            just_task_terminal_command(justfile, "test's recipe", true),
+            "watchexec --restart --clear --shell=none -- just --justfile '.justfile' 'test'\\''s recipe'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_navigation_history_tests {
+    use super::EditorNavigationHistory;
+    use crate::ross::{OpenColumn, OpenLocation, OpenRequest};
+
+    fn location(line: usize) -> OpenRequest {
+        OpenRequest {
+            path: "src/lib.rs".into(),
+            permanent: true,
+            location: Some(OpenLocation {
+                line,
+                column: OpenColumn::Character(0),
+                end_line: line,
+                end_column: OpenColumn::Character(0),
+            }),
+        }
+    }
+
+    #[test]
+    fn back_and_forward_restore_the_previous_editor_location() {
+        let mut history = EditorNavigationHistory::default();
+        history.record_jump(Some(location(10)), &location(20));
+
+        assert_eq!(history.go_back(Some(location(20))), Some(location(10)));
+        assert_eq!(history.go_forward(Some(location(10))), Some(location(20)));
+    }
+
+    #[test]
+    fn a_new_jump_after_going_back_discards_the_forward_branch() {
+        let mut history = EditorNavigationHistory::default();
+        history.record_jump(Some(location(10)), &location(20));
+        assert_eq!(history.go_back(Some(location(20))), Some(location(10)));
+
+        history.record_jump(Some(location(10)), &location(30));
+
+        assert_eq!(history.go_forward(Some(location(30))), None);
+        assert_eq!(history.go_back(Some(location(30))), Some(location(10)));
     }
 }
 

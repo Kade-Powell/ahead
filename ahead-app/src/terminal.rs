@@ -6,7 +6,8 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event as TerminalEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
@@ -19,6 +20,8 @@ const TERMINAL_COLUMNS: usize = 120;
 const TERMINAL_ROWS: usize = 28;
 const MAX_SCROLLBACK: usize = 10_000;
 const SHARED_HISTORY_LINES: i32 = 500;
+const AGENT_CONTEXT_LINES: usize = 120;
+const AGENT_CONTEXT_BYTES: usize = 16 * 1024;
 
 fn terminal_history_text<T: EventListener>(terminal: &Term<T>) -> String {
     let grid = terminal.grid();
@@ -48,6 +51,55 @@ fn terminal_history_text<T: EventListener>(terminal: &Term<T>) -> String {
     }
     text.push_str(row.trim_end());
     text
+}
+
+fn bounded_terminal_context(history: &str) -> String {
+    let mut lines = history
+        .lines()
+        .rev()
+        .take(AGENT_CONTEXT_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let mut excerpt = lines.join("\n");
+    if excerpt.len() > AGENT_CONTEXT_BYTES {
+        let mut start = excerpt.len() - AGENT_CONTEXT_BYTES;
+        while !excerpt.is_char_boundary(start) {
+            start += 1;
+        }
+        excerpt.replace_range(..start, "");
+        if let Some(newline) = excerpt.find('\n') {
+            excerpt.replace_range(..=newline, "");
+        }
+        excerpt.insert_str(0, "[Earlier terminal output omitted]\n");
+    }
+    excerpt
+}
+
+fn terminal_agent_context<T: EventListener>(terminal: &Term<T>) -> (String, bool) {
+    if let Some(selection) = terminal
+        .selection_to_string()
+        .filter(|selection| !selection.trim().is_empty())
+    {
+        return (bounded_terminal_context(&selection), true);
+    }
+
+    (
+        bounded_terminal_context(&terminal_history_text(terminal)),
+        false,
+    )
+}
+
+fn select_all_terminal_content<T: EventListener>(terminal: &mut Term<T>) {
+    let (start, end) = {
+        let grid = terminal.grid();
+        (
+            Point::new(grid.topmost_line(), Column(0)),
+            Point::new(grid.bottommost_line(), grid.last_column()),
+        )
+    };
+    let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+    selection.update(end, Side::Right);
+    terminal.selection = Some(selection);
 }
 
 #[derive(Clone)]
@@ -106,7 +158,22 @@ pub(crate) struct TerminalBackend {
 }
 
 impl TerminalBackend {
+    #[cfg(test)]
     pub(crate) fn new(cwd: &str, shell: &str) -> Result<Self, String> {
+        Self::new_with_command(
+            cwd,
+            shell,
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    pub(crate) fn new_with_command(
+        cwd: &str,
+        program: &str,
+        args: Vec<String>,
+        extra_env: std::collections::HashMap<String, String>,
+    ) -> Result<Self, String> {
         let (events_tx, events) = unbounded();
         let dimensions = TerminalDimensions {
             columns: TERMINAL_COLUMNS,
@@ -131,8 +198,9 @@ impl TerminalBackend {
             "TERM_PROGRAM_VERSION".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         );
+        env.extend(extra_env);
         let options = PtyOptions {
-            shell: Some(PtyShell::new(shell.to_string(), Vec::new())),
+            shell: Some(PtyShell::new(program.to_string(), args)),
             working_directory: Some(PathBuf::from(cwd)),
             hold: false,
             env,
@@ -199,6 +267,42 @@ impl TerminalBackend {
             .map_err(|error| format!("failed to write to terminal: {error}"))
     }
 
+    pub(crate) fn paste(&self, text: &str) -> Result<(), String> {
+        self.send(terminal_paste_bytes(self.mode(), text))
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.terminal.lock().selection_to_string()
+    }
+
+    pub(crate) fn select_all(&self) {
+        select_all_terminal_content(&mut self.terminal.lock());
+    }
+
+    pub(crate) fn set_selection(
+        &self,
+        point: Point,
+        side: Side,
+        selection_type: SelectionType,
+    ) {
+        self.terminal.lock().selection =
+            Some(Selection::new(selection_type, point, side));
+    }
+
+    pub(crate) fn update_selection(&self, point: Point, side: Side) {
+        if let Some(selection) = self.terminal.lock().selection.as_mut() {
+            selection.update(point, side);
+        }
+    }
+
+    pub(crate) fn clear_selection(&self) {
+        self.terminal.lock().selection = None;
+    }
+
+    pub(crate) fn display_offset(&self) -> usize {
+        self.terminal.lock().grid().display_offset()
+    }
+
     pub(crate) fn resize(&self, columns: usize, rows: usize) -> Result<(), String> {
         if !self.is_running() {
             return Err("terminal is closed".into());
@@ -213,8 +317,13 @@ impl TerminalBackend {
     pub(crate) fn snapshot(&self) -> TerminalSnapshot {
         let terminal = self.terminal.lock();
         let content = terminal.renderable_content();
+        let selection = content.selection;
+        let cursor_shape = content.cursor.shape;
         let mut rows = BTreeMap::<i32, Vec<TerminalCell>>::new();
         for indexed in content.display_iter {
+            let selected = selection.is_some_and(|selection| {
+                selection.contains_cell(&indexed, indexed.point, cursor_shape)
+            });
             rows.entry(indexed.point.line.0)
                 .or_default()
                 .push(TerminalCell {
@@ -224,6 +333,7 @@ impl TerminalBackend {
                     flags: indexed.cell.flags,
                     line: indexed.point.line.0,
                     column: indexed.point.column.0,
+                    selected,
                 });
         }
         let cursor = match content.cursor.shape {
@@ -243,6 +353,10 @@ impl TerminalBackend {
 
     pub(crate) fn shared_history_text(&self) -> String {
         terminal_history_text(&self.terminal.lock())
+    }
+
+    pub(crate) fn agent_context(&self) -> (String, bool) {
+        terminal_agent_context(&self.terminal.lock())
     }
 
     pub(crate) fn mode(&self) -> TermMode {
@@ -289,6 +403,15 @@ impl TerminalBackend {
         }
         self.shutdown_complete.clone()
     }
+}
+
+fn terminal_paste_bytes(mode: TermMode, text: &str) -> Vec<u8> {
+    let text = if mode.contains(TermMode::BRACKETED_PASTE) {
+        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r")
+    };
+    text.into_bytes()
 }
 
 impl Drop for TerminalBackend {
@@ -368,6 +491,7 @@ pub(crate) struct TerminalCell {
     pub(crate) flags: Flags,
     pub(crate) line: i32,
     pub(crate) column: usize,
+    pub(crate) selected: bool,
 }
 
 #[derive(Clone, Default)]
@@ -403,6 +527,213 @@ mod tests {
         let text = terminal_history_text(&terminal);
         assert!(text.contains("one\ntwo\nthree\nfour\nfive"), "{text:?}");
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn agent_terminal_context_is_bounded_and_keeps_utf8_boundaries() {
+        let history = (0..AGENT_CONTEXT_LINES + 20)
+            .map(|line| format!("line {line} café 日本語"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context = bounded_terminal_context(&history);
+
+        assert!(context.contains("line 20 café 日本語"));
+        assert!(!context.contains("line 19 café 日本語"));
+        assert!(
+            context.ends_with(&format!(
+                "line {} café 日本語",
+                AGENT_CONTEXT_LINES + 19
+            ))
+        );
+
+        let long_history = format!("{}\nend", "🦀".repeat(AGENT_CONTEXT_BYTES));
+        let byte_bounded = bounded_terminal_context(&long_history);
+        assert!(byte_bounded.starts_with("[Earlier terminal output omitted]\n"));
+        assert!(context.len() <= AGENT_CONTEXT_BYTES + 64);
+        assert!(byte_bounded.len() <= AGENT_CONTEXT_BYTES + 64);
+        assert!(byte_bounded.is_char_boundary(0));
+        assert!(byte_bounded.is_char_boundary(byte_bounded.len()));
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_and_wraps_bracketed_paste() {
+        assert_eq!(
+            terminal_paste_bytes(TermMode::empty(), "one\r\ntwo\nthree"),
+            b"one\rtwo\rthree"
+        );
+        assert_eq!(
+            terminal_paste_bytes(TermMode::BRACKETED_PASTE, "one\n\x1b[31mtwo"),
+            b"\x1b[200~one\n[31mtwo\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn pasted_command_reaches_the_integrated_shell() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let backend = TerminalBackend::new(
+            workspace.path().to_str().expect("workspace path"),
+            "/bin/sh",
+        )
+        .expect("start disposable shell");
+        let marker = "AHEAD_TERMINAL_PASTE_OK";
+        backend
+            .paste(&format!("printf '{marker}\\n'\n"))
+            .expect("paste into shell");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !backend.shared_history_text().contains(marker) {
+            assert!(
+                Instant::now() < deadline,
+                "pasted command did not reach the shell"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let shell_process = backend.process_id().expect("shell process ID") as i32;
+        assert_terminal_shutdown(backend, &[shell_process]);
+    }
+
+    #[test]
+    fn direct_auth_command_preserves_arguments_environment_and_working_directory() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let expected_directory = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace path")
+            .to_string_lossy()
+            .into_owned();
+        let backend = TerminalBackend::new_with_command(
+            &expected_directory,
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                "printf '%s|%s\\n' \"$AHEAD_AUTH_TEST\" \"$PWD\"".to_string(),
+            ],
+            std::collections::HashMap::from([(
+                "AHEAD_AUTH_TEST".to_string(),
+                "launch-context-preserved".to_string(),
+            )]),
+        )
+        .expect("start the advertised terminal login command");
+        let expected_output =
+            format!("launch-context-preserved|{expected_directory}");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !backend.shared_history_text().contains(&expected_output) {
+            assert!(
+                Instant::now() < deadline,
+                "terminal did not receive configured args/env/cwd: {}",
+                backend.shared_history_text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_process =
+            backend.process_id().expect("terminal process ID") as i32;
+        assert_terminal_shutdown(backend, &[child_process]);
+    }
+
+    #[test]
+    fn shell_osc52_copy_emits_a_clipboard_event() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let backend = TerminalBackend::new(
+            workspace.path().to_str().expect("workspace path"),
+            "/bin/sh",
+        )
+        .expect("start disposable shell");
+        let events = backend.events();
+        backend
+            .send(b"printf '\\033]52;c;Y29weQ==\\007'\r".to_vec())
+            .expect("send OSC 52 shell command");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let clipboard_text = loop {
+            if let Some(text) = events.try_iter().find_map(|event| match event {
+                TerminalEvent::ClipboardStore(_, text) => Some(text),
+                _ => None,
+            }) {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell OSC 52 request emitted no clipboard event"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(clipboard_text, "copy");
+
+        let shell_process = backend.process_id().expect("shell process ID") as i32;
+        assert_terminal_shutdown(backend, &[shell_process]);
+    }
+
+    #[test]
+    fn terminal_selection_extracts_text_for_copy() {
+        let mut terminal =
+            Term::new(Config::default(), &TermSize::new(20, 4), VoidListener);
+        let mut parser =
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        for byte in b"hello world" {
+            parser.advance(&mut terminal, *byte);
+        }
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        selection.update(Point::new(Line(0), Column(4)), Side::Right);
+        terminal.selection = Some(selection);
+
+        assert_eq!(terminal.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn agent_context_prefers_selected_output_and_falls_back_to_recent_history() {
+        let mut terminal =
+            Term::new(Config::default(), &TermSize::new(20, 4), VoidListener);
+        let mut parser =
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        for byte in b"error: selected\r\nother output" {
+            parser.advance(&mut terminal, *byte);
+        }
+
+        let (recent, selected) = terminal_agent_context(&terminal);
+        assert!(!selected);
+        assert!(recent.contains("error: selected"));
+        assert!(recent.contains("other output"));
+
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        selection.update(Point::new(Line(0), Column(14)), Side::Right);
+        terminal.selection = Some(selection);
+
+        let (context, selected) = terminal_agent_context(&terminal);
+        assert!(selected);
+        assert_eq!(context, "error: selected");
+    }
+
+    #[test]
+    fn terminal_select_all_includes_scrollback_and_visible_output() {
+        let mut terminal = Term::new(
+            Config {
+                scrolling_history: 10,
+                ..Config::default()
+            },
+            &TermSize::new(20, 4),
+            VoidListener,
+        );
+        let mut parser =
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        for byte in b"one\r\ntwo\r\nthree\r\nfour\r\nfive" {
+            parser.advance(&mut terminal, *byte);
+        }
+
+        select_all_terminal_content(&mut terminal);
+
+        assert_eq!(
+            terminal.selection_to_string().as_deref(),
+            Some("one\ntwo\nthree\nfour\nfive")
+        );
     }
 
     fn read_pid(path: &std::path::Path) -> i32 {

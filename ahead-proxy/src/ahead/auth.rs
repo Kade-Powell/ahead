@@ -25,7 +25,7 @@ pub struct AuthRecord {
 }
 
 pub struct GitHubAuthManager {
-    config_dir: PathBuf,
+    config_dir: Option<PathBuf>,
     current_user: Option<GitHubUser>,
     access_token: Option<String>,
 }
@@ -38,25 +38,26 @@ impl Default for GitHubAuthManager {
 
 impl GitHubAuthManager {
     pub fn new() -> Self {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let config_dir = PathBuf::from(home).join(".ahead");
+        Self::from_config_dir(
+            ahead_core::directory::Directory::home_dir()
+                .map(|home| home.join(".ahead")),
+        )
+    }
+
+    fn from_config_dir(config_dir: Option<PathBuf>) -> Self {
         let mut mgr = Self {
             config_dir,
             current_user: None,
             access_token: None,
         };
-        drop(mgr.load_saved_auth());
+        if let Err(error) = mgr.load_saved_auth() {
+            tracing::warn!(error = %error, "could not load saved GitHub auth");
+        }
         mgr
     }
 
     pub fn with_custom_dir(dir: PathBuf) -> Self {
-        let mut mgr = Self {
-            config_dir: dir,
-            current_user: None,
-            access_token: None,
-        };
-        drop(mgr.load_saved_auth());
-        mgr
+        Self::from_config_dir(Some(dir))
     }
 
     /// Automatically detects and imports active GitHub CLI (gh) session if available
@@ -82,7 +83,7 @@ impl GitHubAuthManager {
         }
         let user_json = String::from_utf8_lossy(&api_output.stdout);
         let user = Self::parse_user_profile(&user_json)?;
-        drop(self.save_auth(token, user.clone()));
+        self.save_auth(token, user.clone())?;
         Ok(user)
     }
 
@@ -136,17 +137,24 @@ impl GitHubAuthManager {
     pub fn sign_out(&mut self) -> Result<()> {
         self.current_user = None;
         self.access_token = None;
-        let auth_path = self.config_dir.join("auth.json");
-        if auth_path.exists() {
-            drop(std::fs::remove_file(auth_path));
+        if let Some(config_dir) = &self.config_dir {
+            let auth_path = config_dir.join("auth.json");
+            match std::fs::remove_file(auth_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("remove saved GitHub auth"),
+            }
         }
         Ok(())
     }
 
     /// Saves token and user record to ~/.ahead/auth.json
     pub fn save_auth(&mut self, token: String, user: GitHubUser) -> Result<()> {
-        std::fs::create_dir_all(&self.config_dir)?;
-        let auth_path = self.config_dir.join("auth.json");
+        let config_dir = self.config_dir.as_ref().context(
+            "AHEAD user home is unavailable; authentication cannot be persisted",
+        )?;
+        std::fs::create_dir_all(config_dir)?;
+        let auth_path = config_dir.join("auth.json");
         let record = AuthRecord {
             access_token: token.clone(),
             token_type: "bearer".into(),
@@ -174,7 +182,10 @@ impl GitHubAuthManager {
 
     /// Loads saved auth from ~/.ahead/auth.json
     pub fn load_saved_auth(&mut self) -> Result<()> {
-        let auth_path = self.config_dir.join("auth.json");
+        let Some(config_dir) = &self.config_dir else {
+            return Ok(());
+        };
+        let auth_path = config_dir.join("auth.json");
         if !auth_path.exists() {
             return Ok(());
         }
@@ -456,5 +467,23 @@ mod tests {
         assert_eq!(fallback_user.id, 0);
 
         drop(std::fs::remove_dir_all(&temp_dir));
+    }
+
+    #[test]
+    fn missing_user_home_disables_auth_persistence() {
+        let mut manager = GitHubAuthManager::from_config_dir(None);
+        let user = GitHubUser {
+            login: "alice".into(),
+            id: 101,
+            name: Some("Alice Developer".into()),
+            avatar_url: None,
+            email: Some("alice@example.com".into()),
+            is_authenticated: true,
+        };
+
+        assert!(manager.load_saved_auth().is_ok());
+        assert!(manager.save_auth("test-token".into(), user).is_err());
+        assert!(manager.sign_out().is_ok());
+        assert!(!manager.is_authenticated());
     }
 }

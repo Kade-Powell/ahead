@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -31,22 +31,24 @@ use lsp_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier,
     TextDocumentSaveRegistrationOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncSaveOptions,
-    VersionedTextDocumentIdentifier,
+    TextDocumentSyncKind, TextDocumentSyncSaveOptions, Unregistration,
+    UnregistrationParams, VersionedTextDocumentIdentifier,
     notification::{
-        Cancel, DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument,
-        DidOpenTextDocument, DidSaveTextDocument, Initialized, LogMessage,
-        Notification, Progress, PublishDiagnostics, ShowMessage,
+        Cancel, DidChangeConfiguration, DidChangeTextDocument,
+        DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+        DidSaveTextDocument, Initialized, LogMessage, Notification, Progress,
+        PublishDiagnostics, ShowMessage,
     },
     request::{
         CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
         CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
-        DocumentDiagnosticRequest, DocumentSymbolRequest, FoldingRangeRequest,
-        Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
-        HoverRequest, Initialize, InlayHintRequest, InlineCompletionRequest,
-        PrepareRenameRequest, References, RegisterCapability, Rename, Request,
-        ResolveCompletionItem, SelectionRangeRequest, SemanticTokensFullRequest,
-        SignatureHelpRequest, WorkDoneProgressCreate, WorkspaceSymbolRequest,
+        DocumentDiagnosticRequest, DocumentSymbolRequest, ExecuteCommand,
+        FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation,
+        GotoTypeDefinition, HoverRequest, Initialize, InlayHintRequest,
+        InlineCompletionRequest, PrepareRenameRequest, References,
+        RegisterCapability, Rename, Request, ResolveCompletionItem,
+        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+        UnregisterCapability, WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
 use parking_lot::{Condvar, Mutex};
@@ -54,10 +56,15 @@ use ropey::{LineType, Rope};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{PluginCatalogRpcHandler, lsp::DocumentFilter};
+use super::{
+    PluginCatalogRpcHandler, lsp::DocumentFilter,
+    watched_files::WatchedFileRegistration,
+};
 
 pub(super) const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+// Leave time for aggregation and IPC before the editor's five-second wait ends.
+const CODE_ACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub enum ResponseHandler<Resp, Error> {
     Chan(Sender<Result<Resp, Error>>),
@@ -111,6 +118,14 @@ pub enum PluginHandlerNotification {
 pub enum PluginServerRpc {
     Shutdown,
     Handler(PluginHandlerNotification),
+    FirstCapableRequest {
+        remaining: VecDeque<PluginServerRpcHandler>,
+        method: Cow<'static, str>,
+        params: Value,
+        language_id: Option<String>,
+        path: Option<PathBuf>,
+        callback: Box<dyn ClonableCallback<Value, RpcError>>,
+    },
     ServerRequest {
         id: Id,
         method: Cow<'static, str>,
@@ -227,6 +242,9 @@ pub trait PluginServerHandler {
         path: Option<&Path>,
     ) -> bool;
     fn method_registered(&mut self, method: &str) -> bool;
+    fn request_supported(&mut self, method: &str, _params: &Params) -> bool {
+        self.method_registered(method)
+    }
     fn handle_host_notification(
         &mut self,
         method: String,
@@ -296,6 +314,11 @@ impl PluginServerRpcHandler {
         rpc
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_receiver(&self) -> Receiver<PluginServerRpc> {
+        self.rpc_rx.clone()
+    }
+
     fn initialize(&self) {
         self.handle_rpc(PluginServerRpc::Handler(
             PluginHandlerNotification::Initialize,
@@ -318,7 +341,12 @@ impl PluginServerRpcHandler {
         state.pending.insert(
             id.clone(),
             PendingRequest {
-                deadline: Instant::now() + SERVER_REQUEST_TIMEOUT,
+                deadline: Instant::now()
+                    + if method == CodeActionRequest::METHOD {
+                        CODE_ACTION_REQUEST_TIMEOUT
+                    } else {
+                        SERVER_REQUEST_TIMEOUT
+                    },
                 response: rh,
             },
         );
@@ -372,6 +400,21 @@ impl PluginServerRpcHandler {
 
     fn reject_stopped(rpc: PluginServerRpc) {
         match rpc {
+            PluginServerRpc::FirstCapableRequest {
+                remaining,
+                method,
+                params,
+                language_id,
+                path,
+                callback,
+            } => Self::request_first_capable(
+                remaining,
+                method,
+                params,
+                language_id,
+                path,
+                callback,
+            ),
             PluginServerRpc::ServerRequest { rh, .. } => {
                 rh.invoke(Err(Self::stopped_error()))
             }
@@ -468,6 +511,36 @@ impl PluginServerRpcHandler {
             check,
             ResponseHandler::Callback(Box::new(f)),
         );
+    }
+
+    pub(super) fn request_first_capable(
+        mut remaining: VecDeque<Self>,
+        method: Cow<'static, str>,
+        params: Value,
+        language_id: Option<String>,
+        path: Option<PathBuf>,
+        callback: Box<dyn ClonableCallback<Value, RpcError>>,
+    ) {
+        if let Some(server) = remaining.pop_front() {
+            server.handle_rpc(PluginServerRpc::FirstCapableRequest {
+                remaining,
+                method,
+                params,
+                language_id,
+                path,
+                callback,
+            });
+        } else {
+            callback(
+                PluginId(0),
+                Err(RpcError {
+                    code: -32601,
+                    message: format!(
+                        "No selected language server supports {method} for this document"
+                    ),
+                }),
+            );
+        }
     }
 
     fn server_request_common<P: Serialize>(
@@ -626,6 +699,41 @@ impl PluginServerRpcHandler {
                 continue;
             }
             match msg {
+                PluginServerRpc::FirstCapableRequest {
+                    remaining,
+                    method,
+                    params,
+                    language_id,
+                    path,
+                    callback,
+                } => {
+                    let request_params = Params::from(params.clone());
+                    if handler
+                        .document_supported(language_id.as_deref(), path.as_deref())
+                        && (handler.request_supported(&method, &request_params)
+                            || (method == PrepareRenameRequest::METHOD
+                                && handler.method_registered(Rename::METHOD)))
+                    {
+                        let plugin_id = self.plugin_id;
+                        self.server_request_async(
+                            method,
+                            params,
+                            language_id,
+                            path,
+                            true,
+                            move |result| callback(plugin_id, result),
+                        );
+                    } else {
+                        Self::request_first_capable(
+                            remaining,
+                            method,
+                            params,
+                            language_id,
+                            path,
+                            callback,
+                        );
+                    }
+                }
                 PluginServerRpc::ServerRequest {
                     id,
                     method,
@@ -636,10 +744,29 @@ impl PluginServerRpcHandler {
                 } => {
                     let supported = handler
                         .document_supported(language_id.as_deref(), path.as_deref());
-                    if supported && handler.method_registered(&method) {
+                    if supported && handler.request_supported(&method, &params) {
                         self.send_server_request(id, &method, params, rh);
-                    } else if supported && method == ResolveCompletionItem::METHOD {
-                        // Resolve is optional; a server without it already supplied the complete item.
+                    } else if supported
+                        && method == PrepareRenameRequest::METHOD
+                        && handler.method_registered(Rename::METHOD)
+                    {
+                        // Rename preparation is optional; use the editor's word range.
+                        rh.invoke(
+                            serde_json::to_value(
+                                lsp_types::PrepareRenameResponse::DefaultBehavior {
+                                    default_behavior: true,
+                                },
+                            )
+                            .map_err(|error| RpcError {
+                                code: 0,
+                                message: error.to_string(),
+                            }),
+                        );
+                    } else if supported
+                        && (method == ResolveCompletionItem::METHOD
+                            || method == CodeActionResolveRequest::METHOD)
+                    {
+                        // LSP resolve is optional; preserve the server's original item.
                         rh.invoke(serde_json::to_value(params).map_err(|error| {
                             RpcError {
                                 code: 0,
@@ -804,6 +931,81 @@ mod parameterless_message_tests {
     use crossbeam_channel::unbounded;
     use jsonrpc_lite::Params;
     use serde_json::Value;
+
+    #[test]
+    fn code_actions_expire_before_the_editor_wait_without_expiring_other_requests() {
+        use lsp_types::request::{CodeActionRequest, Request};
+
+        let (io_tx, io_rx) = unbounded();
+        let rpc = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".into(),
+                name: "test".into(),
+            },
+            None,
+            io_tx,
+        );
+        let (actions_sender, actions_receiver) = unbounded();
+        rpc.server_request_async(
+            CodeActionRequest::METHOD,
+            Value::Null,
+            None,
+            None,
+            false,
+            move |result: Result<Value, ahead_rpc::RpcError>| {
+                actions_sender.send(result).expect("code-action result");
+            },
+        );
+        let actions_request = io_rx.recv().expect("request").expect("frame");
+        let (other_sender, other_receiver) = unbounded();
+        rpc.server_request_async(
+            "test/other",
+            Value::Null,
+            None,
+            None,
+            false,
+            move |result: Result<Value, ahead_rpc::RpcError>| {
+                other_sender.send(result).expect("other result");
+            },
+        );
+        let other_request = io_rx.recv().expect("request").expect("frame");
+        rpc.expire_requests(
+            std::time::Instant::now()
+                + super::CODE_ACTION_REQUEST_TIMEOUT
+                + std::time::Duration::from_millis(100),
+        );
+        let cancellation = io_rx.recv().expect("cancel").expect("frame");
+        assert_eq!(cancellation.get_method(), Some("$/cancelRequest"));
+        assert_eq!(
+            serde_json::to_value(cancellation.get_params()).expect("cancel params")
+                ["id"],
+            serde_json::to_value(actions_request.get_id()).expect("id")
+        );
+        assert_eq!(
+            actions_receiver
+                .recv()
+                .expect("reply")
+                .expect_err("timeout")
+                .code,
+            -32098
+        );
+        assert!(other_receiver.try_recv().is_err());
+        rpc.handle_server_response(
+            actions_request.get_id().expect("id").clone(),
+            Ok(Value::Null),
+        );
+        assert!(actions_receiver.try_recv().is_err());
+        rpc.handle_server_response(
+            other_request.get_id().expect("id").clone(),
+            Ok(Value::Bool(true)),
+        );
+        assert_eq!(
+            other_receiver.recv().expect("reply").expect("success"),
+            Value::Bool(true)
+        );
+        assert!(io_rx.try_recv().is_err());
+        rpc.shutdown();
+    }
 
     #[test]
     fn timed_out_requests_cancel_once_and_do_not_close_the_server() {
@@ -1013,12 +1215,13 @@ mod parameterless_message_tests {
 
 struct SaveRegistration {
     include_text: bool,
-    filters: Vec<DocumentFilter>,
+    filters: Option<Vec<DocumentFilter>>,
 }
 
 #[derive(Default)]
 struct ServerRegistrations {
-    save: Option<SaveRegistration>,
+    save: HashMap<String, SaveRegistration>,
+    execute_command: HashMap<String, Vec<String>>,
 }
 
 pub struct PluginHostHandler {
@@ -1129,23 +1332,10 @@ impl PluginHostHandler {
         path: Option<&Path>,
     ) -> bool {
         match language_id {
-            Some(language_id) => {
-                for filter in self.document_selector.iter() {
-                    if (filter.language_id.is_none()
-                        || filter.language_id.as_deref() == Some(language_id))
-                        && (path.is_none()
-                            || filter.pattern.is_none()
-                            || filter
-                                .pattern
-                                .as_ref()
-                                .unwrap()
-                                .is_match(path.as_ref().unwrap()))
-                    {
-                        return true;
-                    }
-                }
-                false
-            }
+            Some(language_id) => self
+                .document_selector
+                .iter()
+                .any(|filter| filter.matches_file_document(language_id, path)),
             None => true,
         }
     }
@@ -1193,6 +1383,10 @@ impl PluginHostHandler {
             }
             SignatureHelpRequest::METHOD => {
                 self.server_capabilities.signature_help_provider.is_some()
+            }
+            ExecuteCommand::METHOD => {
+                self.server_capabilities.execute_command_provider.is_some()
+                    || !self.server_registrations.execute_command.is_empty()
             }
             HoverRequest::METHOD => self
                 .server_capabilities
@@ -1288,16 +1482,35 @@ impl PluginHostHandler {
             WorkspaceSymbolRequest::METHOD => {
                 self.server_capabilities.workspace_symbol_provider.is_some()
             }
-            PrepareRenameRequest::METHOD => {
-                self.server_capabilities.rename_provider.is_some()
-            }
-            Rename::METHOD => self.server_capabilities.rename_provider.is_some(),
+            PrepareRenameRequest::METHOD => self
+                .server_capabilities
+                .rename_provider
+                .as_ref()
+                .is_some_and(|provider| {
+                    matches!(provider,
+                    OneOf::Right(options) if options.prepare_provider == Some(true))
+                }),
+            Rename::METHOD => self
+                .server_capabilities
+                .rename_provider
+                .as_ref()
+                .is_some_and(|provider| match provider {
+                    OneOf::Left(enabled) => *enabled,
+                    OneOf::Right(_) => true,
+                }),
             SelectionRangeRequest::METHOD => {
                 self.server_capabilities.selection_range_provider.is_some()
             }
-            CodeActionResolveRequest::METHOD => {
-                self.server_capabilities.code_action_provider.is_some()
-            }
+            CodeActionResolveRequest::METHOD => self
+                .server_capabilities
+                .code_action_provider
+                .as_ref()
+                .is_some_and(|provider| match provider {
+                    CodeActionProviderCapability::Simple(_) => false,
+                    CodeActionProviderCapability::Options(options) => {
+                        options.resolve_provider.unwrap_or(false)
+                    }
+                }),
             CodeLensRequest::METHOD => {
                 self.server_capabilities.code_lens_provider.is_some()
             }
@@ -1317,10 +1530,32 @@ impl PluginHostHandler {
         }
     }
 
+    pub fn request_supported(&mut self, method: &str, params: &Params) -> bool {
+        if method != ExecuteCommand::METHOD {
+            return self.method_registered(method);
+        }
+        let command = match params {
+            Params::Map(params) => params.get("command").and_then(Value::as_str),
+            Params::Array(_) | Params::None(_) => None,
+        };
+        command.is_some_and(|command| {
+            self.server_capabilities
+                .execute_command_provider
+                .as_ref()
+                .is_some_and(|provider| {
+                    provider.commands.iter().any(|allowed| allowed == command)
+                })
+                || self.server_registrations.execute_command.values().any(
+                    |commands| commands.iter().any(|allowed| allowed == command),
+                )
+        })
+    }
+
     fn check_save_capability(&self, language_id: &str, path: &Path) -> (bool, bool) {
-        if self.document_supported(Some(language_id), Some(path)) {
-            let (should_send, include_text) = self
-                .server_capabilities
+        let (mut should_send, mut include_text) = if self
+            .document_supported(Some(language_id), Some(path))
+        {
+            self.server_capabilities
                 .text_document_sync
                 .as_ref()
                 .and_then(|sync| match sync {
@@ -1336,55 +1571,104 @@ impl PluginHostHandler {
                         (true, options.include_text.unwrap_or(false))
                     }
                 })
-                .unwrap_or((false, false));
-            if should_send {
-                return (true, include_text);
+                .unwrap_or((false, false))
+        } else {
+            (false, false)
+        };
+
+        for options in self.server_registrations.save.values() {
+            let applies = options.filters.as_ref().map_or_else(
+                || self.document_supported(Some(language_id), Some(path)),
+                |filters| {
+                    filters.iter().any(|filter| {
+                        filter.matches_file_document(language_id, Some(path))
+                    })
+                },
+            );
+            if applies {
+                should_send = true;
+                include_text |= options.include_text;
             }
         }
 
-        if let Some(options) = self.server_registrations.save.as_ref() {
-            for filter in options.filters.iter() {
-                if (filter.language_id.is_none()
-                    || filter.language_id.as_deref() == Some(language_id))
-                    && (filter.pattern.is_none()
-                        || filter.pattern.as_ref().unwrap().is_match(path))
-                {
-                    return (true, options.include_text);
-                }
-            }
-        }
-
-        (false, false)
+        (should_send, include_text)
     }
 
-    fn register_capabilities(&mut self, registrations: Vec<Registration>) {
+    fn register_capabilities(
+        &mut self,
+        registrations: Vec<Registration>,
+    ) -> Result<()> {
         for registration in registrations {
-            if let Err(err) = self.register_capability(registration) {
-                tracing::error!("{:?}", err);
-            }
+            self.register_capability(registration)?;
         }
+        Ok(())
     }
 
     fn register_capability(&mut self, registration: Registration) -> Result<()> {
         match registration.method.as_str() {
+            DidChangeWatchedFiles::METHOD => {
+                let options = serde_json::from_value::<
+                    lsp_types::DidChangeWatchedFilesRegistrationOptions,
+                >(
+                    registration.register_options.ok_or_else(|| {
+                        anyhow!("file watchers require registration options")
+                    })?,
+                )?;
+                let watched = WatchedFileRegistration::new(
+                    self.workspace.as_deref(),
+                    options,
+                )?;
+                self.catalog_rpc.catalog_notification(
+                    super::PluginCatalogNotification::RegisterWatchedFiles {
+                        plugin_id: self.server_rpc.plugin_id,
+                        id: registration.id,
+                        registration: watched,
+                    },
+                )?;
+            }
             DidSaveTextDocument::METHOD => {
-                let options = registration
-                    .register_options
-                    .ok_or_else(|| anyhow!("don't have options"))?;
-                let options: TextDocumentSaveRegistrationOptions =
-                    serde_json::from_value(options)?;
-                self.server_registrations.save = Some(SaveRegistration {
-                    include_text: options.include_text.unwrap_or(false),
-                    filters: options
-                        .text_document_registration_options
-                        .document_selector
-                        .map(|s| {
-                            s.iter()
-                                .map(DocumentFilter::from_lsp_filter_loose)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                });
+                let options =
+                    registration
+                        .register_options
+                        .filter(|options| !options.is_null())
+                        .map(
+                            serde_json::from_value::<
+                                TextDocumentSaveRegistrationOptions,
+                            >,
+                        )
+                        .transpose()?;
+                let (filters, include_text) =
+                    options.map_or((None, false), |options| {
+                        (
+                            options
+                                .text_document_registration_options
+                                .document_selector
+                                .map(|selector| {
+                                    selector
+                                        .iter()
+                                        .map(DocumentFilter::from_lsp_filter_loose)
+                                        .collect()
+                                }),
+                            options.include_text.unwrap_or(false),
+                        )
+                    });
+                self.server_registrations.save.insert(
+                    registration.id,
+                    SaveRegistration {
+                        include_text,
+                        filters,
+                    },
+                );
+            }
+            ExecuteCommand::METHOD => {
+                if let Some(options) = registration.register_options {
+                    let options = serde_json::from_value::<
+                        lsp_types::ExecuteCommandOptions,
+                    >(options)?;
+                    self.server_registrations
+                        .execute_command
+                        .insert(registration.id, options.commands);
+                }
             }
             _ => {
                 eprintln!(
@@ -1394,6 +1678,30 @@ impl PluginHostHandler {
             }
         }
         Ok(())
+    }
+
+    fn unregister_capabilities(&mut self, unregisterations: Vec<Unregistration>) {
+        for unregistration in unregisterations {
+            if unregistration.method == DidChangeWatchedFiles::METHOD {
+                if let Err(error) = self.catalog_rpc.catalog_notification(
+                    super::PluginCatalogNotification::UnregisterWatchedFiles {
+                        plugin_id: self.server_rpc.plugin_id,
+                        id: unregistration.id,
+                    },
+                ) {
+                    tracing::error!(
+                        ?error,
+                        "unregistering language-server file watchers"
+                    );
+                }
+            } else if unregistration.method == DidSaveTextDocument::METHOD {
+                self.server_registrations.save.remove(&unregistration.id);
+            } else if unregistration.method == ExecuteCommand::METHOD {
+                self.server_registrations
+                    .execute_command
+                    .remove(&unregistration.id);
+            }
+        }
     }
 
     pub fn handle_request(
@@ -1421,7 +1729,13 @@ impl PluginHostHandler {
             RegisterCapability::METHOD => {
                 let params: RegistrationParams =
                     serde_json::from_value(serde_json::to_value(params)?)?;
-                self.register_capabilities(params.registrations);
+                self.register_capabilities(params.registrations)?;
+                resp.send_null();
+            }
+            UnregisterCapability::METHOD => {
+                let params: UnregistrationParams =
+                    serde_json::from_value(serde_json::to_value(params)?)?;
+                self.unregister_capabilities(params.unregisterations);
                 resp.send_null();
             }
             "workspace/configuration" => {
@@ -1431,6 +1745,30 @@ impl PluginHostHandler {
                     &params,
                 );
                 resp.send(result);
+            }
+            "workspace/applyEdit" => {
+                let params: lsp_types::ApplyWorkspaceEditParams =
+                    serde_json::from_value(serde_json::to_value(params)?)?;
+                let response = match self.core_rpc.request(
+                    ahead_rpc::core::CoreRequest::ApplyWorkspaceEdit(params),
+                ) {
+                    Ok(ahead_rpc::core::CoreResponse::ApplyWorkspaceEdit(
+                        response,
+                    )) => response,
+                    Ok(_) => lsp_types::ApplyWorkspaceEditResponse {
+                        applied: false,
+                        failure_reason: Some(
+                            "The editor returned an unexpected response".into(),
+                        ),
+                        failed_change: None,
+                    },
+                    Err(error) => lsp_types::ApplyWorkspaceEditResponse {
+                        applied: false,
+                        failure_reason: Some(error.message),
+                        failed_change: None,
+                    },
+                };
+                resp.send(response);
             }
             "workspace/diagnostic/refresh" => {
                 resp.send_null();
@@ -1647,7 +1985,11 @@ fn workspace_configuration_response(
         .into_iter()
         .flatten()
         .map(|item| match item.get("section").and_then(Value::as_str) {
-            Some(section) => settings.get(section).cloned().unwrap_or(Value::Null),
+            // VS Code-style servers may dereference nested fields on an absent section.
+            Some(section) => settings
+                .get(section)
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
             None => settings.clone(),
         })
         .collect();
@@ -1657,6 +1999,268 @@ fn workspace_configuration_response(
 #[cfg(test)]
 mod save_capability_tests {
     use super::*;
+
+    #[test]
+    fn document_selectors_and_dynamic_save_registrations_match_file_scheme() {
+        let make_host = |scheme: &str| {
+            let core_rpc = CoreRpcHandler::new();
+            let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+            let (io_tx, _io_rx) = crossbeam_channel::unbounded();
+            let server_id = ServerId {
+                author: "ahead".into(),
+                name: "scheme-test".into(),
+            };
+            let server_rpc =
+                PluginServerRpcHandler::new(server_id.clone(), None, io_tx);
+            PluginHostHandler::new(
+                None,
+                None,
+                server_id,
+                "Scheme Test".into(),
+                vec![lsp_types::DocumentFilter {
+                    language: Some("rust".into()),
+                    scheme: Some(scheme.into()),
+                    pattern: None,
+                }],
+                core_rpc,
+                server_rpc,
+                catalog_rpc,
+                None,
+            )
+        };
+        let file_path = Path::new("/workspace/src/main.rs");
+        let host = make_host("FILE");
+        assert!(host.document_supported(Some("rust"), Some(file_path)));
+        assert!(
+            !make_host("untitled").document_supported(Some("rust"), Some(file_path))
+        );
+
+        let mut host = make_host("file");
+        host.register_capability(Registration {
+            id: "untitled-save".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"language": "rust", "scheme": "untitled"}],
+                "includeText": true
+            })),
+        })
+        .expect("register non-file save filter");
+        assert_eq!(
+            host.check_save_capability("rust", file_path),
+            (false, false)
+        );
+
+        host.register_capability(Registration {
+            id: "file-save".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"language": "rust", "scheme": "file"}],
+                "includeText": true
+            })),
+        })
+        .expect("register file save filter");
+        assert_eq!(host.check_save_capability("rust", file_path), (true, true));
+    }
+
+    #[test]
+    fn dynamic_file_watchers_validate_before_ack_and_route_registration_by_owner() {
+        let project = tempfile::tempdir().expect("project");
+        let core = CoreRpcHandler::new();
+        let catalog = PluginCatalogRpcHandler::new(core.clone());
+        let receiver = catalog.test_receiver();
+        let (sender, _io) = crossbeam_channel::unbounded();
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test".into(),
+        };
+        let server = PluginServerRpcHandler::new(
+            server_id.clone(),
+            Some(PluginId(42)),
+            sender,
+        );
+        let mut host = PluginHostHandler::new(
+            Some(project.path().to_owned()),
+            None,
+            server_id,
+            "test".into(),
+            Vec::new(),
+            core,
+            server,
+            catalog,
+            None,
+        );
+        let (sender, response) = crossbeam_channel::unbounded();
+        host.handle_request(Id::Num(1), RegisterCapability::METHOD.into(), Params::from(serde_json::json!({
+            "registrations": [{ "id": "config", "method": DidChangeWatchedFiles::METHOD, "registerOptions": { "watchers": [{ "globPattern": "**/*.toml" }] } }]
+        })), ResponseSender::new(sender));
+        assert_eq!(
+            response.recv().expect("ack").expect("valid registration"),
+            Value::Null
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(super::super::PluginCatalogRpc::Handler(super::super::PluginCatalogNotification::RegisterWatchedFiles { plugin_id: PluginId(42), id, .. })) if id == "config")
+        );
+        let (sender, response) = crossbeam_channel::unbounded();
+        host.handle_request(Id::Num(2), RegisterCapability::METHOD.into(), Params::from(serde_json::json!({
+            "registrations": [{ "id": "bad", "method": DidChangeWatchedFiles::METHOD, "registerOptions": { "watchers": [{ "globPattern": "[invalid" }] } }]
+        })), ResponseSender::new(sender));
+        assert!(
+            response
+                .recv()
+                .expect("invalid registration response")
+                .is_err()
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "invalid registration must not be installed"
+        );
+        host.unregister_capabilities(vec![Unregistration {
+            id: "config".into(),
+            method: DidChangeWatchedFiles::METHOD.into(),
+        }]);
+        assert!(
+            matches!(receiver.try_recv(), Ok(super::super::PluginCatalogRpc::Handler(super::super::PluginCatalogNotification::UnregisterWatchedFiles { plugin_id: PluginId(42), id })) if id == "config")
+        );
+    }
+
+    #[test]
+    fn execute_command_is_limited_to_server_advertised_commands() {
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test".into(),
+        };
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, sender);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let capabilities = serde_json::from_value(serde_json::json!({
+            "executeCommandProvider": {"commands": ["allowed.command"]}
+        }))
+        .expect("valid execute-command capability");
+        host.initialized(InitializeResult {
+            capabilities,
+            server_info: None,
+            offset_encoding: None,
+        });
+        let request = |command: &str| {
+            Params::from(serde_json::json!({"command": command, "arguments": []}))
+        };
+
+        assert!(
+            host.request_supported(
+                ExecuteCommand::METHOD,
+                &request("allowed.command")
+            )
+        );
+        assert!(!host.request_supported(
+            ExecuteCommand::METHOD,
+            &request("unadvertised.command")
+        ));
+        assert!(!host.request_supported(
+            ExecuteCommand::METHOD,
+            &Params::from(serde_json::json!({"arguments": []}))
+        ));
+    }
+
+    #[test]
+    fn dynamic_execute_commands_are_allowlisted_and_unregistered_by_id() {
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test".into(),
+        };
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, sender);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let request = |command: &str| {
+            Params::from(serde_json::json!({"command": command, "arguments": []}))
+        };
+
+        host.register_capability(Registration {
+            id: "commands-one".into(),
+            method: ExecuteCommand::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "commands": ["dynamic.only", "shared.command"]
+            })),
+        })
+        .expect("first dynamic execute-command registration");
+        host.register_capability(Registration {
+            id: "commands-two".into(),
+            method: ExecuteCommand::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "commands": ["shared.command"]
+            })),
+        })
+        .expect("overlapping dynamic execute-command registration");
+
+        assert!(host.method_registered(ExecuteCommand::METHOD));
+        assert!(
+            host.request_supported(ExecuteCommand::METHOD, &request("dynamic.only"))
+        );
+        assert!(
+            host.request_supported(
+                ExecuteCommand::METHOD,
+                &request("shared.command")
+            )
+        );
+        assert!(
+            !host.request_supported(
+                ExecuteCommand::METHOD,
+                &request("unknown.command")
+            )
+        );
+
+        host.unregister_capabilities(vec![Unregistration {
+            id: "commands-one".into(),
+            method: ExecuteCommand::METHOD.into(),
+        }]);
+        assert!(
+            !host
+                .request_supported(ExecuteCommand::METHOD, &request("dynamic.only"))
+        );
+        assert!(
+            host.request_supported(
+                ExecuteCommand::METHOD,
+                &request("shared.command")
+            )
+        );
+
+        host.unregister_capabilities(vec![Unregistration {
+            id: "commands-two".into(),
+            method: ExecuteCommand::METHOD.into(),
+        }]);
+        assert!(!host.method_registered(ExecuteCommand::METHOD));
+        assert!(
+            !host.request_supported(
+                ExecuteCommand::METHOD,
+                &request("shared.command")
+            )
+        );
+    }
 
     #[test]
     fn initialization_and_custom_status_use_the_same_server_identity() {
@@ -1751,7 +2355,31 @@ mod save_capability_tests {
     }
 
     #[test]
-    fn dynamic_save_registration_applies_when_static_save_is_absent() {
+    fn incremental_selection_replacement_keeps_a_precise_utf16_range() {
+        use ahead_rpc::delta::DeltaOp;
+
+        let old_text = Rope::from("a🙂bcdef");
+        let delta = AheadDelta::new(
+            old_text.len(),
+            vec![
+                DeltaOp::Retain(1),
+                DeltaOp::Delete("🙂b".len()),
+                DeltaOp::Insert("🦀".into()),
+                DeltaOp::Retain("cdef".len()),
+            ],
+        );
+        let new_text = delta.apply(&old_text);
+        let change = get_document_content_change(&old_text, &delta, &new_text);
+        let range = change.range.expect("incremental replacement range");
+
+        assert_eq!(range.start, Position::new(0, 1));
+        assert_eq!(range.end, Position::new(0, 4));
+        assert_eq!(change.text, "🦀");
+        assert_eq!(new_text.to_string(), "a🦀cdef");
+    }
+
+    #[test]
+    fn dynamic_save_registrations_merge_null_and_unregister_by_id() {
         let core_rpc = CoreRpcHandler::new();
         let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
         let server_id = ServerId {
@@ -1787,14 +2415,82 @@ mod save_capability_tests {
                 "documentSelector": [{"pattern": "**/*.rs"}, {"pattern": "**/Cargo.toml"}],
                 "includeText": false
             })),
-        }).expect("valid dynamic registration");
-        assert_eq!(host.check_save_capability("rust", rust_path), (true, false));
+        })
+        .expect("valid dynamic registration");
+        host.register_capability(Registration {
+            id: "save-text".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"language": "rust"}],
+                "includeText": true
+            })),
+        })
+        .expect("valid overlapping dynamic registration");
+        assert_eq!(host.check_save_capability("rust", rust_path), (true, true));
         assert_eq!(
             host.check_save_capability("toml", Path::new("/workspace/Cargo.toml")),
             (true, false)
         );
         assert_eq!(
             host.check_save_capability("json", Path::new("/workspace/data.json")),
+            (false, false)
+        );
+
+        let (unregister_sender, unregister_receiver) = crossbeam_channel::bounded(1);
+        host.process_request(
+            UnregisterCapability::METHOD.into(),
+            Params::from(serde_json::json!({
+                "unregisterations": [{
+                    "id": "save-text",
+                    "method": DidSaveTextDocument::METHOD
+                }]
+            })),
+            ResponseSender::new(unregister_sender),
+        )
+        .expect("unregister request");
+        assert_eq!(
+            unregister_receiver
+                .recv()
+                .expect("unregister response")
+                .expect("unregister response is successful"),
+            Value::Null
+        );
+        assert_eq!(host.check_save_capability("rust", rust_path), (true, false));
+
+        host.unregister_capabilities(vec![Unregistration {
+            id: "save".into(),
+            method: "textDocument/didChange".into(),
+        }]);
+        assert_eq!(
+            host.check_save_capability("toml", Path::new("/workspace/Cargo.toml")),
+            (true, false)
+        );
+        host.unregister_capabilities(vec![Unregistration {
+            id: "save".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(
+            host.check_save_capability("rust", rust_path),
+            (false, false)
+        );
+
+        host.register_capability(Registration {
+            id: "save-all".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(Value::Null),
+        })
+        .expect("null options use the client document selector");
+        assert_eq!(host.check_save_capability("rust", rust_path), (true, false));
+        assert_eq!(
+            host.check_save_capability("python", Path::new("/workspace/main.py")),
+            (false, false)
+        );
+        host.unregister_capabilities(vec![Unregistration {
+            id: "save-all".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(
+            host.check_save_capability("rust", rust_path),
             (false, false)
         );
 
@@ -1896,7 +2592,7 @@ mod workspace_configuration_tests {
     }
 
     #[test]
-    fn responds_with_requested_sections_and_whole_configuration() {
+    fn responds_with_requested_sections_and_empty_objects_for_missing_settings() {
         let settings = json!({
             "rust-analyzer": { "check": { "command": "clippy" } },
             "zed": { "channel": "stable" }
@@ -1923,7 +2619,7 @@ mod workspace_configuration_tests {
                 { "check": { "command": "clippy" } },
                 { "check": { "command": "clippy" } },
                 settings,
-                null,
+                {},
                 settings
             ])
         );
@@ -1968,43 +2664,20 @@ fn get_document_content_change(
     delta: &AheadDelta,
     new_text: &Rope,
 ) -> TextDocumentContentChangeEvent {
-    let (start, end) = delta.summary();
-
-    // TODO: Handle more trivial cases like typing when there's a selection or transpose
-    if let Some(node) = delta.as_simple_insert() {
-        let start = offset_to_position(text, start);
-
-        let end = offset_to_position(text, end);
-
-        let text = node.to_string();
-        let text_document_content_change_event = TextDocumentContentChangeEvent {
-            range: Some(Range { start, end }),
-            range_length: None,
-            text,
-        };
-
-        return text_document_content_change_event;
-    }
-    // Or a simple delete
-    else if delta.is_simple_delete() {
-        let end_position = offset_to_position(text, end);
-
-        let start = offset_to_position(text, start);
-
-        let text_document_content_change_event = TextDocumentContentChangeEvent {
+    if let Some((range, replacement)) = delta.contiguous_replacement(text, new_text)
+    {
+        return TextDocumentContentChangeEvent {
             range: Some(Range {
-                start,
-                end: end_position,
+                start: offset_to_position(text, range.start),
+                end: offset_to_position(text, range.end),
             }),
             range_length: None,
-            text: String::new(),
+            text: replacement,
         };
-
-        return text_document_content_change_event;
     }
 
-    // Incremental servers need the replaced range in the *old* snapshot,
-    // including when a paste or editor snapshot replaces the whole document.
+    // Invalid or mismatched deltas must still leave incremental servers with
+    // the complete new snapshot rather than applying a partial edit.
     TextDocumentContentChangeEvent {
         range: Some(Range::new(
             Position::new(0, 0),
@@ -2069,5 +2742,92 @@ fn semantic_tokens_legend(
         SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
             options,
         ) => &options.semantic_tokens_options.legend,
+    }
+}
+
+#[cfg(test)]
+mod workspace_apply_edit_tests {
+    use super::{
+        PluginCatalogRpcHandler, PluginHostHandler, PluginServerRpcHandler,
+        ResponseSender,
+    };
+    use ahead_rpc::{
+        core::{CoreRequest, CoreResponse, CoreRpc, CoreRpcHandler},
+        plugin::ServerId,
+    };
+    use crossbeam_channel::bounded;
+    use lsp_types::{ApplyWorkspaceEditParams, WorkspaceEdit};
+
+    #[test]
+    fn server_apply_edit_relays_to_editor_and_returns_its_result() {
+        let core_rpc = CoreRpcHandler::new();
+        let core_messages = core_rpc.rx().clone();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "test-lsp".into(),
+        };
+        let (io_sender, _) = crossbeam_channel::unbounded();
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, io_sender);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Test LSP".into(),
+            Vec::new(),
+            core_rpc.clone(),
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        let params = ApplyWorkspaceEditParams {
+            label: Some("Add import".into()),
+            edit: WorkspaceEdit::default(),
+        };
+        let rpc_params = jsonrpc_lite::Params::from(
+            serde_json::to_value(params).expect("serialize workspace edit"),
+        );
+        let (response_sender, response_receiver) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            host.process_request(
+                "workspace/applyEdit".into(),
+                rpc_params,
+                ResponseSender::new(response_sender),
+            )
+        });
+
+        let CoreRpc::Request(request_id, request) = core_messages
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("workspace edit core request")
+        else {
+            panic!("expected a core request");
+        };
+        assert!(matches!(
+            request,
+            CoreRequest::ApplyWorkspaceEdit(params)
+                if params.label.as_deref() == Some("Add import")
+        ));
+        core_rpc.handle_response(
+            request_id,
+            Ok(CoreResponse::ApplyWorkspaceEdit(
+                lsp_types::ApplyWorkspaceEditResponse {
+                    applied: false,
+                    failure_reason: Some("stale document version".into()),
+                    failed_change: None,
+                },
+            )),
+        );
+        worker
+            .join()
+            .expect("server request worker")
+            .expect("process server request");
+
+        let response = response_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("LSP response")
+            .expect("serialize LSP response");
+        assert_eq!(response["applied"], false);
+        assert_eq!(response["failureReason"], "stale document version");
     }
 }

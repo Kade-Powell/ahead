@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, process::Command};
 
 use anyhow::Result;
 
@@ -71,39 +71,17 @@ fn get_info() -> ReleaseInfo {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 fn get_head() -> Option<String> {
-    let repo = match git2::Repository::discover(format!(
-        "{}/..",
-        env::var("CARGO_MANIFEST_DIR").ok()?
-    )) {
-        Ok(v) => v,
-        Err(err) => {
-            println!("cargo::warning=Failed to obtain git repo: {err}");
-            return None;
-        }
-    };
-    let reference = match repo.head() {
-        Ok(v) => v,
-        Err(err) => {
-            println!("cargo::warning=Failed to obtain head: {err}");
-            return None;
-        }
-    };
-    let commit = reference.target();
-    println!("cargo::warning=Commit found: {commit:?}");
-    commit.map(|s| s.to_string().split_at(7).0.to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn get_head() -> Option<String> {
-    let cmd = std::process::Command::new("git")
-        .args(["show", "--pretty=format:%h", "--no-patch"])
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")?;
+    let repository_root = Path::new(&manifest_dir).parent()?;
+    let output = Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(repository_root)
         .output()
         .ok()?;
-
-    let commit = String::from_utf8_lossy(&cmd.stdout);
-    let commit = commit.trim();
-
-    Some(commit.to_string())
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -8,10 +8,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ahead_core::{
+    directory::Directory,
     encoding::offset_utf16_to_utf8_str,
     search::{
         WorkspaceFileIndex, is_binary_content, is_private_file,
@@ -22,8 +23,8 @@ use ahead_extension_host::install_extension_from_url;
 use ahead_rpc::{
     RequestId, RpcError,
     ahead::{
-        AheadRequest as AgentHostRequest, SharedBufferEditResult,
-        SharedBufferSnapshot,
+        AheadRequest as AgentHostRequest, PredictionBinding, PredictionRequest,
+        SharedBufferEditResult, SharedBufferSnapshot,
     },
     buffer::BufferId,
     core::{CoreNotification, CoreRpcHandler, FileChanged},
@@ -35,21 +36,23 @@ use ahead_rpc::{
         ProxyRpcHandler, SearchMatch,
     },
     source_control::{
-        BlameCommit, BlameHunk, DiffHunkKind, DiffInfo, FileDiff, GitFileState,
+        BlameCommit, BlameHunk, DiffHunkKind, DiffInfo, FileDiff, GitCommitSummary,
+        GitFileState, GitPatch, GitStatusFile, GitWorkspaceStatus,
     },
-    style::{LineStyle, SemanticStyles},
+    style::{ExtensionSyntax, LineStyle, SemanticStyles, SyntaxCapture},
     terminal::TermId,
 };
 use alacritty_terminal::{event::WindowSize, event_loop::Msg};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
 use git2::{
-    DiffOptions, ErrorCode::NotFound, Oid, Repository, build::CheckoutBuilder,
+    DiffFormat, DiffOptions, ErrorCode::NotFound, Oid, Repository,
+    build::CheckoutBuilder,
 };
 use indexmap::IndexMap;
 use lsp_types::{
-    CancelParams, MessageType, NumberOrString, Position, Range, ShowMessageParams,
-    TextDocumentItem,
+    CancelParams, GotoDefinitionResponse, MessageType, NumberOrString, Position,
+    Range, ShowMessageParams, TextDocumentItem,
     notification::{Cancel, Notification},
 };
 use parking_lot::Mutex;
@@ -58,28 +61,88 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    ahead::prediction::OpenBufferContext,
+    ahead::prediction::{
+        OpenBufferContext, PredictionCancellation, PredictionContextSnapshot,
+        PredictionEngine, prediction_excerpt_for_snapshot,
+    },
     buffer::{Buffer, get_mod_time, language_id_from_path_with_content, load_file},
-    plugin::{PluginCatalogRpcHandler, catalog::PluginCatalog},
+    plugin::{
+        PluginCatalogRpcHandler, catalog::PluginCatalog,
+        watched_files::LSP_FILE_EVENT_TOKEN,
+    },
     terminal::{Terminal, TerminalSender},
-    watcher::{FileWatcher, Notify, WatchToken},
+    watcher::{FileWatcher, FileWatcherHandle, Notify, WatchToken},
 };
 
 const OPEN_FILE_EVENT_TOKEN: WatchToken = WatchToken(1);
 const WORKSPACE_EVENT_TOKEN: WatchToken = WatchToken(2);
+const USER_SETTINGS_EVENT_TOKEN: WatchToken = WatchToken(3);
+const USER_SETTINGS_HOME_EVENT_TOKEN: WatchToken = WatchToken(4);
+const INSTRUCTION_EVENT_TOKEN: WatchToken = WatchToken(6);
+const INSTRUCTION_ROOT_EVENT_TOKEN: WatchToken = WatchToken(7);
 const AHEAD_GITIGNORE: &str = include_str!("../../.ahead/.gitignore");
 const MAX_FIM_OPEN_BUFFERS: usize = 4;
 const MAX_FIM_OPEN_BUFFER_BYTES: usize = 4096;
+const MAX_FIM_DEFINITION_REQUESTS: usize = 8;
+const MAX_FIM_DEFINITION_CACHE_ENTRIES: usize = 128;
+const MAX_CACHED_FIM_SEMANTIC_TOKENS: usize = 16_384;
+const FIM_DEFINITION_LINE_RADIUS: usize = 3;
+const FIM_DEFINITION_CACHE_TTL: Duration = Duration::from_secs(3);
+const FIM_DEFINITION_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_READY_PREDICTIONS: usize = 32;
+const PREDICTION_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_SHARED_BUFFER_BYTES: usize = 1024 * 1024;
 
+fn rpc_error_from_agent(error: anyhow::Error) -> RpcError {
+    let code = ahead_agent::acp_client::acp_error_code(&error).unwrap_or(0);
+    RpcError {
+        code,
+        message: error.to_string(),
+    }
+}
+
 fn is_provider_settings_path(workspace: &Path, path: &Path) -> bool {
-    path.strip_prefix(workspace).is_ok_and(|relative| {
-        relative.parent() == Some(Path::new(".ahead"))
-            && matches!(
-                relative.file_name().and_then(|name| name.to_str()),
-                Some("settings.toml" | "config.toml" | "config.local.toml")
-            )
+    if !matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("settings.toml" | "config.toml" | "config.local.toml")
+    ) {
+        return false;
+    }
+    let Some(directory) = path.parent().filter(|directory| {
+        directory.file_name().is_some_and(|name| name == ".ahead")
+    }) else {
+        return false;
+    };
+    directory.parent().is_some_and(|root| {
+        root == workspace || root.canonicalize().is_ok_and(|root| root == workspace)
     })
+}
+
+fn user_settings_home_directory() -> Option<PathBuf> {
+    Directory::home_dir()?.canonicalize().ok()
+}
+
+fn user_settings_directory_in(home: &Path) -> Option<PathBuf> {
+    let path = home.join(".ahead");
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn user_settings_directory() -> Option<PathBuf> {
+    user_settings_directory_in(&user_settings_home_directory()?)
+}
+
+fn is_user_ahead_directory(home: &Path, path: &Path) -> bool {
+    path.parent() == Some(home)
+        && path.file_name().is_some_and(|name| name == ".ahead")
+}
+
+fn is_user_lsp_settings_path(settings_directory: &Path, path: &Path) -> bool {
+    path.parent() == Some(settings_directory)
+        && path.file_name().is_some_and(|name| name == "settings.toml")
 }
 
 fn ensure_ahead_gitignore(workspace: &Path) -> io::Result<()> {
@@ -107,9 +170,17 @@ pub struct Dispatcher {
     shared_remote_recovery: HashMap<PathBuf, SharedRemoteRecovery>,
     terminals: HashMap<TermId, TerminalSender>,
     file_watcher: FileWatcher,
+    user_settings_watched: bool,
     file_index: Option<Arc<WorkspaceFileIndex>>,
+    file_index_warmup: Option<Arc<AtomicBool>>,
     workspace_file_jobs: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     shown_prediction_errors: Arc<Mutex<HashSet<String>>>,
+    prediction_definition_cache: Arc<
+        Mutex<HashMap<PredictionDefinitionCacheKey, CachedPredictionDefinitions>>,
+    >,
+    prediction_semantic_tokens: Arc<Mutex<PredictionSemanticTokenCache>>,
+    inline_prediction_jobs: Arc<Mutex<HashMap<RequestId, InlinePredictionJob>>>,
+    ready_predictions: Arc<Mutex<HashMap<PathBuf, ReadyPrediction>>>,
     window_id: usize,
     tab_id: usize,
     ahead_storage_error: Option<String>,
@@ -128,6 +199,247 @@ struct SharedRemoteRecovery {
     relative_path: PathBuf,
 }
 
+struct InlinePredictionJob {
+    path: PathBuf,
+    dependencies: HashSet<PathBuf>,
+    cancellation: PredictionCancellation,
+}
+
+#[derive(Default)]
+struct PredictionSemanticTokenCache {
+    buffers: HashMap<PathBuf, PredictionSemanticTokenEntry>,
+}
+
+struct PredictionSemanticTokenEntry {
+    buffer_id: BufferId,
+    revision: u64,
+    len: usize,
+    styles: Option<SemanticStyles>,
+    syntax_captures: Option<Vec<SyntaxCapture>>,
+}
+
+impl PredictionSemanticTokenCache {
+    fn track_buffer(&mut self, path: &Path, buffer: &Buffer) {
+        let entry = self.buffers.entry(path.to_path_buf()).or_insert_with(|| {
+            PredictionSemanticTokenEntry {
+                buffer_id: buffer.id.clone(),
+                revision: buffer.rev,
+                len: buffer.rope.len(),
+                styles: None,
+                syntax_captures: None,
+            }
+        });
+        if entry.buffer_id != buffer.id
+            || entry.revision != buffer.rev
+            || entry.len != buffer.rope.len()
+        {
+            *entry = PredictionSemanticTokenEntry {
+                buffer_id: buffer.id.clone(),
+                revision: buffer.rev,
+                len: buffer.rope.len(),
+                styles: None,
+                syntax_captures: None,
+            };
+        }
+    }
+
+    fn remove_buffer(&mut self, path: &Path) {
+        self.buffers.remove(path);
+    }
+
+    fn store(&mut self, buffer_id: BufferId, styles: &SemanticStyles) {
+        let Some(entry) = self.buffers.get_mut(&styles.path) else {
+            return;
+        };
+        if entry.buffer_id == buffer_id
+            && entry.revision == styles.rev
+            && entry.len == styles.len
+        {
+            let mut identifier_styles = styles.clone();
+            identifier_styles.styles.retain(|style| {
+                style
+                    .style
+                    .fg_color
+                    .as_deref()
+                    .is_some_and(is_prediction_identifier_semantic_token_type)
+            });
+            if identifier_styles.styles.len() <= MAX_CACHED_FIM_SEMANTIC_TOKENS {
+                entry.styles = Some(identifier_styles);
+            } else {
+                entry.styles = None;
+            }
+        }
+    }
+
+    fn styles_for(&self, path: &Path, buffer: &Buffer) -> Option<SemanticStyles> {
+        let entry = self.buffers.get(path)?;
+        if entry.buffer_id == buffer.id
+            && entry.revision == buffer.rev
+            && entry.len == buffer.rope.len()
+        {
+            entry.styles.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store_syntax_captures(
+        &mut self,
+        buffer_id: &BufferId,
+        path: &Path,
+        revision: u64,
+        len: usize,
+        captures: Vec<SyntaxCapture>,
+    ) {
+        let Some(entry) = self.buffers.get_mut(path) else {
+            return;
+        };
+        if &entry.buffer_id != buffer_id
+            || entry.revision != revision
+            || entry.len != len
+        {
+            return;
+        }
+
+        let captures = captures
+            .into_iter()
+            .filter(|capture| {
+                capture.start < capture.end
+                    && capture.end <= len
+                    && is_prediction_identifier_syntax_scope(&capture.scope)
+            })
+            .collect::<Vec<_>>();
+        entry.syntax_captures =
+            (captures.len() <= MAX_CACHED_FIM_SEMANTIC_TOKENS).then_some(captures);
+    }
+
+    fn syntax_captures_for(
+        &self,
+        path: &Path,
+        buffer: &Buffer,
+    ) -> Option<Vec<SyntaxCapture>> {
+        let entry = self.buffers.get(path)?;
+        if entry.buffer_id == buffer.id
+            && entry.revision == buffer.rev
+            && entry.len == buffer.rope.len()
+        {
+            entry.syntax_captures.clone()
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct PredictionDefinitionCacheKey {
+    path: PathBuf,
+    buffer_id: BufferId,
+    revision: u64,
+    identifier: String,
+    line: u32,
+    character: u32,
+}
+
+struct CachedPredictionDefinition {
+    path: PathBuf,
+    line: u32,
+    buffer_id: BufferId,
+    revision: u64,
+}
+
+struct CachedPredictionDefinitions {
+    created: Instant,
+    locations: Vec<CachedPredictionDefinition>,
+}
+
+struct ReadyPrediction {
+    binding: PredictionBinding,
+    created: Instant,
+    snapshot: PredictionContextSnapshot,
+    request: PredictionRequest,
+    open_buffers: Vec<OpenBufferContext>,
+    dependencies: BTreeMap<PathBuf, (BufferId, u64)>,
+    target_id: BufferId,
+    target: Rope,
+    insertion_offset: usize,
+    replacement: String,
+}
+
+impl ReadyPrediction {
+    fn new(
+        mut snapshot: PredictionContextSnapshot,
+        mut request: PredictionRequest,
+        open_buffers: Vec<OpenBufferContext>,
+        buffers: &HashMap<PathBuf, Buffer>,
+        target: &Buffer,
+        replacement: String,
+    ) -> Result<Self> {
+        let dependencies = open_buffers
+            .iter()
+            .map(|context| {
+                let path = snapshot.workspace.join(&context.path);
+                let buffer =
+                    buffers.get(&path).context("prediction dependency closed")?;
+                Ok((path, (buffer.id, buffer.rev)))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let insertion_offset = request.prefix.len();
+        let (prefix, suffix) =
+            prediction_excerpt_for_snapshot(&snapshot, &open_buffers)?;
+        request.prefix = prefix.clone();
+        request.suffix = suffix.clone();
+        snapshot.request.prefix = prefix;
+        snapshot.request.suffix = suffix;
+        let bytes = serde_json::to_vec(&(
+            1,
+            &snapshot,
+            &open_buffers,
+            &dependencies,
+            target.id,
+            target.rev,
+        ))?;
+        let binding = PredictionBinding {
+            version: 1,
+            request_id: request.request_id.clone(),
+            context_sha256: format!("{:x}", Sha256::digest(bytes)),
+            target_revision: target.rev,
+        };
+        Ok(Self {
+            binding,
+            created: Instant::now(),
+            snapshot,
+            request,
+            open_buffers,
+            dependencies,
+            target_id: target.id,
+            target: target.rope.clone(),
+            insertion_offset,
+            replacement,
+        })
+    }
+
+    fn publish(
+        self,
+        path: PathBuf,
+        cache: &Mutex<HashMap<PathBuf, Self>>,
+    ) -> PredictionBinding {
+        let binding = self.binding.clone();
+        let mut cached = cache.lock();
+        cached.retain(|_, ready| ready.created.elapsed() <= PREDICTION_LIFETIME);
+        if cached.len() >= MAX_READY_PREDICTIONS
+            && !cached.contains_key(&path)
+            && let Some(oldest) = cached
+                .iter()
+                .min_by_key(|(_, ready)| ready.created)
+                .map(|(path, _)| path.clone())
+        {
+            cached.remove(&oldest);
+        }
+        cached.insert(path, self);
+        binding
+    }
+}
+
 impl ProxyHandler for Dispatcher {
     fn handle_notification(&mut self, rpc: ProxyNotification) {
         use ProxyNotification::*;
@@ -139,6 +451,11 @@ impl ProxyHandler for Dispatcher {
             } => {
                 self.window_id = window_id;
                 self.tab_id = tab_id;
+                self.cancel_inline_predictions(None);
+                self.ready_predictions.lock().clear();
+                if let Some(cancelled) = self.file_index_warmup.take() {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
                 for cancelled in self.workspace_file_jobs.lock().values() {
                     cancelled.store(true, Ordering::SeqCst);
                 }
@@ -148,7 +465,7 @@ impl ProxyHandler for Dispatcher {
                 self.file_index = self.workspace.as_ref().map(|workspace| {
                     Arc::new(WorkspaceFileIndex::new(workspace.clone()))
                 });
-                let notifier = FileWatchNotifier::new(
+                let mut notifier = FileWatchNotifier::new(
                     self.workspace.clone(),
                     self.core_rpc.clone(),
                     self.proxy_rpc.clone(),
@@ -156,7 +473,40 @@ impl ProxyHandler for Dispatcher {
                     self.file_index.clone(),
                 );
                 let git_metadata_paths = notifier.git_metadata_paths.clone();
-                self.file_watcher.notify(notifier);
+                let user_settings_home = user_settings_home_directory();
+                let user_settings_directory = user_settings_home
+                    .as_deref()
+                    .and_then(user_settings_directory_in);
+                notifier.user_settings_home = user_settings_home.clone();
+                notifier.user_settings_watcher = Some(self.file_watcher.handle());
+                notifier.watch_instruction_ancestors(&mut self.file_watcher);
+                *notifier.user_settings_directory.lock() =
+                    user_settings_directory.clone();
+                if !self.user_settings_watched
+                    && let Some(home) = user_settings_home.as_deref()
+                {
+                    let watched_home = home.to_owned();
+                    self.file_watcher.watch_filtered(
+                        home,
+                        false,
+                        USER_SETTINGS_HOME_EVENT_TOKEN,
+                        move |path| is_user_ahead_directory(&watched_home, path),
+                    );
+                    if let Some(settings_directory) =
+                        user_settings_directory.as_deref()
+                    {
+                        let watched_directory = settings_directory.to_owned();
+                        self.file_watcher.watch_filtered(
+                            settings_directory,
+                            false,
+                            USER_SETTINGS_EVENT_TOKEN,
+                            move |path| {
+                                is_user_lsp_settings_path(&watched_directory, path)
+                            },
+                        );
+                    }
+                    self.user_settings_watched = true;
+                }
                 if let Some(workspace) = self.workspace.as_ref() {
                     self.file_watcher
                         .watch(workspace, true, WORKSPACE_EVENT_TOKEN);
@@ -172,16 +522,30 @@ impl ProxyHandler for Dispatcher {
                         }
                     }
                 }
+                self.file_watcher.notify(notifier);
+                self.file_index_warmup = self.file_index.as_ref().map(|index| {
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    let warmup_cancelled = cancelled.clone();
+                    let index = index.clone();
+                    thread::spawn(move || {
+                        let _ = index.snapshot_with_generation_while(move || {
+                            !warmup_cancelled.load(Ordering::SeqCst)
+                        });
+                    });
+                    cancelled
+                });
 
                 let plugin_rpc = self.catalog_rpc.clone();
                 let proxy_rpc = self.proxy_rpc.clone();
                 let workspace = self.workspace.clone();
+                let file_watcher = self.file_watcher.handle();
                 let (stopped, catalog_stopped) = crossbeam_channel::bounded(1);
                 self.catalog_stopped = Some(catalog_stopped);
                 thread::spawn(move || {
                     let mut plugin =
                         PluginCatalog::new(workspace, plugin_rpc.clone())
-                            .with_proxy_rpc(proxy_rpc);
+                            .with_proxy_rpc(proxy_rpc)
+                            .with_file_watcher(file_watcher);
                     plugin_rpc.mainloop(&mut plugin);
                     if let Err(error) = stopped.send(()) {
                         tracing::debug!(
@@ -316,13 +680,27 @@ impl ProxyHandler for Dispatcher {
                 request_id,
                 path,
                 position,
+                context,
             } => {
-                self.catalog_rpc.signature_help(request_id, &path, position);
+                self.catalog_rpc
+                    .signature_help(request_id, &path, position, context);
+            }
+            CancelInlineCompletions { request_id } => {
+                if let Some(job) =
+                    self.inline_prediction_jobs.lock().remove(&request_id)
+                {
+                    job.cancellation.cancel();
+                }
             }
             Shutdown {} => {
+                self.cancel_inline_predictions(None);
+                self.ready_predictions.lock().clear();
                 self.shared_session_server = None;
                 *self.shared_session_client.lock() = None;
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                if let Some(cancelled) = self.file_index_warmup.take() {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
                 for cancelled in self.workspace_file_jobs.lock().values() {
                     cancelled.store(true, Ordering::SeqCst);
                 }
@@ -343,7 +721,16 @@ impl ProxyHandler for Dispatcher {
                 }
                 self.proxy_rpc.disconnect();
             }
-            RestartLanguageServers {} => {
+            RepairLanguageServer { server_id } => {
+                if let Err(error) = self.catalog_rpc.catalog_notification(
+                    crate::plugin::PluginCatalogNotification::RepairBuiltinNpmServer {
+                        server_id,
+                    },
+                ) {
+                    tracing::error!(?error, "repairing cached language server");
+                }
+            }
+            RestartLanguageServers { extension_id } => {
                 let documents = self
                     .buffers
                     .iter_mut()
@@ -361,7 +748,12 @@ impl ProxyHandler for Dispatcher {
                         })
                     })
                     .collect();
-                if let Err(error) = self.catalog_rpc.catalog_notification(crate::plugin::PluginCatalogNotification::RestartLanguageServers { documents }) {
+                if let Err(error) = self.catalog_rpc.catalog_notification(
+                    crate::plugin::PluginCatalogNotification::RestartLanguageServers {
+                        documents,
+                        extension_id,
+                    },
+                ) {
                     tracing::error!(?error, "restarting language servers");
                 }
             }
@@ -389,6 +781,9 @@ impl ProxyHandler for Dispatcher {
                     tracing::warn!(path = %path.display(), rev, "ignoring stale editor update");
                     return;
                 }
+                self.prediction_semantic_tokens
+                    .lock()
+                    .track_buffer(&path, buffer);
                 self.catalog_rpc.did_change_text_document(
                     &path,
                     rev,
@@ -396,6 +791,23 @@ impl ProxyHandler for Dispatcher {
                     old_text,
                     buffer.rope.clone(),
                 );
+                self.cancel_inline_predictions(Some(&path));
+            }
+            EditorEdit { path, delta } => {
+                if self.shared_remote_pending.contains_key(&path) {
+                    tracing::debug!(
+                        ?path,
+                        "editor edit waits for shared change acknowledgement"
+                    );
+                    return;
+                }
+                if let Err(error) = self.sync_editor_delta(path.clone(), delta) {
+                    tracing::warn!(
+                        ?error,
+                        path = %path.display(),
+                        "applying incremental editor edit"
+                    );
+                }
             }
             EditorSnapshot { path, content } => {
                 let acknowledging_shared_change =
@@ -545,14 +957,6 @@ impl ProxyHandler for Dispatcher {
                     tracing::error!("{:?}", err);
                 }
             }
-            GitCheckout { reference } => {
-                if let Some(workspace) = self.workspace.as_ref() {
-                    match git_checkout(workspace, &reference) {
-                        Ok(()) => (),
-                        Err(e) => eprintln!("{e:?}"),
-                    }
-                }
-            }
             GitDiscardFilesChanges { files } => {
                 if let Some(workspace) = self.workspace.as_ref() {
                     match git_discard_files_changes(
@@ -631,6 +1035,27 @@ impl ProxyHandler for Dispatcher {
                     proxy_rpc.handle_response(id, result);
                 });
             }
+            UninstallLanguageExtension { extension_id } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                let failed_request_id = id.clone();
+                if let Err(error) = self.catalog_rpc.uninstall_language_extension(
+                    extension_id,
+                    Box::new(move |result: Result<(), RpcError>| {
+                        proxy_rpc.handle_response(
+                            id,
+                            result.map(|()| ProxyResponse::Success {}),
+                        );
+                    }),
+                ) {
+                    self.proxy_rpc.handle_response(
+                        failed_request_id,
+                        Err(RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        }),
+                    );
+                }
+            }
             GitStageAll {} => {
                 let workspace = self.workspace.clone();
                 let proxy_rpc = self.proxy_rpc.clone();
@@ -638,6 +1063,169 @@ impl ProxyHandler for Dispatcher {
                     let result = workspace
                         .ok_or_else(|| anyhow!("no workspace set"))
                         .and_then(|workspace| git_stage_all(&workspace))
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitStatus {} => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| git_workspace_status(&workspace))
+                        .map(|status| ProxyResponse::GitStatus { status })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitCheckout { reference } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| git_checkout(&workspace, &reference))
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitCreateBranch { reference } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_create_branch(&workspace, &reference)
+                        })
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitDeleteBranch { reference } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_delete_branch(&workspace, &reference)
+                        })
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitPush { remote } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                let core_rpc = self.core_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_push(&workspace, remote.as_deref(), core_rpc)
+                        })
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitHistory { limit } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| git_history(&workspace, limit))
+                        .map(|commits| ProxyResponse::GitHistory { commits })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitCommitPatch { id: commit_id } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_commit_patch(&workspace, &commit_id)
+                        })
+                        .map(|patch| ProxyResponse::GitCommitPatch { patch })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitWorktreeFilePatch { path } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_worktree_file_patch(&workspace, &path)
+                        })
+                        .map(|patch| ProxyResponse::GitWorktreeFilePatch { patch })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitWorktreePatch {} => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| git_worktree_patch(&workspace))
+                        .map(|patch| ProxyResponse::GitWorktreePatch { patch })
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
+            }
+            GitStagePaths { paths, staged } => {
+                let workspace = self.workspace.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            git_stage_paths(&workspace, &paths, staged)
+                        })
                         .map(|_| ProxyResponse::Success {})
                         .map_err(|error| RpcError {
                             code: 0,
@@ -1304,6 +1892,9 @@ impl ProxyHandler for Dispatcher {
                         | AgentHostRequest::AgentTurnRetry { .. }
                         | AgentHostRequest::AgentTurnCancel { .. }
                         | AgentHostRequest::AgentSessionPrepare { .. }
+                        | AgentHostRequest::AgentAuthenticate { .. }
+                        | AgentHostRequest::AgentTerminalAuthLaunch { .. }
+                        | AgentHostRequest::AgentTerminalAuthComplete { .. }
                         | AgentHostRequest::AgentConfigOptionSet { .. }
                 );
                 let host = self.ahead_host.clone();
@@ -1316,10 +1907,7 @@ impl ProxyHandler for Dispatcher {
                             .map(|response| ProxyResponse::AheadResponse {
                                 response,
                             })
-                            .map_err(|error| RpcError {
-                                code: 0,
-                                message: error.to_string(),
-                            })
+                            .map_err(rpc_error_from_agent)
                     } else {
                         Err(RpcError {
                             code: 0,
@@ -1340,6 +1928,9 @@ impl ProxyHandler for Dispatcher {
                 let buffer = Buffer::new(buffer_id, path.clone());
                 let content = buffer.rope.to_string();
                 let read_only = buffer.read_only;
+                self.prediction_semantic_tokens
+                    .lock()
+                    .track_buffer(&path, &buffer);
                 self.catalog_rpc.did_open_document(
                     &path,
                     buffer.language_id.to_string(),
@@ -1354,25 +1945,28 @@ impl ProxyHandler for Dispatcher {
                 );
             }
             GitCommit { message, diffs } => {
-                let host = self.ahead_host.as_ref().map(|host| host.read());
-                let result = self
-                    .workspace
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("no workspace set"))
-                    .and_then(|workspace| {
-                        git_commit_attributed(
-                            workspace,
-                            &message,
-                            diffs,
-                            host.as_deref(),
-                        )
-                    })
-                    .map(|_| ProxyResponse::Success {})
-                    .map_err(|error| RpcError {
-                        code: 0,
-                        message: error.to_string(),
-                    });
-                self.respond_rpc(id, result);
+                let workspace = self.workspace.clone();
+                let host = self.ahead_host.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                thread::spawn(move || {
+                    let result = workspace
+                        .ok_or_else(|| anyhow!("no workspace set"))
+                        .and_then(|workspace| {
+                            let host = host.as_ref().map(|host| host.read());
+                            git_commit_attributed(
+                                &workspace,
+                                &message,
+                                diffs,
+                                host.as_deref(),
+                            )
+                        })
+                        .map(|_| ProxyResponse::Success {})
+                        .map_err(|error| RpcError {
+                            code: 0,
+                            message: error.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
             }
             GitFileState { path, content } => {
                 let workspace = self.workspace.clone();
@@ -1428,7 +2022,7 @@ impl ProxyHandler for Dispatcher {
                             message: "no workspace set".to_string(),
                         }),
                         Some(index) => {
-                            match index.snapshot_with_generation_while(|| {
+                            match index.snapshot_with_generation_while(move || {
                                 !cancelled.load(Ordering::SeqCst)
                             }) {
                                 Some((generation, files)) => {
@@ -1475,7 +2069,7 @@ impl ProxyHandler for Dispatcher {
                         .collect::<HashMap<_, _>>();
                     let indexed_files = if let Some(index) = file_index.as_ref() {
                         let Some((_, files)) =
-                            index.snapshot_with_generation_while(|| {
+                            index.snapshot_with_generation_while(move || {
                                 WORKER_ID.load(Ordering::SeqCst) == our_id
                             })
                         else {
@@ -1566,7 +2160,6 @@ impl ProxyHandler for Dispatcher {
                     proxy_rpc.handle_response(id, result);
                 });
             }
-            GetSignature { .. } => {}
             GetReferences { path, position } => {
                 let proxy_rpc = self.proxy_rpc.clone();
                 self.catalog_rpc.get_references(
@@ -1662,7 +2255,19 @@ impl ProxyHandler for Dispatcher {
             }
             GetInlayHints { path } => {
                 let proxy_rpc = self.proxy_rpc.clone();
-                let buffer = self.buffers.get(&path).unwrap();
+                let Some(buffer) = self.buffers.get(&path) else {
+                    self.respond_rpc(
+                        id,
+                        Err(RpcError {
+                            code: 0,
+                            message: format!(
+                                "inlay hints requested for unopened buffer: {}",
+                                path.display()
+                            ),
+                        }),
+                    );
+                    return;
+                };
                 let range = Range {
                     start: Position::new(0, 0),
                     end: buffer.offset_to_position(buffer.len()),
@@ -1678,141 +2283,409 @@ impl ProxyHandler for Dispatcher {
                 path,
                 position,
                 trigger_kind,
+                session_id,
+                model_context,
             } => {
                 let proxy_rpc = self.proxy_rpc.clone();
                 let ahead_host = self.ahead_host.clone();
                 let core_rpc = self.core_rpc.clone();
                 let shown_prediction_errors = self.shown_prediction_errors.clone();
+                let prediction_definition_cache =
+                    self.prediction_definition_cache.clone();
+                let prediction_semantic_tokens =
+                    self.prediction_semantic_tokens.clone();
                 let buffer_snapshot = self.buffers.clone();
                 let workspace = self.workspace.clone();
                 let path_buf = path.clone();
+                let cancellation = PredictionCancellation::default();
+                let mut dependencies = HashSet::from([path.clone()]);
+                if let Some(workspace) = workspace.as_deref()
+                    && let Some(buffer) = buffer_snapshot.get(&path)
+                {
+                    dependencies.extend(
+                        relevant_open_buffer_contexts(
+                            &buffer_snapshot,
+                            workspace,
+                            &path,
+                            &buffer.rope.to_string(),
+                            &[],
+                        )
+                        .into_iter()
+                        .map(|buffer| workspace.join(buffer.path)),
+                    );
+                }
+                let prediction_jobs = self.inline_prediction_jobs.clone();
+                let ready_predictions = self.ready_predictions.clone();
+                let catalog_rpc = self.catalog_rpc.clone();
+                {
+                    let mut jobs = prediction_jobs.lock();
+                    jobs.retain(|_, job| {
+                        if job.path == path {
+                            job.cancellation.cancel();
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    jobs.insert(
+                        id,
+                        InlinePredictionJob {
+                            path: path.clone(),
+                            dependencies,
+                            cancellation: cancellation.clone(),
+                        },
+                    );
+                }
                 self.catalog_rpc.get_inline_completions(
                     &path,
                     position,
                     trigger_kind,
                     move |_, result| {
-                        let mut completions_opt = result.ok();
-                        let has_items = completions_opt
-                            .as_ref()
-                            .map(|completions| match completions {
-                                lsp_types::InlineCompletionResponse::Array(
-                                    items,
-                                ) => !items.is_empty(),
+                        let failed_proxy = proxy_rpc.clone();
+                        let failed_jobs = prediction_jobs.clone();
+                        let has_items = result.as_ref().is_ok_and(|completions| {
+                            match completions {
+                                lsp_types::InlineCompletionResponse::Array(items) => {
+                                    !items.is_empty()
+                                }
                                 lsp_types::InlineCompletionResponse::List(list) => {
                                     !list.items.is_empty()
                                 }
+                            }
+                        });
+                        let can_resolve_related_buffers = !has_items
+                            && !cancellation.is_cancelled()
+                            && ahead_host.is_some()
+                            && workspace.as_deref().is_some_and(|workspace| {
+                                is_prediction_target_visible(workspace, &path_buf)
                             })
-                            .unwrap_or(false);
-
-                        if !has_items {
-                            if let Some(host_lock) = ahead_host {
-                                if let Some(workspace) = workspace.as_deref()
-                                    && is_prediction_target_visible(
-                                        workspace,
-                                        &path_buf,
+                            && buffer_snapshot.contains_key(&path_buf);
+                        let definition_responses = if can_resolve_related_buffers {
+                            buffer_snapshot.get(&path_buf).and_then(|buffer| {
+                                let (semantic_styles, syntax_captures) = {
+                                    let cache = prediction_semantic_tokens.lock();
+                                    (
+                                        cache.styles_for(&path_buf, buffer),
+                                        cache.syntax_captures_for(&path_buf, buffer),
                                     )
-                                    && let Some(buffer) =
-                                        buffer_snapshot.get(&path_buf)
+                                };
+                                let positions =
+                                    prediction_identifier_positions_with_semantic_styles(
+                                        &buffer.rope,
+                                        position,
+                                        semantic_styles.as_ref(),
+                                        syntax_captures.as_deref(),
+                                    );
+                                if positions.is_empty() {
+                                    return None;
+                                }
+
+                                let mut cached = Vec::new();
+                                let mut pending = Vec::new();
+                                for (index, (identifier, definition_position)) in
+                                    positions.iter().enumerate()
                                 {
-                                    let active_text = buffer.rope.to_string();
-                                    let (prefix, suffix) =
-                                        prediction_prefix_suffix(
-                                            &buffer.rope,
-                                            position,
-                                        );
-                                    let open_buffers =
-                                        relevant_open_buffer_contexts(
-                                            &buffer_snapshot,
-                                            workspace,
-                                            &path_buf,
-                                            &active_text,
-                                        );
-                                    let request =
-                                        ahead_rpc::ahead::PredictionRequest {
-                                            request_id: uuid::Uuid::new_v4()
-                                                .to_string(),
-                                            session_id: "active".to_string(),
-                                            path: path_buf
-                                                .to_string_lossy()
-                                                .to_string(),
-                                            cursor:
-                                                ahead_rpc::ahead::DisplayPosition {
-                                                    line: position.line,
-                                                    col: position.character,
-                                                },
-                                            prefix,
-                                            suffix,
-                                            work_context:
-                                                "ahead-editor-flow".to_string(),
-                                        };
-                                    let host = host_lock.read();
-                                    match host.request_prediction(request, &open_buffers) {
-                                        Ok(prediction) => {
-                                            shown_prediction_errors.lock().clear();
-                                            if !prediction.replacement.is_empty() {
-                                                completions_opt = Some(
-                                                    lsp_types::InlineCompletionResponse::Array(
-                                                        vec![lsp_types::InlineCompletionItem {
-                                                            insert_text: prediction.replacement,
-                                                            filter_text: None,
-                                                            range: None,
-                                                            command: None,
-                                                            insert_text_format: None,
-                                                        }],
-                                                    ),
+                                    let key = PredictionDefinitionCacheKey {
+                                        path: path_buf.clone(),
+                                        buffer_id: buffer.id,
+                                        revision: buffer.rev,
+                                        identifier: identifier.clone(),
+                                        line: definition_position.line,
+                                        character: definition_position.character,
+                                    };
+                                    if let Some(locations) = cached_prediction_definitions(
+                                        &prediction_definition_cache,
+                                        &key,
+                                        workspace.as_deref(),
+                                        &buffer_snapshot,
+                                    ) {
+                                        cached.push((index, locations));
+                                    } else {
+                                        pending.push((index, *definition_position, key));
+                                    }
+                                }
+
+                                let (sender, receiver) =
+                                    crossbeam_channel::bounded(pending.len().max(1));
+                                for (index, definition_position, key) in &pending {
+                                    let sender = sender.clone();
+                                    let key = key.clone();
+                                    let index = *index;
+                                    let definition_position = *definition_position;
+                                    catalog_rpc.get_definition(
+                                        &path_buf,
+                                        definition_position,
+                                        move |_, result| {
+                                            let locations = result
+                                                .ok()
+                                                .map(prediction_definition_locations);
+                                            if sender.send((index, key, locations)).is_err() {
+                                                tracing::debug!(
+                                                    "discarding edit-prediction definition after request ended"
                                                 );
                                             }
+                                        },
+                                    );
+                                }
+                                drop(sender);
+                                Some((receiver, pending.len(), cached))
+                            })
+                        } else {
+                            None
+                        };
+                        let response_deadline =
+                            Instant::now() + FIM_DEFINITION_RESPONSE_TIMEOUT;
+                        let run_prediction = move || {
+                            let mut completions_opt = result.ok();
+                            let mut context_paths = Vec::new();
+                            let mut ready_prediction = None;
+                            let definition_locations: Vec<(PathBuf, u32)> = definition_responses
+                                .filter(|_| !cancellation.is_cancelled())
+                                .map(|(receiver, expected, mut responses)| {
+                                    let mut pending_responses = 0;
+                                    while pending_responses < expected
+                                        && !cancellation.is_cancelled()
+                                    {
+                                        let remaining =
+                                            response_deadline
+                                                .saturating_duration_since(Instant::now());
+                                        if remaining.is_zero() {
+                                            break;
                                         }
-                                        Err(error) => {
-                                            let message = format!("{error:#}");
-                                            if shown_prediction_errors.lock().insert(message.clone()) {
-                                                core_rpc.show_message(
-                                                    "AHEAD edit prediction unavailable".into(),
-                                                    ShowMessageParams {
-                                                        typ: MessageType::WARNING,
-                                                        message,
+                                        match receiver.recv_timeout(remaining) {
+                                            Ok((index, key, locations)) => {
+                                                if let Some(locations) = locations {
+                                                    cache_prediction_definitions(
+                                                        &prediction_definition_cache,
+                                                        key,
+                                                        &locations,
+                                                        workspace.as_deref(),
+                                                        &buffer_snapshot,
+                                                    );
+                                                    responses.push((index, locations));
+                                                } else {
+                                                    responses.push((index, Vec::new()));
+                                                }
+                                                pending_responses += 1;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    responses.sort_by_key(|(index, _)| *index);
+                                    responses
+                                        .into_iter()
+                                        .flat_map(|(_, locations)| locations)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !has_items && !cancellation.is_cancelled() {
+                                if let Some(host_lock) = ahead_host {
+                                    if let Some(workspace) = workspace.as_deref()
+                                        && is_prediction_target_visible(
+                                            workspace,
+                                            &path_buf,
+                                        )
+                                        && let Some(buffer) =
+                                            buffer_snapshot.get(&path_buf)
+                                    {
+                                        let active_text = buffer.rope.to_string();
+                                        let (prefix, suffix) =
+                                            prediction_prefix_suffix(
+                                                &buffer.rope,
+                                                position,
+                                            );
+                                        let open_buffers =
+                                            relevant_open_buffer_contexts(
+                                                &buffer_snapshot,
+                                                workspace,
+                                                &path_buf,
+                                                &active_text,
+                                                &definition_locations,
+                                            );
+                                        if let Some(job) =
+                                            prediction_jobs.lock().get_mut(&id)
+                                        {
+                                            job.dependencies.extend(
+                                                open_buffers.iter().map(|buffer| {
+                                                    workspace.join(&buffer.path)
+                                                }),
+                                            );
+                                        }
+                                        context_paths = open_buffers.iter()
+                                            .map(|buffer| PathBuf::from(&buffer.path))
+                                            .collect();
+                                        let request =
+                                            ahead_rpc::ahead::PredictionRequest {
+                                                request_id: uuid::Uuid::new_v4()
+                                                    .to_string(),
+                                                session_id,
+                                                path: path_buf
+                                                    .to_string_lossy()
+                                                    .to_string(),
+                                                cursor:
+                                                    ahead_rpc::ahead::DisplayPosition {
+                                                        line: position.line,
+                                                        col: position.character,
                                                     },
-                                                );
+                                                prefix,
+                                                suffix,
+                                                work_context:
+                                                    "ahead-editor-flow".to_string(),
+                                            };
+                                        let prediction = (|| -> Result<_> {
+                                            let snapshot = host_lock.read()
+                                                .prepare_prediction_with_model_context(
+                                                    request.clone(),
+                                                    &open_buffers,
+                                                    model_context.as_ref(),
+                                                )?;
+                                            let prediction = PredictionEngine::predict_cancellable_with_model_context(
+                                                &snapshot.work, &snapshot.request, &open_buffers,
+                                                &snapshot.provider, snapshot.model_context.as_ref(),
+                                                &cancellation,
+                                            )?;
+                                            let current = host_lock.read()
+                                                .prepare_prediction_with_model_context(
+                                                    request.clone(),
+                                                    &open_buffers,
+                                                    model_context.as_ref(),
+                                                )?;
+                                            if current != snapshot {
+                                                cancellation.cancel();
+                                                anyhow::bail!("prediction context changed during inference");
+                                            }
+                                            let ready = ReadyPrediction::new(snapshot, request,
+                                                open_buffers, &buffer_snapshot, buffer,
+                                                prediction.replacement.clone())?;
+                                            Ok((prediction, ready))
+                                        })();
+                                        match prediction {
+                                            Ok((prediction, ready)) => {
+                                                shown_prediction_errors.lock().clear();
+                                                if !prediction.replacement.is_empty() {
+                                                    ready_prediction = Some(ready);
+                                                    completions_opt = Some(
+                                                        lsp_types::InlineCompletionResponse::Array(
+                                                            vec![lsp_types::InlineCompletionItem {
+                                                                insert_text: prediction.replacement,
+                                                                filter_text: None,
+                                                                range: None,
+                                                                command: None,
+                                                                insert_text_format: None,
+                                                            }],
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            Err(_) if cancellation.is_cancelled() => {}
+                                            Err(error) => {
+                                                let message = format!("{error:#}");
+                                                if shown_prediction_errors.lock().insert(message.clone()) {
+                                                    core_rpc.show_message(
+                                                        "AHEAD edit prediction unavailable".into(),
+                                                        ShowMessageParams {
+                                                            typ: MessageType::WARNING,
+                                                            message,
+                                                        },
+                                                    );
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        let final_result = Ok(ProxyResponse::GetInlineCompletions {
-                            completions:
-                                completions_opt.unwrap_or_else(|| {
-                                    lsp_types::InlineCompletionResponse::Array(
-                                        Vec::new(),
-                                    )
-                                }),
-                        });
-                        proxy_rpc.handle_response(id, final_result);
+                            if cancellation.is_cancelled() {
+                                completions_opt = None;
+                                ready_prediction = None;
+                            }
+                            prediction_jobs.lock().remove(&id);
+                            let prediction = ready_prediction
+                                .map(|ready| ready.publish(path_buf, &ready_predictions));
+
+                            let final_result = Ok(ProxyResponse::GetInlineCompletions {
+                                context_paths,
+                                prediction,
+                                completions:
+                                    completions_opt.unwrap_or_else(|| {
+                                        lsp_types::InlineCompletionResponse::Array(
+                                            Vec::new(),
+                                        )
+                                    }),
+                            });
+                            proxy_rpc.handle_response(id, final_result);
+                        };
+                        let spawned = thread::Builder::new()
+                            .name("ahead-inline-prediction".into())
+                            .spawn(run_prediction);
+                        if let Err(error) = spawned {
+                            failed_jobs.lock().remove(&id);
+                            failed_proxy.handle_response(id, Err(RpcError {
+                                code: 0,
+                                message: format!("could not start edit prediction: {error}"),
+                            }));
+                        }
                     },
                 );
             }
+            ValidateInlinePrediction {
+                path,
+                position,
+                content_sha256,
+                replacement,
+                binding,
+            } => {
+                let result = self
+                    .validate_inline_prediction(
+                        &path,
+                        position,
+                        &content_sha256,
+                        &replacement,
+                        &binding,
+                    )
+                    .map(|valid| ProxyResponse::ValidateInlinePrediction { valid })
+                    .map_err(rpc_error_from_agent);
+                self.respond_rpc(id, result);
+            }
             GetSemanticTokens { path } => {
-                let buffer = self.buffers.get(&path).unwrap();
+                let Some(buffer) = self.buffers.get(&path) else {
+                    self.respond_rpc(
+                        id,
+                        Err(RpcError {
+                            code: 0,
+                            message: format!(
+                                "semantic tokens requested for unopened buffer: {}",
+                                path.display()
+                            ),
+                        }),
+                    );
+                    return;
+                };
                 let text = buffer.rope.clone();
                 let rev = buffer.rev;
-                let len = buffer.len();
+                let len = buffer.rope.len();
+                let buffer_id = buffer.id.clone();
                 let local_path = path.clone();
                 let proxy_rpc = self.proxy_rpc.clone();
                 let catalog_rpc = self.catalog_rpc.clone();
+                let semantic_token_cache = self.prediction_semantic_tokens.clone();
 
                 let handle_tokens =
                     move |result: Result<Vec<LineStyle>, RpcError>| match result {
                         Ok(styles) => {
+                            let semantic_styles = SemanticStyles {
+                                rev,
+                                path: local_path.clone(),
+                                styles,
+                                len,
+                            };
+                            semantic_token_cache
+                                .lock()
+                                .store(buffer_id, &semantic_styles);
                             proxy_rpc.handle_response(
                                 id,
                                 Ok(ProxyResponse::GetSemanticTokens {
-                                    styles: SemanticStyles {
-                                        rev,
-                                        path: local_path,
-                                        styles,
-                                        len,
-                                    },
+                                    styles: semantic_styles,
                                 }),
                             );
                         }
@@ -1839,6 +2712,97 @@ impl ProxyHandler for Dispatcher {
                     },
                 );
             }
+            GetExtensionSyntax { path } => {
+                let Some(buffer) = self.buffers.get(&path) else {
+                    self.respond_rpc(
+                        id,
+                        Err(RpcError {
+                            code: 0,
+                            message: format!(
+                                "extension syntax requested for unopened buffer: {}",
+                                path.display()
+                            ),
+                        }),
+                    );
+                    return;
+                };
+                let source = buffer.rope.to_string();
+                let revision = buffer.rev;
+                let source_length = source.len();
+                let buffer_id = buffer.id.clone();
+                let local_path = path.clone();
+                let proxy_rpc = self.proxy_rpc.clone();
+                let syntax_cache = self.prediction_semantic_tokens.clone();
+                thread::spawn(move || {
+                    let result = Directory::plugins_directory()
+                        .map(|extensions_root| {
+                            ahead_extension_host::extension_syntax_for_path(
+                                &extensions_root,
+                                &local_path,
+                                &source,
+                            )
+                        })
+                        .transpose()
+                        .map(|syntax| syntax.flatten());
+                    match result {
+                        Ok(syntax) => {
+                            let (captures, comments) = match syntax {
+                                Some(syntax) => (
+                                    syntax
+                                        .captures
+                                        .into_iter()
+                                        .map(|capture| SyntaxCapture {
+                                            start: capture.start,
+                                            end: capture.end,
+                                            scope: capture.scope,
+                                        })
+                                        .collect(),
+                                    Some(ahead_rpc::style::LanguageComments {
+                                        line_comment: syntax.comments.line_comment,
+                                        block_comment: syntax.comments.block_comment,
+                                    }),
+                                ),
+                                None => (Vec::new(), None),
+                            };
+                            syntax_cache.lock().store_syntax_captures(
+                                &buffer_id,
+                                &local_path,
+                                revision,
+                                source_length,
+                                captures.clone(),
+                            );
+                            proxy_rpc.handle_response(
+                                id,
+                                Ok(ProxyResponse::GetExtensionSyntax {
+                                    syntax: ExtensionSyntax {
+                                        rev: revision,
+                                        path: local_path,
+                                        len: source_length,
+                                        captures,
+                                        comments,
+                                    },
+                                }),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                path = %local_path.display(),
+                                ?error,
+                                "loading installed extension syntax"
+                            );
+                            proxy_rpc.handle_response(
+                                id,
+                                Err(RpcError {
+                                    code: 0,
+                                    message: format!(
+                                        "loading extension syntax: {error:#}"
+                                    ),
+                                }),
+                            );
+                        }
+                    }
+                });
+            }
             GetCodeActions {
                 path,
                 position,
@@ -1849,9 +2813,9 @@ impl ProxyHandler for Dispatcher {
                     &path,
                     position,
                     diagnostics,
-                    move |plugin_id, result| {
-                        let result = result.map(|resp| {
-                            ProxyResponse::GetCodeActionsResponse { plugin_id, resp }
+                    move |result| {
+                        let result = result.map(|actions| {
+                            ProxyResponse::GetCodeActionsResponse { actions }
                         });
                         proxy_rpc.handle_response(id, result);
                     },
@@ -2017,6 +2981,9 @@ impl ProxyHandler for Dispatcher {
                 let mut buffer = Buffer::new(buffer_id, path.clone());
                 buffer.rope = Rope::from(content);
                 buffer.rev = rev;
+                self.prediction_semantic_tokens
+                    .lock()
+                    .track_buffer(&path, &buffer);
                 let result = buffer
                     .save(rev, create_parents)
                     .and_then(|()| self.clear_shared_remote_recovery(&path))
@@ -2159,9 +3126,15 @@ impl ProxyHandler for Dispatcher {
                             for (path, suffix) in child_buffers {
                                 if let Some(mut buffer) = self.buffers.remove(&path)
                                 {
+                                    self.prediction_semantic_tokens
+                                        .lock()
+                                        .remove_buffer(&path);
                                     let new_path = to.join(suffix);
                                     buffer.path = new_path;
 
+                                    self.prediction_semantic_tokens
+                                        .lock()
+                                        .track_buffer(&buffer.path, &buffer);
                                     self.buffers.insert(buffer.path.clone(), buffer);
                                 }
                             }
@@ -2171,7 +3144,13 @@ impl ProxyHandler for Dispatcher {
                             let buffer = self.buffers.remove(&from);
 
                             if let Some(mut buffer) = buffer {
+                                self.prediction_semantic_tokens
+                                    .lock()
+                                    .remove_buffer(&from);
                                 buffer.path.clone_from(&to);
+                                self.prediction_semantic_tokens
+                                    .lock()
+                                    .track_buffer(&to, &buffer);
                                 self.buffers.insert(to.clone(), buffer);
                             }
                         }
@@ -2241,6 +3220,23 @@ impl ProxyHandler for Dispatcher {
                                 item: Box::new(item),
                             }
                         });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            ExecuteLspCommand {
+                plugin_id,
+                command,
+                arguments,
+            } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.execute_command(
+                    plugin_id,
+                    command,
+                    arguments,
+                    move |result| {
+                        let result = result
+                            .map(|_| ProxyResponse::ExecuteLspCommandResponse {});
                         proxy_rpc.handle_response(id, result);
                     },
                 );
@@ -2370,6 +3366,523 @@ fn prediction_prefix_suffix(rope: &Rope, position: Position) -> (String, String)
     )
 }
 
+// shortcut: use current LSP semantic tokens first; fall back to lexical scanning
+// until editor parse captures can be reused here.
+fn prediction_identifier_positions(
+    rope: &Rope,
+    cursor: Position,
+) -> Vec<(String, Position)> {
+    let line_count = rope.len_lines(ropey::LineType::LF_CR);
+    if line_count == 0 {
+        return Vec::new();
+    }
+
+    let cursor_line = (cursor.line as usize).min(line_count - 1);
+    let cursor_line_start =
+        rope.line_to_byte_idx(cursor_line, ropey::LineType::LF_CR);
+    let cursor_text = rope.line(cursor_line, ropey::LineType::LF_CR).to_string();
+    let cursor_content = cursor_text.trim_end_matches(['\r', '\n']);
+    let cursor_byte = cursor_line_start
+        + offset_utf16_to_utf8_str(cursor_content, cursor.character as usize);
+    let first_line = cursor_line.saturating_sub(FIM_DEFINITION_LINE_RADIUS);
+    let last_line = cursor_line
+        .saturating_add(FIM_DEFINITION_LINE_RADIUS)
+        .min(line_count - 1);
+
+    let mut identifiers = Vec::new();
+    for line in first_line..=last_line {
+        let line_start = rope.line_to_byte_idx(line, ropey::LineType::LF_CR);
+        let text = rope.line(line, ropey::LineType::LF_CR).to_string();
+        let content = text.trim_end_matches(['\r', '\n']);
+        let mut token_start = None;
+
+        for (byte_index, character) in content
+            .char_indices()
+            .chain(std::iter::once((content.len(), ' ')))
+        {
+            if token_start.is_none() {
+                if character == '_' || character.is_alphabetic() {
+                    token_start = Some(byte_index);
+                }
+                continue;
+            }
+
+            if character == '_' || character.is_alphanumeric() {
+                continue;
+            }
+
+            let Some(start) = token_start.take() else {
+                continue;
+            };
+            let name = &content[start..byte_index];
+            let byte_start = line_start + start;
+            let byte_end = line_start + byte_index;
+            let distance = if cursor_byte < byte_start {
+                byte_start - cursor_byte
+            } else if cursor_byte > byte_end {
+                cursor_byte - byte_end
+            } else {
+                0
+            };
+            let Ok(utf16_column) =
+                u32::try_from(content[..start].encode_utf16().count())
+            else {
+                continue;
+            };
+            identifiers.push((
+                distance,
+                name.to_string(),
+                Position::new(line as u32, utf16_column),
+            ));
+        }
+    }
+
+    identifiers.sort_by(
+        |(left_distance, left_name, left_position),
+         (right_distance, right_name, right_position)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left_position.line.cmp(&right_position.line))
+                .then_with(|| left_position.character.cmp(&right_position.character))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+
+    let mut seen = HashSet::new();
+    identifiers
+        .into_iter()
+        .filter_map(|(_, name, position)| {
+            seen.insert(name.clone()).then_some((name, position))
+        })
+        .take(MAX_FIM_DEFINITION_REQUESTS)
+        .collect()
+}
+
+fn prediction_identifier_positions_with_semantic_styles(
+    rope: &Rope,
+    cursor: Position,
+    semantic_styles: Option<&SemanticStyles>,
+    syntax_captures: Option<&[SyntaxCapture]>,
+) -> Vec<(String, Position)> {
+    let semantic_positions = semantic_styles.and_then(|semantic_styles| {
+        prediction_semantic_identifier_positions(rope, cursor, semantic_styles)
+    });
+    if let Some(positions) = semantic_positions
+        .as_ref()
+        .filter(|items| !items.is_empty())
+    {
+        return positions.clone();
+    }
+    if let Some(captures) = syntax_captures {
+        let positions =
+            prediction_syntax_identifier_positions(rope, cursor, captures);
+        if !positions.is_empty() {
+            return positions;
+        }
+    }
+    if let Some(positions) = semantic_positions {
+        return positions;
+    }
+
+    prediction_identifier_positions(rope, cursor)
+}
+
+fn prediction_syntax_identifier_positions(
+    rope: &Rope,
+    cursor: Position,
+    captures: &[SyntaxCapture],
+) -> Vec<(String, Position)> {
+    let text = rope.to_string();
+    let line_count = rope.len_lines(ropey::LineType::LF_CR);
+    if line_count == 0 {
+        return Vec::new();
+    }
+    let cursor_line = (cursor.line as usize).min(line_count - 1);
+    let cursor_line_start =
+        rope.line_to_byte_idx(cursor_line, ropey::LineType::LF_CR);
+    let cursor_text = rope.line(cursor_line, ropey::LineType::LF_CR).to_string();
+    let cursor_content = cursor_text.trim_end_matches(['\r', '\n']);
+    let cursor_byte = cursor_line_start
+        + offset_utf16_to_utf8_str(cursor_content, cursor.character as usize);
+    let first_line = cursor_line.saturating_sub(FIM_DEFINITION_LINE_RADIUS);
+    let last_line = cursor_line
+        .saturating_add(FIM_DEFINITION_LINE_RADIUS)
+        .min(line_count - 1);
+
+    let mut identifiers = Vec::new();
+    for capture in captures {
+        if capture.start >= capture.end
+            || capture.end > text.len()
+            || !is_prediction_identifier_syntax_scope(&capture.scope)
+        {
+            continue;
+        }
+        let Some(name) = text.get(capture.start..capture.end) else {
+            continue;
+        };
+        if !is_prediction_identifier(name) {
+            continue;
+        }
+        let line = rope.byte_to_line_idx(capture.start, ropey::LineType::LF_CR);
+        if line < first_line || line > last_line {
+            continue;
+        }
+        let line_start = rope.line_to_byte_idx(line, ropey::LineType::LF_CR);
+        let line_text = rope.line(line, ropey::LineType::LF_CR).to_string();
+        let line_content = line_text.trim_end_matches(['\r', '\n']);
+        let Some(column_prefix) = line_content.get(..capture.start - line_start)
+        else {
+            continue;
+        };
+        let Ok(line) = u32::try_from(line) else {
+            continue;
+        };
+        let Ok(character) = u32::try_from(column_prefix.encode_utf16().count())
+        else {
+            continue;
+        };
+        let distance = if cursor_byte < capture.start {
+            capture.start - cursor_byte
+        } else if cursor_byte > capture.end {
+            cursor_byte - capture.end
+        } else {
+            0
+        };
+        identifiers.push((
+            distance,
+            name.to_owned(),
+            Position::new(line, character),
+        ));
+    }
+
+    identifiers.sort_by(
+        |(left_distance, left_name, left_position),
+         (right_distance, right_name, right_position)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left_position.line.cmp(&right_position.line))
+                .then_with(|| left_position.character.cmp(&right_position.character))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+    let mut seen = HashSet::new();
+    identifiers
+        .into_iter()
+        .filter_map(|(_, name, position)| {
+            seen.insert(name.clone()).then_some((name, position))
+        })
+        .take(MAX_FIM_DEFINITION_REQUESTS)
+        .collect()
+}
+
+fn is_prediction_identifier_syntax_scope(scope: &str) -> bool {
+    matches!(
+        scope
+            .trim_start_matches('@')
+            .split('.')
+            .next()
+            .unwrap_or_default(),
+        "attribute"
+            | "class"
+            | "constant"
+            | "constructor"
+            | "enum"
+            | "enumMember"
+            | "event"
+            | "field"
+            | "function"
+            | "identifier"
+            | "interface"
+            | "label"
+            | "macro"
+            | "method"
+            | "module"
+            | "namespace"
+            | "parameter"
+            | "property"
+            | "struct"
+            | "tag"
+            | "type"
+            | "typeAlias"
+            | "typeParameter"
+            | "variable"
+    )
+}
+
+fn prediction_semantic_identifier_positions(
+    rope: &Rope,
+    cursor: Position,
+    semantic_styles: &SemanticStyles,
+) -> Option<Vec<(String, Position)>> {
+    let text = rope.to_string();
+    if semantic_styles.len != text.len()
+        || !semantic_styles.styles.iter().any(|style| {
+            style
+                .style
+                .fg_color
+                .as_deref()
+                .is_some_and(is_prediction_identifier_semantic_token_type)
+        })
+    {
+        return None;
+    }
+
+    let line_count = rope.len_lines(ropey::LineType::LF_CR);
+    if line_count == 0 {
+        return Some(Vec::new());
+    }
+    let cursor_line = (cursor.line as usize).min(line_count - 1);
+    let cursor_line_start =
+        rope.line_to_byte_idx(cursor_line, ropey::LineType::LF_CR);
+    let cursor_text = rope.line(cursor_line, ropey::LineType::LF_CR).to_string();
+    let cursor_content = cursor_text.trim_end_matches(['\r', '\n']);
+    let cursor_byte = cursor_line_start
+        + offset_utf16_to_utf8_str(cursor_content, cursor.character as usize);
+    let first_line = cursor_line.saturating_sub(FIM_DEFINITION_LINE_RADIUS);
+    let last_line = cursor_line
+        .saturating_add(FIM_DEFINITION_LINE_RADIUS)
+        .min(line_count - 1);
+
+    let mut identifiers = Vec::new();
+    for style in &semantic_styles.styles {
+        if style.start >= style.end || style.end > text.len() {
+            continue;
+        }
+        let Some(token_type) = style.style.fg_color.as_deref() else {
+            continue;
+        };
+        if !is_prediction_identifier_semantic_token_type(token_type) {
+            continue;
+        }
+        let Some(name) = text.get(style.start..style.end) else {
+            continue;
+        };
+        if !is_prediction_identifier(name) {
+            continue;
+        }
+        let line = rope.byte_to_line_idx(style.start, ropey::LineType::LF_CR);
+        if line < first_line || line > last_line {
+            continue;
+        }
+        let line_start = rope.line_to_byte_idx(line, ropey::LineType::LF_CR);
+        let line_text = rope.line(line, ropey::LineType::LF_CR).to_string();
+        let line_content = line_text.trim_end_matches(['\r', '\n']);
+        let Some(column_prefix) = line_content.get(..style.start - line_start)
+        else {
+            continue;
+        };
+        let Ok(line) = u32::try_from(line) else {
+            continue;
+        };
+        let Ok(character) = u32::try_from(column_prefix.encode_utf16().count())
+        else {
+            continue;
+        };
+        let distance = if cursor_byte < style.start {
+            style.start - cursor_byte
+        } else if cursor_byte > style.end {
+            cursor_byte - style.end
+        } else {
+            0
+        };
+        identifiers.push((
+            distance,
+            name.to_owned(),
+            Position::new(line, character),
+        ));
+    }
+
+    identifiers.sort_by(
+        |(left_distance, left_name, left_position),
+         (right_distance, right_name, right_position)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left_position.line.cmp(&right_position.line))
+                .then_with(|| left_position.character.cmp(&right_position.character))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+
+    let mut seen = HashSet::new();
+    Some(
+        identifiers
+            .into_iter()
+            .filter_map(|(_, name, position)| {
+                seen.insert(name.clone()).then_some((name, position))
+            })
+            .take(MAX_FIM_DEFINITION_REQUESTS)
+            .collect(),
+    )
+}
+
+fn is_prediction_identifier_semantic_token_type(token_type: &str) -> bool {
+    matches!(
+        token_type,
+        "class"
+            | "decorator"
+            | "enum"
+            | "enumMember"
+            | "event"
+            | "function"
+            | "interface"
+            | "macro"
+            | "method"
+            | "module"
+            | "namespace"
+            | "parameter"
+            | "property"
+            | "struct"
+            | "type"
+            | "typeAlias"
+            | "typeParameter"
+            | "variable"
+    )
+}
+
+fn is_prediction_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters.next().is_some_and(|character| {
+        character == '_' || character == '$' || character.is_alphabetic()
+    }) && characters.all(|character| {
+        character == '_' || character == '$' || character.is_alphanumeric()
+    })
+}
+
+fn cached_prediction_definitions(
+    cache: &Mutex<
+        HashMap<PredictionDefinitionCacheKey, CachedPredictionDefinitions>,
+    >,
+    key: &PredictionDefinitionCacheKey,
+    workspace: Option<&Path>,
+    buffers: &HashMap<PathBuf, Buffer>,
+) -> Option<Vec<(PathBuf, u32)>> {
+    let mut cache = cache.lock();
+    let workspace_root =
+        workspace.and_then(|workspace| workspace.canonicalize().ok())?;
+    let is_stale = {
+        let entry = cache.get(key)?;
+        entry.created.elapsed() > FIM_DEFINITION_CACHE_TTL
+            || entry.locations.iter().any(|location| {
+                open_buffer_for_resolved_path(
+                    buffers,
+                    &workspace_root,
+                    workspace,
+                    &location.path,
+                )
+                .is_none_or(|buffer| {
+                    buffer.id != location.buffer_id
+                        || buffer.rev != location.revision
+                })
+            })
+    };
+    if is_stale {
+        cache.remove(key);
+        return None;
+    }
+
+    let entry = cache.get(key)?;
+    Some(
+        entry
+            .locations
+            .iter()
+            .map(|location| (location.path.clone(), location.line))
+            .collect(),
+    )
+}
+
+fn open_buffer_for_resolved_path<'a>(
+    buffers: &'a HashMap<PathBuf, Buffer>,
+    workspace_root: &Path,
+    workspace: Option<&Path>,
+    resolved_path: &Path,
+) -> Option<&'a Buffer> {
+    buffers.values().find(|buffer| {
+        let relative = buffer.path.strip_prefix(workspace_root).ok().or_else(|| {
+            workspace.and_then(|workspace| buffer.path.strip_prefix(workspace).ok())
+        });
+        relative
+            .and_then(|relative| resolve_open_buffer_path(workspace_root, relative))
+            .is_some_and(|open_path| open_path == resolved_path)
+    })
+}
+
+fn cache_prediction_definitions(
+    cache: &Mutex<
+        HashMap<PredictionDefinitionCacheKey, CachedPredictionDefinitions>,
+    >,
+    key: PredictionDefinitionCacheKey,
+    locations: &[(PathBuf, u32)],
+    workspace: Option<&Path>,
+    buffers: &HashMap<PathBuf, Buffer>,
+) {
+    let Some(workspace_root) =
+        workspace.and_then(|workspace| workspace.canonicalize().ok())
+    else {
+        return;
+    };
+
+    let mut cached_locations = Vec::new();
+    let mut cached_paths = HashSet::new();
+    for (path, line) in locations {
+        let relative = path.strip_prefix(&workspace_root).ok().or_else(|| {
+            workspace.and_then(|workspace| path.strip_prefix(workspace).ok())
+        });
+        let Some(relative) = relative else {
+            continue;
+        };
+        let Some(resolved_path) =
+            resolve_open_buffer_path(&workspace_root, relative)
+        else {
+            continue;
+        };
+        if !ahead_core::search::is_agent_visible_path(
+            &workspace_root,
+            &resolved_path,
+        ) {
+            continue;
+        }
+        let Some(buffer) = open_buffer_for_resolved_path(
+            buffers,
+            &workspace_root,
+            workspace,
+            &resolved_path,
+        ) else {
+            continue;
+        };
+        if cached_paths.insert(resolved_path.clone()) {
+            cached_locations.push(CachedPredictionDefinition {
+                path: resolved_path,
+                line: *line,
+                buffer_id: buffer.id,
+                revision: buffer.rev,
+            });
+        }
+    }
+
+    if !locations.is_empty() && cached_locations.is_empty() {
+        return;
+    }
+
+    let mut cache = cache.lock();
+    cache.retain(|_, entry| entry.created.elapsed() <= FIM_DEFINITION_CACHE_TTL);
+    if cache.len() >= MAX_FIM_DEFINITION_CACHE_ENTRIES {
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest_key) = oldest_key {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        key,
+        CachedPredictionDefinitions {
+            created: Instant::now(),
+            locations: cached_locations,
+        },
+    );
+}
+
 fn is_prediction_target_visible(workspace: &Path, path: &Path) -> bool {
     let Ok(workspace_root) = workspace.canonicalize() else {
         return false;
@@ -2388,11 +3901,125 @@ fn is_prediction_target_visible(workspace: &Path, path: &Path) -> bool {
     })
 }
 
+fn is_prediction_import_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("use ")
+        || line.starts_with("pub use ")
+        || line.starts_with("pub(crate) use ")
+        || line.starts_with("mod ")
+        || line.starts_with("import ")
+        || line.starts_with("from ")
+        || line.starts_with("export ")
+        || line.starts_with("#include")
+        || line.contains("import(")
+        || line.contains("require(")
+        || line.contains("include!(")
+}
+
+fn contains_prediction_identifier(source: &str, identifier: &str) -> bool {
+    !identifier.is_empty()
+        && source.match_indices(identifier).any(|(start, matched)| {
+            let end = start + matched.len();
+            let before = source[..start].chars().next_back();
+            let after = source[end..].chars().next();
+            before.is_none_or(|character| {
+                !character.is_alphanumeric() && character != '_'
+            }) && after.is_none_or(|character| {
+                !character.is_alphanumeric() && character != '_'
+            })
+        })
+}
+
+fn prediction_definition_locations(
+    response: GotoDefinitionResponse,
+) -> Vec<(PathBuf, u32)> {
+    fn push_location(locations: &mut Vec<(PathBuf, u32)>, uri: &Url, line: u32) {
+        if let Ok(path) = uri.to_file_path() {
+            locations.push((path, line));
+        }
+    }
+
+    let mut locations = Vec::new();
+    match response {
+        GotoDefinitionResponse::Scalar(location) => {
+            push_location(&mut locations, &location.uri, location.range.start.line);
+        }
+        GotoDefinitionResponse::Array(definitions) => {
+            for location in definitions {
+                push_location(
+                    &mut locations,
+                    &location.uri,
+                    location.range.start.line,
+                );
+            }
+        }
+        GotoDefinitionResponse::Link(links) => {
+            for link in links {
+                push_location(
+                    &mut locations,
+                    &link.target_uri,
+                    link.target_selection_range.start.line,
+                );
+            }
+        }
+    }
+    locations
+}
+
+fn prediction_buffer_excerpt(
+    buffer: &Buffer,
+    definition_line: Option<u32>,
+) -> String {
+    let contents = buffer.rope.to_string();
+    if contents.len() <= MAX_FIM_OPEN_BUFFER_BYTES {
+        return contents;
+    }
+
+    let target_byte = definition_line.and_then(|line| {
+        let line_count = buffer.rope.len_lines(ropey::LineType::LF_CR);
+        (line_count > 0).then(|| {
+            buffer.rope.line_to_byte_idx(
+                (line as usize).min(line_count - 1),
+                ropey::LineType::LF_CR,
+            )
+        })
+    });
+    let mut start = target_byte
+        .map(|offset| offset.saturating_sub(MAX_FIM_OPEN_BUFFER_BYTES / 2))
+        .unwrap_or(0);
+    while !contents.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = start
+        .saturating_add(MAX_FIM_OPEN_BUFFER_BYTES)
+        .min(contents.len());
+    while !contents.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push_str("[open-buffer excerpt truncated]\n");
+    }
+    if let Some(line) = definition_line {
+        excerpt.push_str(&format!(
+            "[definition near line {}]\n",
+            line.saturating_add(1)
+        ));
+    }
+    excerpt.push_str(&contents[start..end]);
+    if end < contents.len() {
+        excerpt.push_str("\n[open-buffer excerpt truncated]");
+    }
+    excerpt
+}
+
 fn relevant_open_buffer_contexts(
     buffers: &HashMap<PathBuf, Buffer>,
     workspace: &Path,
     active_path: &Path,
     active_text: &str,
+    definition_locations: &[(PathBuf, u32)],
 ) -> Vec<OpenBufferContext> {
     let Ok(workspace_root) = workspace.canonicalize() else {
         return Vec::new();
@@ -2411,7 +4038,26 @@ fn relevant_open_buffer_contexts(
     let Ok(active_relative) = active_path.strip_prefix(&workspace_root) else {
         return Vec::new();
     };
+    let definition_rows = definition_locations
+        .iter()
+        .filter_map(|(definition_path, line)| {
+            let relative = definition_path
+                .strip_prefix(&workspace_root)
+                .or_else(|_| definition_path.strip_prefix(workspace))
+                .ok()?;
+            let path = resolve_open_buffer_path(&workspace_root, relative)?;
+            Some((path, *line))
+        })
+        .fold(HashMap::new(), |mut rows, (path, line)| {
+            rows.entry(path).or_insert(line);
+            rows
+        });
     let active_text = active_text.to_lowercase();
+    let import_text = active_text
+        .lines()
+        .filter(|line| is_prediction_import_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut candidates = buffers
         .values()
@@ -2430,15 +4076,30 @@ fn relevant_open_buffer_contexts(
                 return None;
             }
             let stem = relative.file_stem()?.to_string_lossy().to_lowercase();
-            let mentioned = stem.chars().count() >= 3 && active_text.contains(&stem);
+            let definition_line = definition_rows.get(&path).copied();
+            let mentioned = stem.chars().count() >= 3
+                && contains_prediction_identifier(&active_text, &stem);
+            let imported = stem.chars().count() >= 3
+                && contains_prediction_identifier(&import_text, &stem);
             let sibling = relative.parent() == active_relative.parent();
-            (mentioned || sibling).then_some((mentioned, relative, buffer))
+            let relevance = if definition_line.is_some() {
+                4
+            } else if imported {
+                3
+            } else if mentioned {
+                2
+            } else if sibling {
+                1
+            } else {
+                0
+            };
+            (relevance > 0).then_some((relevance, relative, buffer, definition_line))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(
-        |(left_mentioned, left_path, _), (right_mentioned, right_path, _)| {
-            right_mentioned
-                .cmp(left_mentioned)
+        |(left_relevance, left_path, _, _), (right_relevance, right_path, _, _)| {
+            right_relevance
+                .cmp(left_relevance)
                 .then_with(|| left_path.cmp(right_path))
         },
     );
@@ -2446,17 +4107,8 @@ fn relevant_open_buffer_contexts(
     candidates
         .into_iter()
         .take(MAX_FIM_OPEN_BUFFERS)
-        .map(|(_, path, buffer)| {
-            let contents = buffer.rope.to_string();
-            let excerpt = if contents.len() > MAX_FIM_OPEN_BUFFER_BYTES {
-                let mut end = MAX_FIM_OPEN_BUFFER_BYTES;
-                while !contents.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}\n[open-buffer excerpt truncated]", &contents[..end])
-            } else {
-                contents
-            };
+        .map(|(_, path, buffer, definition_line)| {
+            let excerpt = prediction_buffer_excerpt(buffer, definition_line);
             OpenBufferContext {
                 path: path
                     .to_string_lossy()
@@ -2472,9 +4124,8 @@ impl Dispatcher {
         let paths: Vec<_> = self
             .shared_remote_pending
             .iter()
-            .filter_map(|(path, (pending_session, _))| {
-                (pending_session == session_id).then(|| path.display().to_string())
-            })
+            .filter(|(_, (pending_session, _))| pending_session == session_id)
+            .map(|(path, _)| path.display().to_string())
             .collect();
         anyhow::ensure!(
             paths.is_empty(),
@@ -2484,10 +4135,95 @@ impl Dispatcher {
         Ok(())
     }
 
+    fn cancel_inline_predictions(&self, path: Option<&Path>) {
+        self.inline_prediction_jobs.lock().retain(|_, job| {
+            if path.is_none_or(|path| job.dependencies.contains(path)) {
+                job.cancellation.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn validate_inline_prediction(
+        &self,
+        path: &Path,
+        position: Position,
+        content_sha256: &str,
+        replacement: &str,
+        binding: &PredictionBinding,
+    ) -> Result<bool> {
+        let ready = {
+            let mut ready = self.ready_predictions.lock();
+            if !ready
+                .get(path)
+                .is_some_and(|ready| &ready.binding == binding)
+            {
+                return Ok(false);
+            }
+            ready.remove(path).context("prediction disappeared")?
+        };
+        let Some(target) = self.buffers.get(path) else {
+            return Ok(false);
+        };
+        if ready.created.elapsed() > PREDICTION_LIFETIME
+            || target.id != ready.target_id
+            || target.rev < binding.target_revision
+            || target.read_only
+            || !is_prediction_target_visible(&ready.snapshot.workspace, path)
+            || ready.dependencies.iter().any(|(path, version)| {
+                self.buffers
+                    .get(path)
+                    .is_none_or(|buffer| (buffer.id, buffer.rev) != *version)
+            })
+        {
+            return Ok(false);
+        }
+        let text = target.rope.to_string();
+        if format!("{:x}", Sha256::digest(text.as_bytes())) != content_sha256 {
+            return Ok(false);
+        }
+        let original = ready.target.to_string();
+        let Some((prefix, suffix)) = original
+            .get(..ready.insertion_offset)
+            .zip(original.get(ready.insertion_offset..))
+        else {
+            return Ok(false);
+        };
+        let Some(typed) = text
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            return Ok(false);
+        };
+        if typed.len() >= ready.replacement.len()
+            || !ready.replacement.starts_with(typed)
+            || ready.replacement.strip_prefix(typed) != Some(replacement)
+            || target.offset_to_position(ready.insertion_offset + typed.len())
+                != position
+        {
+            return Ok(false);
+        }
+        let host = self
+            .ahead_host
+            .as_ref()
+            .context("prediction host disconnected")?;
+        let model_context = ready.snapshot.model_context.clone();
+        Ok(host.read().prepare_prediction_with_model_context(
+            ready.request,
+            &ready.open_buffers,
+            model_context.as_ref(),
+        )? == ready.snapshot)
+    }
+
     fn close_editor_buffer(&mut self, path: &Path) {
         if self.shared_remote_pending.contains_key(path) {
             return;
         }
+        self.cancel_inline_predictions(Some(path));
+        self.ready_predictions.lock().remove(path);
+        self.prediction_semantic_tokens.lock().remove_buffer(path);
         if self.buffers.remove(path).is_some() {
             self.catalog_rpc.did_close_document(path.to_owned());
             let watched_path =
@@ -2502,8 +4238,18 @@ impl Dispatcher {
         path: PathBuf,
         content: String,
     ) -> Result<u64> {
+        if self
+            .buffers
+            .get(&path)
+            .is_none_or(|buffer| buffer.get_document() != content)
+        {
+            self.cancel_inline_predictions(Some(&path));
+        }
         if let Some(buffer) = self.buffers.get_mut(&path) {
             if buffer.get_document() == content {
+                self.prediction_semantic_tokens
+                    .lock()
+                    .track_buffer(&path, buffer);
                 return Ok(buffer.rev);
             }
             let old_text = buffer.rope.clone();
@@ -2518,6 +4264,9 @@ impl Dispatcher {
             buffer
                 .update(&delta, rev)
                 .context("editor snapshot revision mismatch")?;
+            self.prediction_semantic_tokens
+                .lock()
+                .track_buffer(&path, buffer);
             self.catalog_rpc.did_change_text_document(
                 &path,
                 rev,
@@ -2534,6 +4283,9 @@ impl Dispatcher {
             buffer.rope = Rope::from(content.clone());
             buffer.rev = u64::from(!content.is_empty());
             let rev = buffer.rev;
+            self.prediction_semantic_tokens
+                .lock()
+                .track_buffer(&path, &buffer);
             self.catalog_rpc.did_open_document(
                 &path,
                 buffer.language_id.clone(),
@@ -2544,6 +4296,45 @@ impl Dispatcher {
             self.buffers.insert(path, buffer);
             Ok(rev)
         }
+    }
+
+    fn sync_editor_delta(
+        &mut self,
+        path: PathBuf,
+        delta: AheadDelta,
+    ) -> Result<u64> {
+        let rev = self
+            .buffers
+            .get(&path)
+            .context("incremental edit for unopened editor buffer")?
+            .rev
+            .checked_add(1)
+            .context("buffer revision overflow")?;
+        let buffer = self
+            .buffers
+            .get_mut(&path)
+            .context("incremental edit for unopened editor buffer")?;
+        let old_text = buffer.rope.clone();
+        let old_byte_len = old_text.chunks().map(str::len).sum::<usize>();
+        anyhow::ensure!(
+            delta.base_len() == old_byte_len,
+            "editor delta base length does not match the open buffer"
+        );
+        buffer
+            .update(&delta, rev)
+            .context("editor delta revision mismatch")?;
+        self.prediction_semantic_tokens
+            .lock()
+            .track_buffer(&path, buffer);
+        self.catalog_rpc.did_change_text_document(
+            &path,
+            rev,
+            delta,
+            old_text,
+            buffer.rope.clone(),
+        );
+        self.cancel_inline_predictions(Some(&path));
+        Ok(rev)
     }
 
     fn shared_buffer_path(&self, relative: &str) -> Result<PathBuf> {
@@ -2792,9 +4583,17 @@ impl Dispatcher {
             shared_remote_recovery: HashMap::new(),
             terminals: HashMap::new(),
             file_watcher,
+            user_settings_watched: false,
             file_index: None,
+            file_index_warmup: None,
             workspace_file_jobs: Arc::new(Mutex::new(HashMap::new())),
             shown_prediction_errors: Arc::new(Mutex::new(HashSet::new())),
+            prediction_definition_cache: Arc::new(Mutex::new(HashMap::new())),
+            prediction_semantic_tokens: Arc::new(Mutex::new(
+                PredictionSemanticTokenCache::default(),
+            )),
+            inline_prediction_jobs: Arc::new(Mutex::new(HashMap::new())),
+            ready_predictions: Arc::new(Mutex::new(HashMap::new())),
             window_id: 1,
             tab_id: 1,
             ahead_host: None,
@@ -2827,9 +4626,83 @@ struct FileWatchNotifier {
     proxy_rpc: ProxyRpcHandler,
     catalog_rpc: PluginCatalogRpcHandler,
     workspace: Option<PathBuf>,
+    user_settings_directory: Mutex<Option<PathBuf>>,
+    user_settings_home: Option<PathBuf>,
+    user_settings_watcher: Option<FileWatcherHandle>,
     file_index: Option<Arc<WorkspaceFileIndex>>,
-    workspace_fs_change_handler: Arc<Mutex<Option<Sender<(bool, bool, bool)>>>>,
+    workspace_fs_change_handler: Arc<
+        Mutex<
+            Option<
+                Sender<(bool, bool, bool, Vec<PathBuf>, Vec<(PathBuf, PathBuf)>)>,
+            >,
+        >,
+    >,
     git_metadata_paths: Vec<PathBuf>,
+    instruction_watch_paths: Mutex<HashSet<PathBuf>>,
+    instruction_root_watch_paths: Mutex<HashSet<PathBuf>>,
+}
+
+fn instruction_watch_directories(
+    workspace: &Path,
+) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let root = ahead_agent::project_instruction_root(workspace);
+    let instruction_directories = workspace
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(&root))
+        .map(Path::to_path_buf)
+        .collect();
+    // Keep the shallow ancestor chain watched so adding or removing a `.git`
+    // marker can change the instruction boundary without restarting the session.
+    let root_marker_directories = workspace
+        .ancestors()
+        .filter(|directory| directory.parent().is_some())
+        .map(Path::to_path_buf)
+        .collect();
+    (instruction_directories, root_marker_directories)
+}
+
+fn reconcile_instruction_watches(
+    watcher: &FileWatcherHandle,
+    current_directories: &Mutex<HashSet<PathBuf>>,
+    desired_directories: HashSet<PathBuf>,
+    token: WatchToken,
+    marker_name: &'static str,
+) {
+    let (removed, added) = {
+        let mut current = current_directories.lock();
+        let removed = current
+            .difference(&desired_directories)
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = desired_directories
+            .difference(&current)
+            .cloned()
+            .collect::<Vec<_>>();
+        *current = desired_directories;
+        (removed, added)
+    };
+    for directory in removed {
+        watcher.unwatch(&directory, token);
+    }
+    for directory in added {
+        let marker = directory.join(marker_name);
+        watcher.watch_filtered(&directory, false, token, move |path| path == marker);
+    }
+}
+
+fn workspace_file_rename(event: &notify::Event) -> Option<(PathBuf, PathBuf)> {
+    if matches!(
+        &event.kind,
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both
+        ))
+    ) && event.paths.len() == 2
+    {
+        Some((event.paths[0].clone(), event.paths[1].clone()))
+    } else {
+        None
+    }
 }
 
 impl Notify for FileWatchNotifier {
@@ -2846,6 +4719,13 @@ impl FileWatchNotifier {
         catalog_rpc: PluginCatalogRpcHandler,
         file_index: Option<Arc<WorkspaceFileIndex>>,
     ) -> Self {
+        let workspace = workspace.map(|path| match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                tracing::warn!(?error, path = %path.display(), "normalizing workspace watcher root");
+                path
+            }
+        });
         let git_metadata_paths = workspace
             .as_ref()
             .and_then(|workspace| Repository::discover(workspace).ok())
@@ -2859,12 +4739,17 @@ impl FileWatchNotifier {
             .unwrap_or_default();
         let notifier = Self {
             workspace,
+            user_settings_directory: Mutex::new(user_settings_directory()),
+            user_settings_home: None,
+            user_settings_watcher: None,
             file_index,
             core_rpc,
             proxy_rpc,
             catalog_rpc,
             workspace_fs_change_handler: Arc::new(Mutex::new(None)),
             git_metadata_paths,
+            instruction_watch_paths: Mutex::default(),
+            instruction_root_watch_paths: Mutex::default(),
         };
 
         if let Some(workspace) = notifier.workspace.clone() {
@@ -2883,10 +4768,163 @@ impl FileWatchNotifier {
         for (token, event) in events {
             match token {
                 OPEN_FILE_EVENT_TOKEN => self.handle_open_file_fs_event(event),
-                WORKSPACE_EVENT_TOKEN => self.handle_workspace_fs_event(event),
+                WORKSPACE_EVENT_TOKEN => {
+                    if event.paths.iter().any(|path| {
+                        matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some("pyproject.toml" | "ruff.toml" | ".ruff.toml")
+                        )
+                    }) {
+                        self.core_rpc.log(
+                            ahead_rpc::core::LogLevel::Trace,
+                            format!(
+                                "workspace watcher delivered {:?} for {:?}",
+                                event.kind, event.paths
+                            ),
+                            Some("ahead_proxy::dispatch::lsp_file_watch".into()),
+                        );
+                    }
+                    self.handle_workspace_fs_event(event);
+                }
+                LSP_FILE_EVENT_TOKEN => self.notify_lsp_file_event(event),
+                USER_SETTINGS_EVENT_TOKEN => {
+                    self.handle_user_settings_fs_event(event)
+                }
+                USER_SETTINGS_HOME_EVENT_TOKEN => {
+                    self.handle_user_settings_home_fs_event(event)
+                }
+                INSTRUCTION_EVENT_TOKEN => {
+                    self.handle_instruction_fs_event(&event);
+                }
+                INSTRUCTION_ROOT_EVENT_TOKEN => {
+                    self.handle_instruction_root_fs_event(&event);
+                }
                 _ => {}
             }
         }
+    }
+
+    fn watch_instruction_ancestors(&self, watcher: &mut FileWatcher) {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return;
+        };
+        let (instruction_directories, root_marker_directories) =
+            instruction_watch_directories(workspace);
+        for directory in &instruction_directories {
+            // Watch the directory, not the file: instructions may be absent at
+            // startup or replaced atomically by an editor.
+            let instruction = directory.join("AGENTS.md");
+            watcher.watch_filtered(
+                directory,
+                false,
+                INSTRUCTION_EVENT_TOKEN,
+                move |path| path == instruction,
+            );
+        }
+        for directory in &root_marker_directories {
+            let root_marker = directory.join(".git");
+            watcher.watch_filtered(
+                directory,
+                false,
+                INSTRUCTION_ROOT_EVENT_TOKEN,
+                move |path| path == root_marker,
+            );
+        }
+        *self.instruction_watch_paths.lock() = instruction_directories;
+        *self.instruction_root_watch_paths.lock() = root_marker_directories;
+    }
+
+    fn handle_instruction_root_fs_event(&self, event: &notify::Event) {
+        if !matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Modify(_)
+        ) {
+            return;
+        }
+        let root_marker_watch_paths = self.instruction_root_watch_paths.lock();
+        let is_root_marker_event = event.paths.iter().any(|path| {
+            if path.file_name().is_none_or(|name| name != ".git") {
+                return false;
+            }
+            let Some(directory) = path.parent() else {
+                return false;
+            };
+            let directory = directory
+                .canonicalize()
+                .unwrap_or_else(|_| directory.to_path_buf());
+            root_marker_watch_paths.contains(&directory)
+        });
+        drop(root_marker_watch_paths);
+        if is_root_marker_event {
+            self.refresh_instruction_ancestor_watches();
+            self.invalidate_prediction_configuration();
+        }
+    }
+
+    fn refresh_instruction_ancestor_watches(&self) {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return;
+        };
+        let Some(watcher) = self.user_settings_watcher.as_ref() else {
+            return;
+        };
+        let (instruction_directories, root_marker_directories) =
+            instruction_watch_directories(workspace);
+        reconcile_instruction_watches(
+            watcher,
+            &self.instruction_watch_paths,
+            instruction_directories,
+            INSTRUCTION_EVENT_TOKEN,
+            "AGENTS.md",
+        );
+        reconcile_instruction_watches(
+            watcher,
+            &self.instruction_root_watch_paths,
+            root_marker_directories,
+            INSTRUCTION_ROOT_EVENT_TOKEN,
+            ".git",
+        );
+    }
+
+    fn handle_instruction_fs_event(&self, event: &notify::Event) {
+        if !matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Modify(_)
+        ) {
+            return;
+        }
+        let Some(workspace) = self.workspace.as_deref() else {
+            return;
+        };
+        let root = ahead_agent::project_instruction_root(workspace);
+        if event.paths.iter().any(|path| {
+            if path.file_name().is_none_or(|name| name != "AGENTS.md") {
+                return false;
+            }
+            let Some(directory) = path.parent() else {
+                return false;
+            };
+            let directory = directory
+                .canonicalize()
+                .unwrap_or_else(|_| directory.to_path_buf());
+            directory.starts_with(workspace)
+                || (workspace.starts_with(&directory)
+                    && directory.starts_with(&root))
+        }) {
+            self.invalidate_prediction_configuration();
+        }
+    }
+
+    fn invalidate_prediction_configuration(&self) {
+        self.core_rpc.ahead_notification(
+            ahead_rpc::ahead::AheadNotification::PredictionContextChanged {
+                session_id: None,
+            },
+        );
     }
 
     fn handle_open_file_fs_event(&self, event: notify::Event) {
@@ -2909,7 +4947,27 @@ impl FileWatchNotifier {
         }
     }
 
+    fn notify_lsp_file_event(&self, event: notify::Event) {
+        self.core_rpc.log(
+            ahead_rpc::core::LogLevel::Trace,
+            format!(
+                "LSP file watcher delivered {:?} for {:?}",
+                event.kind, event.paths
+            ),
+            Some("ahead_proxy::dispatch::lsp_file_watch".into()),
+        );
+        if let Err(error) = self.catalog_rpc.catalog_notification(
+            crate::plugin::PluginCatalogNotification::WatchedFilesChanged(event),
+        ) {
+            tracing::debug!(?error, "forwarding language-server file event");
+        }
+    }
+
     fn handle_workspace_fs_event(&self, event: notify::Event) {
+        self.handle_instruction_fs_event(&event);
+        let renames = workspace_file_rename(&event)
+            .into_iter()
+            .collect::<Vec<_>>();
         let ignore_rule_change = event.paths.iter().any(|path| {
             matches!(
                 path.file_name().and_then(|name| name.to_str()),
@@ -2937,7 +4995,11 @@ impl FileWatchNotifier {
                 .iter()
                 .any(|path| is_provider_settings_path(workspace, path))
         });
-        let notify_relevant = search_relevant || settings_relevant;
+        if settings_relevant {
+            self.invalidate_prediction_configuration();
+        }
+        let notify_relevant =
+            search_relevant || settings_relevant || !renames.is_empty();
         // Git can change without changing the file-status list (for example,
         // amend on the same branch). Invalidate buffer metadata on those events.
         let git_relevant = search_relevant
@@ -2959,19 +5021,108 @@ impl FileWatchNotifier {
             }
         }
 
+        self.queue_filesystem_changes(
+            notify_relevant,
+            git_relevant,
+            settings_relevant,
+            event.paths,
+            renames,
+        );
+    }
+
+    fn handle_user_settings_fs_event(&self, event: notify::Event) {
+        let is_settings_change = matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Modify(_)
+        );
+        let settings_directory = self.user_settings_directory.lock().clone();
+        if !is_settings_change
+            || !settings_directory.is_some_and(|directory| {
+                event
+                    .paths
+                    .iter()
+                    .any(|path| is_user_lsp_settings_path(&directory, path))
+            })
+        {
+            return;
+        }
+
+        self.invalidate_prediction_configuration();
+        self.queue_filesystem_changes(true, false, true, event.paths, Vec::new());
+    }
+
+    fn handle_user_settings_home_fs_event(&self, event: notify::Event) {
+        let is_directory_change = matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+        );
+        let Some(home) = self.user_settings_home.as_deref() else {
+            return;
+        };
+        if !is_directory_change
+            || !event
+                .paths
+                .iter()
+                .any(|path| is_user_ahead_directory(home, path))
+        {
+            return;
+        }
+
+        let next_directory = user_settings_directory_in(home);
+        let mut current_directory = self.user_settings_directory.lock();
+        if let Some(watcher) = &self.user_settings_watcher {
+            if let Some(previous_directory) = current_directory.as_deref() {
+                watcher.unwatch(previous_directory, USER_SETTINGS_EVENT_TOKEN);
+            }
+            if let Some(next_directory) = next_directory.as_deref() {
+                let watched_directory = next_directory.to_owned();
+                watcher.watch_filtered(
+                    next_directory,
+                    false,
+                    USER_SETTINGS_EVENT_TOKEN,
+                    move |path| is_user_lsp_settings_path(&watched_directory, path),
+                );
+            }
+        }
+        *current_directory = next_directory;
+        drop(current_directory);
+        self.invalidate_prediction_configuration();
+        self.queue_filesystem_changes(true, false, true, event.paths, Vec::new());
+    }
+
+    fn queue_filesystem_changes(
+        &self,
+        notify_relevant: bool,
+        git_relevant: bool,
+        settings_relevant: bool,
+        paths: Vec<PathBuf>,
+        renames: Vec<(PathBuf, PathBuf)>,
+    ) {
         let mut handler = self.workspace_fs_change_handler.lock();
         if let Some(sender) = handler.as_mut() {
-            if let Err(err) =
-                sender.send((notify_relevant, git_relevant, settings_relevant))
-            {
+            if let Err(err) = sender.send((
+                notify_relevant,
+                git_relevant,
+                settings_relevant,
+                paths,
+                renames,
+            )) {
                 tracing::error!("{:?}", err);
             }
             return;
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
-        if let Err(err) =
-            sender.send((notify_relevant, git_relevant, settings_relevant))
-        {
+        if let Err(err) = sender.send((
+            notify_relevant,
+            git_relevant,
+            settings_relevant,
+            paths,
+            renames,
+        )) {
             tracing::error!("{:?}", err);
         }
 
@@ -2979,7 +5130,7 @@ impl FileWatchNotifier {
         let core_rpc = self.core_rpc.clone();
         let catalog_rpc = self.catalog_rpc.clone();
         let file_index = self.file_index.clone();
-        let workspace = self.workspace.clone().unwrap();
+        let workspace = self.workspace.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(500));
 
@@ -2987,15 +5138,25 @@ impl FileWatchNotifier {
                 local_handler.lock().take();
             }
 
-            let (notify_relevant, git_relevant, settings_relevant) =
+            let (notify_relevant, git_relevant, settings_relevant, paths, renames) =
                 receiver.into_iter().fold(
-                    (false, false, false),
-                    |(notify, git, settings),
-                     (next_notify, next_git, next_settings)| {
+                    (false, false, false, Vec::new(), Vec::new()),
+                    |(notify, git, settings, mut paths, mut renames),
+                     (
+                        next_notify,
+                        next_git,
+                        next_settings,
+                        next_paths,
+                        next_renames,
+                    )| {
+                        paths.extend(next_paths);
+                        renames.extend(next_renames);
                         (
                             notify || next_notify,
                             git || next_git,
                             settings || next_settings,
+                            paths,
+                            renames,
                         )
                     },
                 );
@@ -3004,9 +5165,17 @@ impl FileWatchNotifier {
                     .as_ref()
                     .map(|index| index.generation())
                     .unwrap_or_default();
-                core_rpc.workspace_file_change(generation);
+                let mut paths = paths;
+                paths.sort();
+                paths.dedup();
+                let mut renames = renames;
+                renames.dedup();
+                for (old_path, new_path) in renames {
+                    core_rpc.workspace_file_renamed(generation, old_path, new_path);
+                }
+                core_rpc.workspace_file_change(generation, paths);
             }
-            if git_relevant {
+            if git_relevant && let Some(workspace) = workspace {
                 core_rpc.diff_info(git_diff_new(&workspace).unwrap_or_default());
             }
             if settings_relevant
@@ -3038,13 +5207,468 @@ fn git_init(workspace_path: &Path) -> Result<()> {
 }
 
 fn git_stage_all(workspace_path: &Path) -> Result<()> {
-    let output = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(workspace_path)
-        .output()?;
+    let status = git_workspace_status(workspace_path)?;
+    // Stage the non-conflicted paths explicitly. An `:(exclude)` pathspec for
+    // an unmerged path makes `git add` fail with "did not match any files", so
+    // the exclusion has to happen here instead.
+    let paths = status
+        .files
+        .iter()
+        .filter(|file| !git_status_is_conflicted(&file.state))
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["--literal-pathspecs", "add", "-A", "--"])
+        .args(&paths)
+        .current_dir(workspace_path);
+    let output = command.output()?;
     anyhow::ensure!(
         output.status.success(),
-        "Could not stage changes: {}",
+        "Could not stage non-conflicted changes: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+fn git_repository_status(repository_root: &Path) -> Result<(bool, bool)> {
+    let output = std::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--no-renames",
+            "-z",
+        ])
+        .current_dir(repository_root)
+        .output()
+        .context("Could not start Git status")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Git status failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let records = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    let mut repository_dirty = false;
+    let mut repository_has_conflicts = false;
+    for record in records {
+        anyhow::ensure!(
+            record.len() >= 4 && record[2] == b' ',
+            "Git returned malformed porcelain status"
+        );
+        repository_dirty = true;
+        repository_has_conflicts |=
+            git_status_bytes_are_conflicted(record[0], record[1]);
+    }
+    Ok((repository_dirty, repository_has_conflicts))
+}
+
+fn git_repository_dirty(repository_root: &Path) -> Result<bool> {
+    Ok(git_repository_status(repository_root)?.0)
+}
+
+fn git_status_bytes_are_conflicted(index_status: u8, worktree_status: u8) -> bool {
+    index_status == b'U'
+        || worktree_status == b'U'
+        || matches!((index_status, worktree_status), (b'A', b'A') | (b'D', b'D'))
+}
+
+fn git_status_is_conflicted(status: &str) -> bool {
+    let mut status_bytes = status.bytes();
+    let Some(index_status) = status_bytes.next() else {
+        return false;
+    };
+    let Some(worktree_status) = status_bytes.next() else {
+        return false;
+    };
+    git_status_bytes_are_conflicted(index_status, worktree_status)
+}
+
+fn git_workspace_status(workspace_path: &Path) -> Result<GitWorkspaceStatus> {
+    let selected_root = workspace_path
+        .canonicalize()
+        .context("Could not resolve workspace folder")?;
+    let repository = Repository::discover(&selected_root)?;
+    let repository_root = repository
+        .workdir()
+        .context("Git repository has no working tree")?
+        .canonicalize()
+        .context("Could not resolve Git working tree")?;
+    let (repository_dirty, repository_has_conflicts) =
+        git_repository_status(&repository_root)?;
+    let workspace_relative = selected_root
+        .strip_prefix(&repository_root)
+        .context("Workspace folder is outside the Git working tree")?;
+    let status_prefix = workspace_relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => component
+                .to_str()
+                .context("Workspace path is not valid UTF-8"),
+            _ => anyhow::bail!("Workspace path is outside the Git working tree"),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("/");
+
+    let branch_output = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&repository_root)
+        .output()
+        .context("Could not start git branch")?;
+    anyhow::ensure!(
+        branch_output.status.success(),
+        "Could not read Git branch: {}",
+        String::from_utf8_lossy(&branch_output.stderr).trim()
+    );
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    let branch_has_upstream = if branch.is_empty() {
+        false
+    } else {
+        match repository.find_branch(&branch, git2::BranchType::Local) {
+            Ok(branch) => match branch.upstream() {
+                Ok(_) => true,
+                Err(error) if error.code() == NotFound => false,
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) if error.code() == NotFound => false,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let remotes = repository
+        .remotes()?
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect();
+    let mut branches = Vec::new();
+    for branch in repository.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = branch?;
+        if let Some(name) = branch.name()? {
+            branches.push(name.to_string());
+        }
+    }
+    branches.sort();
+
+    // Follow Zed's porcelain-v1 status query: NUL-delimited paths avoid Git's
+    // quoted-path format, and no-renames keeps each file row unambiguous.
+    let mut status_command = std::process::Command::new("git");
+    status_command
+        .args([
+            "--literal-pathspecs",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--no-renames",
+            "-z",
+            "--",
+        ])
+        .current_dir(&repository_root);
+    if !status_prefix.is_empty() {
+        status_command.arg(&status_prefix);
+    }
+    let output = status_command
+        .output()
+        .context("Could not start git status")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Git status failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let mut files = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            anyhow::ensure!(
+                record.len() >= 4 && record[2] == b' ',
+                "Git returned malformed porcelain status"
+            );
+            let status = String::from_utf8_lossy(&record[..2]).trim().to_owned();
+            let staged = !git_status_bytes_are_conflicted(record[0], record[1])
+                && record[0] != b' '
+                && record[0] != b'?';
+            let path = String::from_utf8_lossy(&record[3..]);
+            let path = if status_prefix.is_empty() {
+                path.into_owned()
+            } else {
+                path.strip_prefix(&format!("{status_prefix}/"))
+                    .context("Git returned a path outside the selected workspace")?
+                    .to_owned()
+            };
+            Ok(GitStatusFile {
+                path,
+                state: status,
+                staged,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(GitWorkspaceStatus {
+        branch: if branch.is_empty() {
+            "HEAD".to_string()
+        } else {
+            branch
+        },
+        branches,
+        branch_has_upstream,
+        remotes,
+        repository_dirty,
+        repository_has_conflicts,
+        files,
+    })
+}
+
+fn git_history(workspace_path: &Path, limit: u32) -> Result<Vec<GitCommitSummary>> {
+    anyhow::ensure!(
+        (1..=100).contains(&limit),
+        "Git history limit must be between 1 and 100"
+    );
+    let repository = Repository::discover(workspace_path)?;
+    let head = match repository.head() {
+        Ok(head) => head,
+        Err(error)
+            if matches!(error.code(), git2::ErrorCode::UnbornBranch | NotFound) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let head = head
+        .target()
+        .context("Git HEAD does not point to a commit")?;
+    let mut revisions = repository.revwalk()?;
+    revisions.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+    revisions.push(head)?;
+    revisions
+        .take(limit as usize)
+        .map(|revision| {
+            let commit = repository.find_commit(revision?)?;
+            let author = commit.author();
+            Ok(GitCommitSummary {
+                id: commit.id().to_string(),
+                author: author.name().unwrap_or("Unknown author").to_string(),
+                timestamp: author.when().seconds(),
+                subject: commit
+                    .summary()
+                    .unwrap_or("(no commit message)")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+const MAX_GIT_PATCH_BYTES: usize = 2 * 1024 * 1024;
+
+fn bounded_git_patch(id: String, diff: &git2::Diff<'_>) -> Result<GitPatch> {
+    let mut patch = String::new();
+    let mut truncated = false;
+    let print_result = diff.print(DiffFormat::Patch, |_, _, line| {
+        // libgit2 hands back the line body without its diff prefix, and the
+        // patch viewer (and `git apply`) rely on `+`/`-`/space to classify
+        // lines, so restore it here.
+        let origin = line.origin();
+        let prefixed = matches!(origin, ' ' | '+' | '-');
+        let content = String::from_utf8_lossy(line.content());
+        let needed = content.len() + usize::from(prefixed);
+        let remaining = MAX_GIT_PATCH_BYTES.saturating_sub(patch.len());
+        if needed > remaining {
+            let mut boundary = remaining.saturating_sub(usize::from(prefixed));
+            while boundary > 0 && !content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            if prefixed && remaining > 0 {
+                patch.push(origin);
+            }
+            patch.push_str(&content[..boundary]);
+            truncated = true;
+            return false;
+        }
+        if prefixed {
+            patch.push(origin);
+        }
+        patch.push_str(&content);
+        true
+    });
+    if !truncated {
+        print_result?;
+    }
+    Ok(GitPatch {
+        id,
+        patch,
+        truncated,
+    })
+}
+
+fn git_commit_patch(workspace_path: &Path, commit_id: &str) -> Result<GitPatch> {
+    let commit_oid = Oid::from_str(commit_id).context("Invalid commit id")?;
+    let repository = Repository::discover(workspace_path)?;
+    let commit = repository
+        .find_commit(commit_oid)
+        .context("Commit was not found in this repository")?;
+    let parent_tree = if commit.parent_count() == 0 {
+        None
+    } else {
+        Some(commit.parent(0)?.tree()?)
+    };
+    let commit_tree = commit.tree()?;
+    let mut options = DiffOptions::new();
+    let diff = repository.diff_tree_to_tree(
+        parent_tree.as_ref(),
+        Some(&commit_tree),
+        Some(&mut options),
+    )?;
+    bounded_git_patch(commit_oid.to_string(), &diff)
+}
+
+fn git_worktree_file_patch(
+    workspace_path: &Path,
+    relative_path: &Path,
+) -> Result<GitPatch> {
+    anyhow::ensure!(
+        relative_path.is_relative()
+            && !relative_path.as_os_str().is_empty()
+            && relative_path.components().all(|component| matches!(
+                component,
+                std::path::Component::Normal(_)
+            )),
+        "Git diff path must be a non-empty workspace-relative path"
+    );
+    let selected_root = workspace_path
+        .canonicalize()
+        .context("Could not resolve workspace folder")?;
+    let repository = Repository::discover(&selected_root)?;
+    let repository_root = repository
+        .workdir()
+        .context("Git repository has no working directory")?
+        .canonicalize()
+        .context("Could not resolve Git working tree")?;
+    let workspace_relative = selected_root
+        .strip_prefix(&repository_root)
+        .context("Workspace folder is outside the Git working tree")?;
+    let repository_relative_path = workspace_relative.join(relative_path);
+    let head_tree = match repository.head() {
+        Ok(head) => Some(head.peel_to_commit()?.tree()?),
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = DiffOptions::new();
+    options
+        .pathspec(&repository_relative_path)
+        .include_untracked(true)
+        .recurse_untracked_dirs(false);
+    let diff = repository
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))?;
+    bounded_git_patch(relative_path.to_string_lossy().into_owned(), &diff)
+}
+
+fn git_worktree_patch(workspace_path: &Path) -> Result<GitPatch> {
+    let selected_root = workspace_path
+        .canonicalize()
+        .context("Could not resolve workspace folder")?;
+    let repository = Repository::discover(&selected_root)?;
+    let repository_root = repository
+        .workdir()
+        .context("Git repository has no working directory")?
+        .canonicalize()
+        .context("Could not resolve Git working tree")?;
+    let workspace_relative = selected_root
+        .strip_prefix(&repository_root)
+        .context("Workspace folder is outside the Git working tree")?;
+    let head_tree = match repository.head() {
+        Ok(head) => Some(head.peel_to_commit()?.tree()?),
+        Err(error)
+            if matches!(
+                error.code(),
+                git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .max_size(MAX_GIT_PATCH_BYTES as i64);
+    if !workspace_relative.as_os_str().is_empty() {
+        options
+            .pathspec(workspace_relative)
+            .disable_pathspec_match(true);
+    }
+    let diff = repository
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))?;
+    bounded_git_patch("working-tree".into(), &diff)
+}
+
+fn git_stage_paths(
+    workspace_path: &Path,
+    paths: &[String],
+    staged: bool,
+) -> Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "Select at least one changed file");
+    for path in paths {
+        anyhow::ensure!(
+            !path.is_empty()
+                && !path.as_bytes().contains(&0)
+                && Path::new(path).is_relative()
+                && Path::new(path).components().all(|component| matches!(
+                    component,
+                    std::path::Component::Normal(_)
+                )),
+            "Git path must stay within the workspace"
+        );
+    }
+    let changed_paths = git_workspace_status(workspace_path)?
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        paths.iter().all(|path| changed_paths.contains(path)),
+        "Git status changed; refresh before staging"
+    );
+
+    let repository = Repository::discover(workspace_path)?;
+    let unborn = match repository.head() {
+        Ok(_) => false,
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => true,
+        Err(error) => return Err(error.into()),
+    };
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .current_dir(workspace_path);
+    if staged {
+        command.args(["add", "-A", "--"]);
+    } else if unborn {
+        command.args(["update-index", "--force-remove", "--"]);
+    } else {
+        command.args(["reset", "--quiet", "--"]);
+    }
+    command.args(paths);
+    let output = command.output().context("Could not update Git index")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Could not {} files: {}",
+        if staged { "stage" } else { "unstage" },
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
@@ -3058,69 +5682,68 @@ fn git_commit(
 ) -> Result<()> {
     anyhow::ensure!(!message.trim().is_empty(), "Enter a commit message");
     let repo = Repository::discover(workspace_path)?;
+    let repository_root = repo
+        .workdir()
+        .context("Git repository has no working tree")?;
+    anyhow::ensure!(
+        !git_repository_status(repository_root)?.1,
+        "Resolve and stage all conflicted files before committing"
+    );
     let mut index = repo.index()?;
     stage_diffs(&mut index, workspace_path, diffs)?;
     index.write()?;
-    let tree = index.write_tree()?;
-    let tree = repo.find_tree(tree)?;
-
     match repo.signature() {
-        Ok(signature) => {
-            let parents = match repo.head() {
-                Ok(head) => vec![
-                    head.peel_to_commit()
-                        .context("HEAD does not point to a commit")?,
-                ],
-                Err(error)
-                    if matches!(
-                        error.code(),
-                        NotFound | git2::ErrorCode::UnbornBranch
-                    ) =>
-                {
-                    Vec::new()
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let parents_refs = parents.iter().collect::<Vec<_>>();
-
-            // Committer is always the human driving the commit. Author is
-            // `ahead` when the changeset carries agent-authored regions, so
-            // attribution is visible in `git log --author=ahead` / blame.
-            let author = if !agent_session_ids.is_empty() {
-                git2::Signature::now("ahead", "ahead@ahead.local")
-                    .unwrap_or_else(|_| signature.clone())
-            } else {
-                signature.clone()
-            };
-            let commit_message = if agent_session_ids.is_empty() {
-                message.to_string()
-            } else {
-                format!(
-                    "{message}\n\nAhead-Session: {}",
-                    agent_session_ids.join("\nAhead-Session: ")
-                )
-            };
-
-            repo.commit(
-                Some("HEAD"),
-                &author,
-                &signature,
-                &commit_message,
-                &tree,
-                &parents_refs,
-            )?;
-            Ok(())
-        }
-        Err(e) => match e.code() {
-            NotFound => Err(anyhow!(
+        Ok(_) => {}
+        Err(error) if error.code() == NotFound => {
+            return Err(anyhow!(
                 "No user.name and/or user.email configured for this git repository."
-            )),
-            _ => Err(anyhow!(
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow!(
                 "Error while creating commit's signature: {}",
-                e.message()
-            )),
-        },
+                error.message()
+            ));
+        }
     }
+    match repo.head() {
+        Ok(head) => {
+            head.peel_to_commit()
+                .context("HEAD does not point to a commit")?;
+        }
+        Err(error)
+            if matches!(error.code(), NotFound | git2::ErrorCode::UnbornBranch) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Let Git run the user's hooks and signing configuration. `--author`
+    // changes only authorship; the configured human remains the committer.
+    let commit_message = if agent_session_ids.is_empty() {
+        message.to_string()
+    } else {
+        format!(
+            "{message}\n\nAhead-Session: {}",
+            agent_session_ids.join("\nAhead-Session: ")
+        )
+    };
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(workspace_path)
+        .args(["commit", "--cleanup=strip", "-m"])
+        .arg(commit_message);
+    if !agent_session_ids.is_empty() {
+        command.args(["--author", "ahead <ahead@ahead.local>"]);
+    }
+    let output = command.output().context("Could not start git commit")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::ensure!(output.status.success(), "Git commit failed: {details}");
+    Ok(())
 }
 
 fn stage_diffs(
@@ -3207,20 +5830,283 @@ fn git_commit_attributed(
     agent_session_ids.dedup();
     git_commit(workspace_path, message, Vec::new(), &agent_session_ids)?;
     if let Some(host) = host {
-        if let Err(error) =
-            host.clear_committed_anchors(&committed_paths, &committed_contents)
-        {
-            tracing::warn!("failed to clear committed anchors: {error}");
+        let cleanup = (|| -> Result<()> {
+            let repo = Repository::discover(workspace_path)?;
+            let (paths, contents) = committed_tree_changes(&repo)?;
+            host.clear_committed_anchors(&paths, &contents)?;
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            tracing::warn!(
+                "failed to verify committed tree for anchor cleanup: {error}"
+            );
         }
     }
     Ok(())
 }
 
+fn committed_tree_changes(
+    repo: &Repository,
+) -> Result<(Vec<String>, HashMap<String, String>)> {
+    let commit = repo
+        .head()
+        .context("committed HEAD is unavailable")?
+        .peel_to_commit()
+        .context("committed HEAD does not point to a commit")?;
+    let tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0)?.tree()?)
+    } else {
+        None
+    };
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let mut paths = diff
+        .deltas()
+        .flat_map(|delta| [delta.old_file().path(), delta.new_file().path()])
+        .flatten()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+
+    let mut contents = HashMap::new();
+    for path in &paths {
+        let entry = match tree.get_path(Path::new(path)) {
+            Ok(entry) => entry,
+            Err(error) if error.code() == NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            continue;
+        }
+        let blob = repo.find_blob(entry.id())?;
+        if let Ok(content) = std::str::from_utf8(blob.content()) {
+            contents.insert(path.clone(), content.to_string());
+        }
+    }
+    Ok((paths, contents))
+}
+
 fn git_checkout(workspace_path: &Path, reference: &str) -> Result<()> {
     let repo = Repository::discover(workspace_path)?;
-    let (object, reference) = repo.revparse_ext(reference)?;
-    repo.checkout_tree(&object, None)?;
-    repo.set_head(reference.unwrap().name().unwrap())?;
+    let repository_root = repo
+        .workdir()
+        .context("Git repository has no working tree")?;
+    anyhow::ensure!(
+        !git_repository_dirty(repository_root)?,
+        "Commit, stash, or discard all repository changes before switching branches"
+    );
+    let branch = repo
+        .find_branch(reference, git2::BranchType::Local)
+        .with_context(|| format!("Local branch '{reference}' was not found"))?;
+    let object = branch.get().peel(git2::ObjectType::Commit)?;
+    let reference_name = branch
+        .get()
+        .name()
+        .context("Git branch name is not valid UTF-8")?;
+    let mut checkout = CheckoutBuilder::new();
+    checkout.safe();
+    repo.checkout_tree(&object, Some(&mut checkout))?;
+    repo.set_head(reference_name)?;
+    Ok(())
+}
+
+fn git_push(
+    workspace_path: &Path,
+    selected_remote: Option<&str>,
+    core_rpc: CoreRpcHandler,
+) -> Result<()> {
+    let repository = Repository::discover(workspace_path)?;
+    let repository_root = repository
+        .workdir()
+        .context("Git repository has no working tree")?;
+    let head = repository
+        .head()
+        .context("Create a commit before publishing this branch")?;
+    let branch = head
+        .shorthand()
+        .context("Publish requires a named local branch")?;
+    let local_ref = head
+        .name()
+        .context("Current branch name is not valid UTF-8")?;
+    anyhow::ensure!(
+        local_ref.starts_with("refs/heads/"),
+        "Publish requires a named local branch"
+    );
+    let branch_has_upstream =
+        match repository.find_branch(branch, git2::BranchType::Local) {
+            Ok(branch) => match branch.upstream() {
+                Ok(_) => true,
+                Err(error) if error.code() == NotFound => false,
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) if error.code() == NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+
+    let config = repository.config()?;
+    let configured_git_askpass = git_optional_config(&config, "core.askPass")?
+        .is_some_and(|command| !command.trim().is_empty());
+    let branch_prefix = format!("branch.{branch}.");
+    let remote_names = repository
+        .remotes()?
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let remote = if let Some(remote) = selected_remote {
+        anyhow::ensure!(
+            remote_names.iter().any(|name| name == remote),
+            "Selected Git remote '{remote}' no longer exists"
+        );
+        remote.to_string()
+    } else {
+        let push_remote =
+            git_optional_config(&config, &format!("{branch_prefix}pushRemote"))?
+                .or(git_optional_config(&config, "remote.pushDefault")?)
+                .or(git_optional_config(
+                    &config,
+                    &format!("{branch_prefix}remote"),
+                )?);
+        push_remote
+            .or_else(|| remote_names.iter().find(|name| *name == "origin").cloned())
+            .or_else(|| (remote_names.len() == 1).then(|| remote_names[0].clone()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "No push remote is configured. Add an 'origin' remote or set remote.pushDefault."
+                )
+            })?
+    };
+    anyhow::ensure!(
+        repository.find_remote(&remote).is_ok(),
+        "Selected Git remote '{remote}' was not found"
+    );
+
+    let remote_ref = git_optional_config(&config, &format!("{branch_prefix}merge"))?
+        .unwrap_or_else(|| local_ref.to_string());
+    anyhow::ensure!(
+        remote_ref.starts_with("refs/heads/"),
+        "Configured upstream '{remote_ref}' is not a remote branch"
+    );
+
+    let refspec = format!("{local_ref}:{remote_ref}");
+    let mut command = std::process::Command::new("git");
+    command.arg("push");
+    if !branch_has_upstream {
+        command.arg("--set-upstream");
+    }
+    command
+        .arg(&remote)
+        .arg(&refspec)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(repository_root);
+    let output = crate::git_askpass::run_git_command(
+        &mut command,
+        core_rpc,
+        configured_git_askpass,
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::ensure!(
+        output.status.success(),
+        "Git push failed: {}",
+        if details.is_empty() {
+            format!("process exited with {}", output.status)
+        } else {
+            details
+        }
+    );
+    Ok(())
+}
+
+fn git_optional_config(config: &git2::Config, key: &str) -> Result<Option<String>> {
+    match config.get_string(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn git_create_branch(workspace_path: &Path, reference: &str) -> Result<()> {
+    anyhow::ensure!(
+        !reference.trim().is_empty() && reference == reference.trim(),
+        "Enter a valid local branch name"
+    );
+    let reference_name = format!("refs/heads/{reference}");
+    anyhow::ensure!(
+        git2::Reference::is_valid_name(&reference_name),
+        "Invalid local branch name '{reference}'"
+    );
+    let repo = Repository::discover(workspace_path)?;
+    let repository_root = repo
+        .workdir()
+        .context("Git repository has no working tree")?;
+    anyhow::ensure!(
+        !git_repository_dirty(repository_root)?,
+        "Commit, stash, or discard all repository changes before creating a branch"
+    );
+    match repo.find_branch(reference, git2::BranchType::Local) {
+        Ok(_) => anyhow::bail!("Local branch '{reference}' already exists"),
+        Err(error) if error.code() == NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    match repo.head() {
+        Ok(head) => {
+            let commit = head.peel_to_commit()?;
+            repo.branch(reference, &commit, false)?;
+        }
+        Err(error)
+            if matches!(error.code(), git2::ErrorCode::UnbornBranch | NotFound) => {}
+        Err(error) => return Err(error.into()),
+    }
+    repo.set_head(&reference_name)?;
+    Ok(())
+}
+
+fn git_delete_branch(workspace_path: &Path, reference: &str) -> Result<()> {
+    anyhow::ensure!(
+        !reference.trim().is_empty() && reference == reference.trim(),
+        "Select a valid local branch"
+    );
+    anyhow::ensure!(
+        git2::Reference::is_valid_name(&format!("refs/heads/{reference}")),
+        "Invalid local branch name '{reference}'"
+    );
+    let repo = Repository::discover(workspace_path)?;
+    let repository_root = repo
+        .workdir()
+        .context("Git repository has no working tree")?;
+    anyhow::ensure!(
+        !git_repository_dirty(repository_root)?,
+        "Commit, stash, or discard all repository changes before deleting a branch"
+    );
+    let head = repo
+        .head()
+        .context("Cannot delete a branch before the repository has a commit")?;
+    anyhow::ensure!(
+        head.shorthand() != Some(reference),
+        "Switch to another branch before deleting the current branch"
+    );
+    let head_commit = head.peel_to_commit()?;
+    let mut branch = repo
+        .find_branch(reference, git2::BranchType::Local)
+        .with_context(|| format!("Local branch '{reference}' was not found"))?;
+    let branch_commit = branch
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("Local branch '{reference}' has no commit"))?;
+    anyhow::ensure!(
+        head_commit.id() == branch_commit.id()
+            || repo.graph_descendant_of(head_commit.id(), branch_commit.id())?,
+        "Branch '{reference}' has commits not merged into the current branch"
+    );
+    branch.delete()?;
     Ok(())
 }
 
@@ -3652,38 +6538,779 @@ fn search_in_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        AHEAD_GITIGNORE, Buffer, Dispatcher, FileWatchNotifier,
-        ensure_ahead_gitignore, git_commit, is_prediction_target_visible,
-        is_provider_settings_path, prediction_prefix_suffix,
-        relevant_open_buffer_contexts, search_in_path,
+        AHEAD_GITIGNORE, Buffer, CachedPredictionDefinitions, Dispatcher,
+        FileWatchNotifier, GotoDefinitionResponse, INSTRUCTION_EVENT_TOKEN,
+        MAX_FIM_OPEN_BUFFERS, PredictionDefinitionCacheKey,
+        PredictionSemanticTokenCache, USER_SETTINGS_HOME_EVENT_TOKEN,
+        WORKSPACE_EVENT_TOKEN, cache_prediction_definitions,
+        cached_prediction_definitions, ensure_ahead_gitignore, git_checkout,
+        git_commit, git_commit_patch, git_create_branch, git_delete_branch,
+        git_history, git_push, git_stage_all, git_stage_paths,
+        git_status_bytes_are_conflicted, git_workspace_status,
+        git_worktree_file_patch, git_worktree_patch, is_prediction_target_visible,
+        is_provider_settings_path, is_user_ahead_directory,
+        is_user_lsp_settings_path, prediction_definition_locations,
+        prediction_identifier_positions,
+        prediction_identifier_positions_with_semantic_styles,
+        prediction_prefix_suffix, relevant_open_buffer_contexts, search_in_path,
+        workspace_file_rename,
     };
-    use crate::plugin::PluginCatalogRpcHandler;
+    use crate::plugin::{PluginCatalogRpc, PluginCatalogRpcHandler};
+    use crate::watcher::FileWatcher;
     use ahead_core::search::WorkspaceFileIndex;
     use ahead_rpc::{
         ahead::{AheadRequest, DisplayPosition, DisplayRange},
         buffer::BufferId,
         core::{CoreNotification, CoreRpc, CoreRpcHandler},
+        delta::{AheadDelta, DeltaOp},
         file::{EditorRecoverySnapshot, EditorRecoverySummary},
         proxy::{
             ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse, ProxyRpc,
             ProxyRpcHandler,
         },
-        source_control::FileDiff,
+        source_control::{FileDiff, GitStatusFile},
     };
     use git2::Repository;
     use ropey::Rope;
     use std::{
         collections::HashMap,
         fs,
+        path::{Path, PathBuf},
         sync::Arc,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
+    use url::Url;
+
+    fn wait_for_prediction_context(receiver: &crossbeam_channel::Receiver<CoreRpc>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let message = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("instruction changes should invalidate prediction context");
+            if matches!(message, CoreRpc::Notification(notification)
+            if matches!(*notification, CoreNotification::AheadNotification {
+                notification: ahead_rpc::ahead::AheadNotification::PredictionContextChanged { session_id: None }
+            })) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_rename_preserves_from_to_path_order() {
+        let old_path = PathBuf::from("src/old.rs");
+        let new_path = PathBuf::from("src/new.rs");
+        let event = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Name(notify::event::RenameMode::Both),
+        ))
+        .add_path(old_path.clone())
+        .add_path(new_path.clone());
+
+        assert_eq!(workspace_file_rename(&event), Some((old_path, new_path)));
+    }
+
+    fn ready_prediction_fixture() -> (
+        tempfile::TempDir,
+        Dispatcher,
+        std::path::PathBuf,
+        ahead_rpc::ahead::PredictionBinding,
+    ) {
+        use super::{OpenBufferContext, PredictionRequest, ReadyPrediction};
+        let directory =
+            tempfile::tempdir().expect("disposable prediction workspace");
+        let workspace = directory.path().canonicalize().expect("workspace");
+        fs::create_dir(workspace.join(".ahead")).expect("private settings");
+        fs::write(workspace.join("AGENTS.md"), "Preserve retries.")
+            .expect("instructions");
+        fs::write(workspace.join(".ahead/settings.toml"), "[ai]\nactive_connection='binding-test'\n[[ai.connections]]\nname='binding-test'\nprovider_id='binding-test'\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:1/v1'\nmodel='generic-model'\napi_key='SYNTHETIC-KEY-NOT-FOR-THE-WIRE'\n").expect("provider route");
+        let host = Arc::new(parking_lot::RwLock::new(
+            crate::ahead::host::AheadSessionHost::in_memory().expect("host"),
+        ));
+        host.read().set_workspace(workspace.clone());
+        let view = host
+            .read()
+            .start_work(
+                Some(ahead_rpc::ahead::WorkKind::ProductChange),
+                "Retries".into(),
+                "Preserve idempotency".into(),
+                None,
+            )
+            .expect("session");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher.workspace = Some(workspace.clone());
+        dispatcher.ahead_host = Some(host.clone());
+        let path = workspace.join("main.rs");
+        dispatcher
+            .sync_editor_snapshot(path.clone(), "fn ".into())
+            .expect("active buffer");
+        let helper = workspace.join("helper.rs");
+        dispatcher
+            .sync_editor_snapshot(helper, "fn helper() {}".into())
+            .expect("related buffer");
+        let request = PredictionRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some(view.session.id),
+            path: path.to_string_lossy().into_owned(),
+            cursor: DisplayPosition { line: 0, col: 3 },
+            prefix: "fn ".into(),
+            suffix: String::new(),
+            work_context: "ahead-editor-flow".into(),
+        };
+        let open_buffers = vec![OpenBufferContext {
+            path: "helper.rs".into(),
+            relevant_excerpt: "fn helper() {}".into(),
+        }];
+        let snapshot = host
+            .read()
+            .prepare_prediction(request.clone(), &open_buffers)
+            .expect("snapshot");
+        let serialized =
+            serde_json::to_string(&snapshot).expect("fingerprint input");
+        assert!(!serialized.contains("SYNTHETIC-KEY-NOT-FOR-THE-WIRE"));
+        assert!(!serialized.contains("api_key"));
+        let ready = ReadyPrediction::new(
+            snapshot,
+            request,
+            open_buffers,
+            &dispatcher.buffers,
+            &dispatcher.buffers[&path],
+            "main() {}".into(),
+        )
+        .expect("ready prediction");
+        let binding = ready.publish(path.clone(), &dispatcher.ready_predictions);
+        (directory, dispatcher, path, binding)
+    }
+
+    #[test]
+    fn prediction_acceptance_rechecks_the_host_and_target_without_notifications() {
+        use sha2::{Digest, Sha256};
+        for change in [
+            "none",
+            "typed-prefix",
+            "unrelated",
+            "target-edit",
+            "dependency-edit",
+            "reopen",
+            "instructions",
+            "provider",
+            "credential",
+            "session",
+            "position",
+            "content-hash",
+            "replacement",
+            "version",
+            "fingerprint",
+            "expired",
+        ] {
+            let (_directory, mut dispatcher, path, mut binding) =
+                ready_prediction_fixture();
+            let workspace = path.parent().expect("workspace");
+            let mut position = lsp_types::Position::new(0, 3);
+            match change {
+                "none" | "content-hash" | "replacement" => {}
+                "typed-prefix" => {
+                    dispatcher
+                        .sync_editor_snapshot(path.clone(), "fn ma".into())
+                        .expect("matching typing");
+                    position.character = 5;
+                }
+                "unrelated" => {
+                    dispatcher
+                        .sync_editor_snapshot(
+                            workspace.join("other.md"),
+                            "changed".into(),
+                        )
+                        .expect("unrelated change");
+                }
+                "target-edit" => {
+                    dispatcher
+                        .sync_editor_snapshot(path.clone(), "fn bad".into())
+                        .expect("divergence");
+                }
+                "dependency-edit" => {
+                    dispatcher
+                        .sync_editor_snapshot(
+                            workspace.join("helper.rs"),
+                            "changed".into(),
+                        )
+                        .expect("consumed change");
+                }
+                "reopen" => {
+                    dispatcher.close_editor_buffer(&workspace.join("helper.rs"));
+                    dispatcher
+                        .sync_editor_snapshot(
+                            workspace.join("helper.rs"),
+                            "fn helper() {}".into(),
+                        )
+                        .expect("new buffer identity");
+                }
+                "instructions" => {
+                    fs::write(workspace.join("AGENTS.md"), "Do not retry.")
+                        .expect("changed instructions")
+                }
+                "provider" | "credential" => {
+                    let settings = workspace.join(".ahead/settings.toml");
+                    let text = fs::read_to_string(&settings).expect("settings");
+                    fs::write(
+                        settings,
+                        if change == "provider" {
+                            text.replace("generic-model", "new-model")
+                        } else {
+                            text.replace(
+                                "SYNTHETIC-KEY-NOT-FOR-THE-WIRE",
+                                "REPLACED-SYNTHETIC-KEY",
+                            )
+                        },
+                    )
+                    .expect("route change");
+                }
+                "session" => {
+                    let session = dispatcher.ready_predictions.lock()[&path]
+                        .request
+                        .session_id
+                        .clone()
+                        .expect("session");
+                    dispatcher
+                        .ahead_host
+                        .as_ref()
+                        .expect("host")
+                        .read()
+                        .archive_session(&session)
+                        .expect("changed lifecycle");
+                }
+                "position" => position.character = 0,
+                "version" => binding.version += 1,
+                "fingerprint" => binding.context_sha256 = "wrong".into(),
+                "expired" => {
+                    dispatcher
+                        .ready_predictions
+                        .lock()
+                        .get_mut(&path)
+                        .expect("cached binding")
+                        .created = Instant::now()
+                        .checked_sub(
+                            super::PREDICTION_LIFETIME + Duration::from_secs(1),
+                        )
+                        .expect("expired instant")
+                }
+                _ => unreachable!(),
+            }
+            let digest = if change == "content-hash" {
+                "wrong".into()
+            } else {
+                format!(
+                    "{:x}",
+                    Sha256::digest(
+                        dispatcher.buffers[&path].rope.to_string().as_bytes()
+                    )
+                )
+            };
+            let replacement = if change == "typed-prefix" {
+                "in() {}"
+            } else if change == "replacement" {
+                "forged_completion()"
+            } else {
+                "main() {}"
+            };
+            let outcome = dispatcher.validate_inline_prediction(
+                &path,
+                position,
+                &digest,
+                replacement,
+                &binding,
+            );
+            if change == "session" {
+                assert!(
+                    outcome
+                        .expect_err("archived context")
+                        .to_string()
+                        .contains("Archived")
+                );
+                continue;
+            }
+            let valid = outcome.expect("authoritative validation");
+            assert_eq!(
+                valid,
+                matches!(change, "none" | "typed-prefix" | "unrelated"),
+                "{change}"
+            );
+            if valid {
+                assert!(
+                    !dispatcher
+                        .validate_inline_prediction(
+                            &path,
+                            position,
+                            &digest,
+                            replacement,
+                            &binding
+                        )
+                        .expect("one-shot binding")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prediction_ready_cache_is_bounded_and_does_not_retire_a_newer_binding() {
+        let (_directory, dispatcher, path, old) = ready_prediction_fixture();
+        let mut ready = dispatcher
+            .ready_predictions
+            .lock()
+            .remove(&path)
+            .expect("ready prediction");
+        ready.binding.request_id = "newer".into();
+        let newer = ready.publish(path.clone(), &dispatcher.ready_predictions);
+        assert!(
+            !dispatcher
+                .validate_inline_prediction(
+                    &path,
+                    lsp_types::Position::new(0, 3),
+                    "unused",
+                    "main() {}",
+                    &old
+                )
+                .expect("old token")
+        );
+        assert_eq!(dispatcher.ready_predictions.lock()[&path].binding, newer);
+        for index in 0..=super::MAX_READY_PREDICTIONS {
+            let (_directory, fixture, fixture_path, _) = ready_prediction_fixture();
+            let ready = fixture
+                .ready_predictions
+                .lock()
+                .remove(&fixture_path)
+                .expect("ready entry");
+            ready.publish(
+                path.with_file_name(format!("{index}.rs")),
+                &dispatcher.ready_predictions,
+            );
+        }
+        assert_eq!(
+            dispatcher.ready_predictions.lock().len(),
+            super::MAX_READY_PREDICTIONS
+        );
+    }
+
+    #[test]
+    fn prediction_binding_reuses_bounded_excerpts_for_large_unicode_targets() {
+        use super::ReadyPrediction;
+        use sha2::{Digest, Sha256};
+        let (_directory, mut dispatcher, path, _) = ready_prediction_fixture();
+        let previous = dispatcher
+            .ready_predictions
+            .lock()
+            .remove(&path)
+            .expect("previous binding");
+        let text = format!("{}fn ", "// café 日本語\n".repeat(8000));
+        dispatcher
+            .sync_editor_snapshot(path.clone(), text.clone())
+            .expect("large unsaved target");
+        let target = &dispatcher.buffers[&path];
+        let position = target.offset_to_position(text.len());
+        let mut request = previous.request;
+        request.prefix = text.clone();
+        request.cursor = DisplayPosition {
+            line: position.line,
+            col: position.character,
+        };
+        let snapshot = dispatcher
+            .ahead_host
+            .as_ref()
+            .expect("host")
+            .read()
+            .prepare_prediction(request.clone(), &previous.open_buffers)
+            .expect("large context");
+        let ready = ReadyPrediction::new(
+            snapshot,
+            request,
+            previous.open_buffers,
+            &dispatcher.buffers,
+            target,
+            "main() {}".into(),
+        )
+        .expect("bounded binding");
+        assert!(ready.request.prefix.len() < text.len());
+        assert_eq!(ready.insertion_offset, text.len());
+        let binding = ready.publish(path.clone(), &dispatcher.ready_predictions);
+        assert!(
+            dispatcher
+                .validate_inline_prediction(
+                    &path,
+                    position,
+                    &format!("{:x}", Sha256::digest(text.as_bytes())),
+                    "main() {}",
+                    &binding
+                )
+                .expect("Unicode target acceptance")
+        );
+    }
+
+    #[test]
+    fn prediction_provider_reply_carries_a_binding_through_acceptance_rpc() {
+        use sha2::{Digest, Sha256};
+        use std::io::{BufRead, Read, Write};
+        let (_directory, mut dispatcher, path, _) = ready_prediction_fixture();
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("local provider");
+        listener.set_nonblocking(true).expect("bounded listener");
+        let address = listener.local_addr().expect("address");
+        let settings = path
+            .parent()
+            .expect("workspace")
+            .join(".ahead/settings.toml");
+        fs::write(
+            &settings,
+            fs::read_to_string(&settings)
+                .expect("settings")
+                .replace("127.0.0.1:1", &address.to_string()),
+        )
+        .expect("local route");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("provider connection: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("bounded reads");
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).expect("header") > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().expect("length");
+                }
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).expect("outbound prompt");
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("provider request");
+            assert!(
+                body["prompt"]
+                    .as_str()
+                    .expect("prompt")
+                    .contains("Preserve retries.")
+            );
+            let response = r#"{"choices":[{"text":"main() {}"}]}"#;
+            write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("completion response");
+        });
+        let rpc = dispatcher.proxy_rpc.clone();
+        let catalog = dispatcher.catalog_rpc.test_receiver();
+        catalog.try_iter().for_each(drop);
+        let session_id = dispatcher.ready_predictions.lock()[&path]
+            .request
+            .session_id
+            .clone();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        rpc.get_inline_completions(
+            path.clone(),
+            lsp_types::Position::new(0, 3),
+            lsp_types::InlineCompletionTriggerKind::Automatic,
+            session_id,
+            None,
+            move |result| sender.send(result).expect("prediction outcome"),
+        );
+        let ProxyRpc::Request(id, request) = rpc.rx().try_recv().expect("request")
+        else {
+            panic!("request")
+        };
+        dispatcher.handle_request(id, request);
+        let PluginCatalogRpc::ServerRequest { f, .. } = catalog
+            .recv_timeout(Duration::from_secs(2))
+            .expect("LSP inline request")
+        else {
+            panic!("LSP request")
+        };
+        f(ahead_rpc::plugin::PluginId(0), Ok(serde_json::json!([])));
+        let response = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("prediction response")
+            .expect("prediction success");
+        let ProxyResponse::GetInlineCompletions {
+            prediction: Some(binding),
+            ..
+        } = response
+        else {
+            panic!("host must bind FIM output")
+        };
+        assert_eq!(binding.version, 1);
+        assert_eq!(binding.context_sha256.len(), 64);
+        let request = ProxyRequest::ValidateInlinePrediction {
+            path: path.clone(),
+            position: lsp_types::Position::new(0, 3),
+            content_sha256: format!("{:x}", Sha256::digest(b"fn ")),
+            replacement: "main() {}".into(),
+            binding,
+        };
+        let request: ProxyRequest = serde_json::from_str(
+            &serde_json::to_string(&request).expect("encode validation"),
+        )
+        .expect("decode validation");
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        rpc.request_async(request, move |result| {
+            sender.send(result).expect("validation outcome")
+        });
+        let ProxyRpc::Request(id, request) =
+            rpc.rx().try_recv().expect("validation")
+        else {
+            panic!("validation request")
+        };
+        dispatcher.handle_request(id, request);
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("validation response")
+                .expect("validation success"),
+            ProxyResponse::ValidateInlinePrediction { valid: true }
+        ));
+        assert_eq!(
+            dispatcher.buffers[&path].rope.to_string(),
+            "fn ",
+            "validation never applies an editor change"
+        );
+        server.join().expect("local provider");
+    }
+
+    #[test]
+    fn inline_prediction_cancellation_tracks_only_consumed_buffers() {
+        use super::InlinePredictionJob;
+        use crate::ahead::prediction::PredictionCancellation;
+        let directory = tempfile::tempdir().expect("disposable FIM workspace");
+        let active = directory.path().join("main.rs");
+        let related = directory.path().join("helper.rs");
+        let unrelated = directory.path().join("other/readme.md");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher
+            .sync_editor_snapshot(active.clone(), "fn main() {}".into())
+            .expect("active buffer");
+        dispatcher
+            .sync_editor_snapshot(related.clone(), "fn helper() {}".into())
+            .expect("related buffer");
+        for action in ["related edit", "close", "shutdown"] {
+            let cancellation = PredictionCancellation::default();
+            dispatcher.inline_prediction_jobs.lock().insert(
+                1,
+                InlinePredictionJob {
+                    path: active.clone(),
+                    dependencies: [active.clone(), related.clone()]
+                        .into_iter()
+                        .collect(),
+                    cancellation: cancellation.clone(),
+                },
+            );
+            dispatcher
+                .sync_editor_snapshot(unrelated.clone(), action.into())
+                .expect("unrelated edit");
+            assert!(
+                !cancellation.is_cancelled(),
+                "unrelated buffer must not cancel FIM"
+            );
+            dispatcher
+                .sync_editor_snapshot(active.clone(), "fn main() {}".into())
+                .expect("unchanged snapshot");
+            assert!(
+                !cancellation.is_cancelled(),
+                "unchanged snapshot must not cancel FIM"
+            );
+            match action {
+                "related edit" => {
+                    dispatcher
+                        .sync_editor_snapshot(
+                            related.clone(),
+                            "fn changed() {}".into(),
+                        )
+                        .expect("changed dependency");
+                }
+                "close" => dispatcher.close_editor_buffer(&related),
+                "shutdown" => {
+                    dispatcher.handle_notification(ProxyNotification::Shutdown {})
+                }
+                _ => unreachable!(),
+            }
+            assert!(cancellation.is_cancelled(), "{action}");
+            assert!(dispatcher.inline_prediction_jobs.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn inline_prediction_releases_the_host_and_aborts_after_an_editor_change() {
+        use std::io::{BufRead, Read};
+        for explicit_cancel in [false, true] {
+            let directory = tempfile::tempdir().expect("disposable FIM project");
+            let workspace = directory.path().canonicalize().expect("workspace");
+            fs::create_dir(workspace.join(".ahead"))
+                .expect("private settings directory");
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("local prediction provider");
+            listener.set_nonblocking(true).expect("bounded accept");
+            let address = listener.local_addr().expect("provider address");
+            let connection = format!("fim-cancel-test-{}", uuid::Uuid::new_v4());
+            fs::write(workspace.join(".ahead/settings.toml"), format!(
+            "[ai]\nactive_connection = '{connection}'\n[[ai.connections]]\nname = '{connection}'\nprovider_id = '{connection}'\nprovider = 'openai-compatible'\nbase_url = 'http://{address}/v1'\nmodel = 'generic-model'\n",
+        )).expect("isolated prediction endpoint");
+            let host = Arc::new(parking_lot::RwLock::new(
+                crate::ahead::host::AheadSessionHost::in_memory()
+                    .expect("session host"),
+            ));
+            host.read().set_workspace(workspace.clone());
+            let rpc = ProxyRpcHandler::new();
+            let mut dispatcher = Dispatcher::new(CoreRpcHandler::new(), rpc.clone());
+            dispatcher.workspace = Some(workspace.clone());
+            dispatcher.ahead_host = Some(host.clone());
+            let active = workspace.join("main.rs");
+            dispatcher
+                .sync_editor_snapshot(active.clone(), "fn ".into())
+                .expect("active buffer");
+            let catalog = dispatcher.catalog_rpc.test_receiver();
+            drop(catalog.try_iter().collect::<Vec<_>>());
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            rpc.get_inline_completions(
+                active.clone(),
+                lsp_types::Position::new(0, 3),
+                lsp_types::InlineCompletionTriggerKind::Automatic,
+                None,
+                None,
+                move |result| sender.send(result).expect("inline response"),
+            );
+            let ProxyRpc::Request(id, request) =
+                rpc.rx().try_recv().expect("inline request")
+            else {
+                panic!("expected inline request");
+            };
+            dispatcher.handle_request(id, request);
+            let PluginCatalogRpc::ServerRequest { f, .. } = catalog
+                .recv_timeout(Duration::from_secs(2))
+                .expect("inline LSP request")
+            else {
+                panic!("expected inline LSP request");
+            };
+            f(ahead_rpc::plugin::PluginId(0), Ok(serde_json::json!([])));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (stream, _) = loop {
+                match listener.accept() {
+                    Ok(connected) => break connected,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("FIM did not connect promptly: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bounded socket reads");
+            let mut provider = std::io::BufReader::new(stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(
+                    provider.read_line(&mut line).expect("FIM request header") > 0
+                );
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().expect("body length");
+                }
+            }
+            provider
+                .read_exact(&mut vec![0; content_length])
+                .expect("FIM request body");
+            assert!(
+                host.try_write().is_some(),
+                "inference must not hold the host lock"
+            );
+            assert!(receiver.try_recv().is_err(), "provider has not answered");
+            if explicit_cancel {
+                dispatcher.handle_notification(
+                    ProxyNotification::CancelInlineCompletions { request_id: id },
+                );
+            } else {
+                dispatcher
+                    .sync_editor_snapshot(active, "fn main".into())
+                    .expect("typing invalidates prediction");
+            }
+            let result = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancelled inline response")
+                .expect("empty completion response");
+            assert!(matches!(result, ProxyResponse::GetInlineCompletions {
+            completions: lsp_types::InlineCompletionResponse::Array(items), ..
+        } if items.is_empty()));
+            assert_eq!(provider.read(&mut [0]).expect("provider socket closure"), 0);
+            assert!(dispatcher.inline_prediction_jobs.lock().is_empty());
+            drop(catalog.try_iter().collect::<Vec<_>>());
+
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            let active = workspace.join("main.rs");
+            rpc.get_inline_completions(
+                active.clone(),
+                lsp_types::Position::new(0, 7),
+                lsp_types::InlineCompletionTriggerKind::Automatic,
+                None,
+                None,
+                move |result| sender.send(result).expect("late inline response"),
+            );
+            let ProxyRpc::Request(id, request) =
+                rpc.rx().try_recv().expect("second inline request")
+            else {
+                panic!("expected second inline request");
+            };
+            dispatcher.handle_request(id, request);
+            let PluginCatalogRpc::ServerRequest { f, .. } = catalog
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second inline LSP request")
+            else {
+                panic!("expected second inline LSP request");
+            };
+            dispatcher.close_editor_buffer(&active);
+            f(ahead_rpc::plugin::PluginId(0), Ok(serde_json::json!([])));
+            let result = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closed-buffer response")
+                .expect("empty completion response");
+            assert!(matches!(result, ProxyResponse::GetInlineCompletions {
+            completions: lsp_types::InlineCompletionResponse::Array(items), ..
+        } if items.is_empty()));
+            assert!(
+                listener.accept().is_err_and(
+                    |error| error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "a late LSP reply must not launch FIM for a closed buffer"
+            );
+        }
+    }
 
     fn git_metadata_fixture() -> (tempfile::TempDir, Repository, std::path::PathBuf)
     {
         let directory = tempfile::tempdir().expect("Git fixture");
-        let repo = Repository::init(directory.path()).expect("init fixture");
+        let mut init_options = git2::RepositoryInitOptions::new();
+        // The machines running these tests do not agree on a default branch
+        // name, so pin it rather than inheriting `init.defaultBranch`.
+        init_options.initial_head("main");
+        let repo = Repository::init_opts(directory.path(), &init_options)
+            .expect("init fixture");
         let path = directory.path().join("main.ts");
         fs::write(&path, "first\nsecond\nthird\n").expect("source");
         let mut index = repo.index().expect("index");
@@ -3704,6 +7331,783 @@ mod tests {
         )
         .expect("commit");
         (directory, repo, path)
+    }
+
+    #[test]
+    fn git_history_returns_newest_commits_and_handles_unborn_repositories() {
+        let (directory, repository, _) = git_metadata_fixture();
+        let first = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("initial commit");
+        let signature = git2::Signature::now("Grace", "grace@example.invalid")
+            .expect("signature");
+        let tree = first.tree().expect("initial tree");
+        let second_id = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Second source",
+                &tree,
+                &[&first],
+            )
+            .expect("second commit");
+
+        let latest = git_history(directory.path(), 1).expect("latest commit");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].id, second_id.to_string());
+        assert_eq!(latest[0].author, "Grace");
+        assert_eq!(latest[0].subject, "Second source");
+
+        let all = git_history(directory.path(), 100).expect("history");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, second_id.to_string());
+        assert_eq!(all[1].subject, "Initial source");
+
+        let unborn = tempfile::tempdir().expect("unborn repository directory");
+        Repository::init(unborn.path()).expect("initialize unborn repository");
+        assert!(
+            git_history(unborn.path(), 100)
+                .expect("empty history")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn git_commit_patch_returns_root_and_parent_diffs() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        let first = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("initial commit");
+
+        let root_patch = git_commit_patch(directory.path(), &first.id().to_string())
+            .expect("root commit patch");
+        assert!(
+            root_patch.patch.contains("diff --git a/main.ts b/main.ts"),
+            "{:?}",
+            root_patch.patch
+        );
+        assert!(
+            root_patch.patch.contains("+first"),
+            "{:?}",
+            root_patch.patch
+        );
+        assert!(!root_patch.truncated);
+
+        fs::write(&tracked_path, "first\nupdated\nthird\n").expect("updated source");
+        let mut index = repository.index().expect("index");
+        index
+            .add_path(std::path::Path::new("main.ts"))
+            .expect("stage updated source");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("updated tree");
+        let signature = git2::Signature::now("Grace", "grace@example.invalid")
+            .expect("signature");
+        let second_id = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Update source",
+                &repository.find_tree(tree_id).expect("updated tree"),
+                &[&first],
+            )
+            .expect("second commit");
+
+        let change_patch =
+            git_commit_patch(directory.path(), &second_id.to_string())
+                .expect("change commit patch");
+        assert!(change_patch.patch.contains("-second"));
+        assert!(change_patch.patch.contains("+updated"));
+        assert!(!change_patch.truncated);
+    }
+
+    #[test]
+    fn git_worktree_file_patch_reads_deleted_content_from_head() {
+        let (directory, repository, _) = git_metadata_fixture();
+        let nested_directory = directory.path().join("nested");
+        fs::create_dir_all(&nested_directory).expect("nested workspace");
+        let deleted_path = nested_directory.join("deleted.ts");
+        fs::write(&deleted_path, "export const beforeDelete = 42;\n")
+            .expect("source to delete");
+
+        let mut index = repository.index().expect("index");
+        index
+            .add_path(Path::new("nested/deleted.ts"))
+            .expect("stage source");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let parent = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("initial commit");
+        let signature = git2::Signature::now("Grace", "grace@example.invalid")
+            .expect("signature");
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Add nested source",
+                &repository.find_tree(tree_id).expect("tree"),
+                &[&parent],
+            )
+            .expect("commit source");
+        fs::remove_file(&deleted_path).expect("delete source");
+
+        let patch =
+            git_worktree_file_patch(&nested_directory, Path::new("deleted.ts"))
+                .expect("deleted file patch");
+        assert_eq!(patch.id, "deleted.ts");
+        assert!(
+            patch
+                .patch
+                .contains("diff --git a/nested/deleted.ts b/nested/deleted.ts")
+        );
+        assert!(patch.patch.contains("-export const beforeDelete = 42;"));
+        assert!(!patch.truncated);
+    }
+
+    #[test]
+    fn git_worktree_file_patch_rejects_paths_outside_workspace() {
+        let (directory, _, _) = git_metadata_fixture();
+        let error =
+            git_worktree_file_patch(directory.path(), Path::new("../secret.txt"))
+                .expect_err("parent traversal must be rejected");
+        assert!(error.to_string().contains("workspace-relative"));
+    }
+
+    #[test]
+    fn git_worktree_patch_includes_all_changes_and_scopes_nested_workspaces() {
+        let (directory, repository, _) = git_metadata_fixture();
+        let nested_workspace = directory.path().join("nested");
+        fs::create_dir_all(&nested_workspace).expect("nested workspace");
+        let tracked_path = nested_workspace.join("tracked.ts");
+        let deleted_path = nested_workspace.join("deleted.ts");
+        let sibling_path = directory.path().join("sibling.ts");
+        fs::write(&tracked_path, "baseline\n").expect("tracked source");
+        fs::write(&deleted_path, "remove me\n").expect("deleted source");
+        fs::write(&sibling_path, "sibling baseline\n").expect("sibling source");
+        let mut index = repository.index().expect("index");
+        index
+            .add_path(Path::new("nested/tracked.ts"))
+            .expect("stage nested source");
+        index
+            .add_path(Path::new("nested/deleted.ts"))
+            .expect("stage deleted source");
+        index
+            .add_path(Path::new("sibling.ts"))
+            .expect("stage sibling source");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let parent = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("initial commit");
+        let signature = git2::Signature::now("Grace", "grace@example.invalid")
+            .expect("signature");
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Add nested files",
+                &repository.find_tree(tree_id).expect("tree"),
+                &[&parent],
+            )
+            .expect("commit fixture files");
+
+        fs::write(&tracked_path, "staged version\n").expect("staged edit");
+        let mut index = repository.index().expect("index");
+        index
+            .add_path(Path::new("nested/tracked.ts"))
+            .expect("stage edit");
+        index.write().expect("write staged edit");
+        fs::write(&tracked_path, "unstaged version\n").expect("unstaged edit");
+        fs::remove_file(&deleted_path).expect("delete nested file");
+        let untracked_path = nested_workspace.join("new directory/untracked.ts");
+        fs::create_dir_all(untracked_path.parent().expect("untracked parent"))
+            .expect("create untracked directory");
+        fs::write(&untracked_path, "new file\n").expect("untracked source");
+        fs::write(&sibling_path, "sibling edit\n").expect("outside edit");
+
+        let patch = git_worktree_patch(&nested_workspace)
+            .expect("nested workspace aggregate diff");
+
+        assert_eq!(patch.id, "working-tree");
+        assert!(patch.patch.contains("nested/tracked.ts"));
+        assert!(patch.patch.contains("+unstaged version"));
+        assert!(patch.patch.contains("nested/deleted.ts"));
+        assert!(patch.patch.contains("-remove me"));
+        assert!(patch.patch.contains("nested/new directory/untracked.ts"));
+        assert!(patch.patch.contains("+new file"));
+        assert!(!patch.patch.contains("sibling.ts"));
+        assert!(!patch.truncated);
+    }
+
+    #[test]
+    fn workspace_git_status_preserves_paths_and_distinguishes_index_from_worktree() {
+        let (directory, _, tracked_path) = git_metadata_fixture();
+        fs::write(&tracked_path, "staged edit\n").expect("staged source");
+        let stage = std::process::Command::new("git")
+            .args(["add", "--", "main.ts"])
+            .current_dir(directory.path())
+            .status()
+            .expect("stage source");
+        assert!(stage.success());
+        fs::write(&tracked_path, "unstaged edit\n").expect("unstaged source");
+        let untracked_path = directory.path().join("nested directory/new file.ts");
+        fs::create_dir_all(untracked_path.parent().expect("parent"))
+            .expect("nested directory");
+        fs::write(&untracked_path, "new source\n").expect("untracked source");
+
+        let status = git_workspace_status(directory.path()).expect("Git status");
+        assert_ne!(status.branch, "HEAD");
+        assert!(status.branches.contains(&status.branch));
+        assert_eq!(
+            status.files,
+            vec![
+                GitStatusFile {
+                    path: "main.ts".into(),
+                    state: "MM".into(),
+                    staged: true,
+                },
+                GitStatusFile {
+                    path: "nested directory/new file.ts".into(),
+                    state: "??".into(),
+                    staged: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_all_leaves_conflicts_unmerged_and_commit_refuses_them() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        let original_branch = repository
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        {
+            let mut config = repository.config().expect("config");
+            config
+                .set_str("user.name", "Human Developer")
+                .expect("name");
+            config
+                .set_str("user.email", "human@example.test")
+                .expect("email");
+        }
+
+        let base = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("base commit");
+        repository
+            .branch("side", &base, false)
+            .expect("side branch");
+        fs::write(&tracked_path, "ours\n").expect("our edit");
+        let output = std::process::Command::new("git")
+            .args(["add", "--", "main.ts"])
+            .current_dir(directory.path())
+            .status()
+            .expect("stage our edit");
+        assert!(output.success());
+        let output = std::process::Command::new("git")
+            .args(["commit", "-m", "ours"])
+            .current_dir(directory.path())
+            .status()
+            .expect("commit our edit");
+        assert!(output.success());
+
+        let output = std::process::Command::new("git")
+            .args(["checkout", "side"])
+            .current_dir(directory.path())
+            .status()
+            .expect("checkout side");
+        assert!(output.success());
+        fs::write(&tracked_path, "theirs\n").expect("side edit");
+        let output = std::process::Command::new("git")
+            .args(["add", "--", "main.ts"])
+            .current_dir(directory.path())
+            .status()
+            .expect("stage side edit");
+        assert!(output.success());
+        let output = std::process::Command::new("git")
+            .args(["commit", "-m", "theirs"])
+            .current_dir(directory.path())
+            .status()
+            .expect("commit side edit");
+        assert!(output.success());
+        let output = std::process::Command::new("git")
+            .args(["checkout", &original_branch])
+            .current_dir(directory.path())
+            .status()
+            .expect("return to original branch");
+        assert!(output.success());
+        let output = std::process::Command::new("git")
+            .args(["merge", "side"])
+            .current_dir(directory.path())
+            .output()
+            .expect("create merge conflict");
+        assert!(!output.status.success(), "merge must stop for resolution");
+
+        let conflict_status =
+            git_workspace_status(directory.path()).expect("conflict status");
+        assert!(conflict_status.repository_has_conflicts);
+        assert_eq!(
+            conflict_status.files[0].state, "UU",
+            "{:?}",
+            conflict_status.files
+        );
+        assert!(!conflict_status.files[0].staged);
+
+        fs::write(directory.path().join("other.ts"), "safe to stage\n")
+            .expect("additional change");
+        git_stage_all(directory.path()).expect("stage non-conflicted changes");
+        let status = git_workspace_status(directory.path()).expect("updated status");
+        let conflict = status
+            .files
+            .iter()
+            .find(|file| file.path == "main.ts")
+            .expect("conflicted path remains");
+        assert_eq!(conflict.state, "UU");
+        assert!(!conflict.staged);
+        assert!(
+            status
+                .files
+                .iter()
+                .any(|file| file.path == "other.ts" && file.staged)
+        );
+
+        let nested_workspace = directory.path().join("project");
+        fs::create_dir_all(&nested_workspace).expect("nested workspace");
+        let nested_status =
+            git_workspace_status(&nested_workspace).expect("nested Git status");
+        assert!(nested_status.repository_has_conflicts);
+        assert!(nested_status.files.is_empty());
+
+        let error = git_commit(&nested_workspace, "Blocked", Vec::new(), &[])
+            .expect_err("unresolved repository conflicts block commits");
+        assert!(
+            error
+                .to_string()
+                .contains("Resolve and stage all conflicted files")
+        );
+        assert!(
+            git_workspace_status(directory.path())
+                .expect("conflict remains after blocked commit")
+                .repository_has_conflicts
+        );
+    }
+
+    #[test]
+    fn git_status_marks_all_porcelain_unmerged_states_as_conflicts() {
+        for (index_status, worktree_status) in [
+            (b'D', b'D'),
+            (b'A', b'U'),
+            (b'U', b'D'),
+            (b'U', b'A'),
+            (b'D', b'U'),
+            (b'A', b'A'),
+            (b'U', b'U'),
+        ] {
+            assert!(git_status_bytes_are_conflicted(
+                index_status,
+                worktree_status
+            ));
+        }
+        assert!(!git_status_bytes_are_conflicted(b'M', b' '));
+        assert!(!git_status_bytes_are_conflicted(b'?', b'?'));
+    }
+
+    #[test]
+    fn git_checkout_switches_local_branches_only_with_a_clean_worktree() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        let original_branch = repository
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        let head = repository
+            .head()
+            .expect("HEAD")
+            .peel_to_commit()
+            .expect("initial commit");
+        repository
+            .branch("feature", &head, false)
+            .expect("create feature branch");
+
+        git_checkout(directory.path(), "feature").expect("switch branch");
+        let checked_out_repository =
+            Repository::open(directory.path()).expect("reopen repo");
+        assert_eq!(
+            checked_out_repository
+                .head()
+                .expect("feature HEAD")
+                .shorthand(),
+            Some("feature")
+        );
+
+        let nested_workspace = directory.path().join("project");
+        fs::create_dir_all(&nested_workspace).expect("nested workspace");
+        fs::write(&tracked_path, "uncommitted sibling change\n")
+            .expect("dirty sibling source");
+        let error = git_checkout(&nested_workspace, &original_branch)
+            .expect_err("dirty worktrees must not be switched");
+        assert!(error.to_string().contains("all repository changes"));
+        let unchanged_repository =
+            Repository::open(directory.path()).expect("reopen repo");
+        assert_eq!(
+            unchanged_repository
+                .head()
+                .expect("unchanged HEAD")
+                .shorthand(),
+            Some("feature")
+        );
+    }
+
+    #[test]
+    fn git_create_branch_selects_local_and_unborn_branches() {
+        let (directory, _, _) = git_metadata_fixture();
+        git_create_branch(directory.path(), "feature/topic")
+            .expect("create and switch to local branch");
+        let status = git_workspace_status(directory.path()).expect("branch status");
+        assert_eq!(status.branch, "feature/topic");
+        assert!(status.branches.contains(&"feature/topic".to_string()));
+
+        let unborn = tempfile::tempdir().expect("unborn repository");
+        Repository::init(unborn.path()).expect("init unborn repository");
+        git_create_branch(unborn.path(), "main").expect("name unborn branch");
+        let status = git_workspace_status(unborn.path()).expect("unborn status");
+        assert_eq!(status.branch, "main");
+        assert!(status.branches.is_empty());
+    }
+
+    #[test]
+    fn git_push_publishes_selected_remote_and_preserves_existing_upstream() {
+        let (directory, repository, _) = git_metadata_fixture();
+        let remote_directory = tempfile::tempdir().expect("bare remote");
+        let hook_directory = directory.path().join("empty-hooks");
+        fs::create_dir(&hook_directory).expect("empty hook directory");
+        let remote_repository = Repository::init_bare(remote_directory.path())
+            .expect("initialize remote");
+        remote_repository
+            .config()
+            .expect("bare remote config")
+            .set_str(
+                "core.hooksPath",
+                hook_directory.to_str().expect("hook path is UTF-8"),
+            )
+            .expect("disable inherited hooks on the test remote");
+        let branch_name = repository
+            .head()
+            .expect("current branch")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        let remote_name = format!("ahead-push-test-{}", std::process::id());
+        repository
+            .remote(
+                &remote_name,
+                remote_directory
+                    .path()
+                    .to_str()
+                    .expect("remote path is UTF-8"),
+            )
+            .expect("configure local test remote");
+        let mut config = repository.config().expect("repository config");
+        config
+            .set_str(&format!("branch.{branch_name}.pushRemote"), &remote_name)
+            .expect("select local test remote");
+        config
+            .set_str(
+                &format!("branch.{branch_name}.merge"),
+                &format!("refs/heads/{branch_name}"),
+            )
+            .expect("select local test branch");
+        config
+            .set_str(
+                "core.hooksPath",
+                hook_directory.to_str().expect("hook path is UTF-8"),
+            )
+            .expect("disable inherited Git hooks for this fixture");
+        drop(config);
+
+        git_push(directory.path(), Some(&remote_name), CoreRpcHandler::new())
+            .expect("publish current branch");
+
+        let second_remote_directory =
+            tempfile::tempdir().expect("second bare remote");
+        let second_remote_repository =
+            Repository::init_bare(second_remote_directory.path())
+                .expect("initialize second remote");
+        second_remote_repository
+            .config()
+            .expect("second bare remote config")
+            .set_str(
+                "core.hooksPath",
+                hook_directory.to_str().expect("hook path is UTF-8"),
+            )
+            .expect("disable inherited hooks on the second test remote");
+        let second_remote_name =
+            format!("ahead-push-test-secondary-{}", std::process::id());
+        repository
+            .remote(
+                &second_remote_name,
+                second_remote_directory
+                    .path()
+                    .to_str()
+                    .expect("second remote path is UTF-8"),
+            )
+            .expect("configure second local test remote");
+        git_push(
+            directory.path(),
+            Some(&second_remote_name),
+            CoreRpcHandler::new(),
+        )
+        .expect("push to selected second remote");
+
+        let repository =
+            Repository::open(directory.path()).expect("reopen repository");
+        let branch = repository
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .expect("published local branch");
+        let expected_upstream = format!("refs/remotes/{remote_name}/{branch_name}");
+        let upstream = branch.upstream().expect("configured upstream");
+        assert_eq!(upstream.get().name(), Some(expected_upstream.as_str()));
+        let status = git_workspace_status(directory.path()).expect("updated status");
+        assert!(status.branch_has_upstream);
+        assert!(status.remotes.contains(&remote_name));
+    }
+
+    #[test]
+    fn git_create_branch_rejects_invalid_duplicate_and_dirty_requests() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        assert!(git_create_branch(directory.path(), "bad..name").is_err());
+        git_create_branch(directory.path(), "feature")
+            .expect("create feature branch");
+        let duplicate = git_create_branch(directory.path(), "feature")
+            .expect_err("duplicate branch");
+        assert!(duplicate.to_string().contains("already exists"));
+
+        fs::write(&tracked_path, "uncommitted\n").expect("dirty source");
+        let dirty = git_create_branch(directory.path(), "other")
+            .expect_err("dirty worktree");
+        assert!(dirty.to_string().contains("repository changes"));
+        assert!(
+            repository
+                .find_branch("other", git2::BranchType::Local)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_delete_branch_requires_clean_merged_non_current_branch() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        git_create_branch(directory.path(), "feature")
+            .expect("create branch to delete");
+        git_checkout(directory.path(), "main").expect("switch to main");
+
+        git_delete_branch(directory.path(), "feature")
+            .expect("delete merged branch");
+        assert!(
+            repository
+                .find_branch("feature", git2::BranchType::Local)
+                .is_err()
+        );
+
+        let current = git_delete_branch(directory.path(), "main")
+            .expect_err("current branch cannot be deleted");
+        assert!(current.to_string().contains("current branch"));
+
+        git_create_branch(directory.path(), "unmerged").expect("create branch");
+        let signature =
+            git2::Signature::now("Ada", "ada@example.invalid").expect("signature");
+        let head = repository
+            .head()
+            .expect("branch HEAD")
+            .peel_to_commit()
+            .expect("branch commit");
+        let tree = head.tree().expect("tree");
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Unmerged work",
+                &tree,
+                &[&head],
+            )
+            .expect("commit on unmerged branch");
+        git_checkout(directory.path(), "main").expect("return to main");
+        let unmerged = git_delete_branch(directory.path(), "unmerged")
+            .expect_err("unmerged branch must be protected");
+        assert!(unmerged.to_string().contains("not merged"));
+
+        fs::write(&tracked_path, "dirty\n").expect("dirty source");
+        let dirty = git_delete_branch(directory.path(), "unmerged")
+            .expect_err("dirty worktree must be protected");
+        assert!(dirty.to_string().contains("repository changes"));
+        assert!(
+            repository
+                .find_branch("unmerged", git2::BranchType::Local)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn workspace_git_status_scopes_nested_workspace_and_stage_paths() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        drop(repository);
+        fs::write(&tracked_path, "sibling edit\n").expect("sibling edit");
+        let nested_workspace = directory.path().join("project space");
+        fs::create_dir_all(&nested_workspace).expect("nested workspace");
+        fs::write(nested_workspace.join("new.ts"), "nested source\n")
+            .expect("nested source");
+
+        let status = git_workspace_status(&nested_workspace).expect("scoped status");
+        assert!(status.repository_dirty);
+        assert_eq!(
+            status.files,
+            vec![GitStatusFile {
+                path: "new.ts".into(),
+                state: "??".into(),
+                staged: false,
+            }]
+        );
+
+        git_stage_paths(&nested_workspace, &["new.ts".into()], true)
+            .expect("stage nested path");
+        assert!(
+            Repository::open(directory.path())
+                .expect("reopen repository")
+                .index()
+                .expect("index")
+                .get_path(std::path::Path::new("project space/new.ts"), 0)
+                .is_some()
+        );
+        assert_eq!(
+            git_workspace_status(&nested_workspace)
+                .expect("refreshed scoped status")
+                .files,
+            vec![GitStatusFile {
+                path: "new.ts".into(),
+                state: "A".into(),
+                staged: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_git_status_returns_errors_instead_of_an_empty_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let error =
+            git_workspace_status(workspace.path()).expect_err("not a Git repo");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn stage_all_from_nested_workspace_does_not_stage_sibling_changes() {
+        let (directory, repository, tracked_path) = git_metadata_fixture();
+        drop(repository);
+        fs::write(&tracked_path, "sibling edit\n").expect("sibling edit");
+        let nested_workspace = directory.path().join("project");
+        fs::create_dir_all(&nested_workspace).expect("nested workspace");
+        fs::write(nested_workspace.join("new.ts"), "nested source\n")
+            .expect("nested source");
+
+        git_stage_all(&nested_workspace).expect("stage nested workspace");
+        let status = git_workspace_status(directory.path()).expect("root status");
+        assert_eq!(
+            status.files,
+            vec![
+                GitStatusFile {
+                    path: "main.ts".into(),
+                    state: "M".into(),
+                    staged: false,
+                },
+                GitStatusFile {
+                    path: "project/new.ts".into(),
+                    state: "A".into(),
+                    staged: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stage_and_unstage_paths_handles_literal_names_and_keeps_worktree_content() {
+        let (directory, _, _) = git_metadata_fixture();
+        let relative_path = "nested directory/:(glob)*.ts";
+        let file_path = directory.path().join(relative_path);
+        fs::create_dir_all(file_path.parent().expect("parent"))
+            .expect("nested directory");
+        fs::write(&file_path, "new source\n").expect("source");
+
+        git_stage_paths(directory.path(), &[relative_path.to_string()], true)
+            .expect("stage selected path");
+        assert!(
+            Repository::open(directory.path())
+                .expect("reopen repository")
+                .index()
+                .expect("index")
+                .get_path(std::path::Path::new(relative_path), 0)
+                .is_some()
+        );
+
+        git_stage_paths(directory.path(), &[relative_path.to_string()], false)
+            .expect("unstage selected path");
+        assert!(
+            Repository::open(directory.path())
+                .expect("reopen repository")
+                .index()
+                .expect("index")
+                .get_path(std::path::Path::new(relative_path), 0)
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_to_string(file_path).expect("worktree file"),
+            "new source\n"
+        );
+        assert!(
+            git_stage_paths(directory.path(), &["../outside".into()], true).is_err()
+        );
+    }
+
+    #[test]
+    fn unstage_paths_on_an_unborn_branch_only_removes_the_index_entry() {
+        let directory = tempfile::tempdir().expect("workspace");
+        Repository::init(directory.path()).expect("Git repository");
+        let relative_path = "first file.rs";
+        let file_path = directory.path().join(relative_path);
+        fs::write(&file_path, "first commit content\n").expect("source");
+
+        git_stage_paths(directory.path(), &[relative_path.to_string()], true)
+            .expect("stage initial file");
+        git_stage_paths(directory.path(), &[relative_path.to_string()], false)
+            .expect("unstage initial file");
+        assert!(
+            Repository::open(directory.path())
+                .expect("reopen repository")
+                .index()
+                .expect("index")
+                .get_path(std::path::Path::new(relative_path), 0)
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_to_string(file_path).expect("worktree file"),
+            "first commit content\n"
+        );
     }
 
     #[test]
@@ -4185,6 +8589,30 @@ mod tests {
     #[test]
     fn git_metadata_tracks_linked_worktree_and_subdirectory_repository_paths() {
         let (_directory, repo, _) = git_metadata_fixture();
+        let source_directory =
+            repo.workdir().expect("repository workdir").join("src");
+        fs::create_dir(&source_directory).expect("source directory");
+        fs::write(source_directory.join("main.ts"), "first\nsecond\nthird\n")
+            .expect("nested source");
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("src/main.ts"))
+            .expect("add nested source");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("nested tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let signature = git2::Signature::now("Grace", "grace@example.invalid")
+            .expect("signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Add nested source",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit nested source");
         let linked = tempfile::tempdir().expect("worktree parent");
         let root = linked.path().join("checkout");
         let worktree = repo
@@ -4193,7 +8621,7 @@ mod tests {
         let linked_repo =
             Repository::open_from_worktree(&worktree).expect("linked repository");
         let subdirectory = root.join("src");
-        fs::create_dir(&subdirectory).expect("subdirectory");
+        let path = subdirectory.join("main.ts");
         for workspace in [&root, &subdirectory] {
             let notifier = FileWatchNotifier::new(
                 Some(workspace.clone()),
@@ -4220,13 +8648,18 @@ mod tests {
                     .iter()
                     .all(|path| !path.starts_with(workspace))
             );
-            let state = super::git_file_state(
-                workspace,
-                &root.join("main.ts"),
-                "first\nunsaved\nthird\n",
-            )
-            .expect("linked metadata");
+            let state =
+                super::git_file_state(workspace, &path, "first\nunsaved\nthird\n")
+                    .expect("linked metadata");
             assert_eq!(state.hunks[0].start, 2);
+            assert_eq!(
+                state.blame[0]
+                    .commit
+                    .as_ref()
+                    .expect("committed nested line")
+                    .author,
+                "Grace"
+            );
             assert!(
                 state
                     .blame
@@ -4237,7 +8670,7 @@ mod tests {
     }
 
     #[test]
-    fn git_metadata_refreshes_when_external_amend_keeps_file_status_unchanged() {
+    fn git_metadata_refreshes_after_external_amend_and_checkout() {
         let (directory, repo, path) = git_metadata_fixture();
         let core = CoreRpcHandler::new();
         let notifier = FileWatchNotifier::new(
@@ -4258,6 +8691,7 @@ mod tests {
             panic!("initial diff")
         };
         let commit = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let original_id = commit.id();
         let author = git2::Signature::now("Grace", "grace@example.invalid")
             .expect("new author");
         commit
@@ -4295,6 +8729,43 @@ mod tests {
             state.blame[0].commit.as_ref().expect("new blame").author,
             "Grace"
         );
+
+        let original = repo.find_commit(original_id).expect("original commit");
+        repo.branch("baseline", &original, false)
+            .expect("baseline branch");
+        repo.set_head("refs/heads/baseline").expect("switch branch");
+        repo.checkout_head(None).expect("checkout baseline");
+        notifier.handle_workspace_fs_event(
+            notify::Event::new(notify::EventKind::Modify(
+                notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+            ))
+            .add_path(repo.path().join("HEAD")),
+        );
+        let after_checkout = loop {
+            let event = core
+                .rx()
+                .recv_timeout(Duration::from_secs(2))
+                .expect("checkout invalidation");
+            if let CoreRpc::Notification(event) = event
+                && let CoreNotification::DiffInfo { diff } = *event
+            {
+                break diff;
+            }
+        };
+        assert_ne!(before.head, "baseline");
+        assert_eq!(after_checkout.head, "baseline");
+        assert!(after_checkout.diffs.is_empty());
+        let state =
+            super::git_file_state(directory.path(), &path, "first\nsecond\nthird\n")
+                .expect("checked-out metadata");
+        assert_eq!(
+            state.blame[0]
+                .commit
+                .as_ref()
+                .expect("checked-out blame")
+                .author,
+            "Ada"
+        );
     }
 
     #[test]
@@ -4317,7 +8788,9 @@ mod tests {
             .sync_editor_snapshot(path.clone(), unsaved.into())
             .expect("unsaved editor snapshot");
 
-        dispatcher.handle_notification(ProxyNotification::RestartLanguageServers {});
+        dispatcher.handle_notification(ProxyNotification::RestartLanguageServers {
+            extension_id: None,
+        });
 
         let documents = notifications
             .try_iter()
@@ -4325,11 +8798,14 @@ mod tests {
                 crate::plugin::PluginCatalogRpc::Handler(
                     crate::plugin::PluginCatalogNotification::RestartLanguageServers {
                         documents,
+                        extension_id,
                     },
-                ) => Some(documents),
+                ) => Some((documents, extension_id)),
                 _ => None,
             })
             .expect("restart notification");
+        let (documents, extension_id) = documents;
+        assert_eq!(extension_id, None);
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].language_id, expected_language);
         assert_eq!(documents[0].text, unsaved);
@@ -4486,6 +8962,44 @@ mod tests {
     }
 
     #[test]
+    fn lsp_requests_for_closed_buffers_return_errors_instead_of_panicking() {
+        let rpc = ProxyRpcHandler::new();
+        let mut dispatcher = Dispatcher::new(CoreRpcHandler::new(), rpc.clone());
+        let path = std::path::PathBuf::from("/workspace/src/main.rs");
+
+        for (request, expected_message) in [
+            (
+                ProxyRequest::GetInlayHints { path: path.clone() },
+                "inlay hints requested for unopened buffer",
+            ),
+            (
+                ProxyRequest::GetSemanticTokens { path: path.clone() },
+                "semantic tokens requested for unopened buffer",
+            ),
+        ] {
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            rpc.request_async(request, move |result| {
+                sender.send(result).expect("RPC response receiver");
+            });
+            let ProxyRpc::Request(id, request) =
+                rpc.rx().try_recv().expect("LSP request")
+            else {
+                panic!("expected LSP request");
+            };
+
+            dispatcher.handle_request(id, request);
+
+            let response = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("RPC response");
+            let Err(error) = response else {
+                panic!("closed-buffer LSP request unexpectedly succeeded");
+            };
+            assert!(error.message.contains(expected_message));
+        }
+    }
+
+    #[test]
     fn closing_editor_buffer_discards_only_its_unsaved_snapshot() {
         let directory = tempfile::tempdir().expect("disposable project");
         let path = directory.path().join("main.ts");
@@ -4514,6 +9028,98 @@ mod tests {
             .sync_editor_snapshot(path.clone(), "saved text".into())
             .expect("reopen");
         assert_eq!(dispatcher.buffers[&path].get_document(), "saved text");
+    }
+
+    #[test]
+    fn editor_snapshot_replaces_unicode_buffer_completely() {
+        let directory = tempfile::tempdir().expect("disposable project");
+        let path = directory.path().join("main.rs");
+        fs::write(&path, "// 🦀 old snapshot\n").expect("source");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher
+            .sync_editor_snapshot(path.clone(), "// 🦀 old snapshot\n".into())
+            .expect("initial snapshot");
+
+        let updated = "// 🦀 updated snapshot with a longer body\nfn main() {}\n";
+        dispatcher
+            .sync_editor_snapshot(path.clone(), updated.into())
+            .expect("updated snapshot");
+
+        assert_eq!(dispatcher.buffers[&path].get_document(), updated);
+    }
+
+    #[test]
+    fn incremental_editor_edit_updates_the_buffer_and_lsp_notification() {
+        let directory = tempfile::tempdir().expect("disposable project");
+        let path = directory.path().join("main.rs");
+        let previous = "fn main() { let crab = \"🦀\"; let value = 1; }\n";
+        let current = "fn main() { let crab = \"🦀\"; let value = 2; }\n";
+        fs::write(&path, previous).expect("source");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        let notifications = dispatcher.catalog_rpc.test_receiver();
+        dispatcher
+            .sync_editor_snapshot(path.clone(), previous.into())
+            .expect("open editor buffer");
+        drop(notifications.try_iter().collect::<Vec<_>>());
+
+        let offset = previous.find('1').expect("changed character");
+        let delta = AheadDelta::new(
+            previous.len(),
+            vec![
+                DeltaOp::Retain(offset),
+                DeltaOp::Delete(1),
+                DeltaOp::Insert("2".into()),
+                DeltaOp::Retain(previous.len() - offset - 1),
+            ],
+        );
+        dispatcher.handle_notification(ProxyNotification::EditorEdit {
+            path: path.clone(),
+            delta,
+        });
+
+        assert_eq!(dispatcher.buffers[&path].get_document(), current);
+        assert_eq!(dispatcher.buffers[&path].rev, 2);
+        let change = notifications
+            .try_iter()
+            .find_map(|notification| match notification {
+                PluginCatalogRpc::DidChangeTextDocument {
+                    document,
+                    delta,
+                    text,
+                    new_text,
+                    ..
+                } => Some((document, delta, text, new_text)),
+                _ => None,
+            })
+            .expect("incremental LSP change");
+        assert_eq!(change.0.version, 2);
+        assert_eq!(change.1.apply(&Rope::from(previous)).to_string(), current);
+        assert_eq!(change.2.to_string(), previous);
+        assert_eq!(change.3.to_string(), current);
+        assert_eq!(fs::read_to_string(path).expect("saved source"), previous);
+    }
+
+    #[test]
+    fn incremental_editor_edit_rejects_a_stale_base_without_mutating_text() {
+        let directory = tempfile::tempdir().expect("disposable project");
+        let path = directory.path().join("main.rs");
+        let previous = "fn main() {}\n";
+        fs::write(&path, previous).expect("source");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        dispatcher
+            .sync_editor_snapshot(path.clone(), previous.into())
+            .expect("open editor buffer");
+
+        dispatcher.handle_notification(ProxyNotification::EditorEdit {
+            path: path.clone(),
+            delta: AheadDelta::new(1, vec![DeltaOp::Delete(1)]),
+        });
+
+        assert_eq!(dispatcher.buffers[&path].get_document(), previous);
+        assert_eq!(dispatcher.buffers[&path].rev, 1);
     }
 
     #[test]
@@ -4626,6 +9232,7 @@ mod tests {
             workspace,
             &active_path,
             "mod sibling;\nmod large;\nuse crate::request::Request;",
+            &[],
         );
 
         assert_eq!(context.len(), 3);
@@ -4652,6 +9259,384 @@ mod tests {
     }
 
     #[test]
+    fn prediction_context_prefers_imports_and_rejects_substring_collisions() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("src")).expect("create source directory");
+        fs::create_dir_all(workspace.join("models"))
+            .expect("create models directory");
+        fs::create_dir_all(workspace.join("docs")).expect("create docs directory");
+        let active_path = workspace.join("src/main.ts");
+        let imported_path = workspace.join("models/request.ts");
+        let substring_path = workspace.join("models/quest.ts");
+        let prose_path = workspace.join("models/log.ts");
+        let generic_paths = [
+            workspace.join("docs/alpha.ts"),
+            workspace.join("docs/beta.ts"),
+            workspace.join("docs/gamma.ts"),
+            workspace.join("docs/delta.ts"),
+        ];
+        let paths = std::iter::once(active_path.clone())
+            .chain([imported_path, substring_path, prose_path])
+            .chain(generic_paths)
+            .collect::<Vec<_>>();
+        for path in &paths {
+            fs::write(path, "on disk").expect("create source file");
+        }
+
+        let buffers = paths
+            .into_iter()
+            .map(|path| (path.clone(), Buffer::new(BufferId::next(), path)))
+            .collect::<HashMap<_, _>>();
+        let context = relevant_open_buffer_contexts(
+            &buffers,
+            workspace,
+            &active_path,
+            "import { Request } from '../models/request';\n\
+             const names = 'alpha beta gamma delta catalog';",
+            &[],
+        );
+
+        assert_eq!(context.len(), MAX_FIM_OPEN_BUFFERS);
+        assert!(
+            context
+                .iter()
+                .any(|buffer| buffer.path == "models/request.ts")
+        );
+        assert!(
+            !context
+                .iter()
+                .any(|buffer| buffer.path == "models/quest.ts")
+        );
+        assert!(!context.iter().any(|buffer| buffer.path == "models/log.ts"));
+    }
+
+    #[test]
+    fn prediction_context_uses_open_lsp_definitions_and_excerpt_location() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("src")).expect("create source directory");
+        fs::create_dir_all(workspace.join("types")).expect("create types directory");
+        let active_path = workspace.join("src/main.rs");
+        let definition_path = workspace.join("types/shared.rs");
+        fs::write(&active_path, "use_shared_type();").expect("create active file");
+        fs::write(&definition_path, "on disk definition")
+            .expect("create target file");
+
+        let definition_text = (0..120)
+            .map(|line| {
+                if line == 70 {
+                    "pub struct SharedType;".to_string()
+                } else {
+                    format!("// context line {line} {}", "x".repeat(72))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut active = Buffer::new(BufferId::next(), active_path.clone());
+        active.rope = Rope::from("use_shared_type();");
+        let mut definition = Buffer::new(BufferId::next(), definition_path.clone());
+        definition.rope = Rope::from(definition_text);
+        let buffers = HashMap::from([
+            (active_path.clone(), active),
+            (definition_path.clone(), definition),
+        ]);
+
+        let context = relevant_open_buffer_contexts(
+            &buffers,
+            workspace,
+            &active_path,
+            "use_shared_type();",
+            &[(definition_path, 70)],
+        );
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].path, "types/shared.rs");
+        assert!(
+            context[0]
+                .relevant_excerpt
+                .contains("definition near line 71")
+        );
+        assert!(
+            context[0]
+                .relevant_excerpt
+                .contains("pub struct SharedType;")
+        );
+    }
+
+    #[test]
+    fn prediction_identifier_positions_rank_nearby_symbols_and_use_utf16_columns() {
+        let source = "fn 𐐀x(value: Thing) {\n    call(value, other);\n}\n";
+        let positions = prediction_identifier_positions(
+            &Rope::from(source),
+            lsp_types::Position::new(1, 11),
+        );
+
+        assert_eq!(
+            positions.first().map(|(name, _)| name.as_str()),
+            Some("value")
+        );
+        assert_eq!(
+            positions.iter().filter(|(name, _)| name == "value").count(),
+            1
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .find(|(name, _)| name == "𐐀x")
+                .map(|(_, position)| *position),
+            Some(lsp_types::Position::new(0, 3))
+        );
+    }
+
+    #[test]
+    fn prediction_context_prefers_current_semantic_tokens_over_comments_and_strings()
+    {
+        use ahead_rpc::style::{LineStyle, SemanticStyles, Style};
+
+        let source =
+            "let value = target;\n// hiddenComment\nlet text = \"hiddenString\";\n";
+        let semantic_style = |name: &str, token_type: &str| {
+            let start = source.find(name).expect("semantic token text");
+            LineStyle {
+                start,
+                end: start + name.len(),
+                style: Style {
+                    fg_color: Some(token_type.into()),
+                },
+            }
+        };
+        let styles = SemanticStyles {
+            rev: 3,
+            path: PathBuf::from("main.rs"),
+            len: source.len(),
+            styles: vec![
+                semantic_style("value", "variable"),
+                semantic_style("target", "parameter"),
+                semantic_style("hiddenComment", "comment"),
+                semantic_style("hiddenString", "string"),
+            ],
+        };
+
+        let positions = prediction_identifier_positions_with_semantic_styles(
+            &Rope::from(source),
+            lsp_types::Position::new(0, 15),
+            Some(&styles),
+            None,
+        );
+
+        assert_eq!(
+            positions
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target", "value"]
+        );
+    }
+
+    #[test]
+    fn prediction_context_uses_extension_identifier_captures_before_lexical_fallback()
+     {
+        use ahead_rpc::style::SyntaxCapture;
+
+        let source =
+            "let actualName = 1;\n// hiddenComment\nlet text = \"hiddenString\";\n";
+        let capture = |name: &str, scope: &str| {
+            let start = source.find(name).expect("capture text");
+            SyntaxCapture {
+                start,
+                end: start + name.len(),
+                scope: scope.into(),
+            }
+        };
+        let captures = vec![
+            capture("actualName", "variable"),
+            capture("hiddenComment", "comment"),
+            capture("hiddenString", "string"),
+        ];
+
+        let positions = prediction_identifier_positions_with_semantic_styles(
+            &Rope::from(source),
+            lsp_types::Position::new(1, 3),
+            None,
+            Some(&captures),
+        );
+
+        assert_eq!(
+            positions,
+            vec![("actualName".into(), lsp_types::Position::new(0, 4))]
+        );
+    }
+
+    #[test]
+    fn prediction_semantic_token_cache_rejects_stale_buffer_revisions() {
+        use ahead_rpc::style::{SemanticStyles, SyntaxCapture};
+
+        let path = PathBuf::from("main.rs");
+        let buffer_id = BufferId::next();
+        let mut cache = PredictionSemanticTokenCache::default();
+        let mut buffer = Buffer::new(buffer_id.clone(), path.clone());
+        buffer.rope = Rope::from("let value = \"🦀\";");
+        buffer.rev = 4;
+        cache.track_buffer(&path, &buffer);
+
+        let styles = SemanticStyles {
+            rev: 4,
+            path: path.clone(),
+            len: buffer.rope.len(),
+            styles: Vec::new(),
+        };
+        cache.store(buffer_id.clone(), &styles);
+        assert!(cache.styles_for(&path, &buffer).is_some());
+        let captures = vec![SyntaxCapture {
+            start: 4,
+            end: 9,
+            scope: "variable".into(),
+        }];
+        cache.store_syntax_captures(
+            &buffer_id,
+            &path,
+            4,
+            buffer.rope.len(),
+            captures.clone(),
+        );
+        let cached_captures = cache
+            .syntax_captures_for(&path, &buffer)
+            .expect("current syntax captures");
+        assert_eq!(cached_captures.len(), 1);
+        assert_eq!(cached_captures[0].scope, "variable");
+
+        buffer.rev += 1;
+        cache.track_buffer(&path, &buffer);
+        assert!(cache.styles_for(&path, &buffer).is_none());
+        assert!(cache.syntax_captures_for(&path, &buffer).is_none());
+        cache.store(buffer_id, &styles);
+        cache.store_syntax_captures(
+            &buffer.id,
+            &path,
+            4,
+            buffer.rope.len(),
+            vec![SyntaxCapture {
+                start: 4,
+                end: 9,
+                scope: "variable".into(),
+            }],
+        );
+        assert!(cache.styles_for(&path, &buffer).is_none());
+        assert!(cache.syntax_captures_for(&path, &buffer).is_none());
+    }
+
+    #[test]
+    fn prediction_definition_cache_invalidates_when_open_target_changes() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("src")).expect("create source directory");
+        fs::create_dir_all(workspace.join("types")).expect("create types directory");
+        let active_path = workspace.join("src/main.rs");
+        let definition_path = workspace.join("types/shared.rs");
+        let private_path = workspace.join(".env");
+        fs::write(&active_path, "use_shared_type();").expect("create active file");
+        fs::write(&definition_path, "struct SharedType;")
+            .expect("create definition file");
+        fs::write(&private_path, "SECRET=value").expect("create private file");
+
+        let buffers = HashMap::from([
+            (
+                active_path.clone(),
+                Buffer::new(BufferId::next(), active_path.clone()),
+            ),
+            (
+                definition_path.clone(),
+                Buffer::new(BufferId::next(), definition_path.clone()),
+            ),
+            (
+                private_path.clone(),
+                Buffer::new(BufferId::next(), private_path.clone()),
+            ),
+        ]);
+        let active = buffers.get(&active_path).expect("active buffer");
+        let resolved_definition_path = workspace
+            .canonicalize()
+            .expect("canonical workspace")
+            .join("types/shared.rs");
+        let key = PredictionDefinitionCacheKey {
+            path: active_path,
+            buffer_id: active.id,
+            revision: active.rev,
+            identifier: "SharedType".into(),
+            line: 0,
+            character: 4,
+        };
+        let cache = parking_lot::Mutex::new(HashMap::<
+            PredictionDefinitionCacheKey,
+            CachedPredictionDefinitions,
+        >::new());
+
+        cache_prediction_definitions(
+            &cache,
+            key.clone(),
+            &[(definition_path.clone(), 0), (private_path, 0)],
+            Some(workspace),
+            &buffers,
+        );
+        assert_eq!(
+            cached_prediction_definitions(&cache, &key, Some(workspace), &buffers),
+            Some(vec![(resolved_definition_path, 0)])
+        );
+
+        let mut changed_buffers = buffers.clone();
+        changed_buffers
+            .get_mut(&definition_path)
+            .expect("definition buffer")
+            .rev += 1;
+        assert!(
+            cached_prediction_definitions(
+                &cache,
+                &key,
+                Some(workspace),
+                &changed_buffers
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn prediction_definition_locations_handle_all_lsp_response_shapes() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let scalar_path = temp.path().join("scalar.rs");
+        let array_path = temp.path().join("array.rs");
+        let link_path = temp.path().join("link.rs");
+        let uri = |path: &PathBuf| Url::from_file_path(path).expect("file URL");
+        let position = lsp_types::Position::new(9, 2);
+        let range = lsp_types::Range::new(position, position);
+
+        let scalar = GotoDefinitionResponse::Scalar(lsp_types::Location {
+            uri: uri(&scalar_path),
+            range,
+        });
+        let array = GotoDefinitionResponse::Array(vec![lsp_types::Location {
+            uri: uri(&array_path),
+            range,
+        }]);
+        let link = GotoDefinitionResponse::Link(vec![lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: uri(&link_path),
+            target_range: range,
+            target_selection_range: range,
+        }]);
+
+        assert_eq!(
+            prediction_definition_locations(scalar),
+            vec![(scalar_path, 9)]
+        );
+        assert_eq!(
+            prediction_definition_locations(array),
+            vec![(array_path, 9)]
+        );
+        assert_eq!(prediction_definition_locations(link), vec![(link_path, 9)]);
+    }
+
+    #[test]
     fn cancel_workspace_files_cancels_only_the_matching_request() {
         let mut dispatcher =
             Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
@@ -4673,6 +9658,35 @@ mod tests {
 
         assert!(first.load(Ordering::SeqCst));
         assert!(!second.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_cancels_workspace_file_index_warmup() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}")
+            .expect("write source file");
+        let mut dispatcher =
+            Dispatcher::new(CoreRpcHandler::new(), ProxyRpcHandler::new());
+        ProxyHandler::handle_notification(
+            &mut dispatcher,
+            ProxyNotification::Initialize {
+                workspace: Some(workspace.path().to_path_buf()),
+                window_id: 1,
+                tab_id: 1,
+            },
+        );
+        let cancelled = dispatcher
+            .file_index_warmup
+            .as_ref()
+            .expect("workspace initialization starts index warmup")
+            .clone();
+
+        ProxyHandler::handle_notification(
+            &mut dispatcher,
+            ProxyNotification::Shutdown {},
+        );
+
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4711,6 +9725,7 @@ mod tests {
             .join(format!("ahead-proxy-content-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&workspace).expect("create workspace");
         let path = workspace.join("example.rs");
+        let changed_path = path.clone();
         fs::write(&path, "before\n").expect("write source");
         let index = Arc::new(WorkspaceFileIndex::new(workspace.clone()));
         assert!(index.snapshot().contains(&path));
@@ -4734,7 +9749,8 @@ mod tests {
         assert!(matches!(
             core_rpc.rx().recv_timeout(Duration::from_secs(2)),
             Ok(CoreRpc::Notification(notification))
-                if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 0 })
+                if matches!(&*notification, CoreNotification::WorkspaceFileChange { generation: 0, paths }
+                    if paths == &vec![changed_path.clone()])
         ));
         fs::remove_dir_all(workspace).expect("remove workspace");
     }
@@ -4772,17 +9788,421 @@ mod tests {
             notify::Event::new(notify::EventKind::Modify(
                 notify::event::ModifyKind::Data(notify::event::DataChange::Content),
             ))
-            .add_path(config),
+            .add_path(config.clone()),
         );
         assert_eq!(index.generation(), 0);
+        assert!(
+            matches!(
+                core_rpc.rx().try_recv(),
+                Ok(CoreRpc::Notification(notification))
+                    if matches!(*notification, CoreNotification::AheadNotification {
+                        notification: ahead_rpc::ahead::AheadNotification::PredictionContextChanged { session_id: None }
+                    })
+            ),
+            "provider invalidation must not wait for the filesystem debounce"
+        );
         assert!(matches!(
             core_rpc.rx().recv_timeout(Duration::from_secs(2)),
             Ok(CoreRpc::Notification(notification))
-                if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 0 })
+                if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 0, .. })
         ));
         assert!(matches!(
             catalog_receiver.recv_timeout(Duration::from_secs(2)),
             Ok(crate::plugin::PluginCatalogRpc::Handler(
+                crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
+            ))
+        ));
+    }
+
+    #[test]
+    fn instruction_changes_are_immediate_and_scoped_to_the_repository() {
+        use notify::{
+            Event, EventKind,
+            event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode},
+        };
+        let directory = tempfile::tempdir().expect("instruction fixture");
+        let repository = directory.path().join("repo");
+        let workspace = repository.join("packages/app");
+        fs::create_dir_all(workspace.join("src")).expect("nested workspace");
+        fs::create_dir(repository.join(".git")).expect("repository boundary");
+        fs::write(workspace.join(".gitignore"), "AGENTS.md\n")
+            .expect("search exclusions");
+        fs::write(
+            workspace.join("src/AGENTS.md"),
+            "ignored source instructions",
+        )
+        .expect("ignored instructions");
+        let index = Arc::new(WorkspaceFileIndex::new(workspace.clone()));
+        assert!(!index.snapshot().contains(&workspace.join("src/AGENTS.md")));
+        let core = CoreRpcHandler::new();
+        let catalog = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let catalog_events = catalog.test_receiver();
+        let notifier = FileWatchNotifier::new(
+            Some(workspace.clone()),
+            core.clone(),
+            ProxyRpcHandler::new(),
+            catalog,
+            Some(index),
+        );
+        for path in [
+            directory.path().join("AGENTS.md"),
+            repository.join("sibling/AGENTS.md"),
+            repository.join("CLAUDE.md"),
+            repository.join("AGENT.md"),
+        ] {
+            notifier.handle_fs_events(vec![(
+                INSTRUCTION_EVENT_TOKEN,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path),
+            )]);
+            assert!(
+                core.rx().try_recv().is_err(),
+                "unrelated instructions must not notify"
+            );
+        }
+        for (path, token) in [
+            (repository.join("AGENTS.md"), INSTRUCTION_EVENT_TOKEN),
+            (
+                repository.join("packages/AGENTS.md"),
+                INSTRUCTION_EVENT_TOKEN,
+            ),
+            (workspace.join("AGENTS.md"), WORKSPACE_EVENT_TOKEN),
+            (workspace.join("src/AGENTS.md"), WORKSPACE_EVENT_TOKEN),
+        ] {
+            for kind in [
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                EventKind::Remove(RemoveKind::File),
+            ] {
+                let mut event = Event::new(kind).add_path(path.clone());
+                if matches!(
+                    kind,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                ) {
+                    event = event.add_path(path.with_file_name("saved.tmp"));
+                }
+                notifier.handle_fs_events(vec![(token, event)]);
+                assert!(
+                    core.rx().try_iter().any(|message| matches!(message, CoreRpc::Notification(notification)
+                    if matches!(*notification, CoreNotification::AheadNotification {
+                        notification: ahead_rpc::ahead::AheadNotification::PredictionContextChanged { session_id: None }
+                    }))),
+                    "{path:?} {kind:?} must invalidate before debounce"
+                );
+            }
+        }
+        assert!(
+            catalog_events.try_recv().is_err(),
+            "instruction changes must not restart language servers"
+        );
+    }
+
+    #[test]
+    fn ancestor_instruction_watch_delivers_native_create_replace_and_remove() {
+        for operation in ["create", "replace", "remove"] {
+            let directory = tempfile::tempdir().expect("native instruction fixture");
+            let repository = directory.path().join("repo");
+            let workspace = repository.join("packages/app");
+            fs::create_dir_all(&workspace).expect("nested workspace");
+            if operation == "remove" {
+                fs::write(repository.join(".git"), "gitdir: elsewhere\n")
+                    .expect("worktree marker");
+            } else {
+                fs::create_dir(repository.join(".git")).expect("repository marker");
+            }
+            let instruction = if operation == "replace" {
+                repository.join("packages/AGENTS.md")
+            } else {
+                repository.join("AGENTS.md")
+            };
+            if operation != "create" {
+                fs::write(&instruction, "before").expect("initial instructions");
+            }
+            let core = CoreRpcHandler::new();
+            let notifier = FileWatchNotifier::new(
+                Some(workspace),
+                core.clone(),
+                ProxyRpcHandler::new(),
+                PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
+                None,
+            );
+            let mut watcher = FileWatcher::new();
+            notifier.watch_instruction_ancestors(&mut watcher);
+            watcher.notify(notifier);
+            match operation {
+                "create" => fs::write(&instruction, "new instructions")
+                    .expect("create instructions"),
+                "replace" => {
+                    let replacement = instruction.with_file_name("instructions.tmp");
+                    fs::write(&replacement, "replacement instructions")
+                        .expect("replacement contents");
+                    fs::rename(replacement, &instruction)
+                        .expect("atomic instruction replacement");
+                }
+                "remove" => {
+                    fs::remove_file(&instruction).expect("remove instructions")
+                }
+                _ => unreachable!(),
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let message = core
+                    .rx()
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|error| {
+                        panic!("{operation} instruction event missing: {error}")
+                    });
+                if matches!(message, CoreRpc::Notification(notification)
+                if matches!(*notification, CoreNotification::AheadNotification {
+                    notification: ahead_rpc::ahead::AheadNotification::PredictionContextChanged { session_id: None }
+                })) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn instruction_watch_boundary_tracks_git_root_changes() {
+        let directory = tempfile::tempdir().expect("instruction root fixture");
+        let repository = directory.path().join("repo");
+        let workspace = repository.join("packages/app");
+        let package = repository.join("packages");
+        fs::create_dir_all(&workspace).expect("nested workspace");
+        fs::create_dir(repository.join(".git")).expect("outer repository marker");
+        let core = CoreRpcHandler::new();
+        let mut notifier = FileWatchNotifier::new(
+            Some(workspace),
+            core.clone(),
+            ProxyRpcHandler::new(),
+            PluginCatalogRpcHandler::new(CoreRpcHandler::new()),
+            None,
+        );
+        let mut watcher = FileWatcher::new();
+        notifier.user_settings_watcher = Some(watcher.handle());
+        notifier.watch_instruction_ancestors(&mut watcher);
+        let receiver = core.rx();
+        watcher.notify(notifier);
+
+        let nested_marker = package.join(".git");
+        fs::create_dir(&nested_marker).expect("nested repository marker");
+        wait_for_prediction_context(&receiver);
+        assert_eq!(
+            ahead_agent::project_instruction_root(&package.join("app")),
+            package
+        );
+        fs::write(package.join("AGENTS.md"), "nested instructions")
+            .expect("write newly active ancestor instructions");
+        wait_for_prediction_context(&receiver);
+
+        fs::remove_dir(&nested_marker).expect("remove nested repository marker");
+        wait_for_prediction_context(&receiver);
+        fs::write(repository.join("AGENTS.md"), "outer instructions")
+            .expect("write restored outer ancestor instructions");
+        wait_for_prediction_context(&receiver);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_settings_watch_preserves_refresh_through_a_workspace_alias() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().expect("fixture");
+        let real = temporary.path().join("workspace");
+        fs::create_dir_all(real.join(".ahead")).expect("settings directory");
+        let alias = temporary.path().join("alias");
+        symlink(&real, &alias).expect("workspace alias");
+        let config = real.join(".ahead/config.toml");
+        fs::write(&config, "[languages]\n").expect("initial settings");
+        let canonical_root = real.canonicalize().expect("canonical root");
+        let aliased_config = alias.join(".ahead/config.toml");
+        assert!(is_provider_settings_path(&canonical_root, &aliased_config));
+        fs::remove_file(&config).expect("remove settings");
+        assert!(is_provider_settings_path(&canonical_root, &aliased_config));
+        assert!(!is_provider_settings_path(
+            &canonical_root,
+            &temporary.path().join(".ahead/config.toml")
+        ));
+        fs::write(&config, "[languages]\n").expect("restore settings");
+        let catalog = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let receiver = catalog.test_receiver();
+        let notifier = FileWatchNotifier::new(
+            Some(alias.clone()),
+            CoreRpcHandler::new(),
+            ProxyRpcHandler::new(),
+            catalog,
+            Some(Arc::new(WorkspaceFileIndex::new(alias.clone()))),
+        );
+        assert_eq!(notifier.workspace, Some(canonical_root));
+        let mut watcher = FileWatcher::new();
+        watcher.watch(&alias, true, WORKSPACE_EVENT_TOKEN);
+        watcher.notify(notifier);
+        fs::write(&config, "[languages.Python]\nlanguage_servers = []\n")
+            .expect("change settings");
+        assert!(matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok(PluginCatalogRpc::Handler(crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations))));
+    }
+
+    #[test]
+    fn workspace_settings_change_reaches_catalog_from_native_file_watcher() {
+        let temporary = tempfile::tempdir().expect("test workspace");
+        let workspace = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let ahead = workspace.join(".ahead");
+        fs::create_dir(&ahead).expect("settings directory");
+        let config = ahead.join("config.toml");
+        fs::write(&config, "[lsp]\n").expect("initial settings");
+
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let catalog_receiver = catalog_rpc.test_receiver();
+        let notifier = FileWatchNotifier::new(
+            Some(workspace.clone()),
+            core_rpc,
+            ProxyRpcHandler::new(),
+            catalog_rpc,
+            Some(Arc::new(WorkspaceFileIndex::new(workspace.clone()))),
+        );
+        let mut file_watcher = FileWatcher::new();
+        file_watcher.watch(&workspace, true, WORKSPACE_EVENT_TOKEN);
+        file_watcher.notify(notifier);
+
+        fs::write(
+            &config,
+            "[lsp.rust-analyzer.settings.check]\ncommand = 'clippy'\n",
+        )
+        .expect("update settings");
+
+        assert!(matches!(
+            catalog_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(PluginCatalogRpc::Handler(
+                crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
+            ))
+        ));
+    }
+
+    #[test]
+    fn user_lsp_settings_change_refreshes_extensions_without_workspace_change() {
+        let user_home = tempfile::tempdir().expect("user home");
+        let settings_directory = user_home.path().join(".ahead");
+        fs::create_dir(&settings_directory).expect("user settings directory");
+        let settings = settings_directory.join("settings.toml");
+        fs::write(&settings, "[lsp]").expect("initial user settings");
+        assert!(is_user_lsp_settings_path(&settings_directory, &settings));
+        assert!(!is_user_lsp_settings_path(
+            &settings_directory,
+            &settings_directory.join("config.toml")
+        ));
+
+        let core_rpc = CoreRpcHandler::new();
+        let core_receiver = core_rpc.rx();
+        let catalog_rpc = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let catalog_receiver = catalog_rpc.test_receiver();
+        let notifier = FileWatchNotifier::new(
+            None,
+            core_rpc.clone(),
+            ProxyRpcHandler::new(),
+            catalog_rpc,
+            None,
+        );
+        *notifier.user_settings_directory.lock() = Some(settings_directory);
+
+        fs::write(
+            &settings,
+            "[lsp.rust-analyzer.settings]\ncheck = 'clippy'\n",
+        )
+        .expect("update user settings");
+        notifier.handle_user_settings_fs_event(
+            notify::Event::new(notify::EventKind::Modify(
+                notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+            ))
+            .add_path(settings.clone()),
+        );
+
+        assert!(matches!(
+            catalog_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(PluginCatalogRpc::Handler(
+                crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
+            ))
+        ));
+        assert!(matches!(
+            core_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(CoreRpc::Notification(notification)) if matches!(
+                &*notification,
+                CoreNotification::AheadNotification {
+                    notification: ahead_rpc::ahead::AheadNotification::PredictionContextChanged { session_id: None }
+                }
+            )
+        ));
+        assert!(matches!(
+            core_receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(CoreRpc::Notification(notification)) if matches!(
+                &*notification,
+                CoreNotification::WorkspaceFileChange { paths, .. }
+                    if paths == &vec![settings]
+            )
+        ));
+    }
+
+    #[test]
+    fn user_lsp_settings_directory_created_after_startup_installs_settings_watch() {
+        let user_home = tempfile::tempdir().expect("user home");
+        let home = user_home.path().canonicalize().expect("canonical home");
+        let settings_directory = user_home.path().join(".ahead");
+        fs::create_dir(&settings_directory).expect("create user settings directory");
+        let settings_directory = settings_directory
+            .canonicalize()
+            .expect("canonical user settings directory");
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(CoreRpcHandler::new());
+        let catalog_receiver = catalog_rpc.test_receiver();
+        let mut file_watcher = FileWatcher::new();
+        let watched_home = home.clone();
+        file_watcher.watch_filtered(
+            &home,
+            false,
+            USER_SETTINGS_HOME_EVENT_TOKEN,
+            move |path| is_user_ahead_directory(&watched_home, path),
+        );
+
+        let mut notifier = FileWatchNotifier::new(
+            None,
+            core_rpc,
+            ProxyRpcHandler::new(),
+            catalog_rpc,
+            None,
+        );
+        *notifier.user_settings_directory.lock() = None;
+        notifier.user_settings_home = Some(home);
+        notifier.user_settings_watcher = Some(file_watcher.handle());
+        notifier.handle_user_settings_home_fs_event(
+            notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::Folder,
+            ))
+            .add_path(settings_directory.clone()),
+        );
+        assert!(matches!(
+            catalog_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(PluginCatalogRpc::Handler(
+                crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
+            ))
+        ));
+        assert_eq!(
+            notifier.user_settings_directory.lock().as_deref(),
+            Some(settings_directory.as_path())
+        );
+
+        let settings = settings_directory.join("settings.toml");
+        fs::write(&settings, "[lsp]\n").expect("create user settings");
+        notifier.handle_user_settings_fs_event(
+            notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(settings),
+        );
+        assert!(matches!(
+            catalog_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(PluginCatalogRpc::Handler(
                 crate::plugin::PluginCatalogNotification::RefreshWorkspaceConfigurations
             ))
         ));
@@ -4844,7 +10264,7 @@ mod tests {
         assert!(matches!(
             core_rpc.rx().recv_timeout(Duration::from_secs(2)),
             Ok(CoreRpc::Notification(notification))
-                if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 1 })
+                if matches!(*notification, CoreNotification::WorkspaceFileChange { generation: 1, .. })
         ));
         fs::remove_dir_all(workspace).expect("remove workspace");
     }
@@ -5061,6 +10481,102 @@ mod tests {
         fs::remove_dir_all(workspace).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn commit_hook_failure_keeps_staged_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("Git fixture");
+        let repo = Repository::init(workspace.path()).expect("init fixture");
+        {
+            let mut config = repo.config().expect("config");
+            config
+                .set_str("user.name", "Human Developer")
+                .expect("name");
+            config
+                .set_str("user.email", "human@example.test")
+                .expect("email");
+        }
+        let hook_directory = workspace.path().join("hooks");
+        fs::create_dir_all(&hook_directory).expect("create hook directory");
+        let hook = hook_directory.join("pre-commit");
+        fs::write(&hook, "#!/bin/sh\necho rejected-by-hook >&2\nexit 1\n")
+            .expect("write hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+            .expect("make hook executable");
+        repo.config()
+            .expect("config")
+            .set_str(
+                "core.hooksPath",
+                hook_directory.to_str().expect("hook path"),
+            )
+            .expect("configure hooks");
+
+        let path = workspace.path().join("main.rs");
+        fs::write(&path, "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let error = git_commit(
+            workspace.path(),
+            "Rejected commit",
+            vec![FileDiff::Added(path)],
+            &[],
+        )
+        .expect_err("the pre-commit hook must run");
+        assert!(error.to_string().contains("rejected-by-hook"), "{error}");
+        let index = repo.index().expect("index");
+        let entry = index
+            .get_path(std::path::Path::new("main.rs"), 0)
+            .expect("staged entry remains");
+        let blob = repo.find_blob(entry.id).expect("staged blob");
+        assert_eq!(blob.content(), b"pub fn answer() -> u8 { 42 }\n");
+        assert!(repo.head().is_err(), "failed commit must not advance HEAD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_failure_keeps_staged_changes() {
+        let workspace = tempfile::tempdir().expect("Git fixture");
+        let repo = Repository::init(workspace.path()).expect("init fixture");
+        {
+            let mut config = repo.config().expect("config");
+            config
+                .set_str("user.name", "Human Developer")
+                .expect("name");
+            config
+                .set_str("user.email", "human@example.test")
+                .expect("email");
+            config
+                .set_str("user.signingkey", "not-a-real-key")
+                .expect("signing key");
+            config
+                .set_str("gpg.format", "openpgp")
+                .expect("signing format");
+            config
+                .set_str("gpg.program", "/usr/bin/false")
+                .expect("signing program");
+            config
+                .set_bool("commit.gpgsign", true)
+                .expect("enable signing");
+        }
+
+        let path = workspace.path().join("main.rs");
+        fs::write(&path, "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let error = git_commit(
+            workspace.path(),
+            "Unsigned commit must fail",
+            vec![FileDiff::Added(path)],
+            &[],
+        )
+        .expect_err("the configured signing failure must stop commit");
+        assert!(error.to_string().contains("Git commit failed"), "{error}");
+        let index = repo.index().expect("index");
+        let entry = index
+            .get_path(std::path::Path::new("main.rs"), 0)
+            .expect("staged entry remains");
+        let blob = repo.find_blob(entry.id).expect("staged blob");
+        assert_eq!(blob.content(), b"pub fn answer() -> u8 { 42 }\n");
+        assert!(repo.head().is_err(), "failed commit must not advance HEAD");
+    }
+
     #[test]
     fn dispatcher_commit_uses_anchor_attribution_and_clears_rows() {
         let workspace = std::env::temp_dir().join(format!(
@@ -5153,7 +10669,9 @@ mod tests {
                 panic!("Git request");
             };
             dispatcher.handle_request(id, request);
-            receiver.recv().expect("Git response")
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Git response")
         };
         let request_commit =
             |dispatcher: &mut Dispatcher, message: &str, diffs: Vec<FileDiff>| {
@@ -5165,17 +10683,51 @@ mod tests {
                     },
                 )
             };
-        assert!(matches!(
-            request_commit(
-                &mut dispatcher,
-                "Commit agent work",
-                vec![
+        let (locked_sender, locked_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        let held_host = host.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = held_host.write();
+            locked_sender.send(()).expect("host lock acquired");
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("commit dispatch should release host lock");
+        });
+        locked_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host lock acquired");
+        let rpc = dispatcher.proxy_rpc.clone();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        rpc.request_async(
+            ProxyRequest::GitCommit {
+                message: "Commit agent work".to_string(),
+                diffs: vec![
                     FileDiff::Added(path),
                     FileDiff::Added(workspace.join("second.md")),
                     FileDiff::Added(workspace.join("third.md")),
                 ],
-            )
-            .expect("commit"),
+            },
+            move |result| sender.send(result).expect("Git response"),
+        );
+        let ProxyRpc::Request(id, request) =
+            rpc.rx().try_recv().expect("Git request")
+        else {
+            panic!("Git request");
+        };
+        let started = Instant::now();
+        dispatcher.handle_request(id, request);
+        let dispatch_time = started.elapsed();
+        release_sender.send(()).expect("release host lock");
+        holder.join().expect("host lock holder");
+        assert!(
+            dispatch_time < Duration::from_secs(1),
+            "Git commit blocked proxy dispatch for {dispatch_time:?}"
+        );
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("Git response")
+                .expect("commit"),
             ProxyResponse::Success {}
         ));
 
@@ -5293,6 +10845,65 @@ mod tests {
                 .message
                 .contains("Stage changes")
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let hooked_path = workspace.join("hooked.md");
+            fs::write(&hooked_path, "Agent content\n").unwrap();
+            host.write()
+                .create_anchor(
+                    &session_id,
+                    "hooked.md".to_string(),
+                    DisplayRange {
+                        start: DisplayPosition { line: 0, col: 0 },
+                        end: DisplayPosition { line: 0, col: 13 },
+                    },
+                    "Agent content".to_string(),
+                    ahead_rpc::ahead::AHEAD_ACTOR_ID,
+                )
+                .unwrap();
+            let hooks = workspace.join("git-hooks");
+            fs::create_dir_all(&hooks).unwrap();
+            let hook = hooks.join("pre-commit");
+            fs::write(
+                &hook,
+                "#!/bin/sh\nprintf 'Hook changed content\\n' > hooked.md\ngit add hooked.md\n",
+            )
+            .unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            repo.config()
+                .unwrap()
+                .set_str("core.hooksPath", hooks.to_str().unwrap())
+                .unwrap();
+
+            assert!(matches!(
+                request_commit(
+                    &mut dispatcher,
+                    "Commit with a hook rewrite",
+                    vec![FileDiff::Added(hooked_path)],
+                )
+                .expect("hooked commit"),
+                ProxyResponse::Success {}
+            ));
+            let commit = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(commit.author().name(), Some("ahead"));
+            let committed_tree = commit.tree().unwrap();
+            let committed_entry = committed_tree
+                .get_path(std::path::Path::new("hooked.md"))
+                .unwrap();
+            let committed_blob = repo.find_blob(committed_entry.id()).unwrap();
+            assert_eq!(committed_blob.content(), b"Hook changed content\n");
+            assert_eq!(
+                host.read()
+                    .anchors_for_paths(&["hooked.md".to_string()])
+                    .unwrap()
+                    .len(),
+                1,
+                "keep attribution when the hook changes the anchored content"
+            );
+        }
 
         fs::remove_dir_all(workspace).unwrap();
     }

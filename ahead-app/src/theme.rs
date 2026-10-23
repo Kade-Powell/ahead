@@ -195,8 +195,8 @@ fn theme_value(source: &str, mode: &str) -> Result<Value> {
         ("progress.bar.background", "$green"),
         ("progress.ring", "editor.focus"),
         ("scrollbar.background", "$secondary-background"),
-        ("scrollbar.thumb.background", "$input-border"),
-        ("scrollbar.thumb.hover.background", "$dim-text"),
+        ("scrollbar.thumb.background", "$dim-text"),
+        ("scrollbar.thumb.hover.background", "$text"),
         ("secondary.background", "$current-background"),
         (
             "secondary.active.background",

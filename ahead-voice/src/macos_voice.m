@@ -1,13 +1,16 @@
 #import <AVFoundation/AVFoundation.h>
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
-#import <Speech/Speech.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef void (*AHEADVoiceEventCallback)(
     void *context,
     int32_t event,
-    const char *text,
+    const uint8_t *audio,
+    size_t length,
+    uint64_t value,
     const char *error
 );
 typedef void (*AHEADVoiceReleaseCallback)(const void *context);
@@ -18,35 +21,45 @@ typedef void (*AHEADVoiceReleaseCallback)(const void *context);
 @property(nonatomic, assign) void *context;
 @property(nonatomic, strong) dispatch_queue_t queue;
 @property(nonatomic, strong) AVAudioEngine *engine;
-@property(nonatomic, strong) SFSpeechRecognizer *recognizer;
-@property(atomic, strong) SFSpeechAudioBufferRecognitionRequest *request;
-@property(nonatomic, strong) SFSpeechRecognitionTask *task;
-@property(nonatomic, copy) NSString *lastTranscript;
+@property(nonatomic, strong) AVAudioConverter *converter;
+@property(nonatomic, strong) AVAudioFormat *voiceFormat;
+@property(nonatomic, strong) AVAudioPlayerNode *player;
+@property(nonatomic, strong) id audioConfigurationObserver;
+@property(nonatomic, strong) id systemSleepObserver;
 @property(atomic, assign) BOOL stopped;
 @property(atomic, assign) BOOL muted;
 @property(atomic, assign) BOOL speechActive;
-@property(atomic, assign) BOOL segmentEnding;
-@property(nonatomic, assign) uint64_t recognitionGeneration;
+@property(nonatomic, assign) BOOL outputActive;
+@property(nonatomic, assign) NSUInteger scheduledBuffers;
+@property(nonatomic, assign) NSUInteger scheduledAudioBytes;
+@property(nonatomic, assign) uint64_t playbackGeneration;
 @property(nonatomic, assign) NSTimeInterval silenceSeconds;
+- (void)emit:(int32_t)event audio:(const uint8_t *)audio length:(size_t)length value:(uint64_t)value error:(NSString *)error;
 @end
 
 @implementation AHEADVoiceCapture
 
-- (void)emit:(int32_t)event text:(NSString *)text error:(NSString *)error {
+- (void)emit:(int32_t)event audio:(const uint8_t *)audio length:(size_t)length error:(NSString *)error {
+    [self emit:event audio:audio length:length value:0 error:error];
+}
+
+- (void)emit:(int32_t)event audio:(const uint8_t *)audio length:(size_t)length value:(uint64_t)value error:(NSString *)error {
     if (self.callback == NULL || self.stopped) {
         return;
     }
     self.callback(
         self.context,
         event,
-        text == nil ? "" : text.UTF8String,
+        audio,
+        length,
+        value,
         error == nil ? "" : error.UTF8String
     );
 }
 
 - (void)start {
     dispatch_async(self.queue, ^{
-        if (@available(macOS 10.15, *)) {
+        if (@available(macOS 10.14, *)) {
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
                                      completionHandler:^(BOOL granted) {
                 dispatch_async(self.queue, ^{
@@ -54,228 +67,338 @@ typedef void (*AHEADVoiceReleaseCallback)(const void *context);
                         return;
                     }
                     if (!granted) {
-                        [self emit:4 text:nil error:@"Microphone access was denied. Enable it in System Settings > Privacy & Security > Microphone."];
+                        [self emit:4 audio:NULL length:0 error:@"Microphone access was denied. Enable it in System Settings > Privacy & Security > Microphone."];
                         return;
                     }
-                    [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) {
-                        dispatch_async(self.queue, ^{
-                            if (self.stopped) {
-                                return;
-                            }
-                            if (status != SFSpeechRecognizerAuthorizationStatusAuthorized) {
-                                [self emit:4 text:nil error:@"Speech recognition access was denied or restricted."];
-                                return;
-                            }
-                            [self startRecognizingOnDevice];
-                        });
-                    }];
+                    [self startAudioEngine];
                 });
             }];
         } else {
-            [self emit:4 text:nil error:@"Local speech input requires macOS 10.15 or newer."];
+            [self emit:4 audio:NULL length:0 error:@"Voice calls require macOS 10.14 or newer."];
         }
     });
 }
 
-- (void)startRecognizingOnDevice API_AVAILABLE(macos(10.15)) {
-    NSLocale *locale = [NSLocale currentLocale];
-    self.recognizer = [[SFSpeechRecognizer alloc] initWithLocale:locale];
-    if (self.recognizer == nil || !self.recognizer.isAvailable) {
-        [self emit:4 text:nil error:@"The system speech recognizer is unavailable for the current language."];
+- (void)startAudioEngine {
+    if (self.stopped) {
         return;
     }
-    if (!self.recognizer.supportsOnDeviceRecognition) {
-        [self emit:4 text:nil error:@"The current system language has no on-device recognizer. AHEAD will not send microphone audio over the network."];
+    AVAudioEngine *engine = [[AVAudioEngine alloc] init];
+    AVAudioInputNode *input = engine.inputNode;
+    NSError *processingError = nil;
+    if (@available(macOS 10.15, *)) {
+        if (![input setVoiceProcessingEnabled:YES error:&processingError]) {
+            [self emit:4 audio:NULL length:0 error:processingError.localizedDescription ?: @"Could not enable microphone echo cancellation."];
+            return;
+        }
+    }
+
+    AVAudioFormat *inputFormat = [input outputFormatForBus:0];
+    if (inputFormat.sampleRate <= 0 || inputFormat.channelCount == 0) {
+        [self emit:4 audio:NULL length:0 error:@"No microphone input format is available."];
+        return;
+    }
+    AVAudioFormat *voiceFormat = [[AVAudioFormat alloc]
+        initWithCommonFormat:AVAudioPCMFormatInt16
+                  sampleRate:24000
+                    channels:1
+                 interleaved:NO];
+    if (voiceFormat == nil) {
+        [self emit:4 audio:NULL length:0 error:@"Could not create the 24 kHz voice audio format."];
+        return;
+    }
+    AVAudioConverter *converter = [[AVAudioConverter alloc]
+        initFromFormat:inputFormat
+              toFormat:voiceFormat];
+    if (converter == nil) {
+        [self emit:4 audio:NULL length:0 error:@"Could not prepare microphone resampling."];
         return;
     }
 
-    self.engine = [[AVAudioEngine alloc] init];
-    AVAudioInputNode *input = self.engine.inputNode;
-    AVAudioFormat *format = [input outputFormatForBus:0];
-    if (format.sampleRate <= 0 || format.channelCount == 0) {
-        [self emit:4 text:nil error:@"No microphone input format is available."];
-        self.engine = nil;
+    AVAudioPlayerNode *player = [[AVAudioPlayerNode alloc] init];
+    [engine attachNode:player];
+    NSError *connectionError = nil;
+    BOOL connected = NO;
+    if (@available(macOS 27.0, *)) {
+        connected = [engine connect:player
+                                 to:engine.mainMixerNode
+                             format:voiceFormat
+                              error:&connectionError];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [engine connect:player to:engine.mainMixerNode format:voiceFormat];
+#pragma clang diagnostic pop
+        connected = YES;
+    }
+    if (!connected) {
+        [self emit:4 audio:NULL length:0 error:connectionError.localizedDescription ?: @"Could not connect speaker audio."];
         return;
     }
     __weak AHEADVoiceCapture *weakSelf = self;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    [input installTapOnBus:0 bufferSize:1024 format:format
+    [input installTapOnBus:0 bufferSize:1024 format:inputFormat
                      block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
         (void)when;
         AHEADVoiceCapture *strongSelf = weakSelf;
-        if (strongSelf == nil) {
-            return;
-        }
-        @autoreleasepool {
-            [strongSelf consume:buffer sampleRate:format.sampleRate];
+        if (strongSelf != nil) {
+            @autoreleasepool {
+                [strongSelf consume:buffer];
+            }
         }
     }];
 #pragma clang diagnostic pop
-    [self.engine prepare];
+
+    self.engine = engine;
+    self.converter = converter;
+    self.voiceFormat = voiceFormat;
+    self.player = player;
+    [engine prepare];
     NSError *startError = nil;
-    if (![self.engine startAndReturnError:&startError]) {
+    if (![engine startAndReturnError:&startError]) {
         [input removeTapOnBus:0];
         self.engine = nil;
-        [self emit:4 text:nil error:startError.localizedDescription ?: @"Could not start the microphone."];
+        self.converter = nil;
+        self.voiceFormat = nil;
+        self.player = nil;
+        [self emit:4 audio:NULL length:0 error:startError.localizedDescription ?: @"Could not start microphone and speaker audio."];
         return;
     }
-    [self startRecognitionSegment];
+    [self observeAudioLifecycleForEngine:engine];
+    [self emit:1 audio:NULL length:0 error:nil];
 }
 
-- (void)startRecognitionSegment {
-    if (self.stopped || self.muted || self.recognizer == nil) {
-        return;
-    }
-    SFSpeechAudioBufferRecognitionRequest *request =
-        [[SFSpeechAudioBufferRecognitionRequest alloc] init];
-    request.shouldReportPartialResults = YES;
-    request.requiresOnDeviceRecognition = YES;
-    uint64_t generation = ++self.recognitionGeneration;
-    @synchronized (self) {
-        if (self.stopped || self.muted) {
-            return;
-        }
-        self.request = request;
-        self.speechActive = NO;
-        self.segmentEnding = NO;
-        self.silenceSeconds = 0;
-        self.lastTranscript = @"";
-    }
+- (void)observeAudioLifecycleForEngine:(AVAudioEngine *)engine {
     __weak AHEADVoiceCapture *weakSelf = self;
-    self.task = [self.recognizer recognitionTaskWithRequest:request
-                                              resultHandler:^(SFSpeechRecognitionResult *result, NSError *error) {
+    self.audioConfigurationObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVAudioEngineConfigurationChangeNotification
+                    object:engine
+                     queue:nil
+                usingBlock:^(NSNotification *notification) {
+        (void)notification;
         AHEADVoiceCapture *strongSelf = weakSelf;
-        if (strongSelf == nil || strongSelf.stopped) {
-            return;
+        if (strongSelf != nil) {
+            dispatch_async(strongSelf.queue, ^{
+                [strongSelf emit:4 audio:NULL length:0 error:@"The audio device changed. End this call and reconnect to resume voice." ];
+            });
         }
-        dispatch_async(strongSelf.queue, ^{
-            if (strongSelf.stopped || generation != strongSelf.recognitionGeneration) {
-                return;
-            }
-            if (result != nil) {
-                NSString *text = result.bestTranscription.formattedString ?: @"";
-                strongSelf.lastTranscript = text;
-                [strongSelf emit:1 text:text error:nil];
-                if (result.isFinal) {
-                    if (text.length > 0) {
-                        [strongSelf emit:3 text:text error:nil];
-                    }
-                    [strongSelf finishRecognitionSegment];
-                    return;
-                }
-            }
-            if (error != nil) {
-                if (strongSelf.segmentEnding || strongSelf.muted) {
-                    if (strongSelf.lastTranscript.length > 0) {
-                        [strongSelf emit:3 text:strongSelf.lastTranscript error:nil];
-                        strongSelf.lastTranscript = @"";
-                    }
-                    [strongSelf finishRecognitionSegment];
-                } else {
-                    [strongSelf emit:4 text:nil error:error.localizedDescription ?: @"On-device transcription failed."];
-                }
-            }
-        });
+    }];
+    self.systemSleepObserver = [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserverForName:NSWorkspaceWillSleepNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *notification) {
+        (void)notification;
+        AHEADVoiceCapture *strongSelf = weakSelf;
+        if (strongSelf != nil) {
+            dispatch_async(strongSelf.queue, ^{
+                [strongSelf emit:4 audio:NULL length:0 error:@"System sleep ended audio capture. Start a new voice call after waking." ];
+            });
+        }
     }];
 }
 
-- (void)finishRecognitionSegment {
-    BOOL shouldRestart = NO;
-    @synchronized (self) {
-        self.task = nil;
-        self.request = nil;
-        self.segmentEnding = NO;
-        shouldRestart = !self.stopped && !self.muted;
+- (void)consume:(AVAudioPCMBuffer *)buffer {
+    if (self.stopped || self.muted || self.converter == nil || self.voiceFormat == nil) {
+        return;
     }
-    if (shouldRestart) {
-        [self startRecognitionSegment];
+    AVAudioFormat *sourceFormat = buffer.format;
+    AVAudioFrameCount outputCapacity = (AVAudioFrameCount)
+        ceil((double)buffer.frameLength * 24000.0 / sourceFormat.sampleRate) + 16;
+    AVAudioPCMBuffer *converted = [[AVAudioPCMBuffer alloc]
+        initWithPCMFormat:self.voiceFormat
+            frameCapacity:outputCapacity];
+    if (converted == nil) {
+        [self emit:4 audio:NULL length:0 error:@"Could not allocate a microphone audio frame."];
+        return;
     }
-}
+    __block BOOL suppliedInput = NO;
+    NSError *conversionError = nil;
+    AVAudioConverterOutputStatus status = [self.converter
+        convertToBuffer:converted
+                  error:&conversionError
+     withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets,
+                                         AVAudioConverterInputStatus *outStatus) {
+        (void)inNumberOfPackets;
+        if (suppliedInput) {
+            *outStatus = AVAudioConverterInputStatus_NoDataNow;
+            return nil;
+        }
+        suppliedInput = YES;
+        *outStatus = AVAudioConverterInputStatus_HaveData;
+        return buffer;
+    }];
+    if (status == AVAudioConverterOutputStatus_Error) {
+        [self emit:4 audio:NULL length:0 error:conversionError.localizedDescription ?: @"Could not resample microphone audio."];
+        return;
+    }
+    if (converted.frameLength == 0 || converted.int16ChannelData == NULL) {
+        return;
+    }
 
-- (void)consume:(AVAudioPCMBuffer *)buffer sampleRate:(double)sampleRate {
-    @synchronized (self) {
-        if (self.stopped || self.muted || self.segmentEnding || self.request == nil) {
-            return;
+    int16_t *samples = converted.int16ChannelData[0];
+    double squareTotal = 0;
+    for (AVAudioFrameCount index = 0; index < converted.frameLength; index++) {
+        const double sample = (double)samples[index] / 32768.0;
+        squareTotal += sample * sample;
+    }
+    const double rootMeanSquare = sqrt(squareTotal / converted.frameLength);
+    const NSTimeInterval duration = (double)converted.frameLength / 24000.0;
+    if (rootMeanSquare >= 0.012) {
+        self.silenceSeconds = 0;
+        if (!self.speechActive) {
+            self.speechActive = YES;
+            [self emit:2 audio:NULL length:0 error:nil];
         }
-        [self.request appendAudioPCMBuffer:buffer];
-        const float *samples = buffer.floatChannelData == NULL ? NULL : buffer.floatChannelData[0];
-        if (samples == NULL || buffer.frameLength == 0 || sampleRate <= 0) {
-            return;
-        }
-        double squareTotal = 0;
-        for (AVAudioFrameCount index = 0; index < buffer.frameLength; index++) {
-            double sample = samples[index];
-            squareTotal += sample * sample;
-        }
-        double rootMeanSquare = sqrt(squareTotal / buffer.frameLength);
-        NSTimeInterval duration = (double)buffer.frameLength / sampleRate;
-        if (rootMeanSquare >= 0.012) {
+    } else if (self.speechActive) {
+        self.silenceSeconds += duration;
+        if (self.silenceSeconds >= 0.8) {
+            self.speechActive = NO;
             self.silenceSeconds = 0;
-            if (!self.speechActive) {
-                self.speechActive = YES;
-                [self emit:2 text:nil error:nil];
-            }
-        } else if (self.speechActive) {
-            self.silenceSeconds += duration;
-            if (self.silenceSeconds >= 0.8) {
-                self.segmentEnding = YES;
-                [self.request endAudio];
-            }
+            [self emit:5 audio:NULL length:0 error:nil];
         }
     }
+    [self emit:3
+         audio:(const uint8_t *)samples
+        length:(size_t)converted.frameLength * sizeof(int16_t)
+         error:nil];
 }
 
 - (void)setCaptureMuted:(BOOL)muted {
     dispatch_async(self.queue, ^{
-        SFSpeechAudioBufferRecognitionRequest *request = nil;
-        BOOL shouldStart = NO;
-        @synchronized (self) {
-            if (self.stopped || self.muted == muted) {
-                return;
-            }
-            self.muted = muted;
-            if (muted) {
-                self.segmentEnding = YES;
-                request = self.request;
-            } else {
-                shouldStart = self.task == nil || self.request == nil;
-            }
+        if (self.stopped || self.muted == muted) {
+            return;
         }
-        if (muted) {
-            [request endAudio];
-        } else if (shouldStart) {
-            [self startRecognitionSegment];
+        self.muted = muted;
+        const BOOL wasSpeaking = self.speechActive;
+        self.speechActive = NO;
+        self.silenceSeconds = 0;
+        if (wasSpeaking) {
+            [self emit:5 audio:NULL length:0 error:nil];
         }
     });
 }
 
-- (void)stop {
-    dispatch_sync(self.queue, ^{
-        AVAudioEngine *engine = nil;
-        SFSpeechAudioBufferRecognitionRequest *request = nil;
-        SFSpeechRecognitionTask *task = nil;
-        NSString *transcript = nil;
-        @synchronized (self) {
-            if (self.stopped) {
+- (void)playAudio:(NSData *)audio {
+    dispatch_async(self.queue, ^{
+        if (self.stopped || self.voiceFormat == nil || self.player == nil || audio.length == 0) {
+            return;
+        }
+        if (self.scheduledAudioBytes + audio.length > 96 * 1024) {
+            [self emit:4 audio:NULL length:0 error:@"Speaker playback fell behind the live audio stream."];
+            return;
+        }
+        const AVAudioFrameCount frames = (AVAudioFrameCount)(audio.length / sizeof(int16_t));
+        AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc]
+            initWithPCMFormat:self.voiceFormat
+                frameCapacity:frames];
+        if (buffer == nil || buffer.int16ChannelData == NULL) {
+            [self emit:4 audio:NULL length:0 error:@"Could not queue speaker audio."];
+            return;
+        }
+        memcpy(buffer.int16ChannelData[0], audio.bytes, audio.length);
+        buffer.frameLength = frames;
+        self.scheduledBuffers += 1;
+        self.scheduledAudioBytes += audio.length;
+        const NSUInteger audioLength = audio.length;
+        const NSUInteger audioFrames = frames;
+        const uint64_t playbackGeneration = self.playbackGeneration;
+        [self.player scheduleBuffer:buffer
+            completionCallbackType:AVAudioPlayerNodeCompletionDataPlayedBack
+                    completionHandler:^(AVAudioPlayerNodeCompletionCallbackType callbackType) {
+            (void)callbackType;
+            dispatch_async(self.queue, ^{
+                if (self.playbackGeneration != playbackGeneration) {
+                    return;
+                }
+                [self emit:8 audio:NULL length:audioFrames value:playbackGeneration error:nil];
+                if (self.scheduledBuffers > 0) {
+                    self.scheduledBuffers -= 1;
+                }
+                self.scheduledAudioBytes = self.scheduledAudioBytes > audioLength
+                    ? self.scheduledAudioBytes - audioLength
+                    : 0;
+                if (self.scheduledBuffers == 0 && self.outputActive) {
+                    self.outputActive = NO;
+                    [self emit:7 audio:NULL length:0 error:nil];
+                }
+            });
+        }];
+        if (!self.player.isPlaying) {
+            NSError *playbackError = nil;
+            BOOL started = NO;
+            if (@available(macOS 27.0, *)) {
+                started = [self.player playAndReturnError:&playbackError];
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                [self.player play];
+#pragma clang diagnostic pop
+                started = YES;
+            }
+            if (!started) {
+                [self.player stop];
+                [self.player reset];
+                self.scheduledBuffers = 0;
+                self.scheduledAudioBytes = 0;
+                [self emit:4 audio:NULL length:0 error:playbackError.localizedDescription ?: @"Could not start speaker playback."];
                 return;
             }
-            self.stopped = YES;
-            engine = self.engine;
-            request = self.request;
-            task = self.task;
-            transcript = self.lastTranscript;
-            self.request = nil;
-            self.task = nil;
-            self.engine = nil;
         }
-        if (transcript.length > 0) {
-            self.callback(self.context, 3, transcript.UTF8String, "");
+        if (!self.outputActive) {
+            self.outputActive = YES;
+            [self emit:6 audio:NULL length:0 error:nil];
         }
-        [engine.inputNode removeTapOnBus:0];
-        [engine stop];
-        [request endAudio];
-        [task cancel];
+    });
+}
+
+- (uint64_t)stopPlayback {
+    __block uint64_t generation = 0;
+    dispatch_sync(self.queue, ^{
+        self.playbackGeneration += 1;
+        generation = self.playbackGeneration;
+        [self.player stop];
+        [self.player reset];
+        self.scheduledBuffers = 0;
+        self.scheduledAudioBytes = 0;
+        if (self.outputActive) {
+            self.outputActive = NO;
+            [self emit:7 audio:NULL length:0 error:nil];
+        }
+    });
+    return generation;
+}
+
+- (void)stop {
+    dispatch_sync(self.queue, ^{
+        if (self.stopped) {
+            return;
+        }
+        self.stopped = YES;
+        AVAudioEngine *engine = self.engine;
+        AVAudioPlayerNode *player = self.player;
+        if (self.audioConfigurationObserver != nil) {
+            [[NSNotificationCenter defaultCenter]
+                removeObserver:self.audioConfigurationObserver];
+            self.audioConfigurationObserver = nil;
+        }
+        if (self.systemSleepObserver != nil) {
+            [[[NSWorkspace sharedWorkspace] notificationCenter]
+                removeObserver:self.systemSleepObserver];
+            self.systemSleepObserver = nil;
+        }
+        self.engine = nil;
+        self.converter = nil;
+        self.voiceFormat = nil;
+        self.player = nil;
+        if (player != nil) {
+            [player stop];
+        }
+        if (engine != nil) {
+            [engine.inputNode removeTapOnBus:0];
+            [engine stop];
+        }
     });
 }
 
@@ -306,6 +429,18 @@ void ahead_voice_start(void *handle) {
 
 void ahead_voice_set_muted(void *handle, bool muted) {
     [(__bridge AHEADVoiceCapture *)handle setCaptureMuted:muted];
+}
+
+void ahead_voice_play(void *handle, const uint8_t *audio, size_t length) {
+    if (audio == NULL || length == 0 || length % sizeof(int16_t) != 0) {
+        return;
+    }
+    NSData *copy = [NSData dataWithBytes:audio length:length];
+    [(__bridge AHEADVoiceCapture *)handle playAudio:copy];
+}
+
+uint64_t ahead_voice_stop_playback(void *handle) {
+    return [(__bridge AHEADVoiceCapture *)handle stopPlayback];
 }
 
 void ahead_voice_stop(void *handle) {

@@ -1,6 +1,8 @@
 //! Searchable editor commands, following Zed's `crates/command_palette` picker behavior.
 
 use crate::app::ShellShortcut;
+use crate::code_panel::EditorCommand;
+use crate::workspace_panels::JustTask;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -18,12 +20,190 @@ struct Command {
     action: ShellShortcut,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommandAction {
+    Shell(ShellShortcut),
+    RunJustTask {
+        recipe: String,
+        cwd: String,
+        justfile: String,
+    },
+}
+
+#[derive(Clone)]
+struct PaletteCommand {
+    name: String,
+    keywords: String,
+    detail: String,
+    action: CommandAction,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CommandContext {
+    pub active_editor: bool,
+    pub text_editor: bool,
+    pub language_editor: bool,
+    pub can_navigate_back: bool,
+    pub can_navigate_forward: bool,
+    pub can_start_or_continue_debugging: bool,
+    pub can_stop_debugging: bool,
+    pub can_step_debugging: bool,
+    pub can_commit_staged: bool,
+    pub can_close_other_editors: bool,
+    pub can_close_editors_to_left: bool,
+    pub can_close_editors_to_right: bool,
+    pub can_move_editor_to_other_group: bool,
+}
+
+impl Command {
+    fn available(self, context: CommandContext) -> bool {
+        match self.action {
+            ShellShortcut::SaveActiveFile | ShellShortcut::DebugKey("f9", false) => {
+                context.text_editor
+            }
+            ShellShortcut::Editor(_) => context.language_editor,
+            ShellShortcut::NavigateBack => context.can_navigate_back,
+            ShellShortcut::NavigateForward => context.can_navigate_forward,
+            ShellShortcut::CloseEditor | ShellShortcut::CloseAllEditors => {
+                context.active_editor
+            }
+            ShellShortcut::CloseOtherEditors => context.can_close_other_editors,
+            ShellShortcut::CloseEditorsToLeft => context.can_close_editors_to_left,
+            ShellShortcut::CloseEditorsToRight => context.can_close_editors_to_right,
+            ShellShortcut::MoveEditorToOtherGroup => {
+                context.can_move_editor_to_other_group
+            }
+            ShellShortcut::CommitStagedChanges => context.can_commit_staged,
+            ShellShortcut::DebugKey("f5", false) => {
+                context.can_start_or_continue_debugging
+            }
+            ShellShortcut::DebugKey("f5", true) => context.can_stop_debugging,
+            ShellShortcut::DebugKey("f10" | "f11", _) => context.can_step_debugging,
+            _ => true,
+        }
+    }
+}
+
 const COMMANDS: &[Command] = &[
     Command {
         name: "Quick Open",
         keywords: "file finder",
         shortcut: "⌘P / Ctrl+P",
         action: ShellShortcut::QuickOpen,
+    },
+    Command {
+        name: "Open File",
+        keywords: "browse file",
+        shortcut: "⌘O / Ctrl+O",
+        action: ShellShortcut::OpenFileDialog,
+    },
+    Command {
+        name: "Open Folder",
+        keywords: "browse project workspace",
+        shortcut: "",
+        action: ShellShortcut::OpenFolderDialog,
+    },
+    Command {
+        name: "Save File",
+        keywords: "write buffer",
+        shortcut: "⌘S / Ctrl+S",
+        action: ShellShortcut::SaveActiveFile,
+    },
+    Command {
+        name: "Close Editor",
+        keywords: "close tab buffer",
+        shortcut: "",
+        action: ShellShortcut::CloseEditor,
+    },
+    Command {
+        name: "Close Other Editors",
+        keywords: "close tabs buffers keep active editor",
+        shortcut: "",
+        action: ShellShortcut::CloseOtherEditors,
+    },
+    Command {
+        name: "Close Editors to the Left",
+        keywords: "close tabs buffers left",
+        shortcut: "",
+        action: ShellShortcut::CloseEditorsToLeft,
+    },
+    Command {
+        name: "Close Editors to the Right",
+        keywords: "close tabs buffers right",
+        shortcut: "",
+        action: ShellShortcut::CloseEditorsToRight,
+    },
+    Command {
+        name: "Close All Editors",
+        keywords: "close tabs buffers all",
+        shortcut: "",
+        action: ShellShortcut::CloseAllEditors,
+    },
+    Command {
+        name: "Move Editor to Other Group",
+        keywords: "split pane group side by side",
+        shortcut: "",
+        action: ShellShortcut::MoveEditorToOtherGroup,
+    },
+    Command {
+        name: "Go Back",
+        keywords: "navigation previous location cursor history",
+        shortcut: "Ctrl+-",
+        action: ShellShortcut::NavigateBack,
+    },
+    Command {
+        name: "Go Forward",
+        keywords: "navigation next location cursor history",
+        shortcut: "Ctrl+_",
+        action: ShellShortcut::NavigateForward,
+    },
+    Command {
+        name: "Go to Definition",
+        keywords: "lsp symbol navigation declaration",
+        shortcut: "F12",
+        action: ShellShortcut::Editor(EditorCommand::GoToDefinition),
+    },
+    Command {
+        name: "Find All References",
+        keywords: "lsp symbol usages references",
+        shortcut: "⇧F12 / Shift+F12",
+        action: ShellShortcut::Editor(EditorCommand::FindReferences),
+    },
+    Command {
+        name: "Go to Implementation",
+        keywords: "lsp symbol navigation",
+        shortcut: "⌘F12 / Ctrl+F12",
+        action: ShellShortcut::Editor(EditorCommand::GoToImplementation),
+    },
+    Command {
+        name: "Rename Symbol",
+        keywords: "lsp refactor rename variable function",
+        shortcut: "F2",
+        action: ShellShortcut::Editor(EditorCommand::RenameSymbol),
+    },
+    Command {
+        name: "Format Document",
+        keywords: "lsp formatter format file",
+        shortcut: "⇧⌥F / Shift+Alt+F",
+        action: ShellShortcut::Editor(EditorCommand::FormatDocument),
+    },
+    Command {
+        name: "Show Completions",
+        keywords: "lsp autocomplete suggestions",
+        shortcut: "Ctrl+Space",
+        action: ShellShortcut::Editor(EditorCommand::ShowCompletions),
+    },
+    Command {
+        name: "Show Signature Help",
+        keywords: "lsp arguments parameter types",
+        shortcut: "⌘⇧Space / Ctrl+Shift+Space",
+        action: ShellShortcut::Editor(EditorCommand::ShowSignatureHelp),
+    },
+    Command {
+        name: "Show Code Actions",
+        keywords: "lsp quick fix refactor lightbulb",
+        shortcut: "⌘. / Ctrl+.",
+        action: ShellShortcut::Editor(EditorCommand::ShowCodeActions),
     },
     Command {
         name: "Search Workspace",
@@ -42,6 +222,18 @@ const COMMANDS: &[Command] = &[
         keywords: "git",
         shortcut: "Ctrl+Shift+G",
         action: ShellShortcut::SourceControl,
+    },
+    Command {
+        name: "Stage All Changes",
+        keywords: "git add stage files",
+        shortcut: "",
+        action: ShellShortcut::StageAllChanges,
+    },
+    Command {
+        name: "Commit Staged Changes",
+        keywords: "git commit",
+        shortcut: "",
+        action: ShellShortcut::CommitStagedChanges,
     },
     Command {
         name: "Problems",
@@ -122,6 +314,18 @@ const COMMANDS: &[Command] = &[
         action: ShellShortcut::Agent,
     },
     Command {
+        name: "New AHEAD Session",
+        keywords: "chat thread managed agent",
+        shortcut: "",
+        action: ShellShortcut::NewAheadSession,
+    },
+    Command {
+        name: "Start External Agent",
+        keywords: "chat thread ACP Pi Codex Claude Code",
+        shortcut: "",
+        action: ShellShortcut::NewExternalAgent,
+    },
+    Command {
         name: "Toggle Threads",
         keywords: "chat sidebar",
         shortcut: "",
@@ -165,10 +369,41 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
-fn rank_commands(query: &str) -> Vec<Command> {
+fn available_commands(
+    context: CommandContext,
+    tasks: &[JustTask],
+) -> Vec<PaletteCommand> {
+    let mut commands = COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.available(context))
+        .map(|command| PaletteCommand {
+            name: command.name.into(),
+            keywords: command.keywords.into(),
+            detail: platform_shortcut(command.shortcut).into(),
+            action: CommandAction::Shell(command.action),
+        })
+        .collect::<Vec<_>>();
+    commands.extend(tasks.iter().map(|task| PaletteCommand {
+        name: format!("Run just {}", task.name),
+        keywords: format!(
+            "just task recipe {}",
+            task.description.as_deref().unwrap_or_default()
+        ),
+        detail: task.cwd.to_string_lossy().into_owned(),
+        action: CommandAction::RunJustTask {
+            recipe: task.name.clone(),
+            cwd: task.cwd.to_string_lossy().into_owned(),
+            justfile: task.justfile.to_string_lossy().into_owned(),
+        },
+    }));
+    commands
+}
+
+fn rank_commands(query: &str, commands: &[PaletteCommand]) -> Vec<PaletteCommand> {
     let query = query.trim();
     if query.is_empty() {
-        return COMMANDS.to_vec();
+        return commands.to_vec();
     }
     let pattern = Pattern::new(
         query,
@@ -179,17 +414,17 @@ fn rank_commands(query: &str) -> Vec<Command> {
     let mut matcher = FuzzyMatcher::new(FuzzyConfig::DEFAULT);
     let mut candidate_chars = Vec::new();
     let lower_query = query.to_ascii_lowercase();
-    let mut matches = COMMANDS
+    let mut matches = commands
         .iter()
         .filter_map(|command| {
             let name = command.name.to_ascii_lowercase();
             let keywords = command.keywords.to_ascii_lowercase();
             let title_score = pattern.score(
-                Utf32Str::new(command.name, &mut candidate_chars),
+                Utf32Str::new(&command.name, &mut candidate_chars),
                 &mut matcher,
             );
             let keyword_score = pattern.score(
-                Utf32Str::new(command.keywords, &mut candidate_chars),
+                Utf32Str::new(&command.keywords, &mut candidate_chars),
                 &mut matcher,
             );
             let score = if name == lower_query {
@@ -208,14 +443,14 @@ fn rank_commands(query: &str) -> Vec<Command> {
             } else {
                 (0, keyword_score?)
             };
-            Some((score, *command))
+            Some((score, command.clone()))
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         right
             .0
             .cmp(&left.0)
-            .then_with(|| left.1.name.cmp(right.1.name))
+            .then_with(|| left.1.name.cmp(&right.1.name))
     });
     matches.into_iter().map(|(_, command)| command).collect()
 }
@@ -259,7 +494,9 @@ mod guide_tests {
 }
 
 pub(crate) fn open(
-    on_command: Box<dyn Fn(ShellShortcut, &mut Window, &mut App)>,
+    on_command: Box<dyn Fn(CommandAction, &mut Window, &mut App)>,
+    context: CommandContext,
+    tasks: Vec<JustTask>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -267,8 +504,9 @@ pub(crate) fn open(
         return;
     }
     let previous_focus = window.focused(cx);
-    let palette =
-        cx.new(|cx| CommandPalette::new(on_command, previous_focus, window, cx));
+    let palette = cx.new(|cx| {
+        CommandPalette::new(on_command, context, tasks, previous_focus, window, cx)
+    });
     let input_focus = palette.read(cx).query.read(cx).focus_handle(cx);
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
@@ -290,21 +528,25 @@ pub(crate) fn open(
 
 struct CommandPalette {
     query: Entity<InputState>,
-    results: Vec<Command>,
+    commands: Vec<PaletteCommand>,
+    results: Vec<PaletteCommand>,
     selected_index: usize,
     scroll: ScrollHandle,
     previous_focus: Option<FocusHandle>,
-    on_command: Box<dyn Fn(ShellShortcut, &mut Window, &mut App)>,
+    on_command: Box<dyn Fn(CommandAction, &mut Window, &mut App)>,
     _escape_interceptor: Subscription,
 }
 
 impl CommandPalette {
     fn new(
-        on_command: Box<dyn Fn(ShellShortcut, &mut Window, &mut App)>,
+        on_command: Box<dyn Fn(CommandAction, &mut Window, &mut App)>,
+        context: CommandContext,
+        tasks: Vec<JustTask>,
         previous_focus: Option<FocusHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let commands = available_commands(context, &tasks);
         let query = cx.new(|cx| InputState::new(window, cx));
         let focus = query.read(cx).focus_handle(cx);
         let escape_interceptor =
@@ -319,7 +561,8 @@ impl CommandPalette {
             });
         cx.subscribe(&query, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.results = rank_commands(&this.query.read(cx).value());
+                this.results =
+                    rank_commands(&this.query.read(cx).value(), &this.commands);
                 this.selected_index = 0;
                 this.scroll.scroll_to_item(0);
                 cx.notify();
@@ -328,7 +571,8 @@ impl CommandPalette {
         .detach();
         Self {
             query,
-            results: COMMANDS.to_vec(),
+            results: commands.clone(),
+            commands,
             selected_index: 0,
             scroll: ScrollHandle::new(),
             previous_focus,
@@ -360,14 +604,14 @@ impl CommandPalette {
     }
 
     fn run_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(command) = self.results.get(self.selected_index).copied() {
+        if let Some(command) = self.results.get(self.selected_index).cloned() {
             self.run(command, window, cx);
         }
     }
 
     fn run(
         &mut self,
-        command: Command,
+        command: PaletteCommand,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -388,7 +632,8 @@ impl Render for CommandPalette {
         let focus = self.query.read(cx).focus_handle(cx);
         let muted = cx.theme().muted_foreground;
         let results = self.results.iter().enumerate().map(|(index, command)| {
-            let command = *command;
+            let command = command.clone();
+            let click_command = command.clone();
             ListItem::new(index)
                 .w_full()
                 .selected(index == self.selected_index)
@@ -397,16 +642,18 @@ impl Render for CommandPalette {
                         .w_full()
                         .justify_between()
                         .gap_2()
-                        .child(command.name)
+                        .child(command.name.clone())
                         .child(
                             div()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(px(11.))
                                 .text_color(muted)
-                                .child(platform_shortcut(command.shortcut)),
+                                .child(command.detail.clone()),
                         ),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.run(command, window, cx)
+                    this.run(click_command.clone(), window, cx)
                 }))
         });
         let footer = if self.results.is_empty() {
@@ -440,7 +687,10 @@ impl Render for CommandPalette {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandPalette, ShellShortcut, open, rank_commands};
+    use super::{
+        CommandAction, CommandContext, CommandPalette, EditorCommand, JustTask,
+        ShellShortcut, available_commands, open, rank_commands,
+    };
     use gpui_kit::component::WindowExt;
     use gpui_kit::component::input::InputState;
     use gpui_kit::prelude::*;
@@ -465,16 +715,197 @@ mod tests {
 
     #[test]
     fn filters_commands_by_name_and_keyword() {
-        assert_eq!(
-            rank_commands("breakpoint")[0].action,
-            ShellShortcut::DebugKey("f9", false)
+        let commands = available_commands(
+            CommandContext {
+                text_editor: true,
+                ..CommandContext::default()
+            },
+            &[],
         );
-        assert_eq!(rank_commands("git")[0].action, ShellShortcut::SourceControl);
         assert_eq!(
-            rank_commands("extensions")[0].action,
-            ShellShortcut::Extensions
+            rank_commands("breakpoint", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::DebugKey("f9", false))
         );
-        assert!(rank_commands("unlikely unknown action").is_empty());
+        assert_eq!(
+            rank_commands("git", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::SourceControl)
+        );
+        assert_eq!(
+            rank_commands("stage all", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::StageAllChanges)
+        );
+        assert_eq!(
+            rank_commands("extensions", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::Extensions)
+        );
+        assert_eq!(
+            rank_commands("new ahead", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::NewAheadSession)
+        );
+        assert_eq!(
+            rank_commands("claude", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::NewExternalAgent)
+        );
+        let commands = available_commands(
+            CommandContext {
+                active_editor: true,
+                ..CommandContext::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            rank_commands("close all", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::CloseAllEditors)
+        );
+        assert!(rank_commands("unlikely unknown action", &commands).is_empty());
+    }
+
+    #[test]
+    fn palette_hides_commands_without_their_editor_or_debug_target() {
+        let commands = available_commands(CommandContext::default(), &[]);
+        for action in [
+            ShellShortcut::SaveActiveFile,
+            ShellShortcut::CloseEditor,
+            ShellShortcut::CloseOtherEditors,
+            ShellShortcut::CloseEditorsToLeft,
+            ShellShortcut::CloseEditorsToRight,
+            ShellShortcut::CloseAllEditors,
+            ShellShortcut::MoveEditorToOtherGroup,
+            ShellShortcut::DebugKey("f9", false),
+            ShellShortcut::DebugKey("f5", false),
+            ShellShortcut::DebugKey("f5", true),
+            ShellShortcut::DebugKey("f10", false),
+            ShellShortcut::CommitStagedChanges,
+            ShellShortcut::NavigateBack,
+            ShellShortcut::NavigateForward,
+        ] {
+            assert!(
+                !commands.iter().any(|command| {
+                    command.action == CommandAction::Shell(action)
+                })
+            );
+        }
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::OpenFileDialog)));
+
+        let commands = available_commands(
+            CommandContext {
+                active_editor: true,
+                text_editor: true,
+                language_editor: true,
+                can_navigate_back: true,
+                can_navigate_forward: true,
+                can_start_or_continue_debugging: true,
+                can_stop_debugging: true,
+                can_step_debugging: true,
+                can_commit_staged: true,
+                can_close_other_editors: true,
+                can_close_editors_to_left: true,
+                can_close_editors_to_right: true,
+                can_move_editor_to_other_group: true,
+            },
+            &[],
+        );
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::SaveActiveFile)));
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::CloseEditor)));
+        for action in [
+            ShellShortcut::CloseOtherEditors,
+            ShellShortcut::CloseEditorsToLeft,
+            ShellShortcut::CloseEditorsToRight,
+            ShellShortcut::CloseAllEditors,
+            ShellShortcut::MoveEditorToOtherGroup,
+        ] {
+            assert!(
+                commands.iter().any(|command| {
+                    command.action == CommandAction::Shell(action)
+                })
+            );
+        }
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::DebugKey("f10", false))));
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::CommitStagedChanges)));
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::NavigateBack)));
+        assert!(commands.iter().any(|command| command.action
+            == CommandAction::Shell(ShellShortcut::NavigateForward)));
+    }
+
+    #[test]
+    fn language_commands_require_an_open_text_editor_with_language_services() {
+        let language_commands = [
+            EditorCommand::GoToDefinition,
+            EditorCommand::FindReferences,
+            EditorCommand::GoToImplementation,
+            EditorCommand::RenameSymbol,
+            EditorCommand::FormatDocument,
+            EditorCommand::ShowCompletions,
+            EditorCommand::ShowSignatureHelp,
+            EditorCommand::ShowCodeActions,
+        ];
+        for context in [
+            CommandContext::default(),
+            CommandContext {
+                text_editor: true,
+                ..CommandContext::default()
+            },
+        ] {
+            let commands = available_commands(context, &[]);
+            assert!(language_commands.iter().all(|action| {
+                !commands.iter().any(|command| {
+                    command.action
+                        == CommandAction::Shell(ShellShortcut::Editor(*action))
+                })
+            }));
+        }
+
+        let commands = available_commands(
+            CommandContext {
+                text_editor: true,
+                language_editor: true,
+                ..CommandContext::default()
+            },
+            &[],
+        );
+        for action in language_commands {
+            assert!(commands.iter().any(|command| {
+                command.action == CommandAction::Shell(ShellShortcut::Editor(action))
+            }));
+        }
+        assert_eq!(
+            rank_commands("signature", &commands)[0].action,
+            CommandAction::Shell(ShellShortcut::Editor(
+                EditorCommand::ShowSignatureHelp
+            ))
+        );
+    }
+
+    #[test]
+    fn discovered_just_recipes_are_searchable_palette_actions() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cwd = workspace.path().to_string_lossy().into_owned();
+        let justfile = workspace
+            .path()
+            .join("justfile")
+            .to_string_lossy()
+            .into_owned();
+        let task = JustTask {
+            justfile: workspace.path().join("justfile"),
+            cwd: workspace.path().to_owned(),
+            name: "format".into(),
+            description: Some("Format Rust and TypeScript".into()),
+        };
+        let commands = available_commands(CommandContext::default(), &[task]);
+        assert_eq!(
+            rank_commands("format", &commands)[0].action,
+            CommandAction::RunJustTask {
+                recipe: "format".into(),
+                cwd,
+                justfile,
+            }
+        );
     }
 
     #[gpui_kit::test]
@@ -491,6 +922,8 @@ mod tests {
                 Box::new(move |command, _, _| {
                     *selected_for_callback.lock().unwrap() = Some(command);
                 }),
+                CommandContext::default(),
+                Vec::new(),
                 window,
                 cx,
             );
@@ -498,12 +931,15 @@ mod tests {
         });
         // The command is selected through the same dialog Enter path as a native user.
         cx.simulate_keystrokes("enter");
-        assert_eq!(*selected.lock().unwrap(), Some(ShellShortcut::QuickOpen));
+        assert_eq!(
+            *selected.lock().unwrap(),
+            Some(CommandAction::Shell(ShellShortcut::QuickOpen))
+        );
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     #[gpui_kit::test]
-    fn typed_query_filters_the_visible_palette_before_enter(
+    fn typed_query_filters_and_runs_a_discovered_just_recipe(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::component::init);
@@ -513,12 +949,31 @@ mod tests {
         });
         let selected = Arc::new(Mutex::new(None));
         let selected_for_callback = selected.clone();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cwd = workspace.path().to_string_lossy().into_owned();
+        let justfile = workspace
+            .path()
+            .join("justfile")
+            .to_string_lossy()
+            .into_owned();
+        let task = JustTask {
+            justfile: workspace.path().join("justfile"),
+            cwd: workspace.path().to_owned(),
+            name: "format".into(),
+            description: Some("Format project files".into()),
+        };
         let palette = cx.update(|window, cx| {
             let palette = cx.new(|cx| {
                 CommandPalette::new(
                     Box::new(move |command, _, _| {
                         *selected_for_callback.lock().unwrap() = Some(command);
                     }),
+                    CommandContext {
+                        active_editor: true,
+                        text_editor: true,
+                        ..CommandContext::default()
+                    },
+                    vec![task],
                     None,
                     window,
                     cx,
@@ -553,18 +1008,28 @@ mod tests {
             assert!(palette.scroll.offset().y < gpui_kit::px(0.));
         });
         query.update_in(cx, |input: &mut InputState, window, cx| {
-            input.replace_all("git".to_string(), window, cx);
+            input.replace_all("format".to_string(), window, cx);
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         palette.read_with(cx, |palette, _| {
-            assert_eq!(palette.results[0].action, ShellShortcut::SourceControl);
+            assert_eq!(
+                palette.results[0].action,
+                CommandAction::RunJustTask {
+                    recipe: "format".into(),
+                    cwd: cwd.clone(),
+                    justfile: justfile.clone(),
+                }
+            );
             assert_eq!(palette.selected_index, 0);
-            assert_eq!(palette.scroll.top_item(), 0);
         });
         cx.simulate_keystrokes("enter");
         assert_eq!(
             *selected.lock().unwrap(),
-            Some(ShellShortcut::SourceControl)
+            Some(CommandAction::RunJustTask {
+                recipe: "format".into(),
+                cwd,
+                justfile,
+            })
         );
     }
 }

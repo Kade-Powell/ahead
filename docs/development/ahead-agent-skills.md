@@ -3,7 +3,7 @@
 Status: project `AGENTS.md` loading from root through turn cwd and Agent Skills
 discovery are implemented in source, with focused library, native-reader, RPC
 and headless composer tests passing. Built-in AHEAD skill packages live under
-`ahead-agent/skills/`; project and user skills resolve from `.agents/skills/`
+`ahead-agent-skills/builtins/`; project and user skills resolve from `.agents/skills/`
 and `~/.agents/skills/`. Live managed-turn loading, persisted skill provenance,
 target-scoped instruction discovery and rendered end-to-end behavior remain
 open; see `TODO.md`.
@@ -18,7 +18,7 @@ vocabulary for its built-in agent. Skills help the agent choose a useful way to
 assist; they do not become a second policy engine, permission system or task
 database.
 
-AHEAD follows the portable Agent Skills shape:
+AHEAD follows the portable format in the [Agent Skills specification](https://agentskills.io/specification). The spec defines each skill package and its `SKILL.md` metadata; it does not prescribe a discovery directory or slash-command syntax. The [client implementation guide](https://agentskills.io/client-implementation/adding-skills-support) describes `.agents/skills/` as a cross-client convention rather than a normative path.
 
 ```text
 skill-name/
@@ -32,7 +32,12 @@ host loads the body only when the task matches, then loads references only when
 the selected procedure needs them. This keeps unrelated procedures out of the
 active context.
 
-Reference inspiration: [Anthropic Agent Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview).
+The format also defines optional `license`, `compatibility` and `metadata`
+fields, plus experimental `allowed-tools`. AHEAD does not treat these fields as
+policy: `allowed-tools` never grants capabilities or bypasses AHEAD's normal
+tool authorization. The client-level `disable-model-invocation` convention
+only controls implicit skill selection; explicit invocation remains available.
+
 AHEAD's skills are reimplemented for AHEAD's session host, task intents, code
 anchors, GPUI presentation and human-led policy; they are not assumed to be
 drop-in copies of another agent's workflows.
@@ -66,7 +71,7 @@ the debugging policy.
 
 ## 3. Built-in AHEAD skills
 
-These are shipped under `ahead-agent/skills/` and are AHEAD-owned versions:
+These are shipped under `ahead-agent-skills/builtins/` and are AHEAD-owned versions:
 
 | Skill | Role | Activation |
 |---|---|---|
@@ -108,7 +113,7 @@ host authorization. A skill cannot weaken AHEAD rules by giving the model a
 different instruction, tool name or apparent approval.
 
 See the shared policy in
-[`ahead-agent/skills/references/human-led-policy.md`](../../ahead-agent/skills/references/human-led-policy.md).
+[`ahead-agent-skills/builtins/references/human-led-policy.md`](../../ahead-agent-skills/builtins/references/human-led-policy.md).
 
 ## 5. Workspace instructions and skill discovery
 
@@ -134,7 +139,11 @@ composer labels their source and uses a source-qualified slash command to
 preserve the human's choice. An unqualified name is activated only when it is
 unique. This duplicate-selection and slash-command behavior belongs to AHEAD's
 UI contract; the Agent Skills format does not define activation syntax or
-collision handling.
+collision handling. The [client implementation guide recommends project-over-
+user precedence](https://agentskills.io/client-implementation/adding-skills-support#handling-name-collisions);
+AHEAD deliberately keeps both packages visible instead of shadowing one, so a
+human can explicitly select either source. This is an AHEAD product choice,
+not a requirement of the Agent Skills format.
 
 AHEAD dogfoods this contract. Runtime-maintenance procedures adapted from the
 Codex CLI live beside the other project skills under `.agents/skills/`, use an
@@ -150,7 +159,8 @@ contain absolute skill paths. A selected host skill carries a
 `<resource_access>` locator in turn context. AHEAD's native `skill_resource_read`
 tool accepts that package handle and either the main resource or a
 package-relative resource such as `<package>/references/guide.md`. The host
-snapshot boundary rejects unknown or disabled skills, and the retained filesystem
+checks that the package was loaded into the current turn and is still enabled;
+merely being installed or enabled is not sufficient. The retained filesystem
 boundary rejects absolute paths, parent traversal, Windows-separator aliases,
 and resources whose canonical target leaves the skill directory. Resource
 contents are bounded and returned in cursor-checked UTF-8 pages.
@@ -163,9 +173,17 @@ The copied generic Codex skills catalog/provider, extension installer, and
 `skills.list`/`skills.read` adapters have been pruned. `ThreadManager::new_for_ahead`
 also uses `empty_extension_registry()`. AHEAD exposes its own direct dynamic
 reader through `HostSkillsSnapshot::read_package_resource`. Package-resource
-containment and native UTF-8 paging/stale-cursor regressions passed on
-2026-09-28; live managed-turn nested-reference verification remains open. See
-`TODO.md` for the remaining gates.
+containment and native UTF-8 paging/stale-cursor regressions passed. The
+2026-10-14 managed-turn regression also verifies that a nested reference is
+read through the native host boundary and its provenance is stored with the
+turn. The native dynamic-tool boundary now requires the opaque skill ID from
+that turn's `SkillContextLoaded` event; an unselected package is rejected even
+if the model fabricates a handle. A mock-model turn using the bundled GPT-5.5
+direct tool mode verifies that the model-facing request advertises
+`skill_resource_read`, its function call reaches the host reader, and the
+nested content appears in the follow-up request. Model-specific `CodeModeOnly`
+selection remains intact; this test does not force a hidden tool call through
+that mode. See `TODO.md` for the remaining gates.
 
 `AGENTS.md` and workspace skills provide extra instructions, not capability
 grants. AHEAD's host policy and explicit human scope always win.
@@ -180,20 +198,27 @@ workspace:<root>:<name>         project-local skill
 user:<root-id>:<name>           configured user skill
 ```
 
-Record the following in task/session context:
+For each selected skill injected into a managed turn, AHEAD persists its opaque
+skill ID, scope, source-file SHA-256, exact injected-prompt SHA-256, and
+selection actor with that turn's existing Turso request record. The IDs and
+hashes do not include filesystem paths. This uses the initial working schema;
+it does not introduce migration or schema-version checks. When the agent reads
+a nested resource, AHEAD records the same opaque skill ID and scope, skill name,
+package-relative path, source-content SHA-256, exact returned-page SHA-256 and
+`agent` as the loader. Host paths are never persisted in this reference. These
+records live in the same turn-request JSON alongside selected-skill provenance;
+Turso close/reopen coverage verifies that the reference remains durable and is
+deduplicated.
 
-- skill ID and revision;
-- source root and trust classification;
-- content hash;
-- selected-by actor (`human`, `agent` or `host`);
-- loaded references;
-- applicable `AGENTS.md` paths and hashes.
+Applicable `AGENTS.md` sources and hashes are captured separately with the
+turn. Recorded scope identifies the skill source; it is provenance, not a trust
+or permission grant.
 
 If a skill or instruction conflicts with AHEAD policy, keep it visible as
 unavailable, explain the conflict and do not execute the conflicting step.
 Scripts, network access, credentials, file changes, debugger effects and
-external writes require their ordinary host authorization even when described by
-a trusted skill.
+external writes require their ordinary host authorization even when described
+by a trusted skill.
 
 ## 7. Automated end-of-session review
 
@@ -214,25 +239,25 @@ update a tracker. A human decides what to fix, accept as risk, defer or publish.
 
 ## 8. Implementation status
 
-Implemented in source; the following focused regressions passed on 2026-09-28
-(see `TODO.md` for command-level evidence):
+Implemented in source; focused regression dates and command-level evidence are
+recorded in `TODO.md`:
 
-- AHEAD-owned skill specifications under `ahead-agent/skills/`, separate from
+- AHEAD-owned skill specifications under `ahead-agent-skills/builtins/`, separate from
   repository-maintenance skills under `.agents/skills/`;
 - project-root `.agents/skills/` and user `~/.agents/skills/` resolution;
 - source-qualified selection for same-named project and user skills, including
   duplicate-name handling in the native resolver;
 - `skill_resource_read` through the host snapshot, including resource
   containment and bounded UTF-8 paging with cursor validation;
+- selected-skill and nested-resource provenance in the existing Turso turn
+  request, including source and exact response-page hashes;
 - Agent Skills package validation, project-source RPC privacy, and headless
   slash-palette filtering and selection.
 
 Still incomplete or not demonstrated as live product behavior:
 
-- a live managed-turn demonstration of selected-body and nested-reference
-  loading, plus rendered invalid-package diagnostics;
-- selected-skill revision/provenance persistence and complete skill/instruction
-  conflict handling;
+- rendered invalid-package diagnostics;
+- complete skill/instruction conflict handling;
 - applicable instruction path/hash capture, target-directory reload, and
   conflict presentation;
 - skill selection events and task routing;

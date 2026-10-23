@@ -1,0 +1,87 @@
+name: Publish reviewed AHEAD extensions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ahead-extension-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Kade-Powell/ahead' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out AHEAD
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Read reviewed source pins
+        id: pins
+        run: |
+          node -e 'const s=require("./extensions/sources.json"); const u=new URL(s.source_repository); if(u.protocol!=="https:"||u.hostname!=="github.com") throw new Error("source repository must be on GitHub over HTTPS"); console.log(`source_repository=${u.pathname.replace(/^\//,"").replace(/\.git$/,"")}`); console.log(`source_revision=${s.source_revision}`); console.log(`cli_revision=${s.zed_extension_cli_revision}`)' >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned extension catalog/source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pins.outputs.source_repository }}
+          ref: ${{ steps.pins.outputs.source_revision }}
+          path: zed-source
+
+      - name: Initialize reviewed extension source submodules
+        run: |
+          node -e 'const {execFileSync}=require("node:child_process"); const s=require("./extensions/sources.json"); const paths=[...new Set(s.extensions.map(x=>x.source_path).filter(x=>x&&x!=="."))]; for(const p of paths) if(p.startsWith("/")||p.split("/").includes("..")||!/^[A-Za-z0-9._/-]+$/.test(p)) throw new Error(`invalid source submodule path: ${p}`); if(paths.length) execFileSync("git",["-C","zed-source","submodule","update","--init","--depth","1","--",...paths],{stdio:"inherit"});'
+
+      - name: Install the pinned Rust toolchain and Wasm target
+        run: |
+          rustup toolchain install 1.90 --profile minimal
+          rustup target add wasm32-wasip2 --toolchain 1.90
+          echo 'RUSTUP_TOOLCHAIN=1.90' >> "$GITHUB_ENV"
+
+      - name: Download Zed's pinned extension CLI
+        env:
+          CLI_REVISION: ${{ steps.pins.outputs.cli_revision }}
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://zed-extension-cli.nyc3.digitaloceanspaces.com/${CLI_REVISION}/x86_64-unknown-linux-gnu/zed-extension" \
+            --output zed-extension
+          chmod +x zed-extension
+
+      - name: Test the AHEAD publisher
+        run: node --test scripts/package-ahead-extensions.test.mjs
+
+      - name: Build reviewed packages and update the feed
+        env:
+          RELEASE_TAG: ahead-extensions-${{ github.run_id }}
+        run: |
+          node scripts/package-ahead-extensions.mjs \
+            --source-root zed-source \
+            --release-tag "$RELEASE_TAG" \
+            --zed-extension "$GITHUB_WORKSPACE/zed-extension" \
+            --output-dir "$GITHUB_WORKSPACE/dist/extensions"
+
+      - name: Publish immutable package assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ahead-extensions-${{ github.run_id }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/extensions/*.tar.gz \
+            --target main \
+            --title "$RELEASE_TAG" \
+            --notes "Reviewed extension packages from the pinned sources in extensions/sources.json."
+
+      - name: Publish the updated live catalog
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add extensions/registry.json
+          git commit -m 'Publish reviewed AHEAD extensions'
+          git push origin HEAD:main

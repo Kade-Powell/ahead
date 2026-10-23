@@ -8,7 +8,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::acp_client::{HarnessUserInputOption, HarnessUserInputQuestion};
+use crate::events::{HarnessUserInputOption, HarnessUserInputQuestion};
 
 #[derive(Clone)]
 pub(super) struct McpForm {
@@ -631,10 +631,10 @@ fn validate_value(name: &str, schema: &Value, value: &Value) -> Result<()> {
     if let Some(text) = value.as_str() {
         let length = text.chars().count() as u64;
         if let Some(minimum) = schema["minLength"].as_u64() {
-            ensure!(length >= minimum, "{} is too short", name);
+            ensure!(length >= minimum, "{name} is too short");
         }
         if let Some(maximum) = schema["maxLength"].as_u64() {
-            ensure!(length <= maximum, "{} is too long", name);
+            ensure!(length <= maximum, "{name} is too long");
         }
         if let Some(pattern) = schema["pattern"].as_str() {
             ensure!(pattern.len() <= 1024, "MCP validation pattern is too long");
@@ -642,8 +642,7 @@ fn validate_value(name: &str, schema: &Value, value: &Value) -> Result<()> {
                 Regex::new(pattern)
                     .context("invalid MCP validation pattern")?
                     .is_match(text),
-                "{} does not match the requested pattern",
-                name
+                "{name} does not match the requested pattern"
             );
         }
         match schema["format"].as_str() {
@@ -656,29 +655,27 @@ fn validate_value(name: &str, schema: &Value, value: &Value) -> Result<()> {
                     && !domain.starts_with('.')
                     && !domain.ends_with('.')
                     && !text.contains(char::is_whitespace)),
-                "{} must be an email address",
-                name
+                "{name} must be an email address"
             ),
             Some("uri") => {
-                Url::parse(text)
-                    .with_context(|| format!("{} must be a URI", name))?;
+                Url::parse(text).with_context(|| format!("{name} must be a URI"))?;
             }
             Some("date") => {
                 NaiveDate::parse_from_str(text, "%Y-%m-%d")
-                    .with_context(|| format!("{} must be a date", name))?;
+                    .with_context(|| format!("{name} must be a date"))?;
             }
             Some("date-time") => {
                 DateTime::parse_from_rfc3339(text)
-                    .with_context(|| format!("{} must be a date-time", name))?;
+                    .with_context(|| format!("{name} must be a date-time"))?;
             }
             Some(_) => bail!("unsupported MCP string format"),
         }
     } else if let Some(number) = value.as_f64() {
         if let Some(minimum) = schema["minimum"].as_f64() {
-            ensure!(number >= minimum, "{} is too small", name);
+            ensure!(number >= minimum, "{name} is too small");
         }
         if let Some(maximum) = schema["maximum"].as_f64() {
-            ensure!(number <= maximum, "{} is too large", name);
+            ensure!(number <= maximum, "{name} is too large");
         }
     }
     Ok(())

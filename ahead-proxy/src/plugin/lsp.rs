@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
+    ffi::OsStr,
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{self, Child, Command, Stdio},
@@ -71,6 +72,14 @@ pub struct LspClient {
 impl PluginServerHandler for LspClient {
     fn method_registered(&mut self, method: &str) -> bool {
         self.host.method_registered(method)
+    }
+
+    fn request_supported(
+        &mut self,
+        method: &str,
+        params: &jsonrpc_lite::Params,
+    ) -> bool {
+        self.host.request_supported(method, params)
     }
 
     fn document_supported(
@@ -475,7 +484,25 @@ impl LspClient {
                 "Workspace is restricted; trust it before starting a language server"
             );
         }
-        let mut process = Command::new(server);
+        let current_dir = std::env::current_dir()
+            .context("resolving language server executable")?;
+        let inherited_path = std::env::var_os("PATH");
+        let path_override = env.iter().rev().find(|(name, _)| {
+            #[cfg(windows)]
+            {
+                name.eq_ignore_ascii_case("PATH")
+            }
+            #[cfg(not(windows))]
+            {
+                name == "PATH"
+            }
+        });
+        let search_path = path_override
+            .map(|(_, value)| OsStr::new(value.as_str()))
+            .or(inherited_path.as_deref());
+        let server_path =
+            resolve_server_executable(server, search_path, &current_dir)?;
+        let mut process = Command::new(server_path);
         if let Some(workspace) = workspace {
             process.current_dir(workspace);
         }
@@ -495,12 +522,27 @@ impl LspClient {
     }
 }
 
+fn resolve_server_executable(
+    server: &str,
+    search_path: Option<&OsStr>,
+    current_dir: &Path,
+) -> Result<PathBuf> {
+    let server_path = Path::new(server);
+    if server_path.is_absolute() || server_path.components().count() > 1 {
+        return Ok(server_path.to_path_buf());
+    }
+    which::CanonicalPath::new_in(server, search_path, current_dir)
+        .map(which::CanonicalPath::into_path_buf)
+        .with_context(|| format!("resolving language server `{server}` on PATH"))
+}
+
 pub struct DocumentFilter {
     /// The document must have this language id, if it exists
     pub language_id: Option<String>,
+    /// The document URI must have this scheme, if it exists
+    pub scheme: Option<String>,
     /// The document's path must match this glob, if it exists
     pub pattern: Option<globset::GlobMatcher>,
-    // TODO: URI Scheme from lsp-types document filter
 }
 impl DocumentFilter {
     /// Constructs a document filter from the LSP version
@@ -510,7 +552,7 @@ impl DocumentFilter {
     ) -> DocumentFilter {
         DocumentFilter {
             language_id: filter.language.clone(),
-            // TODO: clean this up
+            scheme: filter.scheme.clone(),
             pattern: filter
                 .pattern
                 .as_deref()
@@ -518,6 +560,25 @@ impl DocumentFilter {
                 .and_then(Result::ok)
                 .map(|x| globset::Glob::compile_matcher(&x)),
         }
+    }
+
+    pub(crate) fn matches_file_document(
+        &self,
+        language_id: &str,
+        path: Option<&Path>,
+    ) -> bool {
+        self.language_id
+            .as_deref()
+            .is_none_or(|language| language == language_id)
+            && self
+                .scheme
+                .as_deref()
+                .is_none_or(|scheme| scheme.eq_ignore_ascii_case("file"))
+            && path.is_none_or(|path| {
+                self.pattern
+                    .as_ref()
+                    .is_none_or(|pattern| pattern.is_match(path))
+            })
     }
 }
 
@@ -635,6 +696,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bare_server_is_resolved_before_workspace_chdir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let bin = directory.path().join("bin");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&bin).expect("server directory");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let executable = bin.join("test-language-server");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("test server");
+        std::fs::set_permissions(
+            &executable,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("executable permissions");
+
+        let resolved = resolve_server_executable(
+            "test-language-server",
+            Some(OsStr::new("bin")),
+            directory.path(),
+        )
+        .expect("server found through relative PATH entry");
+        assert_eq!(resolved, executable.canonicalize().expect("absolute path"));
+        assert!(
+            Command::new(resolved)
+                .current_dir(workspace)
+                .status()
+                .expect("start server after changing directory")
+                .success()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn starting_a_language_server_does_not_change_executable_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -674,6 +769,310 @@ mod tests {
                 & 0o777,
             0o644
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_capable_requests_do_not_race_or_hide_empty_replies_and_errors() {
+        use crate::plugin::{PluginCatalogNotification, PluginCatalogRpc};
+        let script = r#"
+while IFS= read -r header; do
+    length=$(printf '%s' "$header" | tr -cd '0-9')
+    IFS= read -r separator
+    body=$(dd bs=1 count="$length" 2>/dev/null)
+    id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$body" in
+        *'"method":"initialize"'*) response=$(printf '{"jsonrpc":"2.0","id":0,"result":{"capabilities":%s}}' "$1") ;;
+        *'"method":"shutdown"'*) response=$(printf '{"jsonrpc":"2.0","id":%s,"result":null}' "$id") ;;
+        *'"method":"exit"'*) exit 0 ;;
+        *'"method":"textDocument/'*)
+            printf '%s\n' "$body" >> "$3"
+            sleep 0.05
+            if [ "$2" = error ]; then
+                response=$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"chosen server failed"}}' "$id")
+            else
+                response=$(printf '{"jsonrpc":"2.0","id":%s,"result":%s}' "$id" "$2")
+            fi ;;
+        *) continue ;;
+    esac
+    printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+done
+"#;
+        for (capability, language, method, first_reply, expected_owner) in [
+            (
+                r#"{"hoverProvider":false}"#,
+                "python",
+                "textDocument/hover",
+                "null",
+                2,
+            ),
+            (
+                r#"{"hoverProvider":true}"#,
+                "rust",
+                "textDocument/hover",
+                "null",
+                2,
+            ),
+            (
+                r#"{"hoverProvider":true}"#,
+                "python",
+                "textDocument/hover",
+                "null",
+                1,
+            ),
+            (
+                r#"{"hoverProvider":true}"#,
+                "python",
+                "textDocument/hover",
+                "error",
+                1,
+            ),
+            (
+                r#"{"hoverProvider":true}"#,
+                "python",
+                "textDocument/hover",
+                r#"{"contents":"first"}"#,
+                1,
+            ),
+            (
+                r#"{"renameProvider":true}"#,
+                "python",
+                "textDocument/prepareRename",
+                "null",
+                1,
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("fixture");
+            let catalog =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let notifications = catalog.test_receiver();
+            let mut servers = Vec::new();
+            let mut workers = Vec::new();
+            let mut processes = Vec::new();
+            for id in 1..=2 {
+                let mut client = LspClient::new(
+                    catalog.clone(), vec![lsp_types::DocumentFilter {
+                        language: Some(if id == 1 { language } else { "python" }.into()),
+                        scheme: None, pattern: None,
+                    }], None,
+                    ServerId { author: "ahead".into(), name: format!("selection-{id}") },
+                    format!("selection-{id}"), Some(ahead_rpc::plugin::PluginId(id)), None,
+                    Url::parse("urn:sh").expect("shell URI"),
+                    vec!["-c".into(), script.into(), "test-lsp".into(),
+                        if id == 1 { capability } else { r#"{"hoverProvider":true,"renameProvider":{"prepareProvider":true}}"# }.into(),
+                        if id == 1 { first_reply } else { r#"{"contents":"second"}"# }.into(),
+                        project.path().join(format!("requests-{id}")).to_string_lossy().into_owned()],
+                    Vec::new(), None, None,
+                ).expect("fake server");
+                let rpc = client.server_rpc.clone();
+                processes.push(client.process.clone());
+                let handler = rpc.clone();
+                workers.push(thread::spawn(move || handler.mainloop(&mut client)));
+                servers.push(rpc);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut ready = 0;
+            while ready < 2 {
+                match notifications.recv_deadline(deadline) {
+                    Ok(PluginCatalogRpc::Handler(
+                        PluginCatalogNotification::LanguageServerStatus {
+                            params,
+                            ..
+                        },
+                    )) if params.is_ok() => ready += 1,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            PluginServerRpcHandler::request_first_capable(
+                servers.clone().into(),
+                method.into(),
+                Value::Null,
+                Some("python".into()),
+                None,
+                Box::new(move |id, result| {
+                    sender.send((id, result)).expect("request result")
+                }),
+            );
+            let reply = receiver.recv_timeout(Duration::from_secs(3));
+            for server in &servers {
+                server.shutdown();
+            }
+            for (server, process) in servers.iter().zip(processes) {
+                if !server.wait_for_shutdown() {
+                    let mut process = process.lock();
+                    process.kill().expect("kill own fixture process");
+                    process.wait().expect("reap own fixture process");
+                }
+            }
+            for worker in workers {
+                worker.join().expect("handler stopped");
+            }
+            assert_eq!(ready, 2, "both fake servers initialize");
+            let (owner, result) = reply.expect("bounded response");
+            assert_eq!(owner, ahead_rpc::plugin::PluginId(expected_owner));
+            if first_reply == "error" {
+                assert_eq!(
+                    result.expect_err("chosen error must not fall through").code,
+                    -32603
+                );
+            } else if method == "textDocument/prepareRename" {
+                assert_eq!(
+                    result.expect("optional preparation"),
+                    serde_json::json!({ "defaultBehavior": true })
+                );
+            } else if expected_owner == 1 && first_reply == "null" {
+                assert_eq!(result.expect("valid null"), Value::Null);
+            } else {
+                assert_eq!(
+                    result.expect("selected response")["contents"],
+                    if expected_owner == 1 {
+                        "first"
+                    } else {
+                        "second"
+                    }
+                );
+            }
+            let unused = if expected_owner == 1 { 2 } else { 1 };
+            assert!(
+                !project.path().join(format!("requests-{unused}")).exists(),
+                "unselected server must never receive the request"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_preparation_respects_the_advertised_capability() {
+        use crate::plugin::{PluginCatalogNotification, PluginCatalogRpc};
+        use lsp_types::request::{PrepareRenameRequest, Rename, Request};
+
+        let script = r#"
+while IFS= read -r header; do
+    length=$(printf '%s' "$header" | tr -cd '0-9')
+    IFS= read -r separator
+    body=$(dd bs=1 count="$length" 2>/dev/null)
+    id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$body" in
+        *'"method":"initialize"'*)
+            response=$(printf '{"jsonrpc":"2.0","id":0,"result":{"capabilities":{"renameProvider":%s}}}' "$1")
+            ;;
+        *'"method":"textDocument/prepareRename"'*)
+            if [ "$2" = prepared ]; then
+                response=$(printf '{"jsonrpc":"2.0","id":%s,"result":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}' "$id")
+            else
+                response=$(printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"prepareRename was not advertised"}}' "$id")
+            fi
+            ;;
+        *'"method":"textDocument/rename"'*)
+            response=$(printf '{"jsonrpc":"2.0","id":%s,"result":{"changes":{}}}' "$id")
+            ;;
+        *'"method":"shutdown"'*)
+            response=$(printf '{"jsonrpc":"2.0","id":%s,"result":null}' "$id")
+            ;;
+        *'"method":"exit"'*) exit 0 ;;
+        *) continue ;;
+    esac
+    printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+done
+"#;
+        for (capability, mode) in [
+            ("null", "disabled"),
+            ("false", "disabled"),
+            ("true", "fallback"),
+            ("{}", "fallback"),
+            (r#"{"prepareProvider":false}"#, "fallback"),
+            (r#"{"prepareProvider":true}"#, "prepared"),
+        ] {
+            let catalog =
+                PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+            let notifications =
+                catalog.plugin_rx.lock().take().expect("catalog receiver");
+            let mut client = LspClient::new(
+                catalog,
+                Vec::new(),
+                None,
+                ServerId {
+                    author: "ahead".into(),
+                    name: "rename-test".into(),
+                },
+                "rename-test".into(),
+                None,
+                None,
+                Url::parse("urn:sh").expect("shell URI"),
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "test-lsp".into(),
+                    capability.into(),
+                    mode.into(),
+                ],
+                Vec::new(),
+                None,
+                None,
+            )
+            .expect("owned fake server");
+            let process = client.process.clone();
+            let rpc = client.server_rpc.clone();
+            let handler = rpc.clone();
+            let mainloop = thread::spawn(move || handler.mainloop(&mut client));
+            let ready = matches!(notifications.recv_timeout(Duration::from_secs(5)), Ok(PluginCatalogRpc::Handler(PluginCatalogNotification::LanguageServerStatus { params, .. })) if params.is_ok());
+            let mut replies = Vec::new();
+            for method in [PrepareRenameRequest::METHOD, Rename::METHOD] {
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                rpc.server_request_async(
+                    method,
+                    Value::Null,
+                    None,
+                    None,
+                    true,
+                    move |result| sender.send(result).expect("request result"),
+                );
+                replies.push(receiver.recv_timeout(Duration::from_secs(3)));
+            }
+            rpc.shutdown();
+            let stopped = rpc.wait_for_shutdown();
+            if !stopped {
+                let mut process = process.lock();
+                process.kill().expect("clean up test child");
+                process.wait().expect("reap test child");
+            }
+            mainloop.join().expect("handler exited");
+            assert!(ready && stopped, "server lifecycle ({capability})");
+            let mut replies = replies
+                .into_iter()
+                .map(|reply| reply.expect("bounded reply"));
+            let prepare = replies.next().expect("preparation reply");
+            let rename = replies.next().expect("rename reply");
+            if mode == "disabled" {
+                assert_eq!(
+                    prepare.expect_err("preparation must be rejected").message,
+                    "server not capable"
+                );
+                assert_eq!(
+                    rename.expect_err("rename must be rejected").message,
+                    "server not capable"
+                );
+            } else {
+                let prepare = prepare.expect("preparation succeeds");
+                if mode == "fallback" {
+                    assert_eq!(
+                        prepare,
+                        serde_json::json!({"defaultBehavior": true})
+                    );
+                } else {
+                    assert_eq!(
+                        prepare,
+                        serde_json::json!({"start":{"line":0,"character":0},"end":{"line":0,"character":5}})
+                    );
+                }
+                assert_eq!(
+                    rename.expect("rename reaches the server"),
+                    serde_json::json!({"changes":{}})
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -824,7 +1223,7 @@ exit 8
     }
 
     #[test]
-    fn completion_resolve_is_a_noop_without_the_optional_capability() {
+    fn completion_and_code_action_resolve_are_noops_without_optional_capabilities() {
         let core_rpc = ahead_rpc::core::CoreRpcHandler::new();
         let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
         let server_id = ServerId {
@@ -854,6 +1253,19 @@ exit 8
             language_id: None,
             path: None,
             rh: ResponseHandler::Chan(reply_sender),
+        });
+        let (action_sender, action_receiver) = crossbeam_channel::bounded(1);
+        let action = serde_json::json!({
+            "title": "Add import",
+            "data": {"opaque": 2},
+        });
+        server_rpc.handle_rpc(PluginServerRpc::ServerRequest {
+            id: Id::Num(43),
+            method: lsp_types::request::CodeActionResolveRequest::METHOD.into(),
+            params: Params::from(action.clone()),
+            language_id: None,
+            path: None,
+            rh: ResponseHandler::Chan(action_sender),
         });
         server_rpc.handle_rpc(PluginServerRpc::Shutdown);
         let mut process =
@@ -895,6 +1307,13 @@ exit 8
                 .expect("reply")
                 .expect("no resolve needed"),
             item
+        );
+        assert_eq!(
+            action_receiver
+                .try_recv()
+                .expect("code-action resolve reply")
+                .expect("no code-action resolve needed"),
+            action
         );
         assert!(
             initialize

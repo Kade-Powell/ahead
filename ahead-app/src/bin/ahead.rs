@@ -3,7 +3,10 @@
 use ahead_app::app;
 
 pub fn main() {
-    if !ahead_proxy::run_if_requested() {
-        app::launch();
+    if ahead_proxy::run_if_requested() {
+        return;
     }
+
+    ahead_app::shell_environment::initialize_login_shell_path();
+    app::launch();
 }

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, writeFile, chmod } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,6 +12,12 @@ const source = fileURLToPath(import.meta.url);
 
 // The disposable executable is this same script, copied onto the proxy's PATH.
 if (path.basename(source) === "rust-analyzer") {
+  assert.equal(
+    process.env.AHEAD_LSP_SHUTDOWN_SECRET_SENTINEL,
+    undefined,
+    "the smoke must not forward arbitrary parent environment to child tools",
+  );
+  if (["--help", "--version"].includes(process.argv[2])) process.exit(0);
   const record = (event) => appendFileSync(process.env.AHEAD_LSP_TEST_LOG, JSON.stringify({ event, pid: process.pid }) + "\n");
   const reply = (id, result) => {
     const body = JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -53,6 +59,31 @@ if (path.basename(source) === "rust-analyzer") {
   const binary = path.resolve(process.argv[2] ?? "target/debug/ahead");
   const directory = await mkdtemp(path.join(tmpdir(), "ahead-lsp-shutdown-"));
   console.log(`Disposable workspaces: ${directory}`);
+  const dataHome = path.join(directory, "data");
+  const runtimeHome = path.join(directory, "runtime");
+  const userHome = path.join(directory, "user");
+  const home = path.join(directory, "home");
+  const tempHome = path.join(directory, "tmp");
+  await Promise.all([dataHome, runtimeHome, userHome, home, tempHome].map((path) =>
+    mkdir(path, { recursive: true }),
+  ));
+  const inheritedEnvironment = Object.fromEntries(
+    [
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "RUSTUP_HOME",
+      "RUSTUP_TOOLCHAIN",
+      "SystemRoot",
+      "WINDIR",
+      "PATHEXT",
+      "ComSpec",
+    ]
+      .filter((name) => process.env[name] !== undefined)
+      .map((name) => [name, process.env[name]]),
+  );
+  process.env.AHEAD_LSP_SHUTDOWN_SECRET_SENTINEL = "do-not-forward";
   const bin = path.join(directory, "bin");
   await mkdir(bin);
   const server = path.join(bin, "rust-analyzer");
@@ -62,6 +93,8 @@ if (path.basename(source) === "rust-analyzer") {
   for (const mode of ["shutdown", "stdin-eof", "initializing", "unresponsive"]) {
     const workspace = path.join(directory, mode);
     await mkdir(workspace);
+    await writeFile(path.join(dataHome, "trusted-workspaces.toml"),
+      `trusted = [${JSON.stringify(await realpath(workspace))}]\nblocked = []\n`);
     const file = path.join(workspace, "main.rs");
     await writeFile(file, "fn main() {}\n");
     const log = path.join(workspace, "server.jsonl");
@@ -69,7 +102,20 @@ if (path.basename(source) === "rust-analyzer") {
       cwd: workspace,
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PATH: `${bin}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, AHEAD_LSP_TEST_LOG: log, AHEAD_LSP_TEST_MODE: mode },
+      env: {
+        ...inheritedEnvironment,
+        HOME: home,
+        USERPROFILE: home,
+        TMPDIR: tempHome,
+        TMP: tempHome,
+        TEMP: tempHome,
+        PATH: [bin, path.dirname(process.execPath), inheritedEnvironment.PATH ?? ""].join(path.delimiter),
+        AHEAD_DATA_HOME: dataHome,
+        AHEAD_HOME: runtimeHome,
+        AHEAD_USER_HOME: userHome,
+        AHEAD_LSP_TEST_LOG: log,
+        AHEAD_LSP_TEST_MODE: mode,
+      },
     });
     let stderr = "";
     let stdout = "";

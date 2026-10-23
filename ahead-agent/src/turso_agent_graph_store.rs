@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use codex_agent_graph_store::{
+use ahead_agent_graph_store::{
     AgentGraphStore, AgentGraphStoreError, AgentGraphStoreFuture,
     ThreadSpawnEdgeStatus,
 };

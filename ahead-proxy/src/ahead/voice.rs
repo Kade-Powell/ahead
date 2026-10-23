@@ -6,7 +6,7 @@
 //! Implements strict barge-in generation tracking and separates speech interruption
 //! from task cancellation.
 
-use ahead_rpc::ahead::{Id, VoiceControl};
+use ahead_rpc::ahead::{Id, VoiceCallLease, VoiceControl};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -29,6 +29,7 @@ pub struct VoiceSession {
     pub session_id: Id,
     pub voice_session_id: Id,
     epoch: AtomicU64,
+    active_call: Mutex<Option<(Id, u64)>>,
     current_generation: AtomicU64,
     mic_muted: AtomicBool,
     speaker_muted: AtomicBool,
@@ -41,7 +42,8 @@ impl VoiceSession {
         Self {
             session_id,
             voice_session_id,
-            epoch: AtomicU64::new(1),
+            epoch: AtomicU64::new(0),
+            active_call: Mutex::new(None),
             current_generation: AtomicU64::new(1),
             mic_muted: AtomicBool::new(false),
             speaker_muted: AtomicBool::new(false),
@@ -56,6 +58,58 @@ impl VoiceSession {
 
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn start_call(&self) -> anyhow::Result<VoiceCallLease> {
+        let mut active_call = self.active_call.lock();
+        anyhow::ensure!(
+            active_call.is_none(),
+            "A voice call is already active for this session"
+        );
+        let previous_epoch = self
+            .epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("Voice connection epoch is exhausted"))?;
+        let connection_epoch = previous_epoch + 1;
+        let call_id = uuid::Uuid::new_v4().to_string();
+        *active_call = Some((call_id.clone(), connection_epoch));
+        Ok(VoiceCallLease {
+            session_id: self.session_id.clone(),
+            voice_session_id: self.voice_session_id.clone(),
+            call_id,
+            connection_epoch,
+        })
+    }
+
+    pub fn matches_call(&self, call_id: &str, connection_epoch: u64) -> bool {
+        self.active_call
+            .lock()
+            .as_ref()
+            .is_some_and(|(active_id, active_epoch)| {
+                active_id == call_id && *active_epoch == connection_epoch
+            })
+    }
+
+    pub fn end_call(&self, lease: &VoiceCallLease) -> bool {
+        if lease.session_id != self.session_id
+            || lease.voice_session_id != self.voice_session_id
+        {
+            return false;
+        }
+        let mut active_call = self.active_call.lock();
+        if !active_call.as_ref().is_some_and(|(call_id, epoch)| {
+            call_id == &lease.call_id && *epoch == lease.connection_epoch
+        }) {
+            return false;
+        }
+        *active_call = None;
+        self.current_generation.fetch_add(1, Ordering::SeqCst);
+        self.audio_output_queue.lock().clear();
+        self.mic_muted.store(false, Ordering::SeqCst);
+        self.speaker_muted.store(false, Ordering::SeqCst);
+        true
     }
 
     pub fn register_coding_task(&self, task_id: Id) {
@@ -176,5 +230,21 @@ mod tests {
             task_id: "task-456".to_string(),
         });
         assert!(!voice.is_task_active("task-456"));
+    }
+
+    #[test]
+    fn call_lease_ends_only_the_matching_connection_epoch() {
+        let voice = VoiceSession::new("sess-1".to_string(), "voice-1".to_string());
+        let first = voice.start_call().expect("first call starts");
+        assert!(voice.matches_call(&first.call_id, first.connection_epoch));
+        assert!(voice.start_call().is_err());
+        assert!(voice.end_call(&first));
+
+        let second = voice.start_call().expect("second call starts");
+        assert!(second.connection_epoch > first.connection_epoch);
+        assert!(!voice.end_call(&first));
+        assert!(voice.matches_call(&second.call_id, second.connection_epoch));
+        assert!(voice.end_call(&second));
+        assert!(!voice.matches_call(&second.call_id, second.connection_epoch));
     }
 }

@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crossbeam_channel::{Receiver, Sender};
@@ -59,7 +60,7 @@ pub enum CoreNotification {
     CompletionResponse {
         request_id: usize,
         input: String,
-        resp: CompletionResponse,
+        resp: Option<CompletionResponse>,
         plugin_id: PluginId,
     },
     SignatureHelpResponse {
@@ -72,6 +73,12 @@ pub enum CoreNotification {
     },
     WorkspaceFileChange {
         generation: u64,
+        paths: Vec<PathBuf>,
+    },
+    WorkspaceFileRename {
+        generation: u64,
+        old_path: PathBuf,
+        new_path: PathBuf,
     },
     PublishDiagnostics {
         diagnostics: PublishDiagnosticsParams,
@@ -151,13 +158,52 @@ pub enum CoreNotification {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CoreRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
-pub enum CoreResponse {}
+pub enum CoreRequest {
+    ApplyWorkspaceEdit(lsp_types::ApplyWorkspaceEditParams),
+    GitCredentialPrompt { prompt: String, secret: bool },
+}
+
+impl std::fmt::Debug for CoreRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplyWorkspaceEdit(params) => formatter
+                .debug_tuple("ApplyWorkspaceEdit")
+                .field(params)
+                .finish(),
+            Self::GitCredentialPrompt { secret, .. } => formatter
+                .debug_struct("GitCredentialPrompt")
+                .field("prompt", &"<redacted>")
+                .field("secret", secret)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "method", content = "params")]
+pub enum CoreResponse {
+    ApplyWorkspaceEdit(lsp_types::ApplyWorkspaceEditResponse),
+    GitCredentialAnswer { answer: Option<String> },
+}
+
+impl std::fmt::Debug for CoreResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplyWorkspaceEdit(response) => formatter
+                .debug_tuple("ApplyWorkspaceEdit")
+                .field(response)
+                .finish(),
+            Self::GitCredentialAnswer { answer } => formatter
+                .debug_struct("GitCredentialAnswer")
+                .field("answer", &answer.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
+}
 
 pub type CoreMessage = RpcMessage<CoreRequest, CoreNotification, CoreResponse>;
 
@@ -219,13 +265,21 @@ impl CoreRpcHandler {
     ) {
         let tx = { self.pending.lock().remove(&id) };
         if let Some(tx) = tx {
-            if let Err(err) = tx.send(response) {
-                tracing::error!("{:?}", err);
+            if tx.send(response).is_err() {
+                tracing::error!("Core RPC response receiver was dropped");
             }
         }
     }
 
     pub fn request(&self, request: CoreRequest) -> Result<CoreResponse, RpcError> {
+        self.request_with_timeout(request, Duration::from_secs(30))
+    }
+
+    pub fn request_with_timeout(
+        &self,
+        request: CoreRequest,
+        timeout: Duration,
+    ) -> Result<CoreResponse, RpcError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let id = self.id.fetch_add(1, Ordering::Relaxed);
         {
@@ -233,12 +287,27 @@ impl CoreRpcHandler {
             pending.insert(id, tx);
         }
         if let Err(err) = self.tx.send(CoreRpc::Request(id, request)) {
-            tracing::error!("{:?}", err);
+            drop(self.pending.lock().remove(&id));
+            return Err(RpcError {
+                code: 0,
+                message: format!("Could not send core request: {err}"),
+            });
         }
-        rx.recv().unwrap_or_else(|_| {
+        rx.recv_timeout(timeout).unwrap_or_else(|error| {
+            drop(self.pending.lock().remove(&id));
             Err(RpcError {
                 code: 0,
-                message: "io error".to_string(),
+                message: match error {
+                    crossbeam_channel::RecvTimeoutError::Timeout => {
+                        format!(
+                            "Core request timed out after {}s",
+                            timeout.as_secs()
+                        )
+                    }
+                    crossbeam_channel::RecvTimeoutError::Disconnected => {
+                        "Core request channel closed".into()
+                    }
+                },
             })
         })
     }
@@ -256,8 +325,24 @@ impl CoreRpcHandler {
         }
     }
 
-    pub fn workspace_file_change(&self, generation: u64) {
-        self.notification(CoreNotification::WorkspaceFileChange { generation });
+    pub fn workspace_file_change(&self, generation: u64, paths: Vec<PathBuf>) {
+        self.notification(CoreNotification::WorkspaceFileChange {
+            generation,
+            paths,
+        });
+    }
+
+    pub fn workspace_file_renamed(
+        &self,
+        generation: u64,
+        old_path: PathBuf,
+        new_path: PathBuf,
+    ) {
+        self.notification(CoreNotification::WorkspaceFileRename {
+            generation,
+            old_path,
+            new_path,
+        });
     }
 
     pub fn diff_info(&self, diff: DiffInfo) {
@@ -272,7 +357,7 @@ impl CoreRpcHandler {
         &self,
         request_id: usize,
         input: String,
-        resp: CompletionResponse,
+        resp: Option<CompletionResponse>,
         plugin_id: PluginId,
     ) {
         self.notification(CoreNotification::CompletionResponse {
@@ -474,5 +559,140 @@ impl ServerStatusParams {
 
     pub fn is_quiescent(&self) -> bool {
         self.quiescent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoreMessage, CoreRequest, CoreResponse, CoreRpcHandler};
+    use crate::RpcMessage;
+    use std::time::Duration;
+
+    #[test]
+    fn workspace_edit_core_messages_round_trip_through_stdio() {
+        let request: CoreMessage = RpcMessage::Request(
+            7,
+            CoreRequest::ApplyWorkspaceEdit(lsp_types::ApplyWorkspaceEditParams {
+                label: Some("Apply edit".into()),
+                edit: lsp_types::WorkspaceEdit::default(),
+            }),
+        );
+        let mut request_bytes = Vec::new();
+        crate::stdio::write_msg(&mut request_bytes, request)
+            .expect("write Core RPC request");
+        let decoded_request: Option<CoreMessage> =
+            crate::stdio::read_msg(&mut std::io::Cursor::new(request_bytes))
+                .expect("read Core RPC request");
+        assert!(matches!(
+            decoded_request,
+            Some(RpcMessage::Request(
+                7,
+                CoreRequest::ApplyWorkspaceEdit(params)
+            )) if params.label.as_deref() == Some("Apply edit")
+        ));
+
+        let response: CoreMessage = RpcMessage::Response(
+            7,
+            CoreResponse::ApplyWorkspaceEdit(
+                lsp_types::ApplyWorkspaceEditResponse {
+                    applied: true,
+                    failure_reason: None,
+                    failed_change: None,
+                },
+            ),
+        );
+        let mut response_bytes = Vec::new();
+        crate::stdio::write_msg(&mut response_bytes, response)
+            .expect("write Core RPC response");
+        let decoded_response: Option<CoreMessage> =
+            crate::stdio::read_msg(&mut std::io::Cursor::new(response_bytes))
+                .expect("read Core RPC response");
+        assert!(matches!(
+            decoded_response,
+            Some(RpcMessage::Response(
+                7,
+                CoreResponse::ApplyWorkspaceEdit(response)
+            )) if response.applied
+        ));
+    }
+
+    #[test]
+    fn timed_out_core_requests_release_their_pending_slot() {
+        let rpc = CoreRpcHandler::new();
+        let result = rpc.request_with_timeout(
+            CoreRequest::ApplyWorkspaceEdit(lsp_types::ApplyWorkspaceEditParams {
+                label: None,
+                edit: lsp_types::WorkspaceEdit::default(),
+            }),
+            Duration::from_millis(1),
+        );
+
+        assert!(result.is_err());
+        assert!(rpc.pending.lock().is_empty());
+    }
+
+    #[test]
+    fn git_credential_prompt_round_trips_through_core_rpc() {
+        let request: CoreMessage = RpcMessage::Request(
+            19,
+            CoreRequest::GitCredentialPrompt {
+                prompt: "Password for https://example.test".into(),
+                secret: true,
+            },
+        );
+        let mut bytes = Vec::new();
+        crate::stdio::write_msg(&mut bytes, request)
+            .expect("write Git credential request");
+        let decoded: Option<CoreMessage> =
+            crate::stdio::read_msg(&mut std::io::Cursor::new(bytes))
+                .expect("read Git credential request");
+        assert!(matches!(
+            decoded,
+            Some(RpcMessage::Request(
+                19,
+                CoreRequest::GitCredentialPrompt { prompt, secret: true }
+            )) if prompt == "Password for https://example.test"
+        ));
+
+        let response: CoreMessage = RpcMessage::Response(
+            19,
+            CoreResponse::GitCredentialAnswer {
+                answer: Some("temporary-secret".into()),
+            },
+        );
+        let mut bytes = Vec::new();
+        crate::stdio::write_msg(&mut bytes, response)
+            .expect("write Git credential answer");
+        let decoded: Option<CoreMessage> =
+            crate::stdio::read_msg(&mut std::io::Cursor::new(bytes))
+                .expect("read Git credential answer");
+        assert!(matches!(
+            decoded,
+            Some(RpcMessage::Response(
+                19,
+                CoreResponse::GitCredentialAnswer {
+                    answer: Some(answer)
+                }
+            )) if answer == "temporary-secret"
+        ));
+    }
+
+    #[test]
+    fn git_credential_response_debug_redacts_the_answer() {
+        let response = CoreResponse::GitCredentialAnswer {
+            answer: Some("disposable-secret".into()),
+        };
+
+        let debug = format!("{response:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("disposable-secret"));
+
+        let request = CoreRequest::GitCredentialPrompt {
+            prompt: "Password for https://private.example.test".into(),
+            secret: true,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("private.example.test"));
     }
 }

@@ -5,26 +5,36 @@
 //! The native agent must not grow a second filesystem-search implementation.
 
 use std::{
-    collections::{HashMap, HashSet},
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::File,
     io::{self, Read, Seek},
     ops::Range,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Condvar, Mutex},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::mpsc::{self, RecvTimeoutError},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Duration,
 };
 
 use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
+use fancy_regex::{
+    NoExpand as FancyNoExpand, Regex as FancyRegex,
+    RegexBuilder as FancyRegexBuilder,
+};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_matcher::{LineTerminator, Matcher, NoError};
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, sinks::UTF8};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, sinks::UTF8};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher as FuzzyMatcher, Utf32Str};
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use regex::{NoExpand, Regex, RegexBuilder};
 
 const SEARCH_PREFIX_BYTES: usize = 1024;
+pub const MAX_SEARCH_RESULT_RANGES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSearchOptions {
@@ -50,6 +60,14 @@ pub struct FileSearchMatch {
     pub preview_match: Range<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSearchReplacement {
+    pub path: PathBuf,
+    pub original_text: String,
+    pub replacement_text: String,
+    pub match_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedPathMatch {
     pub path: PathBuf,
@@ -65,7 +83,10 @@ pub enum FileSearchError {
     InvalidPattern(String),
     InvalidGlob(String),
     InvalidWorkspace(String),
+    TooManyMatches,
+    RegexExecution(String),
     Cancelled,
+    WorkerFailed,
 }
 
 impl fmt::Display for FileSearchError {
@@ -80,29 +101,40 @@ impl fmt::Display for FileSearchError {
             Self::InvalidWorkspace(error) => {
                 write!(formatter, "can't open search workspace: {error}")
             }
+            Self::TooManyMatches => write!(
+                formatter,
+                "search replacement exceeded the {MAX_SEARCH_RESULT_RANGES}-match safety limit; narrow the search"
+            ),
+            Self::RegexExecution(error) => {
+                write!(formatter, "regular expression search failed: {error}")
+            }
             Self::Cancelled => formatter.write_str("expired search job"),
+            Self::WorkerFailed => {
+                formatter.write_str("workspace search worker stopped unexpectedly")
+            }
         }
     }
 }
 
 impl std::error::Error for FileSearchError {}
 
-struct Utf8ValidatingReader<R> {
+struct Utf8ValidatingReader<'a, R> {
     inner: R,
     incomplete: Vec<u8>,
     validation: Vec<u8>,
-    prefix: Vec<u8>,
+    prefix: &'a mut Vec<u8>,
     prefix_offset: usize,
     initialized: bool,
 }
 
-impl<R: Read> Utf8ValidatingReader<R> {
-    fn new(inner: R) -> Self {
+impl<'a, R: Read> Utf8ValidatingReader<'a, R> {
+    fn new(inner: R, prefix: &'a mut Vec<u8>) -> Self {
+        prefix.clear();
         Self {
             inner,
-            incomplete: Vec::with_capacity(4),
+            incomplete: Vec::new(),
             validation: Vec::new(),
-            prefix: Vec::with_capacity(SEARCH_PREFIX_BYTES),
+            prefix,
             prefix_offset: 0,
             initialized: false,
         }
@@ -140,7 +172,7 @@ impl<R: Read> Utf8ValidatingReader<R> {
     }
 }
 
-impl<R: Read> Read for Utf8ValidatingReader<R> {
+impl<R: Read> Read for Utf8ValidatingReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
@@ -156,23 +188,15 @@ impl<R: Read> Read for Utf8ValidatingReader<R> {
             bytes_read
         } else {
             let bytes_read = self.inner.read(buffer)?;
-            if bytes_read > 0
-                && (buffer[..bytes_read].contains(&0) || bytes_read >= 128)
-            {
-                match classify_search_bytes(&buffer[..bytes_read]) {
-                    SearchByteClass::Utf8 => {}
-                    SearchByteClass::Encoded => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "encoded text requires decoding before search",
-                        ));
-                    }
-                    SearchByteClass::Binary => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "binary content is not searchable text",
-                        ));
-                    }
+            if bytes_read > 0 {
+                let chunk = &buffer[..bytes_read];
+                if chunk.contains(&0)
+                    || (bytes_read >= 128 && has_binary_control_bytes(chunk))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "binary content is not searchable text",
+                    ));
                 }
             }
             bytes_read
@@ -187,15 +211,23 @@ impl<R: Read> Read for Utf8ValidatingReader<R> {
             ));
         }
 
-        self.validation.clear();
-        self.validation.extend_from_slice(&self.incomplete);
-        self.validation.extend_from_slice(&buffer[..bytes_read]);
-        match std::str::from_utf8(&self.validation) {
+        let has_incomplete_prefix = !self.incomplete.is_empty();
+        if has_incomplete_prefix {
+            self.validation.clear();
+            self.validation.extend_from_slice(&self.incomplete);
+            self.validation.extend_from_slice(&buffer[..bytes_read]);
+        }
+        let bytes_to_validate = if has_incomplete_prefix {
+            &self.validation[..]
+        } else {
+            &buffer[..bytes_read]
+        };
+        match std::str::from_utf8(bytes_to_validate) {
             Ok(_) => self.incomplete.clear(),
             Err(error) if error.error_len().is_none() => {
                 self.incomplete.clear();
                 self.incomplete
-                    .extend_from_slice(&self.validation[error.valid_up_to()..]);
+                    .extend_from_slice(&bytes_to_validate[error.valid_up_to()..]);
             }
             Err(error) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, error));
@@ -256,8 +288,18 @@ fn has_known_binary_header(bytes: &[u8]) -> bool {
         b"\xFF\xFA",
         b"\xFF\xF3",
         b"\xFF\xF2",
+        b"\x1F\x8B",
+        b"\xFD7zXZ\x00",
+        b"\x28\xB5\x2F\xFD",
+        b"\x04\x22\x4D\x18",
+        b"7z\xBC\xAF\x27\x1C",
+        b"Rar!\x1A\x07",
     ];
     HEADERS.iter().any(|header| bytes.starts_with(header))
+        || (bytes.starts_with(b"BZh")
+            && bytes
+                .get(3)
+                .is_some_and(|block_size| (b'1'..=b'9').contains(block_size)))
 }
 
 fn unmarked_utf16_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
@@ -349,10 +391,10 @@ fn has_binary_control_bytes(bytes: &[u8]) -> bool {
 fn read_search_file<F>(
     file: &mut File,
     path: &Path,
-    should_continue: &mut F,
+    should_continue: &F,
 ) -> Result<Option<Vec<u8>>, FileSearchError>
 where
-    F: FnMut() -> bool,
+    F: Fn() -> bool,
 {
     match file.rewind() {
         Ok(()) => {}
@@ -435,6 +477,10 @@ impl<'a> SearchWorkspace<'a> {
 
     fn open_file(&self, path: &Path) -> io::Result<File> {
         let relative = self.relative_path(path)?;
+        self.open_relative_file(relative)
+    }
+
+    fn open_relative_file(&self, relative: &Path) -> io::Result<File> {
         #[cfg(unix)]
         {
             crate::secure_fs::open_relative_regular_file(&self.directory, relative)
@@ -535,7 +581,7 @@ fn search_match_preview(
 
 fn search_result_sink<'a, M, F>(
     matcher: &'a M,
-    should_continue: &'a mut F,
+    should_continue: &'a F,
     file_matches: &'a mut Vec<FileSearchMatch>,
     match_count: &'a mut usize,
     max_results: usize,
@@ -544,7 +590,7 @@ fn search_result_sink<'a, M, F>(
 ) -> impl Sink<Error = io::Error> + 'a
 where
     M: Matcher<Error = NoError> + 'a,
-    F: FnMut() -> bool + 'a,
+    F: Fn() -> bool + 'a,
 {
     UTF8(move |line_number, line: &str| {
         if !should_continue() {
@@ -585,6 +631,205 @@ where
         })?;
         Ok(!*cancelled && !*limit_reached)
     })
+}
+
+fn search_one_path<M>(
+    path: &Path,
+    relative_path: Option<&Path>,
+    workspace: Option<&SearchWorkspace<'_>>,
+    overrides: &HashMap<PathBuf, String>,
+    matcher: &M,
+    searcher: &mut Searcher,
+    prefix_scratch: &mut Vec<u8>,
+    options: &FileSearchOptions,
+    should_continue: &(impl Fn() -> bool + Sync),
+) -> Result<Vec<FileSearchMatch>, FileSearchError>
+where
+    M: Matcher<Error = NoError>,
+{
+    if !overrides.contains_key(path) && workspace.is_none() {
+        return Ok(Vec::new());
+    }
+    let decoded_bytes = overrides.get(path).map(String::as_bytes);
+    let mut file_matches = Vec::new();
+    let mut match_count = 0;
+    let mut cancelled = false;
+    let mut limit_reached = false;
+    let mut disk_file = None;
+
+    let initial_result = if let Some(bytes) = decoded_bytes {
+        searcher.search_slice(
+            matcher,
+            bytes,
+            search_result_sink(
+                matcher,
+                should_continue,
+                &mut file_matches,
+                &mut match_count,
+                options.max_results,
+                &mut cancelled,
+                &mut limit_reached,
+            ),
+        )
+    } else {
+        let Some(workspace) = workspace else {
+            return Ok(Vec::new());
+        };
+        let Some(relative_path) = relative_path else {
+            return Ok(Vec::new());
+        };
+        let mut file = match workspace.open_relative_file(relative_path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
+                return Ok(Vec::new());
+            }
+        };
+        let result = searcher.search_reader(
+            matcher,
+            Utf8ValidatingReader::new(&mut file, prefix_scratch),
+            search_result_sink(
+                matcher,
+                should_continue,
+                &mut file_matches,
+                &mut match_count,
+                options.max_results,
+                &mut cancelled,
+                &mut limit_reached,
+            ),
+        );
+        disk_file = Some(file);
+        result
+    };
+
+    let result = match initial_result {
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                && overrides.get(path).is_none() =>
+        {
+            let Some(file) = disk_file.as_mut() else {
+                return Ok(Vec::new());
+            };
+            match read_search_file(file, path, should_continue)?
+                .and_then(|bytes| decode_search_text(&bytes))
+            {
+                Some(decoded) => {
+                    file_matches.clear();
+                    match_count = 0;
+                    cancelled = false;
+                    limit_reached = false;
+                    searcher.search_slice(
+                        matcher,
+                        decoded.as_bytes(),
+                        search_result_sink(
+                            matcher,
+                            should_continue,
+                            &mut file_matches,
+                            &mut match_count,
+                            options.max_results,
+                            &mut cancelled,
+                            &mut limit_reached,
+                        ),
+                    )
+                }
+                None => return Ok(Vec::new()),
+            }
+        }
+        result => result,
+    };
+
+    if cancelled || !should_continue() {
+        return Err(FileSearchError::Cancelled);
+    }
+    if let Err(error) = result {
+        tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
+        return Ok(Vec::new());
+    }
+    Ok(file_matches)
+}
+
+/// Look-around can span lines, so regex searches decode each file before
+/// matching; literal searches keep the streaming grep path.
+fn search_regex_one_path<F>(
+    path: &Path,
+    relative_path: Option<&Path>,
+    workspace: Option<&SearchWorkspace<'_>>,
+    overrides: &HashMap<PathBuf, String>,
+    matcher: &FancyRegex,
+    options: &FileSearchOptions,
+    should_continue: &F,
+) -> Result<Vec<FileSearchMatch>, FileSearchError>
+where
+    F: Fn() -> bool,
+{
+    if !should_continue() {
+        return Err(FileSearchError::Cancelled);
+    }
+    let text = if let Some(text) = overrides.get(path) {
+        if is_binary_content(text.as_bytes()) {
+            return Ok(Vec::new());
+        }
+        Cow::Borrowed(text.as_str())
+    } else {
+        let Some(workspace) = workspace else {
+            return Ok(Vec::new());
+        };
+        let Some(relative_path) = relative_path else {
+            return Ok(Vec::new());
+        };
+        let mut file = match workspace.open_relative_file(relative_path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
+                return Ok(Vec::new());
+            }
+        };
+        let Some(bytes) = read_search_file(&mut file, path, should_continue)? else {
+            return Ok(Vec::new());
+        };
+        if is_binary_content(&bytes) {
+            return Ok(Vec::new());
+        }
+        let Some(text) = decode_search_text(&bytes) else {
+            return Ok(Vec::new());
+        };
+        Cow::Owned(text)
+    };
+
+    let mut file_matches = Vec::new();
+    for result in matcher.find_iter(text.as_ref()).take(options.max_results) {
+        if !should_continue() {
+            return Err(FileSearchError::Cancelled);
+        }
+        let found = result
+            .map_err(|error| FileSearchError::RegexExecution(error.to_string()))?;
+        let (start_line_offset, start) =
+            search_match_position(text.as_ref(), found.start());
+        let (end_line_offset, end) =
+            search_match_position(text.as_ref(), found.end());
+        let (line_content, preview_match) =
+            search_match_preview(text.as_ref(), found.start(), found.end());
+        file_matches.push(FileSearchMatch {
+            line: start_line_offset,
+            start,
+            end_line: end_line_offset,
+            end,
+            line_content,
+            preview_match,
+        });
+    }
+    if !should_continue() {
+        return Err(FileSearchError::Cancelled);
+    }
+    Ok(file_matches)
+}
+
+fn whole_word_pattern(pattern: String, whole_word: bool) -> String {
+    if whole_word {
+        format!(r"(?<!\w)(?:{pattern})(?!\w)")
+    } else {
+        pattern
+    }
 }
 
 /// Restrict content search to paths within one worktree. Like Zed's project
@@ -648,6 +893,8 @@ fn split_path_patterns(input: &str) -> Vec<&str> {
     let mut patterns = Vec::new();
     let mut start = 0;
     let mut brace_depth = 0usize;
+    let mut in_class = false;
+    let mut class_has_content = false;
     let mut escaped = false;
     for (index, character) in input.char_indices() {
         if escaped {
@@ -656,15 +903,25 @@ fn split_path_patterns(input: &str) -> Vec<&str> {
         }
         match character {
             '\\' => escaped = true,
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            ',' if brace_depth == 0 => {
+            '[' if !in_class => {
+                in_class = true;
+                class_has_content = false;
+            }
+            ']' if in_class && !class_has_content => {
+                class_has_content = true;
+            }
+            ']' if in_class => in_class = false,
+            '!' | '^' if in_class && !class_has_content => {}
+            '{' if !in_class => brace_depth += 1,
+            '}' if !in_class => brace_depth = brace_depth.saturating_sub(1),
+            ',' if !in_class && brace_depth == 0 => {
                 let pattern = input[start..index].trim();
                 if !pattern.is_empty() {
                     patterns.push(pattern);
                 }
                 start = index + character.len_utf8();
             }
+            _ if in_class => class_has_content = true,
             _ => {}
         }
     }
@@ -922,6 +1179,88 @@ fn workspace_entries(
     walker.build().filter_map(Result::ok)
 }
 
+#[derive(Default)]
+struct WorkspaceIndexWalkOutput {
+    files: Vec<PathBuf>,
+    visible_entries: HashSet<PathBuf>,
+}
+
+struct WorkspaceIndexWalkCollector {
+    files: Vec<PathBuf>,
+    visible_entries: HashSet<PathBuf>,
+    output: Arc<Mutex<WorkspaceIndexWalkOutput>>,
+}
+
+impl Drop for WorkspaceIndexWalkCollector {
+    fn drop(&mut self) {
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        output.files.append(&mut self.files);
+        output.visible_entries.extend(self.visible_entries.drain());
+    }
+}
+
+fn workspace_index_entries<F>(
+    workspace: &Path,
+    should_continue: Arc<F>,
+) -> Option<WorkspaceIndexWalkOutput>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let output = Arc::new(Mutex::new(WorkspaceIndexWalkOutput::default()));
+    let mut walker = ignore::WalkBuilder::new(workspace);
+    walker.require_git(false);
+    walker.build_parallel().run({
+        let should_continue = should_continue.clone();
+        let cancelled = cancelled.clone();
+        let output = output.clone();
+        move || {
+            let mut collector = WorkspaceIndexWalkCollector {
+                files: Vec::new(),
+                visible_entries: HashSet::new(),
+                output: output.clone(),
+            };
+            let should_continue = should_continue.clone();
+            let cancelled = cancelled.clone();
+            Box::new(move |entry| {
+                if cancelled.load(Ordering::Acquire) {
+                    return ignore::WalkState::Quit;
+                }
+                if !should_continue() {
+                    cancelled.store(true, Ordering::Release);
+                    return ignore::WalkState::Quit;
+                }
+                let Ok(entry) = entry else {
+                    return ignore::WalkState::Continue;
+                };
+                let Some(kind) = entry.file_type() else {
+                    return ignore::WalkState::Continue;
+                };
+                let path = entry.into_path();
+                if kind.is_file() {
+                    collector.files.push(path.clone());
+                }
+                if kind.is_file() || kind.is_dir() {
+                    collector.visible_entries.insert(path);
+                }
+                ignore::WalkState::Continue
+            })
+        }
+    });
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut output = output.lock().unwrap_or_else(|error| error.into_inner());
+    output.files.sort_unstable();
+    Some(WorkspaceIndexWalkOutput {
+        files: std::mem::take(&mut output.files),
+        visible_entries: std::mem::take(&mut output.visible_entries),
+    })
+}
+
 /// A worktree path snapshot. The proxy invalidates it on file-set and ignore
 /// rule changes; searches use one stable path view while reading live content.
 #[derive(Debug)]
@@ -986,7 +1325,7 @@ impl WorkspaceFileIndex {
     /// builder releases waiting searches so one of them can finish the walk.
     pub fn snapshot_with_generation_while(
         &self,
-        should_continue: impl FnMut() -> bool,
+        should_continue: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Option<(u64, Arc<Vec<PathBuf>>)> {
         self.snapshot_with_search_revision_while(should_continue)
             .map(|(generation, _, files)| (generation, files))
@@ -997,8 +1336,9 @@ impl WorkspaceFileIndex {
     /// content-only edits.
     pub fn snapshot_with_search_revision_while(
         &self,
-        mut should_continue: impl FnMut() -> bool,
+        should_continue: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Option<(u64, u64, Arc<Vec<PathBuf>>)> {
+        let should_continue = Arc::new(should_continue);
         loop {
             if !should_continue() {
                 return None;
@@ -1026,27 +1366,17 @@ impl WorkspaceFileIndex {
                 state.building = true;
                 state.generation
             };
-            let mut files = Vec::new();
-            let mut visible_entries = HashSet::new();
-            for entry in workspace_entries(&self.workspace) {
-                if !should_continue() {
-                    let mut state =
-                        self.state.lock().unwrap_or_else(|error| error.into_inner());
-                    state.building = false;
-                    self.ready.notify_all();
-                    return None;
-                }
-                let Some(kind) = entry.file_type() else {
-                    continue;
-                };
-                let path = entry.into_path();
-                if kind.is_file() {
-                    files.push(path.clone());
-                }
-                if kind.is_file() || kind.is_dir() {
-                    visible_entries.insert(path);
-                }
-            }
+            let Some(WorkspaceIndexWalkOutput {
+                files,
+                visible_entries,
+            }) = workspace_index_entries(&self.workspace, should_continue.clone())
+            else {
+                let mut state =
+                    self.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.building = false;
+                self.ready.notify_all();
+                return None;
+            };
             let files = Arc::new(files);
             let mut state =
                 self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1105,6 +1435,10 @@ impl WorkspaceFileIndex {
 
     pub fn invalidate(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // In-flight walks still need a generation fence; an idle empty cache does not.
+        if state.files.is_none() && !state.building {
+            return;
+        }
         state.generation = state.generation.wrapping_add(1);
         state.search_revision = state.search_revision.wrapping_add(1);
         state.files = None;
@@ -1214,7 +1548,7 @@ pub fn search_paths<I, F>(
 ) -> Result<Vec<(PathBuf, Vec<FileSearchMatch>)>, FileSearchError>
 where
     I: IntoIterator<Item = PathBuf>,
-    F: FnMut() -> bool,
+    F: Fn() -> bool + Sync,
 {
     search_paths_with_overrides(
         scope,
@@ -1223,6 +1557,384 @@ where
         options,
         should_continue,
     )
+}
+
+/// Replace every match in one editor buffer using the same text, whole-word,
+/// regex, and case options as project search. Text-mode replacements are
+/// literal; regex replacements expand capture groups and Zed-style `\\n`,
+/// `\\t`, and `\\\\` escapes.
+pub fn replace_text_matches(
+    text: &str,
+    options: &FileSearchOptions,
+    replacement: &str,
+) -> Result<(String, usize), FileSearchError> {
+    if options.pattern.is_empty() {
+        return Ok((text.to_owned(), 0));
+    }
+    let matcher = replacement_matcher(options)?;
+    replace_text_with_matcher(
+        text,
+        options,
+        replacement,
+        &matcher,
+        MAX_SEARCH_RESULT_RANGES,
+    )
+}
+
+/// Replace one previously searched match in a workspace file without writing
+/// it to disk. Dirty editor contents take precedence over disk.
+pub fn replace_path_match_with_overrides<F>(
+    scope: SearchScope<'_>,
+    path: &Path,
+    overrides: &HashMap<PathBuf, String>,
+    options: &FileSearchOptions,
+    replacement: &str,
+    matched: &FileSearchMatch,
+    should_continue: F,
+) -> Result<Option<FileSearchReplacement>, FileSearchError>
+where
+    F: Fn() -> bool,
+{
+    if options.pattern.is_empty() {
+        return Ok(None);
+    }
+    if !should_continue() {
+        return Err(FileSearchError::Cancelled);
+    }
+
+    let workspace = match scope {
+        SearchScope::Workspace(path) => {
+            Some(SearchWorkspace::open(path).map_err(|error| {
+                FileSearchError::InvalidWorkspace(error.to_string())
+            })?)
+        }
+        SearchScope::BuffersOnly => None,
+    };
+    if let Some(workspace) = workspace.as_ref() {
+        workspace
+            .relative_path(path)
+            .map_err(|error| FileSearchError::InvalidWorkspace(error.to_string()))?;
+    }
+
+    let text = if let Some(text) = overrides.get(path) {
+        text.clone()
+    } else {
+        let Some(workspace) = workspace.as_ref() else {
+            return Ok(None);
+        };
+        let mut file = match workspace.open_file(path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
+                return Ok(None);
+            }
+        };
+        let Some(bytes) = read_search_file(&mut file, path, &should_continue)?
+        else {
+            return Ok(None);
+        };
+        if is_binary_content(&bytes) {
+            return Ok(None);
+        }
+        let Some(text) = decode_search_text(&bytes) else {
+            return Ok(None);
+        };
+        text
+    };
+
+    let Some(replacement_text) =
+        replace_text_match(&text, options, replacement, matched)?
+    else {
+        return Ok(None);
+    };
+    if !should_continue() {
+        return Err(FileSearchError::Cancelled);
+    }
+    Ok(Some(FileSearchReplacement {
+        path: path.to_path_buf(),
+        original_text: text,
+        replacement_text,
+        match_count: 1,
+    }))
+}
+
+fn replace_text_match(
+    text: &str,
+    options: &FileSearchOptions,
+    replacement: &str,
+    matched: &FileSearchMatch,
+) -> Result<Option<String>, FileSearchError> {
+    let Some(start) = search_offset_at_position(text, matched.line, matched.start)
+    else {
+        return Ok(None);
+    };
+    let Some(end) = search_offset_at_position(text, matched.end_line, matched.end)
+    else {
+        return Ok(None);
+    };
+    if start > end {
+        return Ok(None);
+    }
+
+    let replacement = if options.is_regex {
+        expand_regex_replacement_escapes(replacement)
+    } else {
+        replacement.to_owned()
+    };
+    let matcher = replacement_matcher(options)?;
+    let mut replaced = false;
+    let replacement_text = match matcher {
+        ReplacementMatcher::Text(matcher) => matcher
+            .replace_all(text, |captures: &regex::Captures<'_>| {
+                let Some(found) = captures.get(0) else {
+                    return String::new();
+                };
+                if !replaced && found.start() == start && found.end() == end {
+                    replaced = true;
+                    replacement.clone()
+                } else {
+                    found.as_str().to_owned()
+                }
+            })
+            .into_owned(),
+        ReplacementMatcher::Regex(matcher) => matcher
+            .try_replacen(text, 0, |captures: &fancy_regex::Captures<'_, str>| {
+                let Some(found) = captures.get(0) else {
+                    return String::new();
+                };
+                if !replaced && found.start() == start && found.end() == end {
+                    replaced = true;
+                    if options.is_regex {
+                        let mut expanded = String::new();
+                        captures.expand(&replacement, &mut expanded);
+                        expanded
+                    } else {
+                        replacement.clone()
+                    }
+                } else {
+                    found.as_str().to_owned()
+                }
+            })
+            .map_err(|error| FileSearchError::RegexExecution(error.to_string()))?
+            .into_owned(),
+    };
+    Ok(replaced.then_some(replacement_text))
+}
+
+fn search_offset_at_position(
+    text: &str,
+    line: usize,
+    column: usize,
+) -> Option<usize> {
+    let line_start = if line == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line - 1)
+            .map(|(offset, _)| offset + 1)?
+    };
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |offset| line_start + offset);
+    let line_text = text.get(line_start..line_end)?;
+    if column > line_text.len() || !line_text.is_char_boundary(column) {
+        return None;
+    }
+    Some(line_start + column)
+}
+
+enum ReplacementMatcher {
+    Text(Regex),
+    Regex(FancyRegex),
+}
+
+fn replacement_matcher(
+    options: &FileSearchOptions,
+) -> Result<ReplacementMatcher, FileSearchError> {
+    let pattern = if options.is_regex {
+        options.pattern.clone()
+    } else {
+        regex::escape(&options.pattern)
+    };
+    let pattern = whole_word_pattern(pattern, options.whole_word);
+    if options.is_regex || options.whole_word {
+        let mut builder = FancyRegexBuilder::new(&pattern);
+        builder
+            .case_insensitive(!options.case_sensitive)
+            .multi_line(true)
+            .crlf(true);
+        builder
+            .build()
+            .map(ReplacementMatcher::Regex)
+            .map_err(|error| FileSearchError::InvalidPattern(error.to_string()))
+    } else {
+        RegexBuilder::new(&pattern)
+            .case_insensitive(!options.case_sensitive)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+            .map(ReplacementMatcher::Text)
+            .map_err(|error| FileSearchError::InvalidPattern(error.to_string()))
+    }
+}
+
+fn replace_text_with_matcher(
+    text: &str,
+    options: &FileSearchOptions,
+    replacement: &str,
+    matcher: &ReplacementMatcher,
+    remaining_matches: usize,
+) -> Result<(String, usize), FileSearchError> {
+    let match_count = match matcher {
+        ReplacementMatcher::Text(matcher) => matcher
+            .find_iter(text)
+            .take(remaining_matches.saturating_add(1))
+            .count(),
+        ReplacementMatcher::Regex(matcher) => {
+            let mut count = 0;
+            for result in matcher
+                .find_iter(text)
+                .take(remaining_matches.saturating_add(1))
+            {
+                result.map_err(|error| {
+                    FileSearchError::RegexExecution(error.to_string())
+                })?;
+                count += 1;
+            }
+            count
+        }
+    };
+    if match_count > remaining_matches {
+        return Err(FileSearchError::TooManyMatches);
+    }
+    if match_count == 0 {
+        return Ok((text.to_owned(), 0));
+    }
+    let replacement = if options.is_regex {
+        expand_regex_replacement_escapes(replacement)
+    } else {
+        replacement.to_owned()
+    };
+    let replaced = match matcher {
+        ReplacementMatcher::Text(matcher) => matcher
+            .replace_all(text, NoExpand(replacement.as_str()))
+            .into_owned(),
+        ReplacementMatcher::Regex(matcher) if options.is_regex => matcher
+            .try_replacen(text, 0, replacement.as_str())
+            .map_err(|error| FileSearchError::RegexExecution(error.to_string()))?
+            .into_owned(),
+        ReplacementMatcher::Regex(matcher) => matcher
+            .try_replacen(text, 0, FancyNoExpand(replacement.as_str()))
+            .map_err(|error| FileSearchError::RegexExecution(error.to_string()))?
+            .into_owned(),
+    };
+    Ok((replaced, match_count))
+}
+
+/// Precompute replacements for project files without writing to disk. Dirty
+/// editor buffers in `overrides` take precedence over their saved contents.
+/// Paths outside the worktree, unreadable files, and binary files are skipped
+/// like project search; callers must validate editor snapshots before applying
+/// any returned changes.
+pub fn replace_paths_with_overrides<I, F>(
+    scope: SearchScope<'_>,
+    paths: I,
+    overrides: &HashMap<PathBuf, String>,
+    options: &FileSearchOptions,
+    replacement: &str,
+    should_continue: F,
+) -> Result<Vec<FileSearchReplacement>, FileSearchError>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: Fn() -> bool,
+{
+    if options.pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+    let matcher = replacement_matcher(options)?;
+    let workspace = match scope {
+        SearchScope::Workspace(path) => {
+            Some(SearchWorkspace::open(path).map_err(|error| {
+                FileSearchError::InvalidWorkspace(error.to_string())
+            })?)
+        }
+        SearchScope::BuffersOnly => None,
+    };
+    let mut seen = HashSet::new();
+    let mut replacements = Vec::new();
+    let mut total_match_count = 0usize;
+    for path in paths {
+        if !should_continue() {
+            return Err(FileSearchError::Cancelled);
+        }
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(workspace) = workspace.as_ref()
+            && workspace.relative_path(&path).is_err()
+        {
+            continue;
+        }
+        let text = if let Some(text) = overrides.get(&path) {
+            text.clone()
+        } else {
+            let Some(workspace) = workspace.as_ref() else {
+                continue;
+            };
+            let Ok(mut file) = workspace.open_file(&path) else {
+                continue;
+            };
+            let Some(bytes) = read_search_file(&mut file, &path, &should_continue)?
+            else {
+                continue;
+            };
+            let Some(text) = decode_search_text(&bytes) else {
+                continue;
+            };
+            text
+        };
+        let remaining_matches =
+            MAX_SEARCH_RESULT_RANGES.saturating_sub(total_match_count);
+        let (replacement_text, match_count) = replace_text_with_matcher(
+            &text,
+            options,
+            replacement,
+            &matcher,
+            remaining_matches,
+        )?;
+        total_match_count += match_count;
+        if match_count > 0 && replacement_text != text {
+            replacements.push(FileSearchReplacement {
+                path,
+                original_text: text,
+                replacement_text,
+                match_count,
+            });
+        }
+    }
+    Ok(replacements)
+}
+
+fn expand_regex_replacement_escapes(replacement: &str) -> String {
+    let mut expanded = String::with_capacity(replacement.len());
+    let mut characters = replacement.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            expanded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('\\') => expanded.push('\\'),
+            Some('n') => expanded.push('\n'),
+            Some('t') => expanded.push('\t'),
+            Some(next) => {
+                expanded.push('\\');
+                expanded.push(next);
+            }
+            None => expanded.push('\\'),
+        }
+    }
+    expanded
 }
 
 /// Search the current editor text for open paths, falling back to disk for
@@ -1237,7 +1949,7 @@ pub fn search_paths_with_overrides<I, F>(
 ) -> Result<Vec<(PathBuf, Vec<FileSearchMatch>)>, FileSearchError>
 where
     I: IntoIterator<Item = PathBuf>,
-    F: FnMut() -> bool,
+    F: Fn() -> bool + Sync,
 {
     let mut matches = Vec::new();
     search_paths_with_overrides_stream(
@@ -1256,19 +1968,68 @@ where
 
 /// Emit each matching file as soon as it finishes scanning. A bounded consumer
 /// can apply backpressure while callers that need all results use the wrapper
-/// above. Returns whether the match limit was reached. Returning false from
-/// the callback cancels the scan.
+/// above. The cancellation predicate is polled concurrently by search workers.
+/// Returns whether the match limit was reached. Returning false from the
+/// callback cancels the scan.
+fn search_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+}
+
+const SEARCH_PATHS_PER_JOB: usize = 8;
+
+fn search_pool() -> Result<&'static ThreadPool, FileSearchError> {
+    static SEARCH_POOL: OnceLock<Result<ThreadPool, String>> = OnceLock::new();
+    match SEARCH_POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(search_worker_count())
+            .thread_name(|index| format!("ahead-search-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(pool) => Ok(pool),
+        Err(error) => {
+            tracing::error!(%error, "failed to initialize the shared search pool");
+            Err(FileSearchError::WorkerFailed)
+        }
+    }
+}
+
+struct SearchWorkerState {
+    searcher: Searcher,
+    utf8_prefix: Vec<u8>,
+}
+
+thread_local! {
+    static SEARCH_STATE: std::cell::RefCell<SearchWorkerState> = std::cell::RefCell::new(
+        SearchWorkerState {
+            searcher: SearcherBuilder::new()
+                .line_terminator(LineTerminator::crlf())
+                .multi_line(true)
+                .binary_detection(BinaryDetection::quit(b'\0'))
+                .build(),
+            utf8_prefix: Vec::new(),
+        }
+    );
+}
+
+enum SearchMatcher {
+    Literal(RegexMatcher),
+    Regex(FancyRegex),
+}
+
 pub fn search_paths_with_overrides_stream<I, F, C>(
     scope: SearchScope<'_>,
     paths: I,
     overrides: &HashMap<PathBuf, String>,
     options: &FileSearchOptions,
-    mut should_continue: F,
+    should_continue: F,
     mut on_file_matches: C,
 ) -> Result<bool, FileSearchError>
 where
     I: IntoIterator<Item = PathBuf>,
-    F: FnMut() -> bool,
+    F: Fn() -> bool + Sync,
     C: FnMut(PathBuf, Vec<FileSearchMatch>) -> bool,
 {
     if options.pattern.is_empty() || options.max_results == 0 {
@@ -1282,152 +2043,259 @@ where
         }
         SearchScope::BuffersOnly => None,
     };
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder
-        .case_insensitive(!options.case_sensitive)
-        .multi_line(true)
-        .crlf(true)
-        // Keep CRLF-aware anchors without banning newlines in multi-line matches.
-        .line_terminator(None)
-        .word(options.whole_word);
-    let matcher = if options.is_regex {
-        matcher_builder
-            .build(&options.pattern)
-            .map_err(|error| FileSearchError::InvalidPattern(error.to_string()))?
-    } else {
-        matcher_builder
-            .build_literals(&[&options.pattern])
-            .map_err(|error| FileSearchError::InvalidPattern(error.to_string()))?
-    };
-    let mut searcher = SearcherBuilder::new()
-        .line_terminator(LineTerminator::crlf())
-        .multi_line(true)
-        .binary_detection(BinaryDetection::quit(b'\0'))
-        .build();
-    let mut match_count = 0;
-
-    for path in paths {
-        if !should_continue() {
-            return Err(FileSearchError::Cancelled);
-        }
-        if match_count >= options.max_results {
-            break;
-        }
-        if workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.relative_path(&path).is_err())
-        {
-            continue;
-        }
-        let content = overrides.get(&path);
-        if content.is_none() && workspace.is_none() {
-            continue;
-        }
-
-        let decoded_bytes = content.map(String::as_bytes);
-
-        let mut file_matches = Vec::new();
-        let match_count_before_file = match_count;
-        let mut cancelled = false;
-        let mut limit_reached = false;
-        let mut disk_file = None;
-        let initial_result = if let Some(bytes) = decoded_bytes {
-            searcher.search_slice(
-                &matcher,
-                bytes,
-                search_result_sink(
-                    &matcher,
-                    &mut should_continue,
-                    &mut file_matches,
-                    &mut match_count,
-                    options.max_results,
-                    &mut cancelled,
-                    &mut limit_reached,
-                ),
-            )
+    let matcher =
+        if options.is_regex {
+            let pattern =
+                whole_word_pattern(options.pattern.clone(), options.whole_word);
+            let mut matcher_builder = FancyRegexBuilder::new(&pattern);
+            matcher_builder
+                .case_insensitive(!options.case_sensitive)
+                .multi_line(true)
+                .crlf(true);
+            SearchMatcher::Regex(matcher_builder.build().map_err(|error| {
+                FileSearchError::InvalidPattern(error.to_string())
+            })?)
         } else {
-            let Some(workspace) = workspace.as_ref() else {
-                continue;
-            };
-            let mut file = match workspace.open_file(&path) {
-                Ok(file) => file,
-                Err(error) => {
-                    tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
+            let mut matcher_builder = RegexMatcherBuilder::new();
+            matcher_builder
+                .case_insensitive(!options.case_sensitive)
+                .multi_line(true)
+                .crlf(true)
+                .word(options.whole_word);
+            // Only single-line literals can use grep-regex's candidate-line prefilter.
+            if options.pattern.contains('\r') || options.pattern.contains('\n') {
+                matcher_builder.line_terminator(None);
+            }
+            SearchMatcher::Literal(
+                matcher_builder
+                    .build_literals(&[&options.pattern])
+                    .map_err(|error| {
+                        FileSearchError::InvalidPattern(error.to_string())
+                    })?,
+            )
+        };
+    let worker_count = search_worker_count();
+    let pool = search_pool()?;
+    pool.in_place_scope(|scope| {
+        let (results_sender, results_receiver) = mpsc::channel::<(
+            Vec<(
+                usize,
+                PathBuf,
+                Result<Vec<FileSearchMatch>, FileSearchError>,
+            )>,
+            bool,
+        )>();
+        let mut results_sender = Some(results_sender);
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let matcher = &matcher;
+        let workspace = workspace.as_ref();
+        let should_continue = &should_continue;
+
+        let mut paths = paths.into_iter();
+        let mut jobs_sent = 0usize;
+        let mut next_result = 0usize;
+        let mut in_flight = 0usize;
+        let mut paths_exhausted = false;
+        let mut match_count = 0usize;
+        let mut pending = BTreeMap::new();
+        let mut failure = None;
+        let mut limit_reached = false;
+
+        loop {
+            while !paths_exhausted
+                && in_flight < worker_count
+                && jobs_sent.saturating_sub(next_result)
+                    < worker_count.saturating_mul(SEARCH_PATHS_PER_JOB)
+            {
+                let mut batch = Vec::with_capacity(SEARCH_PATHS_PER_JOB);
+                while batch.len() < SEARCH_PATHS_PER_JOB && !paths_exhausted {
+                    if !should_continue() {
+                        keep_running.store(false, Ordering::Relaxed);
+                        failure = Some(FileSearchError::Cancelled);
+                        break;
+                    }
+                    let Some(path) = paths.next() else {
+                        paths_exhausted = true;
+                        break;
+                    };
+                    let relative_path = match workspace {
+                        Some(workspace) => match workspace.relative_path(&path) {
+                            Ok(relative_path) => Some(relative_path.to_path_buf()),
+                            Err(_) => continue,
+                        },
+                        None if overrides.contains_key(&path) => None,
+                        None => continue,
+                    };
+                    batch.push((jobs_sent, path, relative_path));
+                    jobs_sent += 1;
+                }
+                if failure.is_some() {
+                    break;
+                }
+                if batch.is_empty() {
                     continue;
                 }
-            };
-            let result = searcher.search_reader(
-                &matcher,
-                Utf8ValidatingReader::new(&mut file),
-                search_result_sink(
-                    &matcher,
-                    &mut should_continue,
-                    &mut file_matches,
-                    &mut match_count,
-                    options.max_results,
-                    &mut cancelled,
-                    &mut limit_reached,
-                ),
-            );
-            disk_file = Some(file);
-            result
-        };
-        let result = match initial_result {
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    && content.is_none() =>
-            {
-                let Some(file) = disk_file.as_mut() else {
-                    continue;
+                let Some(sender) = results_sender.as_ref() else {
+                    keep_running.store(false, Ordering::Relaxed);
+                    failure = Some(FileSearchError::WorkerFailed);
+                    break;
                 };
-                match read_search_file(file, &path, &mut should_continue)?
-                    .and_then(|bytes| decode_search_text(&bytes))
-                {
-                    Some(decoded) => {
-                        file_matches.clear();
-                        match_count = match_count_before_file;
-                        cancelled = false;
-                        limit_reached = false;
-                        searcher.search_slice(
-                            &matcher,
-                            decoded.as_bytes(),
-                            search_result_sink(
-                                &matcher,
-                                &mut should_continue,
-                                &mut file_matches,
-                                &mut match_count,
-                                options.max_results,
-                                &mut cancelled,
-                                &mut limit_reached,
+                let sender = sender.clone();
+                let keep_running = keep_running.clone();
+                // Batch misses to avoid task/channel overhead, but flush hits promptly.
+                scope.spawn(move |_| {
+                    let mut results = Vec::with_capacity(batch.len());
+                    let batch_len = batch.len();
+                    let mut batch_complete = false;
+                    for (position, (job_index, path, relative_path)) in
+                        batch.into_iter().enumerate()
+                    {
+                        if !keep_running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let worker_should_continue = || {
+                            let continuing = keep_running.load(Ordering::Relaxed)
+                                && should_continue();
+                            if !continuing {
+                                keep_running.store(false, Ordering::Relaxed);
+                            }
+                            continuing
+                        };
+                        let result = match matcher {
+                            SearchMatcher::Literal(matcher) => {
+                                SEARCH_STATE.with(|state| {
+                                    let mut state = state.borrow_mut();
+                                    let SearchWorkerState {
+                                        searcher,
+                                        utf8_prefix,
+                                    } = &mut *state;
+                                    search_one_path(
+                                        &path,
+                                        relative_path.as_deref(),
+                                        workspace,
+                                        overrides,
+                                        matcher,
+                                        searcher,
+                                        utf8_prefix,
+                                        options,
+                                        &worker_should_continue,
+                                    )
+                                })
+                            }
+                            SearchMatcher::Regex(matcher) => search_regex_one_path(
+                                &path,
+                                relative_path.as_deref(),
+                                workspace,
+                                overrides,
+                                matcher,
+                                options,
+                                &worker_should_continue,
                             ),
-                        )
+                        };
+                        let flush = match &result {
+                            Ok(matches) => !matches.is_empty(),
+                            Err(_) => true,
+                        };
+                        results.push((job_index, path, result));
+                        if flush {
+                            batch_complete = position + 1 == batch_len;
+                            let partial_results = std::mem::replace(
+                                &mut results,
+                                Vec::with_capacity(SEARCH_PATHS_PER_JOB),
+                            );
+                            if let Err(error) =
+                                sender.send((partial_results, batch_complete))
+                            {
+                                tracing::debug!(
+                                    result_count = error.0.0.len(),
+                                    "search result receiver closed before worker batch completed"
+                                );
+                                return;
+                            }
+                        }
                     }
-                    None => {
-                        match_count = match_count_before_file;
-                        continue;
+                    if !batch_complete {
+                        if let Err(error) = sender.send((results, true)) {
+                            tracing::debug!(
+                                result_count = error.0.0.len(),
+                                "search result receiver closed before worker batch completed"
+                            );
+                        }
                     }
+                });
+                in_flight += 1;
+            }
+            if paths_exhausted {
+                results_sender = None;
+            }
+            if failure.is_some() || in_flight == 0 {
+                break;
+            }
+            if !should_continue() {
+                keep_running.store(false, Ordering::Relaxed);
+                failure = Some(FileSearchError::Cancelled);
+                break;
+            }
+
+            match results_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok((results, batch_complete)) => {
+                    if batch_complete {
+                        in_flight -= 1;
+                    }
+                    for (job_index, path, result) in results {
+                        pending.insert(job_index, (path, result));
+                    }
+                    while let Some((path, result)) = pending.remove(&next_result) {
+                        if !should_continue() {
+                            keep_running.store(false, Ordering::Relaxed);
+                            failure = Some(FileSearchError::Cancelled);
+                            break;
+                        }
+                        next_result += 1;
+                        let mut file_matches = match result {
+                            Ok(matches) => matches,
+                            Err(error) => {
+                                failure = Some(error);
+                                keep_running.store(false, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+                        file_matches.truncate(
+                            options.max_results.saturating_sub(match_count),
+                        );
+                        match_count += file_matches.len();
+                        if !file_matches.is_empty()
+                            && !on_file_matches(path, file_matches)
+                        {
+                            failure = Some(FileSearchError::Cancelled);
+                            keep_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        if match_count >= options.max_results {
+                            limit_reached = true;
+                            keep_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    keep_running.store(false, Ordering::Relaxed);
+                    failure = Some(FileSearchError::WorkerFailed);
+                    break;
                 }
             }
-            result => result,
-        };
-        if cancelled || !should_continue() {
-            return Err(FileSearchError::Cancelled);
+            if failure.is_some() || limit_reached {
+                break;
+            }
         }
-        if let Err(error) = result {
-            match_count = match_count_before_file;
-            file_matches.clear();
-            tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
-            continue;
-        }
-        if !file_matches.is_empty() && !on_file_matches(path, file_matches) {
-            return Err(FileSearchError::Cancelled);
-        }
-        if limit_reached {
-            break;
-        }
-    }
 
-    Ok(match_count >= options.max_results)
+        drop(results_sender);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(match_count >= options.max_results),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1437,8 +2305,64 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn concurrent_searches_share_the_bounded_worker_pool() {
+        let pool = search_pool().expect("search worker pool");
+        assert_eq!(pool.current_num_threads(), search_worker_count());
+        assert!(std::ptr::eq(
+            pool,
+            search_pool().expect("same search worker pool")
+        ));
+    }
+
+    #[test]
+    fn concurrent_workspace_searches_complete_from_shared_pool() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..256 {
+            fs::write(
+                workspace.path().join(format!("file-{index:03}.rs")),
+                "AHEAD_SHARED_POOL\n",
+            )
+            .expect("write search file");
+        }
+        let options = FileSearchOptions {
+            pattern: "AHEAD_SHARED_POOL".into(),
+            case_sensitive: true,
+            whole_word: true,
+            is_regex: false,
+            max_results: 500,
+        };
+
+        std::thread::scope(|scope| {
+            let searches = (0..8)
+                .map(|_| {
+                    let workspace = workspace.path();
+                    let options = &options;
+                    scope.spawn(move || {
+                        search_paths(
+                            SearchScope::Workspace(workspace),
+                            workspace_files(workspace),
+                            options,
+                            || true,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for search in searches {
+                let results = search
+                    .join()
+                    .expect("search worker must finish")
+                    .expect("independent search must not be cancelled");
+                assert_eq!(results.len(), 256);
+            }
+        });
+    }
+
+    #[test]
     fn utf8_validator_handles_split_and_truncated_code_points() {
-        let mut split = Utf8ValidatingReader::new(Cursor::new([0xC3, 0xA9]));
+        let mut split_prefix = Vec::new();
+        let mut split =
+            Utf8ValidatingReader::new(Cursor::new([0xC3, 0xA9]), &mut split_prefix);
         let mut byte = [0; 1];
         assert_eq!(split.read(&mut byte).expect("first UTF-8 byte"), 1);
         assert_eq!(byte[0], 0xC3);
@@ -1446,7 +2370,9 @@ mod tests {
         assert_eq!(byte[0], 0xA9);
         assert_eq!(split.read(&mut byte).expect("end of UTF-8 stream"), 0);
 
-        let mut truncated = Utf8ValidatingReader::new(Cursor::new([0xC3]));
+        let mut truncated_prefix = Vec::new();
+        let mut truncated =
+            Utf8ValidatingReader::new(Cursor::new([0xC3]), &mut truncated_prefix);
         assert_eq!(truncated.read(&mut byte).expect("partial UTF-8 byte"), 1);
         assert_eq!(
             truncated
@@ -1455,6 +2381,81 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+
+        let mut malformed_prefix = Vec::new();
+        let mut malformed = Utf8ValidatingReader::new(
+            Cursor::new([0xC3, 0x28]),
+            &mut malformed_prefix,
+        );
+        let mut bytes = [0; 2];
+        assert_eq!(
+            malformed
+                .read(&mut bytes)
+                .expect_err("malformed UTF-8 must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn utf8_validator_handles_code_point_split_at_classifier_boundary() {
+        let mut expected = vec![b'x'; SEARCH_PREFIX_BYTES - 1];
+        expected.extend_from_slice("é".as_bytes());
+        let mut prefix = Vec::new();
+        let mut reader =
+            Utf8ValidatingReader::new(Cursor::new(expected.clone()), &mut prefix);
+        let mut actual = Vec::new();
+
+        reader
+            .read_to_end(&mut actual)
+            .expect("valid UTF-8 crossing the prefix boundary");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn utf8_validator_streams_large_multibyte_content() {
+        let expected = "é🙂".repeat(32_768);
+        let mut prefix = Vec::new();
+        let mut reader =
+            Utf8ValidatingReader::new(Cursor::new(expected.as_bytes()), &mut prefix);
+        let mut actual = Vec::new();
+
+        reader
+            .read_to_end(&mut actual)
+            .expect("large valid UTF-8 remains searchable");
+
+        assert_eq!(actual, expected.as_bytes());
+    }
+
+    #[test]
+    fn utf8_validator_reuses_prefix_capacity_between_files() {
+        let mut prefix = Vec::new();
+        let first = {
+            let mut reader = Utf8ValidatingReader::new(
+                Cursor::new(b"first short file".as_slice()),
+                &mut prefix,
+            );
+            let mut contents = Vec::new();
+            reader.read_to_end(&mut contents).expect("read first file");
+            contents
+        };
+        let first_capacity = prefix.capacity();
+        let first_pointer = prefix.as_ptr();
+        let second = {
+            let mut reader = Utf8ValidatingReader::new(
+                Cursor::new(b"other short file".as_slice()),
+                &mut prefix,
+            );
+            let mut contents = Vec::new();
+            reader.read_to_end(&mut contents).expect("read second file");
+            contents
+        };
+
+        assert_eq!(first, b"first short file");
+        assert_eq!(second, b"other short file");
+        assert_eq!(prefix.capacity(), first_capacity);
+        assert_eq!(prefix.as_ptr(), first_pointer);
     }
 
     #[test]
@@ -1486,6 +2487,238 @@ mod tests {
         assert!(results[0].0.ends_with("src/lib.rs"));
         assert_eq!(results[0].1[0].line, 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replace_text_matches_preserves_literal_dollars_and_expands_regex_captures() {
+        let literal = FileSearchOptions {
+            pattern: "needle".into(),
+            case_sensitive: true,
+            whole_word: true,
+            is_regex: false,
+            max_results: 1,
+        };
+        assert_eq!(
+            replace_text_matches(
+                "needle needlessly needle_2 needle",
+                &literal,
+                "$1"
+            )
+            .expect("literal replacement"),
+            ("$1 needlessly needle_2 $1".into(), 2)
+        );
+
+        let regex = FileSearchOptions {
+            pattern: r"(?P<word>needle)".into(),
+            case_sensitive: false,
+            whole_word: true,
+            is_regex: true,
+            max_results: 1,
+        };
+        assert_eq!(
+            replace_text_matches("Needle needlessly", &regex, r"<$word>\n")
+                .expect("regex replacement"),
+            ("<Needle>\n needlessly".into(), 1)
+        );
+    }
+
+    #[test]
+    fn replace_path_match_changes_only_the_selected_unsaved_match() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("main.rs");
+        fs::write(&path, "needle needle\n").expect("write search file");
+        let unsaved_text = "é needle needle\n";
+        let overrides = HashMap::from([(path.clone(), unsaved_text.to_string())]);
+        let options = FileSearchOptions {
+            pattern: "needle".into(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: false,
+            max_results: 10,
+        };
+        let matched = FileSearchMatch {
+            line: 0,
+            start: 10,
+            end_line: 0,
+            end: 16,
+            line_content: unsaved_text.trim_end().into(),
+            preview_match: 10..16,
+        };
+
+        let result = replace_path_match_with_overrides(
+            SearchScope::Workspace(workspace.path()),
+            &path,
+            &overrides,
+            &options,
+            "done",
+            &matched,
+            || true,
+        )
+        .expect("replace selected match")
+        .expect("selected result remains available");
+
+        assert_eq!(result.match_count, 1);
+        assert_eq!(result.original_text, unsaved_text);
+        assert_eq!(result.replacement_text, "é needle done\n");
+        assert_eq!(
+            fs::read_to_string(path).expect("disk contents"),
+            "needle needle\n"
+        );
+    }
+
+    #[test]
+    fn replace_selected_regex_match_expands_captures_and_escapes() {
+        let options = FileSearchOptions {
+            pattern: r"(?P<word>cat)(?P<plural>s?)".into(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: true,
+            max_results: 10,
+        };
+        let matched = FileSearchMatch {
+            line: 0,
+            start: 0,
+            end_line: 0,
+            end: 4,
+            line_content: "cats cat".into(),
+            preview_match: 0..4,
+        };
+
+        assert_eq!(
+            replace_text_match("cats cat", &options, "$word!$plural\\n", &matched)
+                .expect("regex replacement")
+                .expect("selected regex match"),
+            "cat!s\n cat"
+        );
+    }
+
+    #[test]
+    fn replace_text_matches_rejects_invalid_regex_without_changing_text() {
+        let options = FileSearchOptions {
+            pattern: "(".into(),
+            case_sensitive: false,
+            whole_word: false,
+            is_regex: true,
+            max_results: 100,
+        };
+        assert!(matches!(
+            replace_text_matches("unchanged", &options, "replacement"),
+            Err(FileSearchError::InvalidPattern(_))
+        ));
+    }
+
+    #[test]
+    fn replace_paths_rejects_more_than_the_global_match_limit() {
+        let first_path = PathBuf::from("first.txt");
+        let second_path = PathBuf::from("second.txt");
+        let mut overrides = HashMap::from([
+            (
+                first_path.clone(),
+                "needle ".repeat(MAX_SEARCH_RESULT_RANGES / 2),
+            ),
+            (
+                second_path.clone(),
+                "needle ".repeat(MAX_SEARCH_RESULT_RANGES / 2),
+            ),
+        ]);
+        let options = FileSearchOptions {
+            pattern: "needle".into(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: false,
+            max_results: 1,
+        };
+
+        let paths = [first_path, second_path.clone()];
+        let replacements = replace_paths_with_overrides(
+            SearchScope::BuffersOnly,
+            paths.clone(),
+            &overrides,
+            &options,
+            "changed",
+            || true,
+        )
+        .expect("the exact global match limit should be accepted");
+        assert_eq!(
+            replacements
+                .iter()
+                .map(|replacement| replacement.match_count)
+                .sum::<usize>(),
+            MAX_SEARCH_RESULT_RANGES
+        );
+
+        overrides.insert(
+            second_path,
+            "needle ".repeat(MAX_SEARCH_RESULT_RANGES / 2 + 1),
+        );
+        assert_eq!(
+            replace_paths_with_overrides(
+                SearchScope::BuffersOnly,
+                paths,
+                &overrides,
+                &options,
+                "changed",
+                || true,
+            ),
+            Err(FileSearchError::TooManyMatches)
+        );
+    }
+
+    #[test]
+    fn replace_paths_uses_unsaved_buffers_and_never_writes_files() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let saved_path = workspace.join("saved.txt");
+        let new_path = workspace.join("new.txt");
+        let outside_path = temporary.path().join("outside.txt");
+        fs::write(&saved_path, "saved needle\n").expect("write saved file");
+        fs::write(&outside_path, "outside needle\n").expect("write outside file");
+        let overrides = HashMap::from([
+            (saved_path.clone(), "unsaved needle needle\n".to_string()),
+            (new_path.clone(), "new needle\n".to_string()),
+            (
+                outside_path.clone(),
+                "outside override needle\n".to_string(),
+            ),
+        ]);
+        let options = FileSearchOptions {
+            pattern: "needle".into(),
+            case_sensitive: true,
+            whole_word: true,
+            is_regex: false,
+            max_results: 1,
+        };
+
+        let replacements = replace_paths_with_overrides(
+            SearchScope::Workspace(&workspace),
+            [
+                saved_path.clone(),
+                saved_path.clone(),
+                new_path.clone(),
+                outside_path,
+            ],
+            &overrides,
+            &options,
+            "changed",
+            || true,
+        )
+        .expect("replace workspace text");
+
+        assert_eq!(replacements.len(), 2);
+        assert_eq!(replacements[0].path, saved_path);
+        assert_eq!(replacements[0].original_text, "unsaved needle needle\n");
+        assert_eq!(
+            replacements[0].replacement_text,
+            "unsaved changed changed\n"
+        );
+        assert_eq!(replacements[0].match_count, 2);
+        assert_eq!(replacements[1].path, new_path);
+        assert_eq!(replacements[1].match_count, 1);
+        assert_eq!(
+            fs::read_to_string(saved_path).expect("saved disk text"),
+            "saved needle\n"
+        );
     }
 
     #[test]
@@ -1566,13 +2799,13 @@ mod tests {
         fs::write(root.join("a.rs"), "first\n").expect("write first file");
         fs::write(root.join("b.rs"), "second\n").expect("write second file");
         let index = WorkspaceFileIndex::new(root.clone());
-        let mut checks = 0;
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let walk_checks = checks.clone();
 
         assert!(
             index
-                .snapshot_with_generation_while(|| {
-                    checks += 1;
-                    checks < 3
+                .snapshot_with_generation_while(move || {
+                    walk_checks.fetch_add(1, Ordering::SeqCst) < 3
                 })
                 .is_none()
         );
@@ -1612,6 +2845,99 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].1.len(), 1);
         fs::remove_dir_all(root).expect("remove search directory");
+    }
+
+    #[test]
+    fn parallel_stream_preserves_input_order_and_global_match_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = workspace.path().join("z-first.txt");
+        let second = workspace.path().join("a-second.txt");
+        let mut first_content = "ordinary line without a match\n".repeat(100_000);
+        first_content.push_str("needle one\nneedle two\n");
+        fs::write(&first, first_content).expect("write first file");
+        fs::write(&second, "needle three\nneedle four\n")
+            .expect("write second file");
+        let mut paths = vec![first.clone()];
+        for index in 0..SEARCH_PATHS_PER_JOB - 1 {
+            let path = workspace.path().join(format!("middle-{index}.txt"));
+            fs::write(&path, "no match\n").expect("write middle file");
+            paths.push(path);
+        }
+        paths.push(second.clone());
+        let options = FileSearchOptions {
+            pattern: "needle".to_string(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: false,
+            max_results: 3,
+        };
+        let mut delivered = Vec::new();
+
+        let limit_reached = search_paths_with_overrides_stream(
+            SearchScope::Workspace(workspace.path()),
+            paths,
+            &HashMap::new(),
+            &options,
+            || true,
+            |path, matches| {
+                delivered.push((path, matches));
+                true
+            },
+        )
+        .expect("search succeeds");
+
+        assert!(limit_reached);
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].0, first);
+        assert_eq!(delivered[0].1.len(), 2);
+        assert!(delivered[1].0.ends_with("a-second.txt"));
+        assert_eq!(delivered[1].1.len(), 1);
+    }
+
+    #[test]
+    fn parallel_stream_cancellation_stops_feeding_the_bounded_worker_window() {
+        use std::sync::atomic::AtomicUsize;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = "needle\n".repeat(1_000);
+        let paths = (0..64)
+            .map(|index| {
+                let path = workspace.path().join(format!("file-{index:02}.txt"));
+                fs::write(&path, &content).expect("write search fixture");
+                path
+            })
+            .collect::<Vec<_>>();
+        let yielded = AtomicUsize::new(0);
+        let options = FileSearchOptions {
+            pattern: "needle".to_string(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: false,
+            max_results: 10_000,
+        };
+        let mut delivered = 0;
+        let result = search_paths_with_overrides_stream(
+            SearchScope::Workspace(workspace.path()),
+            paths.into_iter().inspect(|_| {
+                yielded.fetch_add(1, Ordering::Relaxed);
+            }),
+            &HashMap::new(),
+            &options,
+            || true,
+            |_, _| {
+                delivered += 1;
+                false
+            },
+        );
+
+        assert_eq!(result, Err(FileSearchError::Cancelled));
+        assert_eq!(delivered, 1);
+        assert!(
+            yielded.load(Ordering::Relaxed)
+                <= search_worker_count().saturating_mul(SEARCH_PATHS_PER_JOB),
+            "cancellation consumed {} paths before stopping",
+            yielded.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -1750,6 +3076,11 @@ mod tests {
         fs::write(&pdf, b"%PDF-1.7\nneedle\n").expect("write PDF signature");
         let jpeg = root.join("image.jpg");
         fs::write(&jpeg, b"\xFF\xD8\xFFneedle").expect("write JPEG signature");
+        let bzip2 = root.join("archive.bz2");
+        fs::write(&bzip2, b"BZh9needle\n").expect("write printable BZip2 signature");
+        let zstd = root.join("archive.zst");
+        fs::write(&zstd, b"\x28\xB5\x2F\xFDneedle\n")
+            .expect("write Zstandard signature");
 
         let options = FileSearchOptions {
             pattern: "needle".to_string(),
@@ -1768,6 +3099,8 @@ mod tests {
                 late_binary,
                 pdf,
                 jpeg,
+                bzip2,
+                zstd,
             ],
             &options,
             || true,
@@ -1788,6 +3121,24 @@ mod tests {
         assert_eq!(results[2].1[0].end, "Привет, needle".len());
         assert_eq!(results[2].1[0].line_content, "Привет, needle");
         fs::remove_dir_all(root).expect("remove search directory");
+    }
+
+    #[test]
+    fn recognizes_common_compressed_file_signatures() {
+        let signatures: &[(&str, &[u8])] = &[
+            ("gzip", b"\x1F\x8B\x08"),
+            ("BZip2", b"BZh9block"),
+            ("XZ", b"\xFD7zXZ\x00"),
+            ("Zstandard", b"\x28\xB5\x2F\xFD"),
+            ("LZ4", b"\x04\x22\x4D\x18"),
+            ("7z", b"7z\xBC\xAF\x27\x1C"),
+            ("RAR", b"Rar!\x1A\x07"),
+        ];
+        for (format, signature) in signatures {
+            assert!(is_binary_content(signature), "{format} signature");
+        }
+
+        assert!(!is_binary_content(b"BZh is a plain-text note"));
     }
 
     #[test]
@@ -1882,15 +3233,12 @@ mod tests {
             is_regex: false,
             max_results: 10,
         };
-        let mut checks = 0;
+        let checks = std::sync::atomic::AtomicUsize::new(0);
         let result = search_paths(
             SearchScope::Workspace(&root),
             std::iter::once(path),
             &options,
-            || {
-                checks += 1;
-                checks < 3
-            },
+            || checks.fetch_add(1, Ordering::Relaxed) < 2,
         );
         assert_eq!(result, Err(FileSearchError::Cancelled));
         fs::remove_dir_all(root).expect("remove search directory");
@@ -2097,6 +3445,22 @@ mod tests {
     }
 
     #[test]
+    fn path_filter_keeps_commas_inside_glob_character_classes() {
+        let workspace = Path::new("/projects/ahead");
+        let filter = WorkspacePathFilter::new(
+            workspace,
+            Some("src/[a,b].rs,docs/*.md"),
+            None,
+        )
+        .expect("valid patterns with a comma inside a character class");
+
+        assert!(filter.matches(&workspace.join("src/a.rs")));
+        assert!(filter.matches(&workspace.join("src/b.rs")));
+        assert!(filter.matches(&workspace.join("docs/readme.md")));
+        assert!(!filter.matches(&workspace.join("src/c.rs")));
+    }
+
+    #[test]
     fn supports_case_word_and_regex_modes() {
         let workspace = std::env::temp_dir()
             .join(format!("ahead-search-modes-{}", std::process::id()));
@@ -2127,9 +3491,13 @@ mod tests {
         assert_eq!(count(&options), 4);
         options.whole_word = true;
         assert_eq!(count(&options), 3);
-        options.pattern = "^cat$".into();
         options.whole_word = false;
         options.is_regex = true;
+        assert_eq!(count(&options), 4);
+        options.whole_word = true;
+        assert_eq!(count(&options), 3);
+        options.pattern = "^cat$".into();
+        options.whole_word = false;
         assert_eq!(count(&options), 2);
         options.whole_word = true;
         assert_eq!(count(&options), 2);
@@ -2181,6 +3549,74 @@ mod tests {
             matched.line_content.get(matched.preview_match.clone()),
             Some("first")
         );
+        fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[test]
+    fn regex_search_supports_lookaround_and_replacement() {
+        let workspace = std::env::temp_dir()
+            .join(format!("ahead-search-lookaround-{}", std::process::id()));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let path = workspace.join("example.txt");
+        fs::write(&path, "foobarbaz\n").expect("write source");
+        let options = FileSearchOptions {
+            pattern: r"(?<=foo)bar(?=baz)".into(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: true,
+            max_results: 10,
+        };
+
+        let results = search_paths(
+            SearchScope::Workspace(&workspace),
+            std::iter::once(path),
+            &options,
+            || true,
+        )
+        .expect("lookaround regex should search successfully");
+        let matches = &results.first().expect("file should match").1;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start..matches[0].end, 3..6);
+        assert_eq!(matches[0].line_content, "foobarbaz");
+        assert_eq!(
+            replace_text_matches("foobarbaz", &options, "qux")
+                .expect("lookaround regex should replace successfully"),
+            ("fooquxbaz".into(), 1)
+        );
+        fs::remove_dir_all(workspace).expect("remove search directory");
+    }
+
+    #[test]
+    fn literal_search_reports_multiline_match_range() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ahead-search-multiline-literal-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let path = workspace.join("example.txt");
+        fs::write(&path, "before\n  first\nsecond tail\n").expect("write source");
+        let options = FileSearchOptions {
+            pattern: "first\nsecond".to_string(),
+            case_sensitive: true,
+            whole_word: false,
+            is_regex: false,
+            max_results: 10,
+        };
+
+        let results = search_paths(
+            SearchScope::Workspace(&workspace),
+            std::iter::once(path),
+            &options,
+            || true,
+        )
+        .expect("search should succeed");
+        let matches = &results.first().expect("file should match").1;
+        assert_eq!(matches.len(), 1);
+        let matched = matches.first().expect("multiline literal should match");
+        assert_eq!(matched.line, 1);
+        assert_eq!(matched.start, 2);
+        assert_eq!(matched.end_line, 2);
+        assert_eq!(matched.end, 6);
         fs::remove_dir_all(workspace).expect("remove workspace");
     }
 
@@ -2248,6 +3684,56 @@ mod tests {
             &[workspace.join("a.rs"), nested.join("b.rs")]
         );
         fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[test]
+    fn workspace_file_index_releases_cancelled_cold_build_for_retry() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        for number in 0..4 {
+            fs::write(workspace.path().join(format!("{number}.rs")), "source")
+                .expect("write source file");
+        }
+        let index = WorkspaceFileIndex::new(workspace.path().to_path_buf());
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let walk_checks = checks.clone();
+        assert!(
+            index
+                .snapshot_with_generation_while(move || {
+                    walk_checks.fetch_add(1, Ordering::SeqCst) < 3
+                })
+                .is_none(),
+            "a search should retry when a superseded cold scan releases ownership"
+        );
+        assert!(checks.load(Ordering::SeqCst) >= 3);
+        assert_eq!(index.snapshot().len(), 4);
+    }
+
+    #[test]
+    fn workspace_file_index_coalesces_invalidations_without_a_snapshot() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let index = WorkspaceFileIndex::new(workspace.path().to_path_buf());
+        let first_revision = index.search_revision();
+        index.invalidate();
+        index.invalidate();
+        assert_eq!(index.generation(), 0);
+        assert_eq!(index.search_revision(), first_revision);
+
+        let first_file = workspace.path().join("first.rs");
+        fs::write(&first_file, "first").expect("write first file");
+        assert_eq!(
+            index.snapshot().as_slice(),
+            std::slice::from_ref(&first_file)
+        );
+
+        index.invalidate();
+        let second_revision = index.search_revision();
+        index.invalidate();
+        assert_eq!(index.generation(), 1);
+        assert_eq!(index.search_revision(), second_revision);
+
+        let second_file = workspace.path().join("second.rs");
+        fs::write(&second_file, "second").expect("write second file");
+        assert_eq!(index.snapshot().as_slice(), &[first_file, second_file]);
     }
 
     #[test]

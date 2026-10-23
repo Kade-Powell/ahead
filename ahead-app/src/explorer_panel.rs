@@ -4,18 +4,20 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::PopupMenuItem;
-use gpui_kit::component::tree::{TreeItem, TreeState, tree};
+use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
+
+use crate::proxy_client::ProxyClient;
 
 pub struct ExplorerPanel {
     pub focus: FocusHandle,
@@ -23,10 +25,12 @@ pub struct ExplorerPanel {
     pub entries: Vec<ExplorerEntry>,
     pub status: SharedString,
     git_badges: std::collections::HashMap<String, GitStatuses>,
+    git_badge_task: Option<Task<()>>,
+    workspace_change_task: Option<Task<()>>,
     ignored_paths: HashSet<String>,
     pub mailbox_id: usize,
     pub tree_state: Entity<TreeState>,
-    icon_theme: Option<Arc<ahead_extension_host::IconTheme>>,
+    _tree_subscription: Subscription,
     trash_handler: Option<std::rc::Rc<dyn Fn(PathBuf, &mut Window, &mut App)>>,
 }
 
@@ -154,40 +158,33 @@ fn record_git_badge(
 impl ExplorerPanel {
     pub fn new(root: &str, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let badges = git_badge_map(root);
+        let tree_state = cx.new(|cx| TreeState::new(cx));
+        let tree_subscription = cx.subscribe(&tree_state, |_: &mut Self, _, event, cx| {
+            if matches!(event, TreeEvent::Expanded(_)) {
+                let panel = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    if let Err(error) = panel.update(cx, |panel, cx| panel.refresh(cx)) {
+                        eprintln!("Explorer panel closed during tree expansion: {error}");
+                    }
+                });
+            }
+        });
         let mut panel = Self {
             focus: cx.focus_handle(),
             root: root.to_string(),
             entries: Vec::new(),
             status: "Explorer ready".into(),
             git_badges: badges,
+            git_badge_task: None,
+            workspace_change_task: None,
             ignored_paths: HashSet::new(),
             mailbox_id: cx.entity_id().as_u64() as usize,
-            tree_state: cx.new(|cx| TreeState::new(cx)),
-            icon_theme: None,
+            tree_state,
+            _tree_subscription: tree_subscription,
             trash_handler: None,
         };
-        panel.reload_icon_theme(cx);
         panel.refresh(cx);
         panel
-    }
-
-    pub fn reload_icon_theme(&mut self, cx: &mut Context<Self>) {
-        if let Some(theme) = &self.icon_theme {
-            let mut invalidated = HashSet::new();
-            for path in theme.image_paths() {
-                if invalidated.insert(path) {
-                    ImageSource::from(path).remove_asset(cx);
-                }
-            }
-        }
-        self.icon_theme = match crate::icon_theme::active_icon_theme() {
-            Ok(theme) => theme.map(Arc::new),
-            Err(error) => {
-                eprintln!("Failed to load file icon theme: {error}");
-                None
-            }
-        };
-        cx.notify();
     }
 
     pub fn set_trash_handler(
@@ -197,7 +194,30 @@ impl ExplorerPanel {
         self.trash_handler = Some(std::rc::Rc::new(handler));
     }
 
+    pub fn watch_workspace_changes(
+        &mut self,
+        proxy: Arc<ProxyClient>,
+        cx: &mut Context<Self>,
+    ) {
+        let updates = proxy.subscribe_workspace_file_changes();
+        let mut generation = proxy.workspace_file_generation();
+        self.workspace_change_task = Some(cx.spawn(async move |this, cx| {
+            while updates.recv().await.is_ok() {
+                let current = proxy.workspace_file_generation();
+                if current == generation {
+                    continue;
+                }
+                generation = current;
+                if this.update(cx, |panel, cx| panel.refresh(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.git_badge_task = None;
+        let (expanded, selected) = tree_state_snapshot(self.tree_state.read(cx));
         let mut entries = Vec::new();
         Self::collect(&std::path::PathBuf::from(&self.root), 0, &mut entries);
         entries.sort_by(|a: &ExplorerEntry, b: &ExplorerEntry| {
@@ -211,14 +231,34 @@ impl ExplorerPanel {
             0,
             &mut tree_paths,
             None,
+            Some(&expanded),
         );
         self.ignored_paths =
             git_ignored_paths(std::path::Path::new(&self.root), &tree_paths);
         self.tree_state.update(cx, |state, cx| {
             state.set_items(tree_items, cx);
+            if let Some(selected) = selected {
+                let index = state.index_of(&selected);
+                state.set_selected_index(index, cx);
+            }
         });
         self.status = format!("{} entries", self.entries.len()).into();
         cx.notify();
+    }
+
+    pub fn refresh_git_badges(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        self.git_badge_task = Some(cx.spawn(async move |this, cx| {
+            let badges = cx
+                .background_spawn(async move { git_badge_map(&root) })
+                .await;
+            if let Err(error) = this.update(cx, |panel, cx| {
+                panel.git_badges = badges;
+                cx.notify();
+            }) {
+                eprintln!("Explorer panel closed during Git refresh: {error}");
+            }
+        }));
     }
 
     fn set_all_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
@@ -228,6 +268,7 @@ impl ExplorerPanel {
             0,
             &mut tree_paths,
             Some(expanded),
+            None,
         );
         self.tree_state.update(cx, |state, cx| {
             state.set_items(tree_items, cx);
@@ -271,6 +312,7 @@ fn build_tree_items(
     depth: usize,
     tree_paths: &mut HashSet<String>,
     expansion: Option<bool>,
+    expanded_paths: Option<&HashMap<String, bool>>,
 ) -> Vec<TreeItem> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -290,17 +332,56 @@ fn build_tree_items(
             let path_string = path.to_string_lossy().into_owned();
             tree_paths.insert(path_string.clone());
             let is_dir = path.is_dir();
-            let children = if is_dir && depth < 2 {
-                build_tree_items(&path, depth + 1, tree_paths, expansion)
+            let expanded = expansion
+                .or_else(|| {
+                    expanded_paths.and_then(|paths| paths.get(&path_string).copied())
+                })
+                .unwrap_or(depth == 0)
+                && !(expansion == Some(true) && depth >= 2);
+            let mut children = if is_dir && (depth < 2 || expanded) {
+                build_tree_items(
+                    &path,
+                    depth + 1,
+                    tree_paths,
+                    expansion,
+                    expanded_paths,
+                )
             } else {
                 Vec::new()
             };
+            if is_dir && children.is_empty() {
+                children.push(
+                    TreeItem::new(format!("empty:{path_string}"), "Empty folder")
+                        .disabled(true),
+                );
+            }
             let item = TreeItem::new(path_string, name)
                 .children(children)
-                .expanded(expansion.unwrap_or(depth == 0));
+                .expanded(expanded);
             Some(item)
         })
         .collect()
+}
+
+fn tree_state_snapshot(
+    state: &TreeState,
+) -> (HashMap<String, bool>, Option<SharedString>) {
+    let mut expanded = HashMap::new();
+    let mut index = 0;
+    while let Some(entry) = state.entry(index) {
+        if entry.is_root() {
+            record_tree_expansion(entry.item(), &mut expanded);
+        }
+        index += 1;
+    }
+    (expanded, state.selected_item().map(|item| item.id.clone()))
+}
+
+fn record_tree_expansion(item: &TreeItem, expanded: &mut HashMap<String, bool>) {
+    expanded.insert(item.id.to_string(), item.is_expanded());
+    for child in &item.children {
+        record_tree_expansion(child, expanded);
+    }
 }
 
 fn git_ignored_paths(
@@ -546,8 +627,6 @@ impl Render for ExplorerPanel {
                 let tree_explorer = explorer.clone();
                 let badges = self.git_badges.clone();
                 let ignored_paths = self.ignored_paths.clone();
-                let icon_theme = self.icon_theme.clone();
-                let text = text;
                 tree(
                     &self.tree_state,
                     move |ix, entry, selected, _window, _cx| {
@@ -605,21 +684,15 @@ impl Render for ExplorerPanel {
                                 h_flex()
                                     .gap_1()
                                     .items_center()
-                                    .child({
-                                        let icon_path = icon_theme.as_ref().and_then(|theme| {
-                                            if is_dir {
-                                                theme.icon_for_directory(Path::new(&path), entry.is_expanded())
-                                            } else {
-                                                theme.icon_for_file(Path::new(&path))
-                                            }
-                                        });
-                                        if let Some(icon_path) = icon_path {
-                                            img(icon_path.to_path_buf()).size(px(16.)).into_any_element()
-                                        } else if is_dir {
-                                            (if entry.is_expanded() { IconName::FolderOpen } else { IconName::Folder }).into_any_element()
+                                    .child(if is_dir {
+                                        (if entry.is_expanded() {
+                                            IconName::FolderOpen
                                         } else {
-                                            IconName::File.into_any_element()
-                                        }
+                                            IconName::Folder
+                                        })
+                                        .into_any_element()
+                                    } else {
+                                        IconName::File.into_any_element()
                                     })
                                     .child(label)
                                     .when(badge.is_some(), |row| {
@@ -790,7 +863,200 @@ impl Render for ExplorerPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitStatuses, record_git_badge, relative_path};
+    use super::{
+        ExplorerPanel, GitStatuses, build_tree_items, record_git_badge,
+        relative_path,
+    };
+    use crate::proxy_client::ProxyClient;
+    use ahead_rpc::core::CoreNotification;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::tree::TreeEvent;
+
+    #[gpui_kit::test]
+    fn nested_and_empty_directories_remain_expandable(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let assets = workspace.path().join("app/assets");
+        let nested = assets.join("images");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        std::fs::write(nested.join("logo.svg"), "<svg/>").expect("nested file");
+        let empty = assets.join("empty");
+        std::fs::create_dir(&empty).expect("empty directory");
+        let root = workspace.path().to_string_lossy().into_owned();
+        let assets_id = assets.to_string_lossy().into_owned().into();
+        let nested_id = nested.to_string_lossy().into_owned().into();
+        let empty_id = empty.to_string_lossy().into_owned().into();
+        let logo_id = nested
+            .join("logo.svg")
+            .to_string_lossy()
+            .into_owned()
+            .into();
+
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| ExplorerPanel::new(&root, window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.tree_state.update(cx, |state, cx| {
+                let assets = state
+                    .entry(state.index_of(&assets_id).expect("assets entry"))
+                    .expect("assets entry");
+                assert!(assets.is_folder());
+                let item = assets.item().clone().expanded(true);
+                cx.emit(TreeEvent::Expanded(item.id));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let state = panel.read(cx).tree_state.read(cx);
+            let nested = state
+                .entry(state.index_of(&nested_id).expect("nested entry"))
+                .expect("nested entry");
+            assert!(nested.is_folder());
+            assert!(
+                state
+                    .entry(state.index_of(&empty_id).expect("empty entry"))
+                    .expect("empty entry")
+                    .is_folder()
+            );
+        });
+        panel.update(cx, |panel, cx| {
+            panel.tree_state.update(cx, |state, cx| {
+                let nested = state
+                    .entry(state.index_of(&nested_id).expect("nested entry"))
+                    .expect("nested entry");
+                let item = nested.item().clone().expanded(true);
+                cx.emit(TreeEvent::Expanded(item.id));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let state = panel.read(cx).tree_state.read(cx);
+            assert!(state.index_of(&logo_id).is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn external_file_set_changes_refresh_tree_without_resetting_state(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let directory = workspace.path().join("src");
+        std::fs::create_dir(&directory).expect("src directory");
+        std::fs::write(directory.join("old.rs"), "old\n").expect("old file");
+        let keep = workspace.path().join("keep.rs");
+        std::fs::write(&keep, "keep\n").expect("selected file");
+        let root = workspace.path().to_string_lossy().into_owned();
+        let src_id: gpui_kit::SharedString =
+            directory.to_string_lossy().into_owned().into();
+        let keep_id = keep.to_string_lossy().into_owned().into();
+        let mut tree_paths = std::collections::HashSet::new();
+        let expanded_paths =
+            std::collections::HashMap::from([(src_id.to_string(), false)]);
+        let tree_items = build_tree_items(
+            workspace.path(),
+            0,
+            &mut tree_paths,
+            None,
+            Some(&expanded_paths),
+        );
+        let proxy = ProxyClient::new_for_test(workspace.path().to_owned());
+
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| ExplorerPanel::new(&root, window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.watch_workspace_changes(proxy.clone(), cx);
+            panel.tree_state.update(cx, |state, cx| {
+                state.set_items(tree_items, cx);
+                state.set_selected_index(state.index_of(&keep_id), cx);
+            });
+        });
+
+        let added = directory.join("new.rs");
+        std::fs::write(&added, "new\n").expect("external create");
+        proxy.route_core(CoreNotification::WorkspaceFileChange {
+            generation: 1,
+            paths: Vec::new(),
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let panel = panel.read(cx);
+            let state = panel.tree_state.read(cx);
+            let src = state
+                .entry(state.index_of(&src_id).expect("src after create"))
+                .expect("src entry");
+            assert!(!src.is_expanded());
+            assert!(
+                src.item()
+                    .children
+                    .iter()
+                    .any(|item| item.label.as_ref() == "new.rs")
+            );
+            assert_eq!(state.selected_item().map(|item| &item.id), Some(&keep_id));
+        });
+
+        std::fs::remove_file(&added).expect("external remove");
+        proxy.route_core(CoreNotification::WorkspaceFileChange {
+            generation: 2,
+            paths: Vec::new(),
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let panel = panel.read(cx);
+            let state = panel.tree_state.read(cx);
+            let src = state
+                .entry(state.index_of(&src_id).expect("src after remove"))
+                .expect("src entry");
+            assert!(
+                !src.item()
+                    .children
+                    .iter()
+                    .any(|item| item.label.as_ref() == "new.rs")
+            );
+            assert_eq!(state.selected_item().map(|item| &item.id), Some(&keep_id));
+        });
+
+        panel.update(cx, |panel, _| panel.status = "No tree rebuild".into());
+        proxy.route_core(CoreNotification::WorkspaceFileChange {
+            generation: 2,
+            paths: Vec::new(),
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| panel.read(cx).status.to_string()),
+            "No tree rebuild"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn git_badges_refresh_after_external_edit(cx: &mut TestAppContext) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let root = workspace.path().to_string_lossy().into_owned();
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| ExplorerPanel::new(&root, window, cx));
+        let path = workspace
+            .path()
+            .join("new.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert!(cx.update(|_, cx| !panel.read(cx).git_badges.contains_key(&path)));
+
+        std::fs::write(&path, "new\n").expect("external edit");
+        panel.update(cx, |panel, cx| panel.refresh_git_badges(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| panel.read(cx).git_badges.get(&path).copied()),
+            Some(GitStatuses(GitStatuses::UNTRACKED))
+        );
+    }
 
     #[test]
     fn propagates_strongest_badge_to_directory_ancestors() {

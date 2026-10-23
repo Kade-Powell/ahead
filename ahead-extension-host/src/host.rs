@@ -1,3 +1,4 @@
+use crate::node_runtime::NodeRuntime;
 use anyhow::{Context, Result, anyhow};
 use fs4::fs_std::FileExt;
 use regex::Regex;
@@ -11,8 +12,13 @@ use std::{
     io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::SystemTime,
 };
-use tokio::process::Command as ProcessCommand;
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command as ProcessCommand},
+    sync::oneshot,
+};
 use wasmtime::{
     Config, Engine, Store,
     component::{Component, HasSelf, Linker, Resource, ResourceTable},
@@ -27,6 +33,10 @@ use zed::extension::{
 const MAX_EXTENSION_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTENSION_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_EXTENSION_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_EXTENSION_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXTENSION_QUERY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CACHED_LANGUAGE_SYNTAX: usize = 32;
+const MAX_EXTENSION_METADATA_BYTES: u64 = 256 * 1024;
 const EXTENSION_DOWNLOAD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
 const EXTENSION_COMMAND_TIMEOUT: std::time::Duration =
@@ -36,10 +46,135 @@ async fn run_extension_command(
     mut command: ProcessCommand,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, String> {
-    command.kill_on_drop(true);
-    tokio::time::timeout(timeout, command.output())
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "extension command stdout was not piped".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "extension command stderr was not piped".to_string())?;
+    let (cancel_sender, mut cancel_receiver) = oneshot::channel::<()>();
+    let (result_sender, result_receiver) = oneshot::channel();
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    tokio::spawn(async move {
+        let mut stdout_task = tokio::spawn(async move {
+            let mut output = Vec::new();
+            let mut stdout = stdout;
+            stdout
+                .read_to_end(&mut output)
+                .await
+                .map(|_| output)
+                .map_err(|error| error.to_string())
+        });
+        let mut stderr_task = tokio::spawn(async move {
+            let mut output = Vec::new();
+            let mut stderr = stderr;
+            stderr
+                .read_to_end(&mut output)
+                .await
+                .map(|_| output)
+                .map_err(|error| error.to_string())
+        });
+
+        let status = tokio::select! {
+            status = child.wait() => status.map_err(|error| error.to_string()),
+            _ = tokio::time::sleep_until(deadline) => {
+                let error = format!("extension command timed out after {timeout:?}");
+                let reap_error = stop_and_reap_extension_child(&mut child).await.err();
+                stdout_task.abort();
+                stderr_task.abort();
+                let error = reap_error.map_or(error.clone(), |reap_error| {
+                    format!("{error}; failed to reap extension command: {reap_error}")
+                });
+                if result_sender.send(Err(error)).is_err() {
+                    return;
+                }
+                return;
+            }
+            _ = &mut cancel_receiver => {
+                if let Err(error) = stop_and_reap_extension_child(&mut child).await {
+                    eprintln!("failed to reap cancelled extension command: {error}");
+                }
+                stdout_task.abort();
+                stderr_task.abort();
+                return;
+            }
+        };
+
+        let output = match status {
+            Ok(status) => {
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::select! {
+                    output = tokio::time::timeout(remaining, async {
+                        let stdout = (&mut stdout_task)
+                            .await
+                            .map_err(|error| error.to_string())??;
+                        let stderr = (&mut stderr_task)
+                            .await
+                            .map_err(|error| error.to_string())??;
+                        Ok::<_, String>(std::process::Output { status, stdout, stderr })
+                    }) => match output {
+                        Ok(output) => output,
+                        Err(_) => {
+                            stdout_task.abort();
+                            stderr_task.abort();
+                            Err(format!("extension command timed out after {timeout:?}"))
+                        }
+                    },
+                    _ = &mut cancel_receiver => {
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                match stop_and_reap_extension_child(&mut child).await {
+                    Ok(()) => Err(error),
+                    Err(reap_error) => Err(format!(
+                        "{error}; failed to reap extension command: {reap_error}"
+                    )),
+                }
+            }
+        };
+        if result_sender.send(output).is_err() {
+            return;
+        }
+    });
+
+    let result = result_receiver
         .await
-        .map_err(|_| format!("extension command timed out after {timeout:?}"))?
+        .map_err(|_| "extension command worker stopped unexpectedly".to_string());
+    drop(cancel_sender);
+    result?
+}
+
+async fn stop_and_reap_extension_child(child: &mut Child) -> Result<(), String> {
+    if let Err(error) = child.start_kill() {
+        if child
+            .try_wait()
+            .map_err(|wait_error| wait_error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        return Err(error.to_string());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .map_err(|_| "timed out waiting for killed extension command".to_string())?
+        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -123,8 +258,6 @@ pub struct LanguageServerExtension {
     languages: Vec<String>,
     language_ids: BTreeMap<String, String>,
     capabilities: Vec<ProcessCapability>,
-    download_capabilities: Vec<DownloadCapability>,
-    npm_capabilities: Vec<NpmCapability>,
 }
 
 #[derive(Default)]
@@ -168,16 +301,95 @@ impl LanguageServerExtension {
 struct LanguageConfig {
     name: String,
     #[serde(default)]
+    grammar: Option<String>,
+    #[serde(default)]
+    line_comments: Vec<String>,
+    #[serde(default)]
+    block_comment: Option<BlockCommentDefinition>,
+    #[serde(default)]
     path_suffixes: Vec<String>,
     #[serde(default)]
     first_line_pattern: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum BlockCommentDefinition {
+    Pair([String; 2]),
+    Structured { start: String, end: String },
+}
+
+impl BlockCommentDefinition {
+    fn into_delimiters(self) -> (String, String) {
+        match self {
+            Self::Pair([start, end]) => (start, end),
+            Self::Structured { start, end } => (start, end),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageDefinition {
     pub name: String,
+    pub grammar: Option<String>,
+    pub comments: LanguageComments,
     pub path_suffixes: Vec<String>,
     pub first_line_pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanguageComments {
+    pub line_comment: Option<String>,
+    pub block_comment: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionSyntax {
+    pub captures: Vec<super::syntax::SyntaxCapture>,
+    pub comments: LanguageComments,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageSyntax {
+    pub extension_directory: PathBuf,
+    pub language_name: String,
+    pub grammar_name: String,
+    pub wasm: Vec<u8>,
+    pub highlights: String,
+    pub injections: String,
+    pub(crate) asset_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct LanguageSyntaxCacheKey {
+    extension_directory: PathBuf,
+    language_path: PathBuf,
+    grammar_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtensionAssetStamp {
+    length: u64,
+    modified: SystemTime,
+}
+
+struct CachedLanguageSyntax {
+    wasm_stamp: ExtensionAssetStamp,
+    highlights_stamp: Option<ExtensionAssetStamp>,
+    injections_stamp: Option<ExtensionAssetStamp>,
+    syntax: Arc<LanguageSyntax>,
+}
+
+static LANGUAGE_SYNTAX_CACHE: OnceLock<
+    Mutex<HashMap<LanguageSyntaxCacheKey, CachedLanguageSyntax>>,
+> = OnceLock::new();
+
+#[derive(Clone)]
+pub(crate) struct LanguageSource {
+    definition: LanguageDefinition,
+    extension_directory: PathBuf,
+    language_path: PathBuf,
+    grammar_names: Vec<String>,
 }
 
 impl LanguageDefinition {
@@ -216,7 +428,7 @@ struct ExtensionManifest {
     #[serde(default)]
     languages: Vec<PathBuf>,
     #[serde(default)]
-    icon_themes: Vec<PathBuf>,
+    grammars: BTreeMap<String, toml::Table>,
     #[serde(default)]
     language_servers: BTreeMap<String, LanguageServerManifestEntry>,
     #[serde(default)]
@@ -330,6 +542,116 @@ impl DownloadCapability {
     }
 }
 
+// Zed keeps host grants separate from an extension's requested process commands.
+#[derive(Clone, Debug, Default)]
+struct ExtensionCapabilityGrants {
+    process: Vec<ProcessCapability>,
+    downloads: Vec<DownloadCapability>,
+    npm: Vec<NpmCapability>,
+}
+
+impl ExtensionCapabilityGrants {
+    fn zed_defaults() -> Self {
+        Self {
+            process: vec![ProcessCapability {
+                command: "*".to_string(),
+                args: vec!["**".to_string()],
+            }],
+            downloads: vec![DownloadCapability {
+                host: "*".to_string(),
+                path: vec!["**".to_string()],
+            }],
+            npm: vec![NpmCapability {
+                package: "*".to_string(),
+            }],
+        }
+    }
+
+    fn from_user_settings(settings: Option<&str>) -> Result<Self> {
+        let Some(settings) = settings else {
+            return Ok(Self::zed_defaults());
+        };
+        let settings = settings
+            .parse::<toml::Table>()
+            .context("parsing AHEAD user settings")?;
+        let Some(value) = settings.get("granted_extension_capabilities") else {
+            return Ok(Self::zed_defaults());
+        };
+        let entries: Vec<CapabilityManifestEntry> = value
+            .clone()
+            .try_into()
+            .context("parsing granted_extension_capabilities")?;
+        let mut grants = Self::default();
+        for entry in entries {
+            match entry.kind.as_str() {
+                "process:exec" => grants.process.push(ProcessCapability {
+                    command: entry
+                        .command
+                        .context("process:exec grant is missing command")?,
+                    args: entry.args,
+                }),
+                "download_file" => {
+                    grants.downloads.push(DownloadCapability {
+                        host: entry
+                            .host
+                            .context("download_file grant is missing host")?,
+                        path: entry.path,
+                    });
+                }
+                "npm:install" => grants.npm.push(NpmCapability {
+                    package: entry
+                        .package
+                        .context("npm:install grant is missing package")?,
+                }),
+                kind => {
+                    return Err(anyhow!("unsupported extension capability {kind}"));
+                }
+            }
+        }
+        Ok(grants)
+    }
+
+    fn load_for_user() -> Result<Self> {
+        let Some(home) = ahead_core::directory::Directory::home_dir() else {
+            return Ok(Self::zed_defaults());
+        };
+        Self::load_for_home(&home)
+    }
+
+    fn load_for_home(home: &Path) -> Result<Self> {
+        let settings = ahead_core::config::read_ahead_config(home, "settings.toml")
+            .with_context(|| {
+                format!("reading extension grants from {}", home.display())
+            })?;
+        Self::from_user_settings(settings.as_deref())
+    }
+
+    fn allows_process_exec(
+        &self,
+        requested: &[ProcessCapability],
+        command: &str,
+        args: &[String],
+    ) -> bool {
+        requested
+            .iter()
+            .any(|capability| capability.allows(command, args))
+            && self
+                .process
+                .iter()
+                .any(|capability| capability.allows(command, args))
+    }
+
+    fn allows_download(&self, url: &url::Url) -> bool {
+        self.downloads
+            .iter()
+            .any(|capability| capability.allows(url))
+    }
+
+    fn allows_npm_install(&self, package: &str) -> bool {
+        self.npm.iter().any(|capability| capability.allows(package))
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct LanguageServerManifestEntry {
     #[serde(default)]
@@ -432,27 +754,6 @@ pub fn discover_language_server_extensions(
                         })
                     })
                     .collect(),
-                download_capabilities: manifest
-                    .capabilities
-                    .iter()
-                    .filter(|capability| capability.kind == "download_file")
-                    .filter_map(|capability| {
-                        Some(DownloadCapability {
-                            host: capability.host.clone()?,
-                            path: capability.path.clone(),
-                        })
-                    })
-                    .collect(),
-                npm_capabilities: manifest
-                    .capabilities
-                    .iter()
-                    .filter(|capability| capability.kind == "npm:install")
-                    .filter_map(|capability| {
-                        Some(NpmCapability {
-                            package: capability.package.clone()?,
-                        })
-                    })
-                    .collect(),
             });
         }
     }
@@ -467,9 +768,253 @@ pub fn language_id_for_path(
     path: &Path,
     content: Option<&str>,
 ) -> Result<Option<String>> {
+    Ok(language_source_for_path(extensions_root, path, content)?
+        .map(|source| source.definition.name))
+}
+
+/// Reads the installed grammar and query assets for a matching file.
+///
+/// This performs filesystem I/O; callers should run it off the UI thread.
+pub fn language_syntax_for_path(
+    extensions_root: &Path,
+    path: &Path,
+    content: Option<&str>,
+) -> Result<Option<LanguageSyntax>> {
+    let Some(source) = language_source_for_path(extensions_root, path, content)?
+    else {
+        return Ok(None);
+    };
+    let Some(grammar_name) = source.definition.grammar.clone() else {
+        return Ok(None);
+    };
+    if !source.grammar_names.contains(&grammar_name) {
+        return Ok(None);
+    }
+    Ok(Some(read_language_syntax(source, grammar_name)?))
+}
+
+pub fn syntax_captures_for_path(
+    extensions_root: &Path,
+    path: &Path,
+    content: &str,
+) -> Result<Option<Vec<super::syntax::SyntaxCapture>>> {
+    Ok(extension_syntax_for_path(extensions_root, path, content)?
+        .map(|syntax| syntax.captures))
+}
+
+pub fn extension_syntax_for_path(
+    extensions_root: &Path,
+    path: &Path,
+    content: &str,
+) -> Result<Option<ExtensionSyntax>> {
+    let (sources, first_error) = language_sources_for_root(extensions_root)?;
+    let Some(source) =
+        language_source_from_path_sources(&sources, path, Some(content))
+    else {
+        return match first_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        };
+    };
+    let comments = source.definition.comments.clone();
+    let captures = match source.definition.grammar.clone() {
+        Some(grammar_name) if source.grammar_names.contains(&grammar_name) => {
+            let syntax = cached_language_syntax(source, grammar_name)?;
+            super::syntax::captures(&sources, &syntax, content)?
+        }
+        Some(_) | None => Vec::new(),
+    };
+    Ok(Some(ExtensionSyntax { captures, comments }))
+}
+
+pub(crate) fn language_syntax_for_name(
+    sources: &[LanguageSource],
+    name: &str,
+) -> Result<Option<Arc<LanguageSyntax>>> {
+    let language_name = name.rsplit('.').next().unwrap_or(name);
+    let source = sources
+        .iter()
+        .filter(|source| {
+            source.definition.grammar.as_deref() == Some(language_name)
+                || source.definition.name.eq_ignore_ascii_case(language_name)
+                || source
+                    .definition
+                    .path_suffixes
+                    .iter()
+                    .any(|suffix| suffix.eq_ignore_ascii_case(language_name))
+        })
+        .max_by_key(|source| {
+            if source.definition.grammar.as_deref() == Some(language_name) {
+                1
+            } else {
+                0
+            }
+        })
+        .cloned();
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let Some(grammar_name) = source.definition.grammar.clone() else {
+        return Ok(None);
+    };
+    if !source.grammar_names.contains(&grammar_name) {
+        return Ok(None);
+    }
+    Ok(Some(cached_language_syntax(source, grammar_name)?))
+}
+
+fn cached_language_syntax(
+    source: LanguageSource,
+    grammar_name: String,
+) -> Result<Arc<LanguageSyntax>> {
+    let wasm_relative_path =
+        Path::new("grammars").join(format!("{grammar_name}.wasm"));
+    let wasm_stamp = extension_asset_stamp(
+        &source.extension_directory,
+        &wasm_relative_path,
+        MAX_EXTENSION_GRAMMAR_BYTES,
+    )?
+    .ok_or_else(|| anyhow!("extension grammar {grammar_name} is missing"))?;
+    let highlights_stamp = extension_asset_stamp(
+        &source.extension_directory,
+        &source.language_path.join("highlights.scm"),
+        MAX_EXTENSION_QUERY_BYTES,
+    )?;
+    let injections_stamp = extension_asset_stamp(
+        &source.extension_directory,
+        &source.language_path.join("injections.scm"),
+        MAX_EXTENSION_QUERY_BYTES,
+    )?;
+    let key = LanguageSyntaxCacheKey {
+        extension_directory: source.extension_directory.clone(),
+        language_path: source.language_path.clone(),
+        grammar_name: grammar_name.clone(),
+    };
+    let cache = LANGUAGE_SYNTAX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("extension syntax assets are unavailable"))?;
+    if let Some(cached) = cache.get(&key)
+        && cached.wasm_stamp == wasm_stamp
+        && cached.highlights_stamp == highlights_stamp
+        && cached.injections_stamp == injections_stamp
+    {
+        return Ok(cached.syntax.clone());
+    }
+    let syntax = Arc::new(read_language_syntax(source, grammar_name)?);
+    cache.retain(|cached_key, _| {
+        cached_key.extension_directory != key.extension_directory
+            || cached_key.language_path != key.language_path
+            || cached_key.grammar_name != key.grammar_name
+    });
+    if cache.len() >= MAX_CACHED_LANGUAGE_SYNTAX
+        && let Some(oldest_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(
+        key,
+        CachedLanguageSyntax {
+            wasm_stamp,
+            highlights_stamp,
+            injections_stamp,
+            syntax: syntax.clone(),
+        },
+    );
+    Ok(syntax)
+}
+
+fn read_language_syntax(
+    source: LanguageSource,
+    grammar_name: String,
+) -> Result<LanguageSyntax> {
+    let wasm_path = Path::new("grammars").join(format!("{grammar_name}.wasm"));
+    let wasm = read_extension_asset(
+        &source.extension_directory,
+        &wasm_path,
+        MAX_EXTENSION_GRAMMAR_BYTES,
+    )?
+    .ok_or_else(|| anyhow!("extension grammar {grammar_name} is missing"))?;
+    let read_query = |filename: &str| -> Result<String> {
+        let query_path = source.language_path.join(filename);
+        let Some(bytes) = read_extension_asset(
+            &source.extension_directory,
+            &query_path,
+            MAX_EXTENSION_QUERY_BYTES,
+        )?
+        else {
+            return Ok(String::new());
+        };
+        String::from_utf8(bytes).context("extension query is not valid UTF-8")
+    };
+    let highlights = read_query("highlights.scm")?;
+    let injections = read_query("injections.scm")?;
+    let mut digest = Sha256::new();
+    digest.update(&wasm);
+    digest.update(highlights.as_bytes());
+    digest.update(injections.as_bytes());
+    Ok(LanguageSyntax {
+        extension_directory: source.extension_directory,
+        language_name: source.definition.name,
+        grammar_name,
+        wasm,
+        highlights,
+        injections,
+        asset_digest: digest.finalize().into(),
+    })
+}
+
+fn language_source_for_path(
+    extensions_root: &Path,
+    path: &Path,
+    content: Option<&str>,
+) -> Result<Option<LanguageSource>> {
+    let (definitions, first_error) = language_sources_for_root(extensions_root)?;
+    let source = language_source_from_path_sources(&definitions, path, content);
+    match (source, first_error) {
+        (Some(source), _) => Ok(Some(source)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(None),
+    }
+}
+
+fn language_source_from_path_sources(
+    definitions: &[LanguageSource],
+    path: &Path,
+    content: Option<&str>,
+) -> Option<LanguageSource> {
+    definitions
+        .iter()
+        .filter(|source| source.definition.matches(path, content))
+        .max_by_key(|source| {
+            source
+                .definition
+                .path_suffixes
+                .iter()
+                .filter(|suffix| {
+                    path.file_name().and_then(|name| name.to_str()).is_some_and(
+                        |name| {
+                            name.eq_ignore_ascii_case(suffix)
+                                || name.to_ascii_lowercase().ends_with(&format!(
+                                    ".{}",
+                                    suffix.to_ascii_lowercase()
+                                ))
+                        },
+                    )
+                })
+                .map(String::len)
+                .max()
+                .unwrap_or_default()
+        })
+        .cloned()
+}
+
+fn language_sources_for_root(
+    extensions_root: &Path,
+) -> Result<(Vec<LanguageSource>, Option<anyhow::Error>)> {
     let mut definitions = Vec::new();
     if !extensions_root.exists() {
-        return Ok(None);
+        return Ok((definitions, None));
     }
     let mut first_error = None;
     for entry in std::fs::read_dir(extensions_root)? {
@@ -494,52 +1039,29 @@ pub fn language_id_for_path(
         if !manifest_path.is_file() {
             continue;
         }
-        match language_definitions_for_extension(&directory, &manifest_path) {
+        match language_definitions_for_extension(&directory) {
             Ok(extension_definitions) => definitions.extend(extension_definitions),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
     }
-    let language = definitions
-        .into_iter()
-        .filter(|definition| definition.matches(path, content))
-        .max_by_key(|definition| {
-            definition
-                .path_suffixes
-                .iter()
-                .filter(|suffix| {
-                    path.file_name().and_then(|name| name.to_str()).is_some_and(
-                        |name| {
-                            name.eq_ignore_ascii_case(suffix)
-                                || name.to_ascii_lowercase().ends_with(&format!(
-                                    ".{}",
-                                    suffix.to_ascii_lowercase()
-                                ))
-                        },
-                    )
-                })
-                .map(String::len)
-                .max()
-                .unwrap_or_default()
-        })
-        .map(|definition| definition.name);
-    match (language, first_error) {
-        (Some(language), _) => Ok(Some(language)),
-        (None, Some(error)) => Err(error),
-        (None, None) => Ok(None),
-    }
+    Ok((definitions, first_error))
 }
 
 fn language_definitions_for_extension(
     directory: &Path,
-    manifest_path: &Path,
-) -> Result<Vec<LanguageDefinition>> {
-    let manifest: ExtensionManifest = toml::from_str(
-        &std::fs::read_to_string(manifest_path)
-            .with_context(|| format!("reading {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+) -> Result<Vec<LanguageSource>> {
+    let manifest_bytes = read_extension_asset(
+        directory,
+        Path::new("extension.toml"),
+        MAX_EXTENSION_METADATA_BYTES,
+    )?
+    .ok_or_else(|| anyhow!("extension manifest is missing"))?;
+    let manifest_source = String::from_utf8(manifest_bytes)
+        .context("extension manifest is not valid UTF-8")?;
+    let manifest: ExtensionManifest =
+        toml::from_str(&manifest_source).context("parsing extension manifest")?;
     anyhow::ensure!(
         directory.file_name().and_then(|name| name.to_str())
             == Some(manifest.id.as_str()),
@@ -565,22 +1087,197 @@ fn language_definitions_for_extension(
                 }),
             "language config path escapes the extension directory"
         );
-        let config_path = directory.join(&language_path).join("config.toml");
-        if !config_path.is_file() {
+        let config_relative_path = language_path.join("config.toml");
+        let config_path = directory.join(&config_relative_path);
+        let Some(config_bytes) = read_extension_asset(
+            directory,
+            &config_relative_path,
+            MAX_EXTENSION_METADATA_BYTES,
+        )?
+        else {
             continue;
+        };
+        let config_source = String::from_utf8(config_bytes).with_context(|| {
+            format!("{} is not valid UTF-8", config_path.display())
+        })?;
+        let config: LanguageConfig = toml::from_str(&config_source)
+            .with_context(|| format!("parsing {}", config_path.display()))?;
+        if let Some(grammar_name) = &config.grammar {
+            anyhow::ensure!(
+                valid_grammar_name(grammar_name),
+                "invalid grammar name in {}",
+                config_path.display()
+            );
         }
-        let config: LanguageConfig = toml::from_str(
-            &std::fs::read_to_string(&config_path)
-                .with_context(|| format!("reading {}", config_path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", config_path.display()))?;
-        definitions.push(LanguageDefinition {
-            name: config.name,
-            path_suffixes: config.path_suffixes,
-            first_line_pattern: config.first_line_pattern,
+        definitions.push(LanguageSource {
+            definition: LanguageDefinition {
+                name: config.name,
+                grammar: config.grammar,
+                comments: LanguageComments {
+                    line_comment: config
+                        .line_comments
+                        .into_iter()
+                        .find(|line_comment| !line_comment.trim().is_empty()),
+                    block_comment: config
+                        .block_comment
+                        .map(BlockCommentDefinition::into_delimiters),
+                },
+                path_suffixes: config.path_suffixes,
+                first_line_pattern: config.first_line_pattern,
+            },
+            extension_directory: directory.to_path_buf(),
+            language_path,
+            grammar_names: manifest.grammars.keys().cloned().collect(),
         });
     }
     Ok(definitions)
+}
+
+fn valid_grammar_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn read_extension_asset(
+    extension_directory: &Path,
+    relative_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+    anyhow::ensure!(
+        relative_path.is_relative()
+            && relative_path.components().all(|component| matches!(
+                component,
+                std::path::Component::Normal(_)
+            )),
+        "extension asset path escapes the extension directory"
+    );
+    let root_metadata = std::fs::symlink_metadata(extension_directory)?;
+    anyhow::ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "extension directory is not a regular directory"
+    );
+    let mut asset_path = extension_directory.to_path_buf();
+    let mut components = relative_path.components().peekable();
+    while let Some(std::path::Component::Normal(component)) = components.next() {
+        asset_path.push(component);
+        let metadata = match std::fs::symlink_metadata(&asset_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "extension asset path contains a symlink"
+        );
+        if components.peek().is_some() {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "extension asset parent is not a directory"
+            );
+        } else {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "extension asset is not a regular file"
+            );
+            anyhow::ensure!(
+                metadata.len() <= max_bytes,
+                "extension asset exceeds the size limit"
+            );
+            let mut bytes = Vec::new();
+            std::fs::File::open(asset_path)?
+                .take(max_bytes + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= max_bytes,
+                "extension asset exceeds the size limit"
+            );
+            return Ok(Some(bytes));
+        }
+    }
+    Err(anyhow!("extension asset path is empty"))
+}
+
+fn extension_asset_stamp(
+    extension_directory: &Path,
+    relative_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<ExtensionAssetStamp>> {
+    anyhow::ensure!(
+        relative_path.is_relative()
+            && relative_path.components().all(|component| matches!(
+                component,
+                std::path::Component::Normal(_)
+            )),
+        "extension asset path escapes the extension directory"
+    );
+    let root_metadata = std::fs::symlink_metadata(extension_directory)?;
+    anyhow::ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "extension directory is not a regular directory"
+    );
+    let mut asset_path = extension_directory.to_path_buf();
+    let mut components = relative_path.components().peekable();
+    while let Some(std::path::Component::Normal(component)) = components.next() {
+        asset_path.push(component);
+        let metadata = match std::fs::symlink_metadata(&asset_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "extension asset path contains a symlink"
+        );
+        if components.peek().is_some() {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "extension asset parent is not a directory"
+            );
+        } else {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "extension asset is not a regular file"
+            );
+            anyhow::ensure!(
+                metadata.len() <= max_bytes,
+                "extension asset exceeds the size limit"
+            );
+            return Ok(Some(ExtensionAssetStamp {
+                length: metadata.len(),
+                modified: metadata.modified()?,
+            }));
+        }
+    }
+    Err(anyhow!("extension asset path is empty"))
+}
+
+fn validate_extension_grammars(
+    extension_directory: &Path,
+    manifest: &ExtensionManifest,
+) -> Result<()> {
+    for grammar_name in manifest.grammars.keys() {
+        anyhow::ensure!(
+            valid_grammar_name(grammar_name),
+            "invalid extension grammar name {grammar_name}"
+        );
+        let wasm_path = Path::new("grammars").join(format!("{grammar_name}.wasm"));
+        anyhow::ensure!(
+            read_extension_asset(
+                extension_directory,
+                &wasm_path,
+                MAX_EXTENSION_GRAMMAR_BYTES,
+            )?
+            .is_some(),
+            "extension package is missing grammar {grammar_name}.wasm"
+        );
+    }
+    Ok(())
 }
 
 pub fn install_extension_from_url(
@@ -652,9 +1349,10 @@ pub fn install_extension_package(
         );
     }
     anyhow::ensure!(
-        !manifest.language_servers.is_empty() || !manifest.icon_themes.is_empty(),
-        "extension package declares no supported language servers or icon themes"
+        !manifest.language_servers.is_empty() || !manifest.grammars.is_empty(),
+        "extension package declares no supported language servers or grammar assets"
     );
+    validate_extension_grammars(&package_root, &manifest)?;
     if !manifest.language_servers.is_empty() {
         manifest.api_version()?;
         anyhow::ensure!(
@@ -664,10 +1362,6 @@ pub fn install_extension_package(
         let wasm = std::fs::read(package_root.join("extension.wasm"))?;
         ExtensionHost::new()?.validate_component(&wasm)?;
     }
-    for theme_file in &manifest.icon_themes {
-        crate::icon_theme::load_icon_theme(&package_root, theme_file)?;
-    }
-
     if backup.exists() {
         std::fs::remove_dir_all(&backup)?;
     }
@@ -688,6 +1382,80 @@ pub fn install_extension_package(
         std::fs::remove_dir_all(backup)?;
     }
     Ok(target)
+}
+
+pub fn uninstall_extension_package(
+    extensions_root: &Path,
+    extension_id: &str,
+) -> Result<()> {
+    anyhow::ensure!(valid_extension_id(extension_id), "invalid extension id");
+    let root_metadata = std::fs::symlink_metadata(extensions_root)?;
+    anyhow::ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "extension root is not a regular directory"
+    );
+    let _install_lock = lock_extension_installs(extensions_root)?;
+    let target = extensions_root.join(extension_id);
+    let backup = extensions_root.join(format!(".{extension_id}.previous"));
+    let target_exists =
+        validate_installed_extension_directory(&target, extension_id)?;
+    let backup_exists =
+        validate_installed_extension_directory(&backup, extension_id)?;
+    anyhow::ensure!(
+        target_exists || backup_exists,
+        "language extension {extension_id} is not installed"
+    );
+
+    // Remove a previous version first so a partial uninstall can never be
+    // mistaken for an interrupted update and restored by discovery.
+    if backup_exists {
+        std::fs::remove_dir_all(&backup)?;
+    }
+    if target_exists {
+        std::fs::remove_dir_all(&target)?;
+    }
+    if let Some(cache) = LANGUAGE_SYNTAX_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, _| {
+                key.extension_directory != target
+                    && key.extension_directory != backup
+            });
+    }
+    Ok(())
+}
+
+fn validate_installed_extension_directory(
+    directory: &Path,
+    extension_id: &str,
+) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "installed extension path is not a regular directory"
+    );
+    let manifest = read_extension_asset(
+        directory,
+        Path::new("extension.toml"),
+        MAX_EXTENSION_METADATA_BYTES,
+    )?
+    .ok_or_else(|| anyhow!("installed extension is missing extension.toml"))?;
+    let manifest = std::str::from_utf8(&manifest)
+        .context("installed extension manifest is not valid UTF-8")?;
+    let manifest: ExtensionManifest =
+        toml::from_str(manifest).context("parsing installed extension manifest")?;
+    anyhow::ensure!(
+        manifest.id == extension_id,
+        "installed extension manifest ID does not match its directory"
+    );
+    Ok(true)
 }
 
 fn valid_extension_id(id: &str) -> bool {
@@ -731,18 +1499,16 @@ fn restore_extension_backup(root: &Path, id: &str) -> Result<()> {
         "extension backup manifest ID does not match"
     );
     anyhow::ensure!(
-        !manifest.language_servers.is_empty() || !manifest.icon_themes.is_empty(),
+        !manifest.language_servers.is_empty() || !manifest.grammars.is_empty(),
         "extension backup has no supported content"
     );
+    validate_extension_grammars(&backup, &manifest)?;
     if !manifest.language_servers.is_empty() {
         manifest.api_version()?;
         anyhow::ensure!(
             std::fs::symlink_metadata(backup.join("extension.wasm"))?.is_file(),
             "extension backup has no language server component"
         );
-    }
-    for theme_file in &manifest.icon_themes {
-        crate::icon_theme::load_icon_theme(&backup, theme_file)?;
     }
     std::fs::rename(&backup, &target)
         .context("restoring an interrupted extension update")?;
@@ -866,6 +1632,21 @@ fn allowed_extension_download_url(url: &reqwest::Url) -> bool {
         },
         _ => false,
     }
+}
+
+async fn latest_npm_package_version(url: &str) -> Result<String> {
+    let response = reqwest::Client::builder()
+        .timeout(EXTENSION_DOWNLOAD_TIMEOUT)
+        .build()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let package: serde_json::Value = response.json().await?;
+    package["dist-tags"]["latest"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("NPM response has no latest version"))
 }
 
 async fn github_release(
@@ -1013,8 +1794,8 @@ struct HostState {
     worktree_root: PathBuf,
     work_dir: PathBuf,
     process_capabilities: Vec<ProcessCapability>,
-    download_capabilities: Vec<DownloadCapability>,
-    npm_capabilities: Vec<NpmCapability>,
+    granted_capabilities: ExtensionCapabilityGrants,
+    node_runtime: NodeRuntime,
 }
 
 impl WasiView for HostState {
@@ -1124,13 +1905,13 @@ impl process::Host for HostState {
         &mut self,
         command: process::Command,
     ) -> wasmtime::Result<Result<process::Output, String>> {
-        if !self
-            .process_capabilities
-            .iter()
-            .any(|capability| capability.allows(&command.command, &command.args))
-        {
+        if !self.granted_capabilities.allows_process_exec(
+            &self.process_capabilities,
+            &command.command,
+            &command.args,
+        ) {
             return Ok(Err(format!(
-                "process:exec is not allowed for {:?} {:?}",
+                "process:exec for {:?} {:?} requires both an extension manifest declaration and a matching user-level granted_extension_capabilities entry",
                 command.command, command.args
             )));
         }
@@ -1149,28 +1930,22 @@ impl nodejs::Host for HostState {
     async fn node_binary_path(
         &mut self,
     ) -> wasmtime::Result<Result<String, String>> {
-        Ok(which_binary("node")
-            .ok_or_else(|| "Node.js is not installed or not on PATH".to_string()))
+        Ok(self
+            .node_runtime
+            .node_binary_path()
+            .await
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|error| error.to_string()))
     }
 
     async fn npm_package_latest_version(
         &mut self,
         package_name: String,
     ) -> wasmtime::Result<Result<String, String>> {
-        let result = (|| -> Result<String> {
-            let response = reqwest::blocking::Client::builder()
-                .timeout(EXTENSION_DOWNLOAD_TIMEOUT)
-                .build()?
-                .get(format!("https://registry.npmjs.org/{package_name}"))
-                .send()?
-                .error_for_status()?;
-            let package: serde_json::Value = response.json()?;
-            package["dist-tags"]["latest"]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("NPM response has no latest version"))
-        })();
-        Ok(result.map_err(|error| error.to_string()))
+        let url = format!("https://registry.npmjs.org/{package_name}");
+        Ok(latest_npm_package_version(&url)
+            .await
+            .map_err(|error| error.to_string()))
     }
 
     async fn npm_package_installed_version(
@@ -1195,27 +1970,27 @@ impl nodejs::Host for HostState {
         package_name: String,
         version: String,
     ) -> wasmtime::Result<Result<(), String>> {
-        if !self
-            .npm_capabilities
-            .iter()
-            .any(|capability| capability.allows(&package_name))
-        {
+        if !self.granted_capabilities.allows_npm_install(&package_name) {
             return Ok(Err(format!(
-                "npm:install is not allowed for {package_name}"
+                "npm:install for {package_name} is not allowed by user-level granted_extension_capabilities"
             )));
         }
-        let Some(npm) = which_binary("npm") else {
-            return Ok(Err("npm is not installed or not on PATH".into()));
+        let invocation = match self.node_runtime.npm_invocation().await {
+            Ok(invocation) => invocation,
+            Err(error) => return Ok(Err(error.to_string())),
         };
-        let mut command = ProcessCommand::new(npm);
-        command.current_dir(&self.work_dir).args([
-            "install",
-            "--prefix",
-            self.work_dir.to_string_lossy().as_ref(),
-            "--ignore-scripts",
-            "--no-package-lock",
-            &format!("{package_name}@{version}"),
-        ]);
+        let mut command = ProcessCommand::new(invocation.program);
+        command
+            .current_dir(&self.work_dir)
+            .args(invocation.prefix_arguments)
+            .args([
+                "install",
+                "--prefix",
+                self.work_dir.to_string_lossy().as_ref(),
+                "--ignore-scripts",
+                "--no-package-lock",
+                &format!("{package_name}@{version}"),
+            ]);
         let result = run_extension_command(command, EXTENSION_COMMAND_TIMEOUT)
             .await
             .and_then(|output| {
@@ -1383,6 +2158,39 @@ fn lsp_settings_for_extension(
     Ok(serde_json::to_string(&settings)?)
 }
 
+fn language_settings_for_extension(
+    worktree_root: &Path,
+    user_home: Option<&Path>,
+    language_name: Option<&str>,
+) -> Result<String> {
+    let settings = ahead_core::config::language_editor_settings(
+        worktree_root,
+        user_home,
+        language_name,
+    )?;
+    Ok(serde_json::json!({
+        "tab_size": settings.tab_size,
+        "hard_tabs": settings.hard_tabs,
+        "preferred_line_length": settings.preferred_line_length,
+    })
+    .to_string())
+}
+
+fn settings_for_extension(
+    worktree_root: &Path,
+    user_home: Option<&Path>,
+    category: &str,
+    key: Option<&str>,
+) -> Result<String> {
+    match category {
+        "lsp" => lsp_settings_for_extension(worktree_root, user_home, key),
+        "language" => language_settings_for_extension(worktree_root, user_home, key),
+        _ => Err(anyhow!(
+            "unsupported Zed extension settings category `{category}`; AHEAD supports `language` and `lsp`"
+        )),
+    }
+}
+
 fn merge_setting(
     existing: &mut serde_json::Value,
     override_value: serde_json::Value,
@@ -1405,6 +2213,102 @@ fn merge_setting(
     }
 }
 
+fn apply_lsp_settings_to_command(
+    command: &mut LanguageServerCommand,
+    settings: serde_json::Value,
+    worktree_root: &Path,
+) -> Result<()> {
+    let settings = settings
+        .as_object()
+        .context("extension LSP settings must be an object")?;
+    if let Some(override_options) = settings.get("initialization_options") {
+        match command.initialization_options.as_mut() {
+            Some(initialization_options) => {
+                merge_setting(initialization_options, override_options.clone());
+            }
+            None => command.initialization_options = Some(override_options.clone()),
+        }
+    }
+
+    let Some(binary) = settings.get("binary") else {
+        return Ok(());
+    };
+    let binary = binary
+        .as_object()
+        .context("extension LSP binary settings must be a table")?;
+    for key in binary.keys() {
+        anyhow::ensure!(
+            matches!(key.as_str(), "path" | "arguments" | "env"),
+            "unsupported extension LSP binary setting `{key}`"
+        );
+    }
+    let path = binary
+        .get("path")
+        .map(|path| {
+            let path = path
+                .as_str()
+                .context("extension LSP binary.path must be a string")?;
+            anyhow::ensure!(!path.is_empty(), "extension LSP binary.path is empty");
+            Ok::<_, anyhow::Error>(path.to_string())
+        })
+        .transpose()?;
+    let arguments = binary
+        .get("arguments")
+        .map(|arguments| {
+            arguments
+                .as_array()
+                .context("extension LSP binary.arguments must be an array")?
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    argument
+                        .as_str()
+                        .map(str::to_string)
+                        .with_context(|| {
+                            format!(
+                                "extension LSP binary.arguments[{index}] must be a string"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    if let Some(path) = path.as_deref() {
+        let path = Path::new(path);
+        command.command = if path.is_absolute() {
+            path.to_string_lossy().into_owned()
+        } else {
+            worktree_root.join(path).to_string_lossy().into_owned()
+        };
+        command.args = arguments.unwrap_or_default();
+    } else if let Some(arguments) = arguments {
+        command.args = arguments;
+    }
+
+    if let Some(environment) = binary.get("env") {
+        let environment = environment
+            .as_object()
+            .context("extension LSP binary.env must be a table")?;
+        for (name, value) in environment {
+            let value = value.as_str().with_context(|| {
+                format!("extension LSP binary.env.{name} must be a string")
+            })?;
+            let mut found = false;
+            for (existing_name, existing_value) in &mut command.env {
+                if existing_name == name {
+                    *existing_value = value.to_string();
+                    found = true;
+                }
+            }
+            if !found {
+                command.env.push((name.clone(), value.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ExtensionImports for HostState {
     async fn get_settings(
         &mut self,
@@ -1412,14 +2316,12 @@ impl ExtensionImports for HostState {
         category: String,
         key: Option<String>,
     ) -> wasmtime::Result<Result<String, String>> {
-        let settings = match category.as_str() {
-            "lsp" => lsp_settings_for_extension(
-                &self.worktree_root,
-                ahead_core::directory::Directory::home_dir().as_deref(),
-                key.as_deref(),
-            ),
-            _ => Ok("{}".to_string()),
-        };
+        let settings = settings_for_extension(
+            &self.worktree_root,
+            ahead_core::directory::Directory::home_dir().as_deref(),
+            &category,
+            key.as_deref(),
+        );
         Ok(settings.map_err(|error| format!("{error:#}")))
     }
 
@@ -1429,22 +2331,21 @@ impl ExtensionImports for HostState {
         path: String,
         file_type: DownloadedFileType,
     ) -> wasmtime::Result<Result<(), String>> {
-        let result = (|| -> Result<()> {
+        let result: Result<()> = async {
             let url = url::Url::parse(&url)?;
             anyhow::ensure!(
-                self.download_capabilities
-                    .iter()
-                    .any(|capability| capability.allows(&url)),
-                "download_file is not allowed for {}",
+                self.granted_capabilities.allows_download(&url),
+                "download_file for {} is not allowed by user-level granted_extension_capabilities",
                 url
             );
             let destination = checked_extension_path(&self.work_dir, &path)?;
-            let client = reqwest::blocking::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(EXTENSION_DOWNLOAD_TIMEOUT)
                 .build()?;
             let mut response = client
                 .get(url.clone())
                 .send()
+                .await
                 .with_context(|| format!("downloading {url}"))?;
             if !response.status().is_success() {
                 return Err(anyhow!(
@@ -1459,12 +2360,13 @@ impl ExtensionImports for HostState {
                 return Err(anyhow!("extension download exceeds the 512 MiB limit"));
             }
             let mut bytes = Vec::new();
-            response
-                .by_ref()
-                .take(MAX_EXTENSION_DOWNLOAD_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_EXTENSION_DOWNLOAD_BYTES {
-                return Err(anyhow!("extension download exceeds the 512 MiB limit"));
+            let maximum_bytes = MAX_EXTENSION_DOWNLOAD_BYTES as usize;
+            while let Some(chunk) = response.chunk().await? {
+                anyhow::ensure!(
+                    bytes.len().saturating_add(chunk.len()) <= maximum_bytes,
+                    "extension download exceeds the 512 MiB limit"
+                );
+                bytes.extend_from_slice(&chunk);
             }
             match file_type {
                 DownloadedFileType::Uncompressed => {
@@ -1528,7 +2430,8 @@ impl ExtensionImports for HostState {
                 }
             }
             Ok(())
-        })();
+        }
+        .await;
         Ok(result.map_err(|error| error.to_string()))
     }
 
@@ -1776,14 +2679,20 @@ type GuestSlot = Arc<tokio::sync::Mutex<Option<GuestSession>>>;
 
 pub struct ExtensionHost {
     engine: Engine,
-    // ponytail: sessions live until proxy restart; invalidate per extension when hot upgrades exist.
     sessions: Mutex<HashMap<(PathBuf, PathBuf), GuestSlot>>,
+    granted_capabilities: ExtensionCapabilityGrants,
+    node_runtime: NodeRuntime,
     #[cfg(test)]
     instantiations: AtomicUsize,
 }
 
 impl ExtensionHost {
     pub fn new() -> Result<Self> {
+        Self::new_with_node_runtime(NodeRuntime::default())
+    }
+
+    pub fn new_with_node_runtime(node_runtime: NodeRuntime) -> Result<Self> {
+        let granted_capabilities = ExtensionCapabilityGrants::load_for_user()?;
         static ENGINE: OnceLock<std::result::Result<Engine, String>> =
             OnceLock::new();
         let engine = ENGINE
@@ -1801,6 +2710,8 @@ impl ExtensionHost {
         Ok(Self {
             engine,
             sessions: Mutex::new(HashMap::new()),
+            granted_capabilities,
+            node_runtime,
             #[cfg(test)]
             instantiations: AtomicUsize::new(0),
         })
@@ -1824,6 +2735,25 @@ impl ExtensionHost {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn invalidate_sessions(&self) -> Result<()> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow!("extension session cache is poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    pub fn invalidate_extension_sessions(
+        &self,
+        extension_directory: &Path,
+    ) -> Result<()> {
+        self.sessions
+            .lock()
+            .map_err(|_| anyhow!("extension session cache is poisoned"))?
+            .retain(|(directory, _), _| directory.as_path() != extension_directory);
+        Ok(())
     }
 
     fn add_v0_6_imports(linker: &mut Linker<HostState>) -> Result<()> {
@@ -1933,16 +2863,17 @@ impl ExtensionHost {
             store,
             extension,
             language_server_id,
-            worktree_root_for_command,
+            worktree_root_for_command.clone(),
         )
         .await?;
-        Ok(LanguageServerCommand {
+        let command = LanguageServerCommand {
             command: resolve_work_dir_command(&work_dir, command),
             args,
             env,
             initialization_options,
             workspace_configuration,
-        })
+        };
+        Ok(command)
     }
 
     async fn instantiate_language_extension(
@@ -2008,8 +2939,8 @@ impl ExtensionHost {
                 worktree_root,
                 work_dir: work_dir.clone(),
                 process_capabilities: extension.capabilities.clone(),
-                download_capabilities: extension.download_capabilities.clone(),
-                npm_capabilities: extension.npm_capabilities.clone(),
+                granted_capabilities: self.granted_capabilities.clone(),
+                node_runtime: self.node_runtime.clone(),
             },
         );
         let guest = match extension.api_version {
@@ -2083,7 +3014,202 @@ impl ExtensionHost {
         Ok(workspace_configuration)
     }
 
-    pub async fn language_server_command_for_extension(
+    async fn additional_workspace_configuration(
+        store: &mut Store<HostState>,
+        extension: &GuestExtension,
+        language_server_id: &str,
+        target_language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let worktree = store
+            .data_mut()
+            .table
+            .push(WorktreeContext {
+                root: worktree_root,
+            })
+            .map_err(|error| anyhow!(error))?;
+        let configuration = match extension {
+            GuestExtension::V0_6(guest) => guest
+                .call_language_server_additional_workspace_configuration(
+                    store,
+                    language_server_id,
+                    target_language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?
+                .map_err(|error| anyhow!(error))?,
+            GuestExtension::V0_8(guest) => guest
+                .call_language_server_additional_workspace_configuration(
+                    store,
+                    language_server_id,
+                    target_language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?
+                .map_err(|error| anyhow!(error))?,
+        }
+        .map(|configuration| serde_json::from_str(&configuration))
+        .transpose()
+        .context("parsing additional language server workspace configuration")?;
+        Ok(configuration)
+    }
+
+    async fn additional_initialization_options(
+        store: &mut Store<HostState>,
+        extension: &GuestExtension,
+        language_server_id: &str,
+        target_language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let worktree = store
+            .data_mut()
+            .table
+            .push(WorktreeContext {
+                root: worktree_root,
+            })
+            .map_err(|error| anyhow!(error))?;
+        let options = match extension {
+            GuestExtension::V0_6(guest) => guest
+                .call_language_server_additional_initialization_options(
+                    store,
+                    language_server_id,
+                    target_language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?
+                .map_err(|error| anyhow!(error))?,
+            GuestExtension::V0_8(guest) => guest
+                .call_language_server_additional_initialization_options(
+                    store,
+                    language_server_id,
+                    target_language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?
+                .map_err(|error| anyhow!(error))?,
+        }
+        .map(|options| serde_json::from_str(&options))
+        .transpose()
+        .context("parsing additional language server initialization options")?;
+        Ok(options)
+    }
+
+    async fn additional_workspace_configuration_for_extension(
+        &self,
+        extension: &LanguageServerExtension,
+        target_language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut session = self
+            .extension_session(extension, worktree_root.clone())
+            .await?;
+        let (store, guest) = session
+            .as_mut()
+            .context("language extension session was not initialized")?;
+        Self::additional_workspace_configuration(
+            store,
+            guest,
+            &extension.server_id,
+            target_language_server_id,
+            worktree_root,
+        )
+        .await
+    }
+
+    async fn additional_initialization_options_for_extension(
+        &self,
+        extension: &LanguageServerExtension,
+        target_language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut session = self
+            .extension_session(extension, worktree_root.clone())
+            .await?;
+        let (store, guest) = session
+            .as_mut()
+            .context("language extension session was not initialized")?;
+        Self::additional_initialization_options(
+            store,
+            guest,
+            &extension.server_id,
+            target_language_server_id,
+            worktree_root,
+        )
+        .await
+    }
+
+    pub async fn language_server_command_with_additional_configuration(
+        &self,
+        extension: &LanguageServerExtension,
+        other_extensions: &[LanguageServerExtension],
+        worktree: WorktreeContext,
+    ) -> Result<LanguageServerCommand> {
+        let mut command = self
+            .resolve_language_server_command_for_extension(
+                extension,
+                worktree.clone(),
+            )
+            .await?;
+        for other_extension in other_extensions
+            .iter()
+            .filter(|other| other.server_id != extension.server_id)
+        {
+            match self
+                .additional_initialization_options_for_extension(
+                    other_extension,
+                    &extension.server_id,
+                    worktree.root.clone(),
+                )
+                .await
+            {
+                Ok(Some(options)) => merge_zed_configuration(
+                    &mut command.initialization_options,
+                    options,
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    source_extension = %other_extension.id,
+                    source_server = %other_extension.server_id,
+                    target_server = %extension.server_id,
+                    %error,
+                    "loading additional language-server initialization options"
+                ),
+            }
+            match self
+                .additional_workspace_configuration_for_extension(
+                    other_extension,
+                    &extension.server_id,
+                    worktree.root.clone(),
+                )
+                .await
+            {
+                Ok(Some(configuration)) => merge_zed_configuration(
+                    &mut command.workspace_configuration,
+                    configuration,
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    source_extension = %other_extension.id,
+                    source_server = %other_extension.server_id,
+                    target_server = %extension.server_id,
+                    %error,
+                    "loading additional language-server workspace configuration"
+                ),
+            }
+        }
+        Self::apply_extension_lsp_settings(
+            &mut command,
+            &extension.server_id,
+            &worktree.root,
+        )?;
+        Ok(command)
+    }
+
+    async fn resolve_language_server_command_for_extension(
         &self,
         extension: &LanguageServerExtension,
         worktree: WorktreeContext,
@@ -2101,6 +3227,41 @@ impl ExtensionHost {
             worktree,
         )
         .await
+    }
+
+    pub async fn language_server_command_for_extension(
+        &self,
+        extension: &LanguageServerExtension,
+        worktree: WorktreeContext,
+    ) -> Result<LanguageServerCommand> {
+        let mut command = self
+            .resolve_language_server_command_for_extension(
+                extension,
+                worktree.clone(),
+            )
+            .await?;
+        Self::apply_extension_lsp_settings(
+            &mut command,
+            &extension.server_id,
+            &worktree.root,
+        )?;
+        Ok(command)
+    }
+
+    fn apply_extension_lsp_settings(
+        command: &mut LanguageServerCommand,
+        language_server_id: &str,
+        worktree_root: &Path,
+    ) -> Result<()> {
+        let user_home = ahead_core::directory::Directory::home_dir();
+        let settings = lsp_settings_for_extension(
+            worktree_root,
+            user_home.as_deref(),
+            Some(language_server_id),
+        )?;
+        let settings = serde_json::from_str(&settings)
+            .context("parsing extension language server settings")?;
+        apply_lsp_settings_to_command(command, settings, worktree_root)
     }
 
     pub async fn workspace_configuration_for_extension(
@@ -2124,6 +3285,83 @@ impl ExtensionHost {
     }
 }
 
+fn merge_zed_configuration(
+    target: &mut Option<serde_json::Value>,
+    source: serde_json::Value,
+) {
+    fn union(source: serde_json::Value, target: &mut serde_json::Value) {
+        match (source, target) {
+            (
+                serde_json::Value::Object(source),
+                serde_json::Value::Object(target),
+            ) => {
+                for (key, value) in source {
+                    if let Some(target) = target.get_mut(&key) {
+                        union(value, target);
+                    } else {
+                        target.insert(key, value);
+                    }
+                }
+            }
+            (serde_json::Value::Array(source), serde_json::Value::Array(target)) => {
+                for value in source {
+                    if !target.contains(&value) {
+                        target.push(value);
+                    }
+                }
+            }
+            (source, target) => *target = source,
+        }
+    }
+
+    union(source, target.get_or_insert_with(|| serde_json::json!({})));
+}
+
+#[cfg(test)]
+mod adapter_configuration_tests {
+    use super::merge_zed_configuration;
+
+    #[test]
+    fn additional_adapter_configuration_uses_zed_union_semantics() {
+        let mut target = Some(serde_json::json!({
+            "nested": { "kept": true, "shared": "target" },
+            "array": [1, 2],
+        }));
+
+        merge_zed_configuration(
+            &mut target,
+            serde_json::json!({
+                "nested": { "added": true, "shared": "additional" },
+                "array": [2, 3],
+                "new": "value",
+            }),
+        );
+
+        assert_eq!(
+            target,
+            Some(serde_json::json!({
+                "nested": {
+                    "kept": true,
+                    "added": true,
+                    "shared": "additional",
+                },
+                "array": [1, 2, 3],
+                "new": "value",
+            }))
+        );
+
+        let mut unconfigured = None;
+        merge_zed_configuration(
+            &mut unconfigured,
+            serde_json::json!({ "additional": true }),
+        );
+        assert_eq!(
+            unconfigured,
+            Some(serde_json::json!({ "additional": true }))
+        );
+    }
+}
+
 pub fn checked_worktree_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let path = root.join(relative);
     let canonical_root = root.canonicalize().with_context(|| {
@@ -2142,7 +3380,10 @@ pub fn checked_worktree_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn checked_extension_path(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(crate) fn checked_extension_path(
+    root: &Path,
+    relative: &str,
+) -> Result<PathBuf> {
     let relative_path = Path::new(relative);
     if relative_path.is_absolute()
         || relative_path
@@ -2211,6 +3452,61 @@ mod tests {
     use fs4::fs_std::FileExt;
     use std::fs;
 
+    fn local_http_response(
+        body: &'static [u8],
+    ) -> Result<(url::Url, std::thread::JoinHandle<Result<()>>)> {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let bytes_read = stream.read(&mut chunk)?;
+                if bytes_read == 0 {
+                    return Err(anyhow!(
+                        "HTTP client closed before finishing headers"
+                    ));
+                }
+                if request.len() + bytes_read > 16 * 1024 {
+                    return Err(anyhow!(
+                        "HTTP request headers exceed the test limit"
+                    ));
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )?;
+            stream.write_all(body)?;
+            Ok(())
+        });
+        Ok((
+            url::Url::parse(&format!("http://{address}/package"))?,
+            server,
+        ))
+    }
+
     #[test]
     fn worktree_binary_lookup_rejects_paths() {
         assert!(which_binary("").is_none());
@@ -2247,6 +3543,84 @@ mod tests {
             .expect_err("hung extension command must time out");
         assert!(error.contains("timed out after 50ms"));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let process_dir = tempfile::tempdir().expect("process fixture");
+        let process_id_path = process_dir.path().join("pid");
+        let mut command = ProcessCommand::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; exec sleep 5")
+            .arg("sh")
+            .arg(&process_id_path);
+        let error = runtime
+            .block_on(run_extension_command(
+                command,
+                std::time::Duration::from_millis(200),
+            ))
+            .expect_err("hung shell must time out");
+        assert!(error.contains("timed out after 200ms"));
+        let process_id = fs::read_to_string(process_id_path)
+            .expect("shell wrote its pid")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("valid process id");
+        assert_eq!(unsafe { libc::kill(process_id, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_extension_command_kills_and_reaps_child() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let process_dir = tempfile::tempdir().expect("process fixture");
+        let process_id_path = process_dir.path().join("pid");
+
+        runtime.block_on(async {
+            let mut command = ProcessCommand::new("sh");
+            command
+                .arg("-c")
+                .arg("echo $$ > \"$1\"; exec sleep 5")
+                .arg("sh")
+                .arg(&process_id_path);
+            let task = tokio::spawn(run_extension_command(
+                command,
+                std::time::Duration::from_secs(30),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !process_id_path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("child wrote its pid");
+            let process_id = fs::read_to_string(&process_id_path)
+                .expect("shell wrote its pid")
+                .trim()
+                .parse::<libc::pid_t>()
+                .expect("valid process id");
+            task.abort();
+            assert!(task.await.expect_err("task was cancelled").is_cancelled());
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if unsafe { libc::kill(process_id, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error()
+                            == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled child was killed and reaped");
+        });
     }
 
     #[test]
@@ -2315,6 +3689,22 @@ mod tests {
                 .expect("test loopback URL")
         ));
     }
+    #[test]
+    fn extension_settings_reject_unsupported_zed_categories() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let error = settings_for_extension(
+            workspace.path(),
+            None,
+            "context_servers",
+            Some("example"),
+        )
+        .expect_err("unsupported Zed categories must not look like empty settings");
+
+        assert!(error.to_string().contains("context_servers"));
+        assert!(error.to_string().contains("supports `language` and `lsp`"));
+    }
+
     #[test]
     fn lsp_settings_are_scoped_and_executable_overrides_stay_private() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -2420,6 +3810,166 @@ mod tests {
     }
 
     #[test]
+    fn language_settings_use_zed_defaults_and_merge_ahead_layers() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let user_home = tempfile::tempdir().expect("user home");
+        fs::create_dir(user_home.path().join(".ahead"))
+            .expect("user settings directory");
+        fs::write(
+            user_home.path().join(".ahead/settings.toml"),
+            "[languages.Python]\ntab_size = 2\nhard_tabs = true\n",
+        )
+        .expect("user settings");
+        let ahead = workspace.path().join(".ahead");
+        fs::create_dir(&ahead).expect("workspace config directory");
+        fs::write(
+            ahead.join("config.toml"),
+            "[languages.python]\npreferred_line_length = 100\n",
+        )
+        .expect("shared workspace settings");
+        fs::write(
+            ahead.join("settings.toml"),
+            "[languages.PYTHON]\ntab_size = 8\nhard_tabs = false\n",
+        )
+        .expect("private workspace settings");
+
+        let settings = language_settings_for_extension(
+            workspace.path(),
+            Some(user_home.path()),
+            Some("Python"),
+        )
+        .expect("language settings");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&settings)
+                .expect("JSON settings"),
+            serde_json::json!({
+                "tab_size": 8,
+                "hard_tabs": false,
+                "preferred_line_length": 100
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &language_settings_for_extension(workspace.path(), None, None,)
+                    .expect("base language settings")
+            )
+            .expect("base JSON settings"),
+            serde_json::json!({
+                "tab_size": 4,
+                "hard_tabs": false,
+                "preferred_line_length": 80
+            })
+        );
+    }
+
+    #[test]
+    fn language_settings_reject_invalid_zed_values() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir(workspace.path().join(".ahead"))
+            .expect("workspace config directory");
+        fs::write(
+            workspace.path().join(".ahead/config.toml"),
+            "[languages.Rust]\ntab_size = 0\n",
+        )
+        .expect("workspace settings");
+
+        let error =
+            language_settings_for_extension(workspace.path(), None, Some("Rust"))
+                .expect_err("zero-width tab size is invalid")
+                .to_string();
+        assert!(error.contains("tab_size has an invalid value"));
+
+        fs::write(
+            workspace.path().join(".ahead/config.toml"),
+            "[languages.Rust]\ntab_size = 2\n[languages.rust]\nhard_tabs = true\n",
+        )
+        .expect("duplicate language settings");
+        let error =
+            language_settings_for_extension(workspace.path(), None, Some("Rust"))
+                .expect_err("case-insensitive duplicate language tables are invalid")
+                .to_string();
+        assert!(error.contains("defines language `Rust` more than once"));
+    }
+
+    #[test]
+    fn lsp_settings_override_extension_command_and_merge_initialization_options() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut command = LanguageServerCommand {
+            command: "extension-server".into(),
+            args: vec!["--extension-argument".into()],
+            env: vec![("EXTENSION_VALUE".into(), "default".into())],
+            initialization_options: Some(serde_json::json!({
+                "retained": true,
+                "nested": { "extension": true, "shared": "extension" },
+                "array": ["extension"]
+            })),
+            workspace_configuration: None,
+        };
+
+        merge_zed_configuration(
+            &mut command.initialization_options,
+            serde_json::json!({
+                "retained": false,
+                "nested": { "shared": "additional", "from_other": true },
+                "array": ["additional"],
+            }),
+        );
+        apply_lsp_settings_to_command(
+            &mut command,
+            serde_json::json!({
+                "initialization_options": {
+                    "nested": { "shared": "user", "added": true },
+                    "array": ["user"]
+                },
+                "binary": {
+                    "path": "tools/custom-lsp",
+                    "arguments": ["--stdio"],
+                    "env": {
+                        "EXTENSION_VALUE": "override",
+                        "USER_VALUE": "private"
+                    }
+                }
+            }),
+            workspace.path(),
+        )
+        .expect("apply user LSP settings");
+
+        assert_eq!(
+            command.command,
+            workspace.path().join("tools/custom-lsp").to_string_lossy()
+        );
+        assert_eq!(command.args, ["--stdio"]);
+        assert_eq!(
+            command.initialization_options,
+            Some(serde_json::json!({
+                "retained": false,
+                "nested": {
+                    "extension": true,
+                    "shared": "user",
+                    "added": true,
+                    "from_other": true
+                },
+                "array": ["user"]
+            }))
+        );
+        assert_eq!(
+            command.env.iter().cloned().collect::<HashMap<_, _>>(),
+            HashMap::from([
+                ("EXTENSION_VALUE".to_string(), "override".to_string()),
+                ("USER_VALUE".to_string(), "private".to_string()),
+            ])
+        );
+
+        let error = apply_lsp_settings_to_command(
+            &mut command,
+            serde_json::json!({ "binary": { "arguments": ["--stdio", 1] } }),
+            workspace.path(),
+        )
+        .expect_err("binary arguments must be strings");
+        assert!(error.to_string().contains("arguments[1] must be a string"));
+    }
+
+    #[test]
     #[ignore = "set AHEAD_ZED_EXTENSION_SOURCE to a real installed extension directory"]
     fn installed_zed_extension_reads_changed_workspace_settings() -> Result<()> {
         use std::io::{Read as _, Write as _};
@@ -2432,11 +3982,13 @@ mod tests {
             .context("extension source has no directory name")?;
         let server_id = std::env::var("AHEAD_ZED_EXTENSION_SERVER_ID")
             .unwrap_or_else(|_| "buf".to_string());
-        let expected_version = toml::from_str::<ExtensionManifest>(
-            &fs::read_to_string(source.join("extension.toml"))?,
-        )?
-        .version
-        .context("extension source has no package version")?;
+        let manifest = toml::from_str::<ExtensionManifest>(&fs::read_to_string(
+            source.join("extension.toml"),
+        )?)?;
+        let expected_version = manifest
+            .version
+            .clone()
+            .context("extension source has no package version")?;
         anyhow::ensure!(
             server_id
                 .chars()
@@ -2450,13 +4002,22 @@ mod tests {
             Vec::new(),
             flate2::Compression::default(),
         ));
-        for name in ["extension.toml", "extension.wasm"] {
-            let bytes = fs::read(source.join(name))?;
+        let mut package_files =
+            vec!["extension.toml".to_string(), "extension.wasm".to_string()];
+        for grammar in manifest.grammars.keys() {
+            anyhow::ensure!(
+                valid_grammar_name(grammar),
+                "invalid extension grammar name {grammar}"
+            );
+            package_files.push(format!("grammars/{grammar}.wasm"));
+        }
+        for name in package_files {
+            let bytes = fs::read(source.join(&name))?;
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(&mut header, name, bytes.as_slice())?;
+            archive.append_data(&mut header, &name, bytes.as_slice())?;
         }
         let archive = archive.into_inner()?.finish()?;
         let archive_sha256 = format!("{:x}", Sha256::digest(&archive));
@@ -2590,6 +4151,33 @@ mod tests {
     }
 
     #[test]
+    fn extension_invalidation_preserves_other_cached_guests() {
+        let host = ExtensionHost::new().expect("extension host");
+        {
+            let mut sessions = host.sessions.lock().expect("session cache");
+            for extension_id in ["html", "rust"] {
+                sessions.insert(
+                    (
+                        PathBuf::from(format!("extensions/{extension_id}")),
+                        PathBuf::from("workspace"),
+                    ),
+                    Arc::new(tokio::sync::Mutex::new(None)),
+                );
+            }
+        }
+
+        host.invalidate_extension_sessions(Path::new("extensions/html"))
+            .expect("invalidate updated extension");
+
+        let sessions = host.sessions.lock().expect("session cache");
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&(
+            PathBuf::from("extensions/rust"),
+            PathBuf::from("workspace"),
+        )));
+    }
+
+    #[test]
     fn discovers_language_servers_from_extension_manifests() {
         let root = tempfile::tempdir().expect("extension root");
         let extension = root.path().join("rust");
@@ -2710,7 +4298,7 @@ mod tests {
         .expect("manifest");
         fs::write(
             extension.join("languages/gleam/config.toml"),
-            "name = 'Gleam'\npath_suffixes = ['gleam']\n",
+            "name = 'Gleam'\npath_suffixes = ['gleam']\nline_comments = ['// ', '/// ']\nblock_comment = { start = '/*', prefix = '* ', end = '*/', tab_size = 1 }\n",
         )
         .expect("language config");
         let broken = root.path().join("broken");
@@ -2722,10 +4310,203 @@ mod tests {
                 .expect("language lookup"),
             Some("Gleam".to_string())
         );
+        let syntax =
+            extension_syntax_for_path(root.path(), Path::new("src/main.gleam"), "")
+                .expect("language config lookup")
+                .expect("matching extension");
+        assert_eq!(syntax.captures, Vec::new());
+        assert_eq!(
+            syntax.comments,
+            LanguageComments {
+                line_comment: Some("// ".into()),
+                block_comment: Some(("/*".into(), "*/".into())),
+            }
+        );
         assert!(
             language_id_for_path(root.path(), Path::new("src/main.unknown"), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_zed_legacy_block_comment_pairs() {
+        let config: LanguageConfig =
+            toml::from_str("name = 'Legacy'\nblock_comment = ['<!--', '-->']\n")
+                .expect("Zed legacy block-comment syntax");
+        assert_eq!(
+            config
+                .block_comment
+                .map(BlockCommentDefinition::into_delimiters),
+            Some(("<!--".into(), "-->".into()))
+        );
+    }
+
+    #[test]
+    fn installs_grammar_only_extension_and_loads_zed_language_assets() {
+        let root = tempfile::tempdir().expect("extension root");
+        let archive = grammar_extension_archive("gleam", "Gleam");
+        install_extension_package(&archive, root.path(), "gleam", Some("1.0.0"))
+            .expect("install grammar-only extension");
+
+        let syntax =
+            language_syntax_for_path(root.path(), Path::new("src/main.gleam"), None)
+                .expect("load extension syntax")
+                .expect("language syntax");
+        assert_eq!(syntax.language_name, "Gleam");
+        assert_eq!(syntax.grammar_name, "gleam");
+        assert_eq!(syntax.wasm, b"tree-sitter grammar wasm");
+        assert_eq!(syntax.highlights, "(identifier) @variable\n");
+        assert_eq!(syntax.injections, "");
+    }
+
+    #[test]
+    #[ignore = "requires an installed HTML Zed extension; set AHEAD_HTML_EXTENSION_ROOT"]
+    fn installed_html_extension_produces_tree_sitter_capture_ranges() {
+        let extensions_root = std::env::var_os("AHEAD_HTML_EXTENSION_ROOT")
+            .map(PathBuf::from)
+            .expect("AHEAD_HTML_EXTENSION_ROOT must point to the plugins directory");
+        let source = "<div title='hello'>Hi</div>";
+        let captures = syntax_captures_for_path(
+            &extensions_root,
+            Path::new("example.html"),
+            source,
+        )
+        .expect("parse installed extension highlights")
+        .expect("HTML extension matches the file");
+
+        assert!(captures.iter().any(|capture| {
+            capture.scope == "tag"
+                && source.get(capture.start..capture.end) == Some("div")
+        }));
+        assert!(captures.iter().any(|capture| {
+            capture.scope == "attribute"
+                && source.get(capture.start..capture.end) == Some("title")
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires an installed HTML Zed extension; set AHEAD_HTML_EXTENSION_ROOT"]
+    fn installed_html_extension_applies_combined_language_injections() {
+        let installed_root = std::env::var_os("AHEAD_HTML_EXTENSION_ROOT")
+            .map(PathBuf::from)
+            .expect("AHEAD_HTML_EXTENSION_ROOT must point to the plugins directory");
+        let installed_html = installed_root.join("html");
+        let root = tempfile::tempdir().expect("extension root");
+        let html = root.path().join("html");
+        for relative_path in [
+            "extension.toml",
+            "grammars/html.wasm",
+            "languages/html/config.toml",
+            "languages/html/highlights.scm",
+        ] {
+            let source = installed_html.join(relative_path);
+            let destination = html.join(relative_path);
+            fs::create_dir_all(
+                destination.parent().expect("extension asset parent"),
+            )
+            .expect("create extension asset directory");
+            fs::copy(source, destination).expect("copy installed HTML asset");
+        }
+        fs::write(
+            html.join("languages/html/injections.scm"),
+            "(script_element (raw_text) @injection.content\n  (#set! injection.language \"html\")\n  (#set! injection.combined))\n",
+        )
+        .expect("write combined injection query");
+
+        let source = "<script><div title='one'>One</div></script><script><span title='two'>Two</span></script>";
+        let captures =
+            syntax_captures_for_path(root.path(), Path::new("example.html"), source)
+                .expect("parse injected HTML")
+                .expect("HTML extension matches the file");
+
+        for name in ["div", "span"] {
+            assert!(captures.iter().any(|capture| {
+                capture.scope == "tag"
+                    && source.get(capture.start..capture.end) == Some(name)
+            }));
+        }
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| {
+                    capture.scope == "attribute"
+                        && source.get(capture.start..capture.end) == Some("title")
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_syntax_assets_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("extension root");
+        let extension = root.path().join("gleam");
+        fs::create_dir_all(extension.join("grammars")).expect("grammar directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        fs::write(outside.path().join("gleam.wasm"), b"outside")
+            .expect("outside grammar");
+        symlink(
+            outside.path().join("gleam.wasm"),
+            extension.join("grammars/gleam.wasm"),
+        )
+        .expect("symlink grammar");
+
+        let error = read_extension_asset(
+            &extension,
+            Path::new("grammars/gleam.wasm"),
+            MAX_EXTENSION_GRAMMAR_BYTES,
+        )
+        .expect_err("symlinked extension assets must be rejected");
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_manifest_and_language_config_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("extension root");
+        let extension = root.path().join("gleam");
+        let language_directory = extension.join("languages/gleam");
+        fs::create_dir_all(&language_directory).expect("language directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let outside_manifest = outside.path().join("extension.toml");
+        fs::write(
+            &outside_manifest,
+            "id = 'gleam'\nlanguages = ['languages/gleam']\n",
+        )
+        .expect("outside manifest");
+        symlink(&outside_manifest, extension.join("extension.toml"))
+            .expect("symlink manifest");
+
+        let manifest_error =
+            language_id_for_path(root.path(), Path::new("src/main.gleam"), None)
+                .expect_err("symlinked extension manifest must be rejected");
+        assert!(manifest_error.to_string().contains("symlink"));
+
+        fs::remove_file(extension.join("extension.toml"))
+            .expect("remove manifest symlink");
+        fs::write(
+            extension.join("extension.toml"),
+            "id = 'gleam'\nlanguages = ['languages/gleam']\n",
+        )
+        .expect("extension manifest");
+        let outside_config = outside.path().join("config.toml");
+        fs::write(
+            &outside_config,
+            "name = 'Gleam'\npath_suffixes = ['gleam']\n",
+        )
+        .expect("outside language config");
+        symlink(&outside_config, language_directory.join("config.toml"))
+            .expect("symlink language config");
+
+        let config_error =
+            language_id_for_path(root.path(), Path::new("src/main.gleam"), None)
+                .expect_err("symlinked language config must be rejected");
+        assert!(config_error.to_string().contains("symlink"));
     }
 
     #[test]
@@ -2740,6 +4521,247 @@ mod tests {
                 .allows("cargo", &["test".to_string(), "--workspace".to_string()])
         );
         assert!(!capability.allows("cargo", &["build".to_string()]));
+    }
+
+    #[test]
+    fn extension_capability_defaults_match_zed() {
+        let grants = ExtensionCapabilityGrants::from_user_settings(None)
+            .expect("Zed default grants");
+        let requested = [ProcessCapability {
+            command: "git".to_string(),
+            args: vec!["status".to_string()],
+        }];
+        let args = vec!["status".to_string()];
+        assert!(grants.allows_process_exec(&requested, "git", &args));
+        assert!(grants.allows_download(
+            &url::Url::parse("https://example.com/a").expect("URL")
+        ));
+        assert!(grants.allows_npm_install("@zed/example"));
+    }
+
+    #[test]
+    fn extension_capability_settings_are_user_grants_not_manifest_grants() {
+        let settings = r#"
+granted_extension_capabilities = [
+    { kind = "process:exec", command = "git", args = ["status", "**"] },
+    { kind = "download_file", host = "github.com", path = ["zed-industries", "**"] },
+    { kind = "npm:install", package = "@zed-industries/vscode-langservers-extracted" },
+]
+"#;
+        let grants = ExtensionCapabilityGrants::from_user_settings(Some(settings))
+            .expect("custom capability grants");
+        let requested = [ProcessCapability {
+            command: "git".to_string(),
+            args: vec!["status".to_string(), "**".to_string()],
+        }];
+        assert!(grants.allows_process_exec(
+            &requested,
+            "git",
+            &["status".to_string(), "--short".to_string()]
+        ));
+        assert!(!grants.allows_process_exec(
+            &requested,
+            "git",
+            &["push".to_string()]
+        ));
+        assert!(
+            grants.allows_download(
+                &url::Url::parse(
+                    "https://github.com/zed-industries/zed/archive/main.zip"
+                )
+                .expect("URL")
+            )
+        );
+        assert!(
+            !grants.allows_download(
+                &url::Url::parse("https://example.com/zed/archive/main.zip")
+                    .expect("URL")
+            )
+        );
+        assert!(
+            grants
+                .allows_npm_install("@zed-industries/vscode-langservers-extracted")
+        );
+        assert!(!grants.allows_npm_install("unapproved-package"));
+
+        let no_grants = ExtensionCapabilityGrants::from_user_settings(Some(
+            "granted_extension_capabilities = []",
+        ))
+        .expect("empty capability grants");
+        assert!(!no_grants.allows_process_exec(
+            &requested,
+            "git",
+            &["status".to_string()]
+        ));
+        assert!(
+            !no_grants
+                .allows_npm_install("@zed-industries/vscode-langservers-extracted")
+        );
+        assert!(
+            ExtensionCapabilityGrants::from_user_settings(Some(
+                "granted_extension_capabilities = [{ kind = 'unknown' }]",
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn extension_capability_settings_load_from_the_user_ahead_directory() {
+        let home = tempfile::tempdir().expect("AHEAD user home");
+        let ahead = home.path().join(".ahead");
+        fs::create_dir(&ahead).expect("AHEAD settings directory");
+        fs::write(
+            ahead.join("settings.toml"),
+            "granted_extension_capabilities = []\n",
+        )
+        .expect("write user settings");
+
+        let grants = ExtensionCapabilityGrants::load_for_home(home.path())
+            .expect("load user capability grants");
+        assert!(!grants.allows_npm_install("@zed/example"));
+    }
+
+    #[test]
+    fn latest_npm_package_version_uses_async_http() -> Result<()> {
+        let (url, server) =
+            local_http_response(br#"{"dist-tags":{"latest":"1.2.3"}}"#)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let version = runtime.block_on(latest_npm_package_version(url.as_str()))?;
+        server
+            .join()
+            .map_err(|_| anyhow!("local npm response server panicked"))??;
+        assert_eq!(version, "1.2.3");
+        Ok(())
+    }
+
+    #[test]
+    fn extension_process_callback_requires_manifest_and_user_grants() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let mut host = HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
+            worktree_root: workspace.path().to_path_buf(),
+            work_dir: workspace.path().to_path_buf(),
+            process_capabilities: vec![ProcessCapability {
+                command: "echo".into(),
+                args: vec!["allowed".into()],
+            }],
+            granted_capabilities: ExtensionCapabilityGrants::from_user_settings(
+                Some("granted_extension_capabilities = []"),
+            )?,
+            node_runtime: NodeRuntime::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let denied_by_user = runtime
+            .block_on(<HostState as process::Host>::run_command(
+                &mut host,
+                process::Command {
+                    command: "echo".into(),
+                    args: vec!["allowed".into()],
+                    env: Vec::new(),
+                },
+            ))
+            .expect("process host callback should not trap");
+        assert!(matches!(
+            denied_by_user,
+            Err(error) if error.contains("user-level granted_extension_capabilities")
+        ));
+
+        host.granted_capabilities = ExtensionCapabilityGrants::from_user_settings(
+            Some(
+                "granted_extension_capabilities = [{ kind = 'process:exec', command = 'echo', args = ['allowed'] }]",
+            ),
+        )?;
+        host.process_capabilities.clear();
+        let denied_by_manifest = runtime
+            .block_on(<HostState as process::Host>::run_command(
+                &mut host,
+                process::Command {
+                    command: "echo".into(),
+                    args: vec!["allowed".into()],
+                    env: Vec::new(),
+                },
+            ))
+            .expect("process host callback should not trap");
+        assert!(matches!(
+            denied_by_manifest,
+            Err(error) if error.contains("extension manifest declaration")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn extension_guest_capabilities_require_user_grants_and_download_async()
+    -> Result<()> {
+        let (url, server) = local_http_response(b"extension asset")?;
+        let workspace = tempfile::tempdir()?;
+        let denied_grants = ExtensionCapabilityGrants::from_user_settings(Some(
+            "granted_extension_capabilities = []",
+        ))?;
+        let mut host = HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
+            worktree_root: workspace.path().to_path_buf(),
+            work_dir: workspace.path().to_path_buf(),
+            process_capabilities: Vec::new(),
+            granted_capabilities: denied_grants,
+            node_runtime: NodeRuntime::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let npm_result = runtime
+            .block_on(<HostState as nodejs::Host>::npm_install_package(
+                &mut host,
+                "@zed/example".into(),
+                "1.0.0".into(),
+            ))
+            .expect("npm host callback should not trap");
+        assert!(npm_result.unwrap_err().contains("not allowed"));
+
+        let denied_download = runtime
+            .block_on(<HostState as ExtensionImports>::download_file(
+                &mut host,
+                url.to_string(),
+                "downloaded.bin".into(),
+                DownloadedFileType::Uncompressed,
+            ))
+            .expect("download host callback should not trap");
+        assert!(denied_download.unwrap_err().contains("not allowed"));
+
+        let host_name = url.host_str().context("mock URL has no host")?;
+        let path = url
+            .path_segments()
+            .and_then(|mut segments| segments.next())
+            .context("mock URL has no path")?;
+        let settings = format!(
+            "granted_extension_capabilities = [{{ kind = 'download_file', host = '{host_name}', path = ['{path}'] }}]"
+        );
+        host.granted_capabilities =
+            ExtensionCapabilityGrants::from_user_settings(Some(&settings))?;
+        let download = runtime
+            .block_on(<HostState as ExtensionImports>::download_file(
+                &mut host,
+                url.to_string(),
+                "downloaded.bin".into(),
+                DownloadedFileType::Uncompressed,
+            ))
+            .expect("granted download callback should not trap");
+        download.map_err(|error| anyhow!(error))?;
+        server
+            .join()
+            .map_err(|_| anyhow!("local download server panicked"))??;
+        assert_eq!(
+            fs::read(workspace.path().join("downloaded.bin"))?,
+            b"extension asset"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2772,6 +4794,55 @@ mod tests {
         drop(first);
         assert!(second.try_lock_exclusive().expect("retry install lock"));
         second.unlock().expect("release second install lock");
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_validated_extension_and_update_backup()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir().expect("extension root");
+        let installed = root.path().join("rust");
+        let backup = root.path().join(".rust.previous");
+        let unrelated = root.path().join("html");
+        for directory in [&installed, &backup, &unrelated] {
+            fs::create_dir(directory)?;
+        }
+        for directory in [&installed, &backup, &unrelated] {
+            let id = if directory == &unrelated {
+                "html"
+            } else {
+                "rust"
+            };
+            fs::write(directory.join("extension.toml"), format!("id = '{id}'\n"))?;
+            fs::write(directory.join("payload"), b"package data")?;
+        }
+
+        uninstall_extension_package(root.path(), "rust")?;
+
+        assert!(!installed.exists());
+        assert!(!backup.exists());
+        assert!(unrelated.join("payload").exists());
+        assert!(
+            uninstall_extension_package(root.path(), "rust")
+                .expect_err("a second uninstall reports the missing package")
+                .to_string()
+                .contains("not installed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_rejects_a_directory_with_a_different_manifest_id() {
+        let root = tempfile::tempdir().expect("extension root");
+        let installed = root.path().join("rust");
+        fs::create_dir(&installed).expect("installed directory");
+        fs::write(installed.join("extension.toml"), "id = 'other'\n")
+            .expect("manifest");
+
+        let error = uninstall_extension_package(root.path(), "rust")
+            .expect_err("a mismatched package must be left untouched");
+
+        assert!(error.to_string().contains("ID does not match"));
+        assert!(installed.exists());
     }
 
     #[test]
@@ -2864,7 +4935,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("no supported language servers or icon themes")
+                .contains("no supported language servers or grammar assets")
         );
         assert!(!root.path().join("rust").exists());
     }
@@ -2883,7 +4954,7 @@ mod tests {
     }
 
     #[test]
-    fn installs_icon_only_extension_without_wasm() {
+    fn rejects_icon_only_extension_before_replacement() {
         let root = tempfile::tempdir().expect("extension root");
         let encoder = flate2::write::GzEncoder::new(
             Vec::new(),
@@ -2922,59 +4993,15 @@ mod tests {
             .expect("archive")
             .finish()
             .expect("compression");
-        let installed =
+        let error =
             install_extension_package(&package, root.path(), "icons", Some("1.0.0"))
-                .expect("install icon theme");
-        assert!(!installed.join("extension.wasm").exists());
-        assert!(installed.join("icons/rust.svg").is_file());
-        assert_eq!(
-            crate::icon_theme::load_icon_theme(
-                &installed,
-                Path::new("icon_themes/icons.json")
-            )
-            .expect("load installed theme")
-            .icon_for_file(Path::new("main.rs"))
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str()),
-            Some("rust.svg")
+                .expect_err("icon themes are outside the supported extension scope");
+        assert!(
+            error
+                .to_string()
+                .contains("no supported language servers or grammar assets")
         );
-    }
-
-    #[test]
-    #[ignore = "set AHEAD_MATERIAL_ICON_THEME_ARCHIVE to the published Zed package"]
-    fn published_material_icon_theme_package_loads() {
-        let archive = std::fs::read(
-            std::env::var("AHEAD_MATERIAL_ICON_THEME_ARCHIVE")
-                .expect("published archive path"),
-        )
-        .expect("published archive");
-        let root = tempfile::tempdir().expect("extension root");
-        let installed = install_extension_package(
-            &archive,
-            root.path(),
-            "material-icon-theme",
-            Some("1.3.1"),
-        )
-        .expect("install published package");
-        let theme = crate::icon_theme::load_icon_theme(
-            &installed,
-            Path::new("icon_themes/material-icon-theme.json"),
-        )
-        .expect("load published theme");
-        assert_eq!(
-            theme
-                .icon_for_file(Path::new("main.rs"))
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str()),
-            Some("rust.svg")
-        );
-        assert_eq!(
-            theme
-                .icon_for_file(Path::new("main.py"))
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str()),
-            Some("python.svg")
-        );
+        assert!(!root.path().join("icons").exists());
     }
 
     fn extension_archive(id: &str) -> Vec<u8> {
@@ -3017,5 +5044,50 @@ mod tests {
             .expect("wasm entry");
         let encoder = archive.into_inner().expect("finish archive");
         encoder.finish().expect("finish compression")
+    }
+
+    fn grammar_extension_archive(id: &str, language_name: &str) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let files = [
+            (
+                "extension.toml".to_string(),
+                format!(
+                    "id = '{id}'\nversion = '1.0.0'\nlanguages = ['languages/{id}']\n[grammars.{id}]\nrepository = 'https://example.invalid/tree-sitter-{id}'\ncommit = '0123456789abcdef'\n"
+                ),
+            ),
+            (
+                format!("languages/{id}/config.toml"),
+                format!(
+                    "name = '{}'\ngrammar = '{id}'\npath_suffixes = ['{id}']\n",
+                    language_name
+                ),
+            ),
+            (
+                format!("languages/{id}/highlights.scm"),
+                "(identifier) @variable\n".to_string(),
+            ),
+            (
+                format!("grammars/{id}.wasm"),
+                "tree-sitter grammar wasm".to_string(),
+            ),
+        ];
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, contents.as_bytes())
+                .expect("append grammar extension asset");
+        }
+        archive
+            .into_inner()
+            .expect("finish grammar extension archive")
+            .finish()
+            .expect("finish compressed grammar extension archive")
     }
 }

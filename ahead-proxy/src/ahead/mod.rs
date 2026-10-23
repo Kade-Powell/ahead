@@ -13,6 +13,8 @@
 pub mod auth;
 pub mod collab;
 pub mod host;
+#[cfg(windows)]
+mod memory_fs;
 pub mod policy;
 pub mod prediction;
 mod recovery;

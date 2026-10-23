@@ -1,0 +1,26 @@
+{
+  "source_repository": "https://github.com/zed-industries/zed",
+  "source_revision": "418f89714891f9d8105a3e92e60b9a7a5084d232",
+  "zed_extension_cli_revision": "9ee3c503a4bbbc6b4a0f8a789acca4871d773223",
+  "extensions": [
+    {
+      "id": "html",
+      "version": "0.3.2",
+      "source_path": ".",
+      "repository": "https://github.com/zed-industries/zed",
+      "revision": "418f89714891f9d8105a3e92e60b9a7a5084d232",
+      "path": "extensions/html",
+      "license": "Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "runtime_dependencies": [
+        "@zed-industries/vscode-langservers-extracted"
+      ],
+      "requested_capabilities": [
+        {
+          "kind": "npm:install",
+          "package": "@zed-industries/vscode-langservers-extracted"
+        }
+      ]
+    }
+  ]
+}

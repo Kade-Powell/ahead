@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::{Read, Write},
+    ffi::OsStr,
+    io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -17,9 +18,6 @@ use codex_protocol::{
 use codex_utils_absolute_path::AbsolutePathBuf;
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
-
-#[cfg(any(not(unix), test))]
-use std::io::ErrorKind;
 
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -95,6 +93,8 @@ fn open_default_runtime_directory(workspace: &Path) -> Result<PathBuf> {
 
 #[cfg(any(not(unix), test))]
 fn write_private_toml_path(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => anyhow::ensure!(
             metadata.is_file(),
@@ -193,6 +193,14 @@ pub(crate) fn mcp_servers_for_workspace(
         let value = declarations.get(&id).with_context(|| {
             format!("AHEAD MCP server `{id}` is enabled but not declared in `.ahead/config.toml`")
         })?;
+        for retired_field in ["environment_id", "name"] {
+            anyhow::ensure!(
+                !value
+                    .as_table()
+                    .is_some_and(|table| table.contains_key(retired_field)),
+                "AHEAD MCP server `{id}` uses unsupported field `{retired_field}`"
+            );
+        }
         let mut server: McpServerConfig =
             value.clone().try_into().with_context(|| {
                 format!("invalid AHEAD MCP server declaration `{id}`")
@@ -201,25 +209,11 @@ pub(crate) fn mcp_servers_for_workspace(
             server.is_local_environment(),
             "AHEAD MCP server `{id}` uses an unsupported non-local environment"
         );
-        match &server.transport {
-            McpServerTransportConfig::Stdio { env, env_vars, .. } => {
-                anyhow::ensure!(
-                    env.is_none(),
-                    "AHEAD MCP server `{id}` must reference host environment variables with `env_vars`, not store values in tracked config"
-                );
-                anyhow::ensure!(
-                    env_vars.iter().all(|variable| {
-                        variable.source().is_none_or(|source| source == "local")
-                    }),
-                    "AHEAD MCP server `{id}` references an unsupported non-local environment variable source"
-                );
-            }
-            McpServerTransportConfig::StreamableHttp { .. } => {
-                anyhow::bail!(
-                    "AHEAD currently supports stdio MCP servers only; HTTP authentication and secret storage are not wired"
-                );
-            }
-        }
+        let McpServerTransportConfig::Stdio { env, .. } = &server.transport;
+        anyhow::ensure!(
+            env.is_none(),
+            "AHEAD MCP server `{id}` must reference host environment variables with `env_vars`, not store values in tracked config"
+        );
         let fingerprint = mcp_declaration_fingerprint(value)?;
         anyhow::ensure!(
             approved_declarations
@@ -396,39 +390,11 @@ pub fn set_mcp_server_approval(
     let workspace = workspace
         .canonicalize()
         .context("AHEAD workspace is unavailable")?;
-    #[cfg(not(unix))]
-    let ahead = workspace.join(".ahead");
-    #[cfg(unix)]
     let ahead_directory = open_mcp_settings_directory(&workspace)?;
-    #[cfg(not(unix))]
-    anyhow::ensure!(
-        std::fs::symlink_metadata(&ahead)?.is_dir(),
-        "AHEAD MCP settings directory must be a regular directory"
-    );
-    #[cfg(not(unix))]
-    let lock_path = ahead.join("settings.toml.lock");
-    #[cfg(not(unix))]
-    match std::fs::symlink_metadata(&lock_path) {
-        Ok(metadata) => anyhow::ensure!(
-            metadata.is_file(),
-            "AHEAD MCP settings lock must be a regular file"
-        ),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).context("failed to inspect AHEAD MCP settings lock");
-        }
-    }
-    #[cfg(unix)]
     let lock = open_mcp_settings_lock(&ahead_directory)?;
-    #[cfg(not(unix))]
-    let lock = open_mcp_settings_lock(&lock_path)?;
     let _lock = McpSettingsLock::acquire(lock)?;
     if action != McpServerApprovalAction::Disable {
-        #[cfg(unix)]
         let config = read_mcp_toml_at(&ahead_directory, "config.toml")?
-            .context("AHEAD MCP declaration file is missing")?;
-        #[cfg(not(unix))]
-        let config = read_project_toml_file(&workspace, ".ahead/config.toml")?
             .context("AHEAD MCP declaration file is missing")?;
         let declaration = config
             .get("mcp")
@@ -447,32 +413,14 @@ pub fn set_mcp_server_approval(
             server.is_local_environment(),
             "MCP server must use the local environment"
         );
-        match &server.transport {
-            McpServerTransportConfig::Stdio { env, env_vars, .. } => {
-                anyhow::ensure!(
-                    env.is_none(),
-                    "MCP server must use env_vars instead of literal env values"
-                );
-                anyhow::ensure!(
-                    env_vars.iter().all(|variable| variable
-                        .source()
-                        .is_none_or(|source| source == "local")),
-                    "MCP server has a non-local environment variable source"
-                );
-            }
-            McpServerTransportConfig::StreamableHttp { .. } => {
-                anyhow::bail!("AHEAD currently supports stdio MCP servers only")
-            }
-        }
+        let McpServerTransportConfig::Stdio { env, .. } = &server.transport;
+        anyhow::ensure!(
+            env.is_none(),
+            "MCP server must use env_vars instead of literal env values"
+        );
     }
 
-    #[cfg(not(unix))]
-    let path = ahead.join("settings.toml");
-    #[cfg(unix)]
     let mut settings = read_mcp_toml_at(&ahead_directory, "settings.toml")?
-        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
-    #[cfg(not(unix))]
-    let mut settings = read_project_toml_file(&workspace, ".ahead/settings.toml")?
         .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
     let mut ids = enabled_mcp_server_ids(&settings, ".ahead/settings.toml")?
         .unwrap_or_default();
@@ -565,82 +513,38 @@ pub fn set_mcp_server_approval(
         content.len() <= MAX_MCP_CONFIG_BYTES,
         "AHEAD MCP settings exceed the 1 MiB limit"
     );
-    #[cfg(unix)]
-    return write_mcp_settings_at(&ahead_directory, &content);
-    #[cfg(not(unix))]
-    write_private_toml_path(&path, &content)
+    write_mcp_settings_at(&ahead_directory, &content)
 }
 
-#[cfg(unix)]
 fn open_mcp_settings_directory(workspace: &Path) -> Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
-
     let workspace_directory =
         ahead_core::secure_fs::open_canonical_directory(workspace)
             .context("failed to open AHEAD workspace directory")?;
-    let directory: std::fs::File = openat(
+    ahead_core::secure_fs::open_relative_directory(
         &workspace_directory,
-        ".ahead",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
+        OsStr::new(".ahead"),
     )
-    .context("AHEAD MCP settings directory must be a regular directory")?
-    .into();
-    Ok(directory)
+    .context("AHEAD MCP settings directory must be a regular directory")
 }
 
-#[cfg(unix)]
 fn open_mcp_settings_lock(directory: &std::fs::File) -> Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
-
-    let file: std::fs::File = openat(
+    ahead_core::secure_fs::open_or_create_relative_lock_file(
         directory,
-        "settings.toml.lock",
-        OFlags::RDWR
-            | OFlags::CREATE
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
+        OsStr::new("settings.toml.lock"),
     )
-    .context("failed to open AHEAD MCP settings lock")?
-    .into();
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "AHEAD MCP settings lock must be a regular file"
-    );
-    Ok(file)
+    .context("failed to open AHEAD MCP settings lock")
 }
 
-#[cfg(not(unix))]
-fn open_mcp_settings_lock(path: &Path) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    let file = options
-        .open(path)
-        .context("failed to open AHEAD MCP settings lock")?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "AHEAD MCP settings lock must be a regular file"
-    );
-    Ok(file)
-}
-
-#[cfg(unix)]
 fn read_mcp_toml_at(
     directory: &std::fs::File,
     name: &str,
 ) -> Result<Option<toml::Value>> {
-    use rustix::fs::{Mode, OFlags, openat};
-
-    let file: std::fs::File = match openat(
+    let file = match ahead_core::secure_fs::open_relative_regular_file(
         directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
+        Path::new(name),
     ) {
-        Ok(file) => file.into(),
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("failed to read AHEAD config `.ahead/{name}`")
@@ -650,58 +554,13 @@ fn read_mcp_toml_at(
     read_mcp_toml(file, &format!(".ahead/{name}")).map(Some)
 }
 
-#[cfg(unix)]
 fn write_mcp_settings_at(directory: &std::fs::File, content: &str) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
-
-    match openat(
+    ahead_core::secure_fs::atomic_replace_relative_file(
         directory,
-        "settings.toml",
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(file) => anyhow::ensure!(
-            std::fs::File::from(file).metadata()?.is_file(),
-            "AHEAD MCP settings must be a regular file"
-        ),
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => {
-            return Err(error).context("failed to inspect AHEAD MCP settings");
-        }
-    }
-    let temporary_name = format!(".settings.toml-{}", uuid::Uuid::new_v4());
-    let result = (|| -> Result<()> {
-        let mut temporary: std::fs::File = openat(
-            directory,
-            temporary_name.as_str(),
-            OFlags::WRONLY
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::NOFOLLOW
-                | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )?
-        .into();
-        temporary.write_all(content.as_bytes())?;
-        temporary.sync_all()?;
-        renameat(
-            directory,
-            temporary_name.as_str(),
-            directory,
-            "settings.toml",
-        )
-        .context("failed to persist AHEAD MCP settings")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        match unlinkat(directory, temporary_name.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(error) => {
-                tracing::warn!(%error, "failed to remove temporary AHEAD MCP settings");
-            }
-        }
-    }
-    result
+        OsStr::new("settings.toml"),
+        content.as_bytes(),
+    )
+    .context("failed to persist AHEAD MCP settings")
 }
 
 fn read_project_toml_file(
@@ -855,6 +714,23 @@ pub(crate) fn file_change_allowed(
         .all(|path| path_is_allowed(path, &scope.allowed_paths, &scope.workspace))
 }
 
+const MANAGED_AGENT_GENERATED_OUTPUT_DIRECTORIES: &[&str] = &[
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".cache",
+    "dist",
+    "build",
+    ".next",
+    "out",
+    "coverage",
+];
+
 pub(crate) fn permission_profile(
     mode: &str,
     cwd: &Path,
@@ -870,6 +746,16 @@ pub(crate) fn permission_profile(
                 workspace.display()
             )
         })?;
+    if !read_only {
+        if let Some(scope) = scope {
+            for path in &scope.allowed_paths {
+                scoped_absolute_path(path, &scope.workspace)?;
+            }
+        }
+        for path in MANAGED_AGENT_GENERATED_OUTPUT_DIRECTORIES {
+            scoped_absolute_path(path, workspace.as_path())?;
+        }
+    }
     let mut private_roots = vec![workspace.as_path().join(".ahead")];
     if let Some(home) = crate::instructions::user_home() {
         private_roots.push(home.join(".ahead"));
@@ -877,25 +763,19 @@ pub(crate) fn permission_profile(
     if let Some(runtime_home) = std::env::var_os("AHEAD_HOME") {
         private_roots.push(PathBuf::from(runtime_home));
     }
-    let write_roots = match scope {
-        _ if read_only => Vec::new(),
-        Some(scope) if !scope.allowed_paths.is_empty() => scope
-            .allowed_paths
-            .iter()
-            .map(|path| scoped_absolute_path(path, &scope.workspace))
-            .collect::<Result<Vec<_>>>()?,
-        _ => vec![workspace],
-    };
-
-    let mut entries = vec![FileSystemSandboxEntry::new(
-        FileSystemPath::Special {
-            value: FileSystemSpecialPath::Root,
-        },
-        FileSystemAccessMode::Read,
-    )];
-    entries.extend(write_roots.into_iter().map(|path| {
-        FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Write)
-    }));
+    let mut entries = vec![
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        ),
+        // A workspace under TMPDIR must not inherit the broader scratch write grant.
+        FileSystemSandboxEntry::new(
+            workspace.clone().into(),
+            FileSystemAccessMode::Read,
+        ),
+    ];
     for root in private_roots {
         let root = AbsolutePathBuf::from_absolute_path(&root)
             .context("AHEAD private agent path must be absolute")?;
@@ -905,6 +785,12 @@ pub(crate) fn permission_profile(
         ));
     }
     if !read_only {
+        for path in MANAGED_AGENT_GENERATED_OUTPUT_DIRECTORIES {
+            entries.push(FileSystemSandboxEntry::new(
+                scoped_absolute_path(path, workspace.as_path())?.into(),
+                FileSystemAccessMode::Write,
+            ));
+        }
         entries.push(FileSystemSandboxEntry::new(
             FileSystemPath::Special {
                 value: FileSystemSpecialPath::Tmpdir,
@@ -1683,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_agent_cannot_read_or_write_private_ahead_state() {
+    fn managed_agent_base_filesystem_policy_separates_source_from_build_outputs() {
         let workspace = tempfile::tempdir().expect("workspace");
         let root = workspace.path();
         let scope = AgentScope {
@@ -1694,7 +1580,16 @@ mod tests {
         let profile = permission_profile("agent", root, Some(&scope))
             .expect("managed permission profile");
         let files = profile.file_system_sandbox_policy();
-        assert!(files.can_write_path_with_cwd(&root.join("src/main.rs"), root));
+        assert!(files.can_read_path_with_cwd(&root.join("src/main.rs"), root));
+        assert!(!files.can_write_path_with_cwd(&root.join("src/main.rs"), root));
+        assert!(files.can_write_path_with_cwd(
+            &root.join("target/debug/incremental/output"),
+            root
+        ));
+        assert!(files.can_write_path_with_cwd(
+            &root.join("node_modules/.cache/output"),
+            root
+        ));
         assert!(
             !files.can_read_path_with_cwd(&root.join(".ahead/settings.toml"), root)
         );
@@ -1733,6 +1628,51 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_policy_excludes_temp_workspaces_without_disabling_scratch() {
+        for scratch_root in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+            let workspace = tempfile::tempdir_in(&scratch_root).expect("workspace");
+            let scratch = tempfile::tempdir_in(&scratch_root).expect("scratch");
+            let canonical_root = workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace");
+            for root in [workspace.path(), canonical_root.as_path()] {
+                let scope = AgentScope {
+                    workspace: root.to_path_buf(),
+                    allowed_paths: Vec::new(),
+                    read_only: false,
+                };
+                for mode in ["agent", "read-only"] {
+                    let profile = permission_profile(mode, root, Some(&scope))
+                        .expect("managed permission profile");
+                    let files = profile.file_system_sandbox_policy();
+                    assert!(
+                        !files.can_write_path_with_cwd(
+                            &root.join("src/main.rs"),
+                            root
+                        )
+                    );
+                    assert_eq!(
+                        files.can_write_path_with_cwd(
+                            &root.join("target/output"),
+                            root
+                        ),
+                        mode == "agent"
+                    );
+                    assert_eq!(
+                        files.can_write_path_with_cwd(
+                            &scratch.path().join("output"),
+                            root
+                        ),
+                        mode == "agent"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn title_is_short_and_deterministic() {
         assert_eq!(
@@ -1759,6 +1699,10 @@ mod tests {
         let files = profile.file_system_sandbox_policy();
         assert!(!files.can_write_path_with_cwd(
             Path::new("/workspace/src/lib.rs"),
+            Path::new("/workspace")
+        ));
+        assert!(!files.can_write_path_with_cwd(
+            Path::new("/workspace/target/debug/output"),
             Path::new("/workspace")
         ));
         assert!(!files.can_read_path_with_cwd(
@@ -2119,10 +2063,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mcp_servers_reject_inline_secrets_and_unwired_http_auth() {
+    fn workspace_mcp_servers_reject_unsupported_config() {
         for declaration in [
             "[mcp.servers.docs]\ncommand = \"docs-mcp\"\nenv = { TOKEN = \"secret-placeholder\" }\n",
             "[mcp.servers.docs]\nurl = \"https://example.test/mcp\"\n",
+            "[mcp.servers.docs]\ncommand = \"docs-mcp\"\nenv_vars = [{ name = \"TOKEN\", source = \"remote\" }]\n",
+            "[mcp.servers.docs]\ncommand = \"docs-mcp\"\nenvironment_id = \"remote\"\n",
+            "[mcp.servers.docs]\ncommand = \"docs-mcp\"\nname = \"Documentation\"\n",
         ] {
             let workspace = tempfile::tempdir().expect("workspace");
             let ahead = workspace.path().join(".ahead");

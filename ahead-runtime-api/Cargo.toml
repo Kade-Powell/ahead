@@ -1,0 +1,14 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "ahead-runtime-api"
+version.workspace = true
+
+[lib]
+name = "ahead_runtime_api"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+codex-utils-absolute-path = { workspace = true }

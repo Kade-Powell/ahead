@@ -19,6 +19,7 @@ This repository is **AHEAD, the editor**, a maintained fork of Lapce. The editor
 - [Artifact templates](../../defaults/artifacts/README.md): Built-in low-friction session, research, design, plan, verification and review records, with optional project overrides.
 - [HumanLayer workflow research](ahead-humanlayer-workflows.md): Dated source observations, adopted and rejected ideas, harness probe evidence, and decision provenance. It is not a second workflow specification.
 - [AHEAD Editor MVP](ahead-editor-mvp.md): The product specification and architecture proposal, including native collaboration, streaming voice, agent boundaries, contextual predictions, tracker integration, and delivery gates.
+- [Agent Cargo layout](../../ahead-agent/README.md): Editor-facing managed sessions and external ACP integration; the [retained engine](../../ahead-agent-engine/README.md) and [AHEAD skills](../../ahead-agent-skills/README.md) have separate ownership.
 - [Decision 0005: Zed source reuse and editor parity](decisions/0005-zed-editor-source-reuse.md): Accepted scope for direct Zed source reuse, editor parity, terminal/tasks, debugging, agent context, voice, and deliberate deferrals.
 - [Editor DTO draft](ahead-editor-contracts.ts): Self-contained, type-checkable editor contracts and protocol shapes for sessions, workflow state, anchors, voice events, predictions, and reviews.
 
@@ -33,7 +34,7 @@ Make sure to use **gpui-kit components whenever possible** (https://gpui-kit.com
 
 This repository preserves Lapce's Git ancestry and upstream source history. The active editor uses the renamed `ahead-app`, `ahead-core`, `ahead-proxy`, and `ahead-rpc` crates. AHEAD features are concentrated at explicit extension points:
 - **Session host & policy**: Governed workflow phases, explicit teaching tasks, assistance-by-default tasks, and Turso/libSQL session persistence.
-- **Built-in skills**: AHEAD-owned progressive-disclosure skills under `ahead-agent/skills/`; human-led teaching, diagnosis, research, design vocabulary, triage, prototyping and automated review.
+- **Built-in skills**: AHEAD-owned progressive-disclosure skills under `ahead-agent-skills/builtins/`; human-led teaching, diagnosis, research, design vocabulary, triage, prototyping and automated review.
 - **Workspace skills**: Discover user-provided `SKILL.md` files under project `.agents/skills/` and user `~/.agents/skills/` as extra instructions, subject to AHEAD policy and host authorization.
 - **Workspace instructions**: Managed chats load project `AGENTS.md` files from the discovered workspace root through the turn working directory. AHEAD also adds the applicable nested files for structured editor and attached-file targets; FIM receives the hierarchy for its active and relevant open-buffer targets. These are standard Markdown project instructions, not a required AHEAD-specific file. AHEAD records the loaded source paths and full-file hashes in Turso. External ACP agents retain their own instruction-discovery behavior; details and limits are in the [agent standards boundary](ahead-agent-standards.md).
 - **Agent skill architecture**: [AHEAD agent skills](ahead-agent-skills.md) is the canonical catalog, policy, discovery, provenance and implementation-status document.

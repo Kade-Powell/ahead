@@ -11,7 +11,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
 
-const LANGUAGE_EXTENSION_CATALOG_URL: &str = "https://api.zed.dev/extensions";
+const AHEAD_EXTENSION_CATALOG_URL: &str = "https://raw.githubusercontent.com/Kade-Powell/ahead/main/extensions/registry.json";
+const ZED_EXTENSION_CATALOG_URL: &str = "https://api.zed.dev/extensions";
 const MAX_EXTENSION_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -24,16 +25,35 @@ struct LanguageExtensionEntry {
     wasm_api_version: Option<String>,
     #[serde(default)]
     provides: Vec<String>,
+    #[serde(default)]
+    runtime_dependencies: Vec<String>,
+    #[serde(default)]
+    requested_capabilities: Vec<ExtensionRequestedCapability>,
     archive_sha256: Option<String>,
+    #[serde(default)]
+    download_url: Option<String>,
     #[serde(skip)]
     installed_version: Option<String>,
     #[serde(skip)]
     from_catalog: bool,
+    #[serde(skip)]
+    from_ahead_registry: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct ExtensionRequestedCapability {
+    kind: String,
+    package: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct LanguageExtensionCatalog {
     data: Vec<LanguageExtensionEntry>,
+}
+
+struct LanguageExtensionCatalogResult {
+    entries: Vec<LanguageExtensionEntry>,
+    warning: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,40 +74,94 @@ fn extension_download_url(entry: &LanguageExtensionEntry) -> Option<String> {
         && entry.version.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')
         });
-    (valid_id && valid_version).then(|| {
+    if !valid_id || !valid_version {
+        return None;
+    }
+    let url = entry.download_url.clone().unwrap_or_else(|| {
         format!(
             "https://api.zed.dev/extensions/{}/{}/download",
             entry.id, entry.version
         )
-    })
+    });
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    match (entry.from_ahead_registry, parsed.host_str(), parsed.path()) {
+        (true, Some("github.com"), path)
+            if path.starts_with("/Kade-Powell/ahead/releases/download/")
+                && path.ends_with(&format!(
+                    "/{}-{}.tar.gz",
+                    entry.id, entry.version
+                )) =>
+        {
+            Some(parsed.to_string())
+        }
+        (false, Some("api.zed.dev"), path)
+            if path
+                == format!(
+                    "/extensions/{}/{}/download",
+                    entry.id, entry.version
+                ) =>
+        {
+            Some(parsed.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn parse_language_extension_catalog(
     body: &[u8],
+) -> Result<Vec<LanguageExtensionEntry>, String> {
+    parse_language_extension_catalog_from(body, false)
+}
+
+fn parse_ahead_extension_catalog(
+    body: &[u8],
+) -> Result<Vec<LanguageExtensionEntry>, String> {
+    parse_language_extension_catalog_from(body, true)
+}
+
+fn parse_language_extension_catalog_from(
+    body: &[u8],
+    from_ahead_registry: bool,
 ) -> Result<Vec<LanguageExtensionEntry>, String> {
     let response: LanguageExtensionCatalog =
         serde_json::from_slice(body).map_err(|error| error.to_string())?;
     Ok(response
         .data
         .into_iter()
+        .map(|mut entry| {
+            entry.from_ahead_registry = from_ahead_registry;
+            entry
+        })
         .filter(|entry| {
             entry.schema_version.is_some_and(|version| version <= 1)
                 && semver::Version::parse(&entry.version).is_ok()
-                && (entry.provides.iter().any(|item| item == "icon-themes")
-                    || entry.provides.iter().any(|item| item == "language-servers"))
-                && (!entry.provides.iter().any(|item| item == "language-servers")
-                    || matches!(
-                        entry.wasm_api_version.as_deref(),
-                        Some("0.6.0" | "0.7.0" | "0.8.0")
-                    ))
+                && entry.provides.iter().any(|item| item == "language-servers")
+                && matches!(
+                    entry.wasm_api_version.as_deref(),
+                    Some("0.6.0" | "0.7.0" | "0.8.0")
+                )
                 && entry.archive_sha256.as_deref().is_none_or(|digest| {
                     digest.len() == 64
                         && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
+                && (!from_ahead_registry
+                    || (entry.archive_sha256.as_deref().is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }) && entry.download_url.is_some()))
                 && extension_download_url(entry).is_some()
         })
         .map(|mut entry| {
             entry.from_catalog = true;
+            entry.from_ahead_registry = from_ahead_registry;
             entry
         })
         .collect())
@@ -103,6 +177,29 @@ fn extension_update_available(entry: &LanguageExtensionEntry) -> bool {
             Some(available > installed)
         })
         .unwrap_or(false)
+}
+
+fn extension_runtime_summary(entry: &LanguageExtensionEntry) -> Option<String> {
+    let mut details = Vec::new();
+    if !entry.runtime_dependencies.is_empty() {
+        details.push(format!(
+            "Runtime: {}",
+            entry.runtime_dependencies.join(", ")
+        ));
+    }
+    if !entry.requested_capabilities.is_empty() {
+        let capabilities = entry
+            .requested_capabilities
+            .iter()
+            .map(|capability| match capability.package.as_deref() {
+                Some(package) => format!("{} ({package})", capability.kind),
+                None => capability.kind.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!("Host access: {capabilities}"));
+    }
+    (!details.is_empty()).then(|| details.join(" · "))
 }
 
 fn installed_language_extension(
@@ -132,15 +229,6 @@ fn installed_language_extension(
         .get("language_servers")
         .and_then(toml::Value::as_table)
         .is_some_and(|servers| !servers.is_empty());
-    let has_icon_themes = manifest
-        .get("icon_themes")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|themes| {
-            themes.iter().filter_map(toml::Value::as_str).any(|theme| {
-                ahead_extension_host::load_icon_theme(directory, Path::new(theme))
-                    .is_ok()
-            })
-        });
     let api_version = manifest
         .get("lib")
         .and_then(toml::Value::as_table)
@@ -150,10 +238,9 @@ fn installed_language_extension(
         .is_ok_and(|metadata| {
             metadata.is_file() && !metadata.file_type().is_symlink()
         });
-    if (!has_language_servers && !has_icon_themes)
-        || (has_language_servers
-            && (!has_wasm
-                || !matches!(api_version, Some("0.6.0" | "0.7.0" | "0.8.0"))))
+    if !has_language_servers
+        || !has_wasm
+        || !matches!(api_version, Some("0.6.0" | "0.7.0" | "0.8.0"))
     {
         return None;
     }
@@ -168,17 +255,14 @@ fn installed_language_extension(
             .map(str::to_string),
         schema_version: Some(1),
         wasm_api_version: api_version.map(str::to_string),
-        provides: [
-            has_language_servers.then_some("language-servers"),
-            has_icon_themes.then_some("icon-themes"),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::to_string)
-        .collect(),
+        provides: vec!["language-servers".to_string()],
+        runtime_dependencies: Vec::new(),
+        requested_capabilities: Vec::new(),
         archive_sha256: None,
+        download_url: None,
         installed_version: Some(version),
         from_catalog: false,
+        from_ahead_registry: false,
     };
     extension_download_url(&entry)?;
     Some(entry)
@@ -208,6 +292,18 @@ fn installed_language_extensions() -> Vec<LanguageExtensionEntry> {
         .unwrap_or_default()
 }
 
+fn merge_extension_catalog_sources(
+    mut zed_catalog: Vec<LanguageExtensionEntry>,
+    ahead_catalog: Vec<LanguageExtensionEntry>,
+) -> Vec<LanguageExtensionEntry> {
+    for entry in ahead_catalog {
+        if !zed_catalog.iter().any(|existing| existing.id == entry.id) {
+            zed_catalog.push(entry);
+        }
+    }
+    zed_catalog
+}
+
 fn merge_language_extension_catalog(
     mut online: Vec<LanguageExtensionEntry>,
     installed: Vec<LanguageExtensionEntry>,
@@ -222,50 +318,79 @@ fn merge_language_extension_catalog(
     online
 }
 
-fn language_extension_catalog_url(query: &str, provides: &str) -> reqwest::Url {
-    let mut url = reqwest::Url::parse(LANGUAGE_EXTENSION_CATALOG_URL)
-        .expect("fixed extension catalog URL is valid");
+fn extension_catalog_status(
+    candidate_count: usize,
+    installed_count: usize,
+    warning: Option<&str>,
+) -> String {
+    match warning {
+        Some(warning) if candidate_count > 0 => format!(
+            "{candidate_count} extension candidates · Some catalog sources failed: {warning}"
+        ),
+        Some(warning) if installed_count > 0 => format!(
+            "Showing {installed_count} installed extensions · online registry unavailable: {warning}"
+        ),
+        Some(warning) => format!("Extension catalog unavailable · {warning}"),
+        None => format!("{candidate_count} extension candidates"),
+    }
+}
+
+fn zed_extension_catalog_url(query: &str) -> reqwest::Url {
+    let mut url = reqwest::Url::parse(ZED_EXTENSION_CATALOG_URL)
+        .expect("fixed Zed catalog URL is valid");
     url.query_pairs_mut()
         .append_pair("max_schema_version", "1")
-        .append_pair("provides", provides);
+        .append_pair("provides", "language-servers");
     if !query.trim().is_empty() {
         url.query_pairs_mut().append_pair("filter", query.trim());
     }
     url
 }
 
+fn fetch_ahead_extension_catalog(
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<u8>, String> {
+    #[cfg(debug_assertions)]
+    {
+        let local_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extensions/registry.json");
+        match std::fs::read(local_path) {
+            Ok(body) => return Ok(body),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    fetch_extension_catalog(client, AHEAD_EXTENSION_CATALOG_URL)
+}
+
 fn fetch_language_extension_catalog(
     query: String,
-) -> Result<Vec<LanguageExtensionEntry>, String> {
+) -> Result<LanguageExtensionCatalogResult, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let mut online = Vec::new();
-    for provides in ["language-servers", "icon-themes"] {
-        let mut response = client
-            .get(language_extension_catalog_url(&query, provides))
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| error.to_string())?;
-        let mut body = Vec::new();
-        response
-            .by_ref()
-            .take(MAX_EXTENSION_CATALOG_BYTES + 1)
-            .read_to_end(&mut body)
-            .map_err(|error| error.to_string())?;
-        if body.len() as u64 > MAX_EXTENSION_CATALOG_BYTES {
-            return Err("extension catalog exceeds the 4 MiB limit".into());
+    let mut errors = Vec::new();
+    let zed_catalog =
+        fetch_extension_catalog(&client, zed_extension_catalog_url(&query).as_str())
+            .and_then(|body| parse_language_extension_catalog(&body));
+    let zed_catalog = match zed_catalog {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("Zed catalog: {error}"));
+            Vec::new()
         }
-        for entry in parse_language_extension_catalog(&body)? {
-            if !online
-                .iter()
-                .any(|existing: &LanguageExtensionEntry| existing.id == entry.id)
-            {
-                online.push(entry);
-            }
+    };
+    let ahead_catalog = match fetch_ahead_extension_catalog(&client)
+        .and_then(|body| parse_ahead_extension_catalog(&body))
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("AHEAD registry: {error}"));
+            Vec::new()
         }
-    }
+    };
+    let online = merge_extension_catalog_sources(zed_catalog, ahead_catalog);
     let installed = installed_language_extensions()
         .into_iter()
         .filter(|entry| {
@@ -278,7 +403,31 @@ fn fetch_language_extension_catalog(
                 .is_empty()
         })
         .collect();
-    Ok(merge_language_extension_catalog(online, installed))
+    Ok(LanguageExtensionCatalogResult {
+        entries: merge_language_extension_catalog(online, installed),
+        warning: (!errors.is_empty()).then(|| errors.join("; ")),
+    })
+}
+
+fn fetch_extension_catalog(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?;
+    let mut body = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_EXTENSION_CATALOG_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.len() as u64 > MAX_EXTENSION_CATALOG_BYTES {
+        return Err("extension catalog exceeds the 4 MiB limit".into());
+    }
+    Ok(body)
 }
 
 fn matching_language_extensions<'a>(
@@ -289,25 +438,49 @@ fn matching_language_extensions<'a>(
     let query = query.trim().to_lowercase();
     entries
         .iter()
+        .filter(|entry| language_extension_matches(entry, &query, filter))
+        .collect()
+}
+
+fn matching_catalog_extensions<'a>(
+    entries: &'a [LanguageExtensionEntry],
+    query: &str,
+    catalog_query: &str,
+    filter: LanguageExtensionFilter,
+) -> Vec<&'a LanguageExtensionEntry> {
+    let query = query.trim().to_lowercase();
+    let catalog_query = catalog_query.trim().to_lowercase();
+    entries
+        .iter()
         .filter(|entry| {
-            let matches_filter = match filter {
-                LanguageExtensionFilter::All => true,
-                LanguageExtensionFilter::Installed => {
-                    entry.installed_version.is_some()
-                }
-                LanguageExtensionFilter::NotInstalled => {
-                    entry.installed_version.is_none()
-                }
+            let entry_query = if entry.from_ahead_registry || catalog_query != query
+            {
+                query.as_str()
+            } else {
+                ""
             };
-            matches_filter
-                && (query.is_empty()
-                    || entry.name.to_lowercase().contains(&query)
-                    || entry.id.to_lowercase().contains(&query)
-                    || entry.description.as_deref().is_some_and(|description| {
-                        description.to_lowercase().contains(&query)
-                    }))
+            language_extension_matches(entry, entry_query, filter)
         })
         .collect()
+}
+
+fn language_extension_matches(
+    entry: &LanguageExtensionEntry,
+    query: &str,
+    filter: LanguageExtensionFilter,
+) -> bool {
+    let matches_filter = match filter {
+        LanguageExtensionFilter::All => true,
+        LanguageExtensionFilter::Installed => entry.installed_version.is_some(),
+        LanguageExtensionFilter::NotInstalled => entry.installed_version.is_none(),
+    };
+    matches_filter
+        && (query.is_empty()
+            || entry.name.to_lowercase().contains(query)
+            || entry.id.to_lowercase().contains(query)
+            || entry.description.as_deref().is_some_and(|description| {
+                description.to_lowercase().contains(query)
+            }))
 }
 
 fn builtin_setup_notices(
@@ -325,6 +498,7 @@ fn builtin_setup_notices(
                 || (!server.is_ready()
                     && server.message.as_deref().is_some_and(|message| {
                         message.starts_with("Installing from npm")
+                            || message.starts_with("Repairing AHEAD's cached")
                     })))
             .then_some((language, server))
         })
@@ -343,13 +517,13 @@ pub struct ExtensionsPanel {
     catalog_revision: u64,
     installing: Option<String>,
     install_failed: Option<String>,
+    uninstalling: Option<String>,
     status: SharedString,
     proxy: Arc<crate::proxy_client::ProxyClient>,
     _server_updates: Task<()>,
     panel_id: PanelId,
     tab_group: Option<WeakEntity<TabGroup>>,
     close_handler: Option<Rc<dyn Fn(PanelId, &mut Window, &mut App)>>,
-    icon_theme_changed_handler: Option<Rc<dyn Fn(&mut App)>>,
 }
 
 impl ExtensionsPanel {
@@ -410,6 +584,7 @@ impl ExtensionsPanel {
             catalog_revision: 0,
             installing: None,
             install_failed: None,
+            uninstalling: None,
             status: format!(
                 "{} installed extensions · Load catalog to browse online",
                 installed.len()
@@ -420,7 +595,6 @@ impl ExtensionsPanel {
             panel_id: PanelId::from(cx.entity_id()),
             tab_group: None,
             close_handler: None,
-            icon_theme_changed_handler: None,
         }
     }
 
@@ -444,10 +618,24 @@ impl ExtensionsPanel {
                 }
                 this.catalog_busy = false;
                 match result {
-                    Ok(entries) => {
-                        this.status =
-                            format!("{} extension candidates", entries.len()).into();
-                        this.catalog = entries;
+                    Ok(result) => {
+                        let candidate_count = result
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.from_catalog)
+                            .count();
+                        let installed_count = result
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.installed_version.is_some())
+                            .count();
+                        this.status = extension_catalog_status(
+                            candidate_count,
+                            installed_count,
+                            result.warning.as_deref(),
+                        )
+                        .into();
+                        this.catalog = result.entries;
                         this.catalog_loaded = true;
                         this.catalog_query = requested_query;
                     }
@@ -501,10 +689,6 @@ impl ExtensionsPanel {
         let extension_id = entry.id.clone();
         let version = entry.version.clone();
         let expected_sha256 = entry.archive_sha256.clone();
-        let icon_theme = entry.provides.iter().any(|item| item == "icon-themes");
-        let restart_language_servers =
-            entry.provides.iter().any(|item| item == "language-servers");
-
         self.installing = Some(extension_id.clone());
         self.install_failed = None;
         self.status = format!("Installing {extension_id}…").into();
@@ -515,7 +699,6 @@ impl ExtensionsPanel {
             extension_id.clone(),
             version.clone(),
             expected_sha256,
-            restart_language_servers,
             move |result| {
                 if let Err(error) = tx.try_send(result) {
                     eprintln!("Extension install result dropped: {error}");
@@ -523,10 +706,9 @@ impl ExtensionsPanel {
             },
         );
         cx.spawn(async move |this, cx| {
-            let result = rx
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err("AHEAD proxy connection closed".to_string()));
+            let result = rx.recv().await.unwrap_or_else(|_| {
+                Err("AHEAD proxy connection closed".to_string())
+            });
             let _ = this.update(cx, |this: &mut Self, cx| {
                 this.installing = None;
                 this.status = match result {
@@ -538,19 +720,10 @@ impl ExtensionsPanel {
                         {
                             entry.installed_version = Some(version);
                         }
-                        if icon_theme {
-                            match crate::icon_theme::select_icon_theme(&extension_id) {
-                                Ok(()) => {
-                                    if let Some(handler) = &this.icon_theme_changed_handler {
-                                        handler(cx);
-                                    }
-                                    format!("{extension_id} installed and in use").into()
-                                }
-                                Err(error) => format!("{extension_id} installed · icon theme could not be activated: {error}").into(),
-                            }
-                        } else {
-                            format!("{extension_id} installed · reloading language servers").into()
-                        }
+                        format!(
+                            "{extension_id} installed · reloading language servers"
+                        )
+                        .into()
                     }
                     Err(error) => {
                         this.install_failed = Some(extension_id.clone());
@@ -563,24 +736,65 @@ impl ExtensionsPanel {
         .detach();
     }
 
-    fn use_icon_theme(&mut self, extension_id: &str, cx: &mut Context<Self>) {
-        self.status = match crate::icon_theme::select_icon_theme(extension_id) {
-            Ok(()) => {
-                if let Some(handler) = &self.icon_theme_changed_handler {
-                    handler(cx);
-                }
-                format!("{extension_id} is now the file icon theme").into()
-            }
-            Err(error) => format!("Could not use icon theme: {error}").into(),
-        };
-        cx.notify();
-    }
-
-    pub fn set_icon_theme_changed_handler(
+    fn uninstall_language_extension(
         &mut self,
-        handler: impl Fn(&mut App) + 'static,
+        extension_id: &str,
+        cx: &mut Context<Self>,
     ) {
-        self.icon_theme_changed_handler = Some(Rc::new(handler));
+        if self.installing.is_some() || self.uninstalling.is_some() {
+            return;
+        }
+        if !self.catalog.iter().any(|entry| {
+            entry.id == extension_id && entry.installed_version.is_some()
+        }) {
+            self.status = "Select an installed extension to uninstall".into();
+            cx.notify();
+            return;
+        }
+
+        let extension_id = extension_id.to_string();
+        self.uninstalling = Some(extension_id.clone());
+        self.status = format!("Uninstalling {extension_id}…").into();
+        cx.notify();
+        let (tx, rx) = async_channel::bounded(1);
+        self.proxy
+            .uninstall_extension(extension_id.clone(), move |result| {
+                if let Err(error) = tx.try_send(result) {
+                    eprintln!("Extension uninstall result dropped: {error}");
+                }
+            });
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv().await.unwrap_or_else(|_| {
+                Err("AHEAD proxy connection closed".to_string())
+            });
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                this.uninstalling = None;
+                match result {
+                    Ok(()) => {
+                        this.catalog.retain(|entry| {
+                            entry.id != extension_id || entry.from_catalog
+                        });
+                        if let Some(entry) = this
+                            .catalog
+                            .iter_mut()
+                            .find(|entry| entry.id == extension_id)
+                        {
+                            entry.installed_version = None;
+                        }
+                        this.status = format!(
+                            "{extension_id} uninstalled · reloading language servers"
+                        )
+                        .into();
+                    }
+                    Err(error) => {
+                        this.status =
+                            format!("Extension uninstall failed · {error}").into();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_extension_content(
@@ -589,14 +803,12 @@ impl ExtensionsPanel {
     ) -> impl IntoElement {
         let text = cx.theme().sidebar_foreground;
         let extension_query = self.search_input.read(cx).value().to_string();
-        let local_query =
-            if self.catalog_loaded && self.catalog_query == extension_query.trim() {
-                ""
-            } else {
-                &extension_query
-            };
-        let matching_extensions =
-            matching_language_extensions(&self.catalog, local_query, self.filter);
+        let matching_extensions = matching_catalog_extensions(
+            &self.catalog,
+            &extension_query,
+            &self.catalog_query,
+            self.filter,
+        );
         let matching_count = matching_extensions.len();
         let visible_count = matching_count.min(self.visible_limit);
         let visible_extensions = matching_extensions
@@ -605,8 +817,8 @@ impl ExtensionsPanel {
             .cloned()
             .collect::<Vec<_>>();
         let extension_install_busy = self.installing.is_some();
+        let extension_uninstall_busy = self.uninstalling.is_some();
         let builtin_setup = builtin_setup_notices(self.proxy.lsp_servers());
-        let setup_failed = builtin_setup.iter().any(|(_, server)| server.is_error());
 
         v_flex()
             .w_full()
@@ -619,7 +831,7 @@ impl ExtensionsPanel {
                         div()
                             .text_size(px(11.))
                             .text_color(cx.theme().muted_foreground)
-                    .child("Browse language servers and icon themes from Zed's catalog. Language server compatibility remains a preview; a matching API version does not verify startup in AHEAD."),
+                    .child("Live catalog and downloads are served by Zed. AHEAD is independent and not endorsed by Zed; language-server extensions are compatibility candidates, not guaranteed to work."),
                     )
                     .when(!builtin_setup.is_empty(), |content| {
                         content.child(
@@ -634,11 +846,16 @@ impl ExtensionsPanel {
                                 )
                                 .children(builtin_setup.into_iter().map(|(language, server)| {
                                     let failed = server.is_error();
+                                    let repairing = server.message.as_deref().is_some_and(|message| {
+                                        message.starts_with("Repairing AHEAD's cached")
+                                    });
                                     let message = if failed {
                                         format!(
-                                            "{language} setup failed: {}",
+                                            "{language} language server failed: {}",
                                             server.message.as_deref().unwrap_or("Unknown error")
                                         )
+                                    } else if repairing {
+                                        format!("Repairing {language} language-server cache…")
                                     } else {
                                         format!("Installing {language} language server…")
                                     };
@@ -655,19 +872,20 @@ impl ExtensionsPanel {
                                         } else {
                                             cx.theme().muted_foreground
                                         }).child(message))
+                                        .when(failed, |row| {
+                                            let server_id = server.name.clone();
+                                            row.child(
+                                                Button::new(format!("repair_{}", server.name))
+                                                    .icon(IconName::RefreshCw)
+                                                    .label("Repair cache")
+                                                    .ghost()
+                                                    .tooltip("Reinstall the AHEAD-managed npm package; system-installed servers are left untouched")
+                                                    .on_click(cx.listener(move |this: &mut Self, _, _, _| {
+                                                        this.proxy.repair_language_server(server_id.clone());
+                                                    })),
+                                            )
+                                        })
                                 }))
-                                .when(setup_failed, |notices| {
-                                    notices.child(
-                                        Button::new("retry_builtin_language_support")
-                                            .icon(IconName::RefreshCw)
-                                            .label("Retry setup")
-                                            .ghost()
-                                            .tooltip("Restart language servers and retry built-in setup")
-                                            .on_click(cx.listener(|this: &mut Self, _, _, _| {
-                                                this.proxy.restart_language_servers();
-                                            })),
-                                    )
-                                }),
                         )
                     })
                     .child(
@@ -699,7 +917,7 @@ impl ExtensionsPanel {
                                     } else {
                                         "Refresh"
                                     })
-                                    .tooltip("Load extensions from Zed's catalog")
+                                    .tooltip("Load the live Zed catalog and AHEAD-reviewed additions")
                                     .disabled(self.catalog_busy)
                                     .on_click(cx.listener(|this: &mut Self, _, _, cx| {
                                         this.refresh_language_extensions(cx);
@@ -752,10 +970,12 @@ impl ExtensionsPanel {
                             .gap_2()
                             .children(visible_extensions.into_iter().map(|entry| {
                                 let extension_id = entry.id.clone();
+                                let runtime_summary = extension_runtime_summary(&entry);
                                 let update_available = extension_update_available(&entry);
                                 let installed = entry.installed_version.is_some() && !update_available;
-                                let icon_theme = entry.provides.iter().any(|item| item == "icon-themes");
-                                let active_icon_theme = icon_theme && crate::icon_theme::active_icon_theme_id() == extension_id;
+                                let can_uninstall = entry.installed_version.is_some();
+                                let uninstalling = self.uninstalling.as_deref()
+                                    == Some(extension_id.as_str());
                                 let action = if self.installing.as_deref()
                                     == Some(extension_id.as_str())
                                 {
@@ -764,8 +984,6 @@ impl ExtensionsPanel {
                                     == Some(extension_id.as_str())
                                 {
                                     "Retry"
-                                } else if installed && icon_theme {
-                                    if active_icon_theme { "In Use" } else { "Use" }
                                 } else if installed {
                                     "Installed"
                                 } else if update_available {
@@ -820,26 +1038,76 @@ impl ExtensionsPanel {
                                                     .child(format!(
                                                         "{} · {}",
                                                         if entry.from_catalog {
-                                                            "Zed catalog"
+                                                            if entry.from_ahead_registry {
+                                                                "AHEAD registry"
+                                                            } else {
+                                                                "Zed catalog"
+                                                            }
                                                         } else {
                                                             "Installed locally"
                                                         },
-                                                        if icon_theme { "Icon theme".to_string() } else { format!("API {} · compatibility candidate", entry.wasm_api_version.as_deref().unwrap_or("unknown")) }
+                                                        format!("API {} · compatibility candidate", entry.wasm_api_version.as_deref().unwrap_or("unknown"))
                                                     )),
+                                            )
+                                            .when_some(
+                                                runtime_summary,
+                                                |column, summary| {
+                                                    column.child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .text_size(px(10.))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(summary),
+                                                    )
+                                                },
                                             ),
                                     )
                                     .child(
-                                        Button::new(format!("install_extension_{extension_id}"))
-                                            .label(action)
-                                            .tooltip(format!("{action} {extension_id}"))
-                                            .disabled((installed && (!icon_theme || active_icon_theme)) || extension_install_busy)
-                                            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
-                                                if installed && icon_theme {
-                                                    this.use_icon_theme(&extension_id, cx);
-                                                } else {
-                                                    this.install_language_extension(&extension_id, cx);
-                                                }
-                                            })),
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(
+                                                Button::new(format!("install_extension_{extension_id}"))
+                                                    .label(action)
+                                                    .tooltip(format!("{action} {extension_id}"))
+                                                    .disabled(
+                                                        installed
+                                                            || extension_install_busy
+                                                            || extension_uninstall_busy,
+                                                    )
+                                                    .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                        this.install_language_extension(&extension_id, cx);
+                                                    })),
+                                            )
+                                            .when(can_uninstall, |actions| {
+                                                let uninstall_extension_id = entry.id.clone();
+                                                actions.child(
+                                                    Button::new(format!(
+                                                        "uninstall_extension_{}",
+                                                        uninstall_extension_id
+                                                    ))
+                                                    .label(if uninstalling {
+                                                        "Uninstalling…"
+                                                    } else {
+                                                        "Uninstall"
+                                                    })
+                                                    .tooltip(format!(
+                                                        "Uninstall {}",
+                                                        uninstall_extension_id
+                                                    ))
+                                                    .disabled(
+                                                        extension_install_busy
+                                                            || extension_uninstall_busy,
+                                                    )
+                                                    .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                                        this.uninstall_language_extension(
+                                                            &uninstall_extension_id,
+                                                            cx,
+                                                        );
+                                                    })),
+                                                )
+                                            }),
                                     )
                             })),
                     )
@@ -974,21 +1242,41 @@ impl Render for ExtensionsPanel {
 mod tests {
     use super::{
         ExtensionsPanel, LanguageExtensionFilter, builtin_setup_notices,
-        extension_download_url, extension_update_available,
-        installed_language_extensions_in, language_extension_catalog_url,
-        matching_language_extensions, merge_language_extension_catalog,
-        parse_language_extension_catalog,
+        extension_catalog_status, extension_download_url, extension_runtime_summary,
+        extension_update_available, fetch_ahead_extension_catalog,
+        installed_language_extensions_in, matching_catalog_extensions,
+        matching_language_extensions, merge_extension_catalog_sources,
+        merge_language_extension_catalog, parse_ahead_extension_catalog,
+        parse_language_extension_catalog, zed_extension_catalog_url,
     };
     use crate::proxy_client::LspServerStatus;
 
     #[test]
-    fn builtin_setup_notices_only_show_installing_and_failed_managed_servers() {
+    fn partial_catalog_failure_reports_available_candidates() {
+        assert_eq!(
+            extension_catalog_status(7, 2, Some("Zed catalog: timeout")),
+            "7 extension candidates · Some catalog sources failed: Zed catalog: timeout"
+        );
+        assert_eq!(
+            extension_catalog_status(0, 0, Some("AHEAD registry: DNS error")),
+            "Extension catalog unavailable · AHEAD registry: DNS error"
+        );
+    }
+
+    #[test]
+    fn builtin_setup_notices_show_installing_repairing_and_failed_managed_servers() {
         let statuses = [
             (
                 "basedpyright-langserver",
                 false,
                 false,
                 Some("Installing from npm into AHEAD's cache…"),
+            ),
+            (
+                "vtsls",
+                false,
+                false,
+                Some("Repairing AHEAD's cached language-server package…"),
             ),
             ("vtsls", false, true, Some("npm could not install vtsls")),
             ("rust-analyzer", false, true, Some("failed")),
@@ -1004,15 +1292,15 @@ mod tests {
         })
         .collect();
         let notices = builtin_setup_notices(statuses);
-        assert_eq!(notices.len(), 2);
+        assert_eq!(notices.len(), 3);
         assert_eq!(notices[0].0, "Python");
         assert_eq!(notices[1].0, "JavaScript / TypeScript");
+        assert_eq!(notices[2].0, "JavaScript / TypeScript");
     }
 
     #[test]
     fn gallery_search_uses_zeds_filtered_catalog_endpoint() {
-        let url =
-            language_extension_catalog_url("  C++ & Rust  ", "language-servers");
+        let url = zed_extension_catalog_url("  C++ & Rust  ");
         assert_eq!(url.path(), "/extensions");
         assert_eq!(
             url.query_pairs().collect::<Vec<_>>(),
@@ -1022,19 +1310,109 @@ mod tests {
                 ("filter".into(), "C++ & Rust".into()),
             ]
         );
+    }
+
+    #[test]
+    fn gallery_search_locally_filters_ahead_feed_and_keeps_zed_matches() {
+        let ahead_catalog = serde_json::json!({"data": [
+            {
+                "id": "html-ahead", "name": "HTML tools", "version": "1.0.0",
+                "description": "HTML support", "schema_version": 1,
+                "wasm_api_version": "0.7.0", "provides": ["language-servers"],
+                "archive_sha256": "a".repeat(64),
+                "download_url": "https://github.com/Kade-Powell/ahead/releases/download/v1/html-ahead-1.0.0.tar.gz"
+            },
+            {
+                "id": "rust-ahead", "name": "Rust tools", "version": "1.0.0",
+                "description": "Rust support", "schema_version": 1,
+                "wasm_api_version": "0.7.0", "provides": ["language-servers"],
+                "archive_sha256": "b".repeat(64),
+                "download_url": "https://github.com/Kade-Powell/ahead/releases/download/v1/rust-ahead-1.0.0.tar.gz"
+            }
+        ]});
+        let zed_catalog = serde_json::json!({"data": [{
+            "id": "html-preview", "name": "HTML preview", "version": "0.3.2",
+            "description": "HTML support", "schema_version": 1,
+            "wasm_api_version": "0.7.0", "provides": ["language-servers"]
+        }]});
+        let ahead_entries =
+            parse_ahead_extension_catalog(ahead_catalog.to_string().as_bytes())
+                .expect("AHEAD catalog");
+        let zed_entries =
+            parse_language_extension_catalog(zed_catalog.to_string().as_bytes())
+                .expect("Zed catalog");
+        let entries = merge_extension_catalog_sources(zed_entries, ahead_entries);
+
+        let html_matches = matching_catalog_extensions(
+            &entries,
+            "html",
+            "html",
+            LanguageExtensionFilter::All,
+        );
         assert_eq!(
-            language_extension_catalog_url(" ", "icon-themes")
-                .query_pairs()
+            html_matches
+                .iter()
+                .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                ("max_schema_version".into(), "1".into()),
-                ("provides".into(), "icon-themes".into()),
-            ]
+            ["html-preview", "html-ahead"]
+        );
+
+        let rust_matches = matching_catalog_extensions(
+            &entries,
+            "rust",
+            "html",
+            LanguageExtensionFilter::All,
+        );
+        assert_eq!(
+            rust_matches
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rust-ahead"]
         );
     }
 
     #[test]
-    fn catalog_accepts_icon_only_extension_without_wasm_api() {
+    fn live_zed_catalog_wins_duplicate_ids_and_ahead_feed_is_fallback() {
+        let zed_catalog = serde_json::json!({"data": [{
+            "id": "shared", "name": "Shared from Zed", "version": "2.0.0",
+            "schema_version": 1, "wasm_api_version": "0.7.0",
+            "provides": ["language-servers"]
+        }]});
+        let ahead_catalog = serde_json::json!({"data": [{
+            "id": "shared", "name": "Shared from AHEAD", "version": "1.0.0",
+            "schema_version": 1, "wasm_api_version": "0.7.0",
+            "provides": ["language-servers"], "archive_sha256": "a".repeat(64),
+            "download_url": "https://github.com/Kade-Powell/ahead/releases/download/v1/shared-1.0.0.tar.gz"
+        }, {
+            "id": "ahead-only", "name": "AHEAD only", "version": "1.0.0",
+            "schema_version": 1, "wasm_api_version": "0.7.0",
+            "provides": ["language-servers"], "archive_sha256": "b".repeat(64),
+            "download_url": "https://github.com/Kade-Powell/ahead/releases/download/v1/ahead-only-1.0.0.tar.gz"
+        }]});
+        let zed_entries =
+            parse_language_extension_catalog(zed_catalog.to_string().as_bytes())
+                .expect("Zed catalog");
+        let ahead_entries =
+            parse_ahead_extension_catalog(ahead_catalog.to_string().as_bytes())
+                .expect("AHEAD catalog");
+
+        let merged =
+            merge_extension_catalog_sources(zed_entries, ahead_entries.clone());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "Shared from Zed");
+        assert_eq!(merged[0].version, "2.0.0");
+        assert!(!merged[0].from_ahead_registry);
+        assert_eq!(merged[1].id, "ahead-only");
+        assert!(merged[1].from_ahead_registry);
+
+        let fallback = merge_extension_catalog_sources(Vec::new(), ahead_entries);
+        assert_eq!(fallback.len(), 2);
+        assert!(fallback.iter().all(|entry| entry.from_ahead_registry));
+    }
+
+    #[test]
+    fn catalog_filters_out_icon_theme_only_extensions() {
         let catalog = serde_json::json!({"data": [{
             "id": "material-icon-theme", "name": "Material Icon Theme", "version": "1.3.1",
             "schema_version": 1, "wasm_api_version": null, "provides": ["icon-themes"]
@@ -1042,29 +1420,7 @@ mod tests {
         let entries =
             parse_language_extension_catalog(catalog.to_string().as_bytes())
                 .expect("catalog");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "material-icon-theme");
-        assert_eq!(entries[0].wasm_api_version, None);
-    }
-
-    #[test]
-    fn installed_icon_only_extension_appears_offline() {
-        let root = tempfile::tempdir().expect("extension root");
-        let extension = root.path().join("material-icon-theme");
-        std::fs::create_dir_all(extension.join("icon_themes")).expect("themes");
-        std::fs::create_dir(extension.join("icons")).expect("icons");
-        std::fs::write(extension.join("extension.toml"),
-            "id = 'material-icon-theme'\nname = 'Material Icon Theme'\nversion = '1.3.1'\nschema_version = 1\nicon_themes = ['icon_themes/material.json']\n[lib]\n")
-            .expect("manifest");
-        std::fs::write(extension.join("icon_themes/material.json"),
-            r#"{"themes":[{"name":"Material Icon Theme","file_icons":{"rust":{"path":"./icons/rust.svg"}},"file_suffixes":{"rs":"rust"}}]}"#)
-            .expect("theme");
-        std::fs::write(extension.join("icons/rust.svg"), "<svg/>").expect("icon");
-        let installed = installed_language_extensions_in(root.path());
-        assert_eq!(installed.len(), 1);
-        assert_eq!(installed[0].id, "material-icon-theme");
-        assert_eq!(installed[0].provides, ["icon-themes"]);
-        assert_eq!(installed[0].wasm_api_version, None);
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -1072,6 +1428,7 @@ mod tests {
         let catalog = serde_json::json!({
             "data": [
                 {"id":"html","name":"HTML","version":"0.3.2","description":"HTML support", "schema_version":1,"wasm_api_version":"0.7.0","provides":["languages","language-servers"],"archive_sha256":"a".repeat(64)},
+                {"id":"no-digest","name":"No digest","version":"1.0.0","schema_version":1,"wasm_api_version":"0.7.0","provides":["language-servers"]},
                 {"id":"future","name":"Future","version":"1.0.0","schema_version":1,"wasm_api_version":"0.9.0","provides":["language-servers"]},
                 {"id":"theme","name":"Theme","version":"1.0.0","schema_version":1,"wasm_api_version":"0.7.0","provides":["themes"]},
                 {"id":"bad-version","name":"Bad version","version":"not-semver","schema_version":1,"wasm_api_version":"0.7.0","provides":["language-servers"]},
@@ -1083,13 +1440,15 @@ mod tests {
         let entries =
             parse_language_extension_catalog(catalog.to_string().as_bytes())
                 .expect("catalog parses");
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "html");
         assert_eq!(
             entries[0].archive_sha256.as_deref(),
             Some("a".repeat(64).as_str())
         );
         assert!(entries[0].from_catalog);
+        assert_eq!(entries[1].id, "no-digest");
+        assert!(entries[1].archive_sha256.is_none());
         let mut installed_entry = entries[0].clone();
         installed_entry.installed_version = Some("0.4.0".into());
         assert!(!extension_update_available(&installed_entry));
@@ -1144,7 +1503,7 @@ mod tests {
                 LanguageExtensionFilter::NotInstalled
             )
             .len(),
-            1
+            2
         );
         let mut installed = entries.clone();
         installed[0].installed_version = Some(installed[0].version.clone());
@@ -1157,14 +1516,115 @@ mod tests {
             .len(),
             1
         );
-        assert!(
-            matching_language_extensions(
-                &installed,
-                "",
-                LanguageExtensionFilter::NotInstalled
-            )
-            .is_empty()
+        let not_installed = matching_language_extensions(
+            &installed,
+            "",
+            LanguageExtensionFilter::NotInstalled,
         );
+        assert_eq!(not_installed.len(), 1);
+        assert_eq!(not_installed[0].id, "no-digest");
+    }
+
+    #[test]
+    fn ahead_registry_requires_a_hashed_asset_from_its_github_releases() {
+        let catalog = serde_json::json!({
+            "data": [
+                {
+                    "id": "html",
+                    "name": "HTML",
+                    "version": "0.3.2",
+                    "schema_version": 1,
+                    "wasm_api_version": "0.7.0",
+                    "provides": ["language-servers"],
+                    "archive_sha256": "a".repeat(64),
+                    "download_url": "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz"
+                },
+                {
+                    "id": "missing-hash",
+                    "name": "Missing hash",
+                    "version": "1.0.0",
+                    "schema_version": 1,
+                    "wasm_api_version": "0.7.0",
+                    "provides": ["language-servers"],
+                    "download_url": "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/missing-hash-1.0.0.tar.gz"
+                },
+                {
+                    "id": "other-host",
+                    "name": "Other host",
+                    "version": "1.0.0",
+                    "schema_version": 1,
+                    "wasm_api_version": "0.7.0",
+                    "provides": ["language-servers"],
+                    "archive_sha256": "b".repeat(64),
+                    "download_url": "https://example.com/other-host-1.0.0.tar.gz"
+                },
+                {
+                    "id": "zed-release",
+                    "name": "Zed release",
+                    "version": "1.0.0",
+                    "schema_version": 1,
+                    "wasm_api_version": "0.7.0",
+                    "provides": ["language-servers"],
+                    "archive_sha256": "c".repeat(64),
+                    "download_url": "https://github.com/zed-industries/extensions/releases/download/v1/zed-release-1.0.0.tar.gz"
+                }
+            ]
+        });
+        let entries = parse_ahead_extension_catalog(catalog.to_string().as_bytes())
+            .expect("AHEAD registry parses");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "html");
+        assert!(entries[0].from_ahead_registry);
+        assert_eq!(
+            extension_download_url(&entries[0]).as_deref(),
+            Some(
+                "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz"
+            )
+        );
+    }
+
+    #[test]
+    fn ahead_registry_keeps_extension_runtime_and_host_requirements_visible() {
+        let catalog = serde_json::json!({
+            "data": [{
+                "id": "html",
+                "name": "HTML",
+                "version": "0.3.2",
+                "schema_version": 1,
+                "wasm_api_version": "0.7.0",
+                "provides": ["language-servers"],
+                "archive_sha256": "a".repeat(64),
+                "download_url": "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz",
+                "runtime_dependencies": ["@zed-industries/vscode-langservers-extracted"],
+                "requested_capabilities": [{
+                    "kind": "npm:install",
+                    "package": "@zed-industries/vscode-langservers-extracted"
+                }]
+            }]
+        });
+        let entries = parse_ahead_extension_catalog(catalog.to_string().as_bytes())
+            .expect("AHEAD registry parses");
+
+        assert_eq!(
+            extension_runtime_summary(&entries[0]).as_deref(),
+            Some(
+                "Runtime: @zed-industries/vscode-langservers-extracted · Host access: npm:install (@zed-industries/vscode-langservers-extracted)"
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn checked_in_ahead_registry_is_a_valid_empty_feed_until_published() {
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .expect("catalog client");
+        let body =
+            fetch_ahead_extension_catalog(&client).expect("local checkout registry");
+        let entries = parse_ahead_extension_catalog(&body)
+            .expect("checked-in registry format");
+        assert!(entries.is_empty());
     }
 
     #[gpui_kit::test]
@@ -1239,12 +1699,16 @@ mod tests {
         assert_eq!(extension_id, "html");
         rpc.handle_response(retry_id, Ok(ProxyResponse::Success {}));
         cx.run_until_parked();
-        assert!(matches!(
-            rpc.rx().try_recv(),
-            Ok(ProxyRpc::Notification(
-                ProxyNotification::RestartLanguageServers {}
-            ))
-        ));
+        let ProxyRpc::Notification(ProxyNotification::RestartLanguageServers {
+            extension_id,
+        }) = rpc
+            .rx()
+            .try_recv()
+            .expect("restart after successful install")
+        else {
+            panic!("expected extension-scoped restart");
+        };
+        assert_eq!(extension_id.as_deref(), Some("html"));
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.catalog[0].installed_version.as_deref(), Some("0.3.2"));
             assert!(panel.installing.is_none());
@@ -1257,6 +1721,57 @@ mod tests {
         assert!(
             rpc.rx().try_recv().is_err(),
             "an older catalog version must not downgrade an installed extension"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn gallery_uninstall_updates_installed_state_through_the_proxy(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_owned(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            ExtensionsPanel::new(proxy.clone(), window, cx)
+        });
+        let catalog = serde_json::json!({"data": [{
+            "id": "html", "name": "HTML", "version": "0.3.2",
+            "schema_version": 1, "wasm_api_version": "0.7.0",
+            "provides": ["language-servers"]
+        }]});
+        let mut entries =
+            parse_language_extension_catalog(catalog.to_string().as_bytes())
+                .expect("catalog");
+        entries[0].installed_version = Some("0.3.2".into());
+        panel.update(cx, |panel, cx| {
+            panel.catalog = entries;
+            panel.uninstall_language_extension("html", cx);
+        });
+
+        let rpc = proxy.rpc_for_test();
+        let ProxyRpc::Request(
+            request_id,
+            ProxyRequest::UninstallLanguageExtension { extension_id },
+        ) = rpc.rx().try_recv().expect("uninstall request")
+        else {
+            panic!("expected language-extension uninstall request");
+        };
+        assert_eq!(extension_id, "html");
+        rpc.handle_response(request_id, Ok(ProxyResponse::Success {}));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert!(panel.uninstalling.is_none());
+            assert_eq!(panel.catalog[0].installed_version, None);
+            assert!(panel.status.contains("html uninstalled"));
+        });
+        assert!(
+            rpc.rx().try_recv().is_err(),
+            "the catalog owns the server restart; the app must not send a duplicate"
         );
     }
 

@@ -68,7 +68,7 @@ mod tests {
     fn scenario_03_in_flight_prediction_invalidation_on_keystroke() -> Result<()> {
         let req = PredictionRequest {
             request_id: "pred-stale".into(),
-            session_id: "sess-1".into(),
+            session_id: Some("sess-1".into()),
             path: "src/lib.rs".into(),
             cursor: DisplayPosition { line: 10, col: 5 },
             prefix: "let x = ".into(),
@@ -348,7 +348,7 @@ mod tests {
 
         let req = PredictionRequest {
             request_id: "pred-14".into(),
-            session_id: "sess-14".into(),
+            session_id: Some("sess-14".into()),
             path: "src/stream.rs".into(),
             cursor: DisplayPosition { line: 20, col: 0 },
             prefix: "pub fn ".into(),

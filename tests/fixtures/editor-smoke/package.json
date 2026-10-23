@@ -4,6 +4,6 @@
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "test": "node --test typescript/math.test.ts javascript/math.test.mjs"
+    "test": "node --test typescript/math.test.ts javascript/math.test.mjs javascript/model-catalog.test.mjs"
   }
 }

@@ -8,10 +8,10 @@
 use anyhow::{Context, Result, bail};
 use parking_lot::{Mutex, RwLock};
 use sha2::Digest;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::fs::OpenOptions;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -19,20 +19,22 @@ use std::{
 use uuid::Uuid;
 
 use ahead_rpc::ahead::{
-    AheadRequest, AssistanceMode, CodeAnchor, CodeComment, ConversationMessage,
-    DisplayRange, GithubIssueRef, HarnessKind, Id, LearningArc, LearningRecord,
-    MemoryDocument, MemoryExcerpt, MemoryScope, MemoryWriteResult, Participant,
+    AHEAD_ACTOR_ID, AheadRequest, AssistanceMode, CodeAnchor, CodeComment,
+    ConversationMessage, DisplayRange, GithubIssueRef, HarnessKind, Id, LearningArc,
+    LearningRecord, MemoryDocument, MemoryExcerpt, MemoryScope, MemoryWriteResult,
+    Participant, PredictionAcceptance, PredictionBinding, PredictionModelContext,
     PredictionRequest, PredictionResult, RepoPath, Revision, SessionExportBundle,
     SessionLifecycle, SessionListItem, SessionParticipantRecord,
     SessionPolicySnapshot, SessionRole, SessionTask, SessionView, TaskIntent,
-    VoiceControl, WorkKind, WorkSession, WorkflowPhase, WorkflowState,
-    mentioned_participants,
+    VoiceCallLease, VoiceControl, VoiceTranscriptSpeaker, VoiceTranscriptTiming,
+    WorkKind, WorkSession, WorkflowPhase, WorkflowState, mentioned_participants,
 };
 
 use super::{
     auth::GitHubAuthManager,
     prediction::{
-        OpenBufferContext, PredictionEngine, PredictionProviderConfig,
+        MAX_PREDICTION_CONTEXT_BYTES, OpenBufferContext, PredictionContextSnapshot,
+        PredictionEngine, PredictionProviderConfig, PredictionSessionVersion,
         PredictionWorkContext,
     },
     store::SessionStore,
@@ -60,7 +62,6 @@ pub struct AheadSessionHost {
     store: Arc<RwLock<SessionStore>>,
     auth: Arc<RwLock<GitHubAuthManager>>,
     active_sessions: Arc<RwLock<HashMap<Id, SessionView>>>,
-    active_session_id: Arc<RwLock<Option<Id>>>,
     active_voice_sessions: Arc<RwLock<HashMap<Id, Arc<VoiceSession>>>>,
     workspace_participants: Arc<RwLock<Vec<SessionParticipantRecord>>>,
     shared_terminal: Arc<RwLock<HashMap<Id, String>>>,
@@ -70,6 +71,8 @@ pub struct AheadSessionHost {
     memory_write_lock: Mutex<()>,
     recovery_owner: Mutex<Option<super::recovery::RecoveryOwner>>,
     notification_sink: RwLock<Option<ahead_agent::HarnessNotificationSink>>,
+    prediction_contexts:
+        Mutex<VecDeque<(Id, PredictionSessionVersion, bool, String)>>,
     /// Streams conversations through the built-in runtime or an external ACP agent.
     harness: HarnessController,
 }
@@ -97,7 +100,6 @@ impl AheadSessionHost {
             store,
             auth: Arc::new(RwLock::new(auth_mgr)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
-            active_session_id: Arc::new(RwLock::new(None)),
             active_voice_sessions: Arc::new(RwLock::new(HashMap::new())),
             workspace_participants: Arc::new(RwLock::new(vec![host_record])),
             shared_terminal: Arc::new(RwLock::new(HashMap::new())),
@@ -107,6 +109,7 @@ impl AheadSessionHost {
             memory_write_lock: Mutex::new(()),
             recovery_owner: Mutex::new(None),
             notification_sink: RwLock::new(None),
+            prediction_contexts: Mutex::new(VecDeque::new()),
             harness,
         }
     }
@@ -121,6 +124,7 @@ impl AheadSessionHost {
         let mut owner = self.recovery_owner.lock();
         *owner = None;
         *self.workspace.write() = Some(workspace.clone());
+        self.prediction_contexts.lock().clear();
         drop(owner);
         self.harness.set_workspace(workspace);
     }
@@ -175,6 +179,16 @@ impl AheadSessionHost {
     pub fn set_notification_sink(&self, sink: ahead_agent::HarnessNotificationSink) {
         *self.notification_sink.write() = Some(sink.clone());
         self.harness.set_notification_sink(sink);
+    }
+
+    fn notify_prediction_context_changed(&self, session_id: &str) {
+        if let Some(sink) = self.notification_sink.read().clone() {
+            sink(
+                ahead_rpc::ahead::AheadNotification::PredictionContextChanged {
+                    session_id: Some(session_id.to_string()),
+                },
+            );
+        }
     }
 
     /// Shared streamed-harness controller (tests and status reporting).
@@ -385,6 +399,28 @@ impl AheadSessionHost {
                 quote,
                 "human",
             )?)?),
+            AheadRequest::RecordPredictionAcceptance {
+                session_id,
+                path,
+                range,
+                binding,
+                model_context,
+                accepted_text_sha256,
+            } => Ok(serde_json::to_value(self.record_prediction_acceptance(
+                &session_id,
+                path,
+                range,
+                binding,
+                model_context,
+                accepted_text_sha256,
+            )?)?),
+            AheadRequest::ListPredictionAcceptances { session_id } => {
+                self.get_session(&session_id)?
+                    .context("Session not found")?;
+                Ok(serde_json::to_value(
+                    self.store.read().list_prediction_acceptances(&session_id)?,
+                )?)
+            }
             AheadRequest::CreateCodeComment {
                 session_id,
                 path,
@@ -403,6 +439,7 @@ impl AheadSessionHost {
             AheadRequest::ListCodeComments { session_id } => {
                 self.get_session(&session_id)?
                     .context("Session not found")?;
+                self.ensure_code_comments_supported(&session_id)?;
                 Ok(serde_json::to_value(
                     self.store.read().list_code_comments(&session_id)?,
                 )?)
@@ -438,6 +475,30 @@ impl AheadSessionHost {
                 &self.auth.read().get_active_user(None).login,
                 None,
             )?)?),
+            AheadRequest::RecordVoiceTranscript {
+                session_id,
+                call_id,
+                segment_id,
+                speaker,
+                start_ms,
+                end_ms,
+                content,
+            } => Ok(serde_json::to_value(self.record_voice_transcript(
+                &session_id,
+                &call_id,
+                &segment_id,
+                speaker,
+                start_ms,
+                end_ms,
+                &content,
+            )?)?),
+            AheadRequest::StartVoiceCall { session_id } => {
+                Ok(serde_json::to_value(self.start_voice_call(&session_id)?)?)
+            }
+            AheadRequest::EndVoiceCall { lease } => {
+                let ended = self.end_voice_call(&lease)?;
+                Ok(serde_json::json!({ "ended": ended }))
+            }
             AheadRequest::PublishSharedTerminal {
                 session_id,
                 content,
@@ -470,6 +531,29 @@ impl AheadSessionHost {
             AheadRequest::AgentSessionPrepare { session_id } => {
                 self.harness.prepare_external_session(&session_id)?;
                 Ok(serde_json::json!({ "ready": true }))
+            }
+            AheadRequest::AgentAuthenticate {
+                session_id,
+                method_id,
+            } => {
+                self.harness
+                    .authenticate_external_agent(&session_id, &method_id)?;
+                Ok(serde_json::json!({ "authenticated": true }))
+            }
+            AheadRequest::AgentTerminalAuthLaunch {
+                session_id,
+                method_id,
+            } => Ok(serde_json::to_value(
+                self.harness
+                    .external_agent_terminal_auth_launch(&session_id, &method_id)?,
+            )?),
+            AheadRequest::AgentTerminalAuthComplete {
+                session_id,
+                succeeded,
+            } => {
+                self.harness
+                    .complete_external_agent_terminal_auth(&session_id, succeeded)?;
+                Ok(serde_json::json!({ "reconnected": succeeded }))
             }
             AheadRequest::AgentConfigOptionSet {
                 session_id,
@@ -570,6 +654,15 @@ impl AheadSessionHost {
                 model.as_deref(),
                 model_provider.as_deref(),
             )?)?),
+            AheadRequest::AgentReasoningOptions {
+                session_id,
+                model,
+                model_provider,
+            } => Ok(serde_json::to_value(self.harness.reasoning_options(
+                &session_id,
+                &model,
+                model_provider.as_deref(),
+            )?)?),
             AheadRequest::WorkItemCreate { session_id, title } => {
                 let owner = self.auth.read().get_active_user(None).login;
                 let item = self.store.read().create_work_item(
@@ -577,6 +670,7 @@ impl AheadSessionHost {
                     &title,
                     &owner,
                 )?;
+                self.notify_prediction_context_changed(&session_id);
                 Ok(serde_json::to_value(item)?)
             }
             AheadRequest::WorkItemList { session_id } => {
@@ -586,6 +680,7 @@ impl AheadSessionHost {
             AheadRequest::WorkItemSetStatus { item_id, status } => {
                 let item =
                     self.store.read().set_work_item_status(&item_id, status)?;
+                self.notify_prediction_context_changed(&item.session_id);
                 Ok(serde_json::to_value(item)?)
             }
             AheadRequest::WorkItemNote {
@@ -603,6 +698,7 @@ impl AheadSessionHost {
                     &body_markdown,
                     &owner,
                 )?;
+                self.notify_prediction_context_changed(&session_id);
                 Ok(serde_json::to_value(event)?)
             }
             AheadRequest::WorkItemClose {
@@ -612,6 +708,7 @@ impl AheadSessionHost {
                 follow_ups_json,
                 skip_reason,
             } => {
+                let session_id = self.work_item_session(&item_id)?;
                 let closeout = self.store.read().close_work_item(
                     &item_id,
                     &summary_markdown,
@@ -619,6 +716,9 @@ impl AheadSessionHost {
                     follow_ups_json,
                     skip_reason,
                 )?;
+                if let Some(session_id) = session_id {
+                    self.notify_prediction_context_changed(&session_id);
+                }
                 Ok(serde_json::to_value(closeout)?)
             }
             AheadRequest::ConversationSummarize {
@@ -633,6 +733,7 @@ impl AheadSessionHost {
                     &summary_markdown,
                     &message_id_range,
                 )?;
+                self.notify_prediction_context_changed(&session_id);
                 Ok(serde_json::to_value(summary)?)
             }
             AheadRequest::ConversationList { session_id } => {
@@ -728,8 +829,18 @@ impl AheadSessionHost {
                 let res = self.request_prediction(request, &[])?;
                 Ok(serde_json::to_value(res)?)
             }
-            AheadRequest::VoiceControl { control } => {
-                self.handle_voice_control(control)?;
+            AheadRequest::VoiceControl {
+                session_id,
+                call_id,
+                connection_epoch,
+                control,
+            } => {
+                self.handle_voice_control(
+                    &session_id,
+                    &call_id,
+                    connection_epoch,
+                    control,
+                )?;
                 Ok(serde_json::json!({ "status": "ok" }))
             }
             AheadRequest::GitHubAuthStart => {
@@ -1071,7 +1182,6 @@ impl AheadSessionHost {
             let mut active = self.active_sessions.write();
             active.insert(session_id.clone(), view.clone());
         }
-        *self.active_session_id.write() = Some(session_id.clone());
 
         // Initialize voice session
         {
@@ -1224,20 +1334,12 @@ impl AheadSessionHost {
 
     fn sync_memory_source(&self, scope: MemoryScope) -> Result<Option<String>> {
         let path = self.memory_source_path(scope, false)?;
-        #[cfg(unix)]
-        {
-            let content = match Self::open_memory_directory(&path, false)? {
-                Some(directory) => Self::read_memory_content_at(&directory, &path)?,
-                None => None,
-            };
-            return self.store.read().sync_memory_content(
-                scope.as_str(),
-                &path,
-                content.as_deref(),
-            );
-        }
-        #[cfg(not(unix))]
-        self.store.read().sync_memory_file(scope.as_str(), &path)
+        let content = Self::read_memory_content(&path)?;
+        self.store.read().sync_memory_content(
+            scope.as_str(),
+            &path,
+            content.as_deref(),
+        )
     }
 
     pub(crate) fn sync_memory_sources(&self) {
@@ -1325,7 +1427,7 @@ impl AheadSessionHost {
             .parent()
             .context("AHEAD memory directory has no AHEAD root")?;
         match std::fs::symlink_metadata(ahead_directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if Self::memory_metadata_is_reparse(&metadata) => {
                 bail!("AHEAD memory directory must not resolve through a symlink");
             }
             Ok(metadata) if !metadata.is_dir() => {
@@ -1338,7 +1440,7 @@ impl AheadSessionHost {
             }
         }
         match std::fs::symlink_metadata(parent) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if Self::memory_metadata_is_reparse(&metadata) => {
                 bail!("AHEAD memory directory must not resolve through a symlink");
             }
             Ok(metadata) if !metadata.is_dir() => {
@@ -1364,7 +1466,10 @@ impl AheadSessionHost {
                 Self::open_memory_directory(&source.path, true)?
                     .context("AHEAD memory directory was not created")?;
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            Self::open_memory_directory(&source.path, true)?
+                .context("AHEAD memory directory was not created")?;
+            #[cfg(not(any(unix, windows)))]
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create memory directory {}", parent.display())
             })?;
@@ -1391,7 +1496,7 @@ impl AheadSessionHost {
             bail!("AHEAD memory directory must not resolve through a symlink");
         }
         match std::fs::symlink_metadata(&source.path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if Self::memory_metadata_is_reparse(&metadata) => {
                 bail!("AHEAD memory file must not be a symlink");
             }
             Ok(metadata) if !metadata.is_file() => {
@@ -1467,24 +1572,39 @@ impl AheadSessionHost {
         Ok(Some(directory))
     }
 
-    fn read_memory_content(path: &std::path::Path) -> Result<String> {
+    #[cfg(windows)]
+    fn open_memory_directory(
+        path: &Path,
+        create: bool,
+    ) -> Result<Option<std::fs::File>> {
+        super::memory_fs::open_memory_directory(path, create).context(
+            "Failed to open AHEAD memory directory without following reparse points",
+        )
+    }
+
+    fn read_memory_content(path: &std::path::Path) -> Result<Option<String>> {
         #[cfg(unix)]
         {
             let Some(directory) = Self::open_memory_directory(path, false)? else {
-                return Ok(String::new());
+                return Ok(None);
             };
-            return Ok(
-                Self::read_memory_content_at(&directory, path)?.unwrap_or_default()
-            );
+            Self::read_memory_content_at(&directory, path)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let Some(directory) = Self::open_memory_directory(path, false)? else {
+                return Ok(None);
+            };
+            Self::read_memory_content_at(&directory, path)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let mut options = OpenOptions::new();
             options.read(true);
             let mut file = match options.open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(String::new());
+                    return Ok(None);
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -1495,7 +1615,7 @@ impl AheadSessionHost {
                     });
                 }
             };
-            Self::read_open_memory_content(&mut file, path)
+            Self::read_open_memory_content(&mut file, path).map(Some)
         }
     }
 
@@ -1521,16 +1641,29 @@ impl AheadSessionHost {
         Self::read_open_memory_content(&mut file, path).map(Some)
     }
 
+    #[cfg(windows)]
+    fn read_memory_content_at(
+        directory: &std::fs::File,
+        path: &Path,
+    ) -> Result<Option<String>> {
+        let Some(mut file) = super::memory_fs::open_existing_memory_file(directory)?
+        else {
+            return Ok(None);
+        };
+        Self::read_open_memory_content(&mut file, path).map(Some)
+    }
+
     fn read_open_memory_content(
         file: &mut std::fs::File,
         path: &std::path::Path,
     ) -> Result<String> {
-        if !file.metadata()?.file_type().is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || Self::memory_metadata_is_reparse(&metadata) {
             bail!("AHEAD memory source must be a regular file");
         }
         const MEMORY_DOCUMENT_LIMIT: u64 =
             ahead_rpc::ahead::MEMORY_DOCUMENT_MAX_BYTES as u64;
-        if file.metadata()?.len() > MEMORY_DOCUMENT_LIMIT {
+        if metadata.len() > MEMORY_DOCUMENT_LIMIT {
             bail!("AHEAD memory document exceeds the 32 KiB limit");
         }
         file.seek(SeekFrom::Start(0)).with_context(|| {
@@ -1548,10 +1681,24 @@ impl AheadSessionHost {
         Ok(content)
     }
 
+    fn memory_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        }
+        #[cfg(not(windows))]
+        {
+            metadata.file_type().is_symlink()
+        }
+    }
+
     fn read_memory(&self, scope: MemoryScope) -> Result<MemoryDocument> {
         let _read_guard = self.memory_write_lock.lock();
         let path = self.memory_source_path(scope, false)?;
-        let content = Self::read_memory_content(&path)?;
+        let content = Self::read_memory_content(&path)?.unwrap_or_default();
         let source = match scope {
             MemoryScope::Project => ".ahead/memories/MEMORY.md",
             MemoryScope::User => "~/.ahead/memories/MEMORY.md",
@@ -1590,11 +1737,17 @@ impl AheadSessionHost {
         #[cfg(unix)]
         let directory = Self::open_memory_directory(&path, true)?
             .context("AHEAD memory directory is unavailable")?;
+        #[cfg(windows)]
+        let directory = Self::open_memory_directory(&path, true)?
+            .context("AHEAD memory directory is unavailable")?;
         #[cfg(unix)]
         let current =
             Self::read_memory_content_at(&directory, &path)?.unwrap_or_default();
-        #[cfg(not(unix))]
-        let current = Self::read_memory_content(&path)?;
+        #[cfg(windows)]
+        let current =
+            Self::read_memory_content_at(&directory, &path)?.unwrap_or_default();
+        #[cfg(not(any(unix, windows)))]
+        let current = Self::read_memory_content(&path)?.unwrap_or_default();
         let current_sha256 =
             format!("{:x}", sha2::Sha256::digest(current.as_bytes()));
         if current_sha256 != expected_sha256 {
@@ -1605,7 +1758,9 @@ impl AheadSessionHost {
 
         #[cfg(unix)]
         Self::replace_memory_content_at(&directory, content)?;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        Self::replace_memory_content_at(&directory, content)?;
+        #[cfg(not(any(unix, windows)))]
         {
             let parent = path
                 .parent()
@@ -1652,14 +1807,11 @@ impl AheadSessionHost {
             }
         }
 
-        #[cfg(unix)]
         let index = self.store.read().sync_memory_content(
             scope.as_str(),
             &path,
             Some(content),
         );
-        #[cfg(not(unix))]
-        let index = self.store.read().sync_memory_file(scope.as_str(), &path);
         let (indexed, warning) = match index {
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
@@ -1704,6 +1856,15 @@ impl AheadSessionHost {
         result.context("Failed to replace AHEAD memory file")
     }
 
+    #[cfg(windows)]
+    fn replace_memory_content_at(
+        directory: &std::fs::File,
+        content: &str,
+    ) -> Result<()> {
+        super::memory_fs::replace_memory_file(directory, content.as_bytes())
+            .context("Failed to replace AHEAD memory file")
+    }
+
     fn write_memory(
         &self,
         scope: MemoryScope,
@@ -1738,9 +1899,14 @@ impl AheadSessionHost {
         #[cfg(unix)]
         let directory = Self::open_memory_directory(&path, true)?
             .context("AHEAD memory directory is unavailable")?;
+        #[cfg(windows)]
+        let directory = Self::open_memory_directory(&path, true)?
+            .context("AHEAD memory directory is unavailable")?;
         #[cfg(unix)]
         let mut file = Self::open_memory_append_at(&directory)?;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let mut file = Self::open_memory_append_at(&directory)?;
+        #[cfg(not(any(unix, windows)))]
         let mut file = {
             let mut options = OpenOptions::new();
             options.read(true).create(true).append(true);
@@ -1748,19 +1914,13 @@ impl AheadSessionHost {
                 format!("Failed to open AHEAD memory file {}", path.display())
             })?
         };
-        if !file.metadata()?.file_type().is_file() {
-            bail!("AHEAD memory source must be a regular file");
-        }
         let existing = Self::read_open_memory_content(&mut file, &path)?;
         if existing.lines().any(|line| line.trim() == marker) {
-            #[cfg(unix)]
             let index = self.store.read().sync_memory_content(
                 scope.as_str(),
                 &path,
                 Some(&existing),
             );
-            #[cfg(not(unix))]
-            let index = self.store.read().sync_memory_file(scope.as_str(), &path);
             let (indexed, warning) = match index {
                 Ok(_) => (true, None),
                 Err(error) => (false, Some(error.to_string())),
@@ -1789,14 +1949,11 @@ impl AheadSessionHost {
             format!("Failed to sync AHEAD memory file {}", path.display())
         })?;
 
-        #[cfg(unix)]
         let index = self.store.read().sync_memory_content(
             scope.as_str(),
             &path,
             Some(&format!("{existing}{entry}")),
         );
-        #[cfg(not(unix))]
-        let index = self.store.read().sync_memory_file(scope.as_str(), &path);
         let (indexed, warning) = match index {
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
@@ -1829,10 +1986,17 @@ impl AheadSessionHost {
         Ok(file)
     }
 
+    #[cfg(windows)]
+    fn open_memory_append_at(directory: &std::fs::File) -> Result<std::fs::File> {
+        super::memory_fs::open_memory_append(directory)
+            .context("Failed to open AHEAD memory file")
+    }
+
     pub fn archive_session(&self, session_id: &str) -> Result<()> {
         self.store.read().archive_session(session_id)?;
         self.active_sessions.write().remove(session_id);
         self.shared_terminal.write().remove(session_id);
+        self.notify_prediction_context_changed(session_id);
         Ok(())
     }
 
@@ -1859,7 +2023,8 @@ impl AheadSessionHost {
             view.workflow = next_wf.clone();
             view.session.revision += 1;
         }
-
+        drop(active);
+        self.notify_prediction_context_changed(session_id);
         Ok(next_wf)
     }
 
@@ -1896,6 +2061,67 @@ impl AheadSessionHost {
         store.record_edit_anchor(&anchor)?;
 
         Ok(anchor)
+    }
+
+    fn record_prediction_acceptance(
+        &self,
+        session_id: &str,
+        path: RepoPath,
+        range: DisplayRange,
+        binding: PredictionBinding,
+        model_context: Option<PredictionModelContext>,
+        accepted_text_sha256: String,
+    ) -> Result<PredictionAcceptance> {
+        let actor_id = self.comment_actor(session_id)?;
+        let path = self.canonical_workspace_file_path(&path)?;
+        anyhow::ensure!(binding.version == 1, "Unsupported prediction binding");
+        anyhow::ensure!(
+            !binding.request_id.is_empty() && binding.request_id.len() <= 128,
+            "Invalid prediction request ID"
+        );
+        anyhow::ensure!(
+            binding.context_sha256.len() == 64
+                && binding
+                    .context_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "Invalid prediction context hash"
+        );
+        anyhow::ensure!(
+            (range.start.line, range.start.col) < (range.end.line, range.end.col),
+            "Prediction acceptance must cover inserted text"
+        );
+        anyhow::ensure!(
+            accepted_text_sha256.len() == 64
+                && accepted_text_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "Invalid accepted-text hash"
+        );
+        if let Some(model) = &model_context {
+            anyhow::ensure!(
+                !model.provider_id.trim().is_empty()
+                    && model.provider_id.len() <= 256
+                    && !model.model_id.trim().is_empty()
+                    && model.model_id.len() <= 256,
+                "Invalid prediction model identity"
+            );
+        }
+        let acceptance = PredictionAcceptance {
+            id: format!("prediction-acceptance:{}", binding.request_id),
+            session_id: session_id.to_string(),
+            actor_id,
+            path,
+            range,
+            binding,
+            model_context,
+            accepted_text_sha256,
+            accepted_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.store
+            .read()
+            .record_prediction_acceptance(&acceptance)?;
+        Ok(acceptance)
     }
 
     pub fn create_code_comment(
@@ -2071,6 +2297,7 @@ impl AheadSessionHost {
                 .any(|session| session.id == session_id),
             "Cannot comment on an archived session"
         );
+        self.ensure_code_comments_supported(session_id)?;
         let actor_id = self.auth.read().get_active_user(None).login;
         anyhow::ensure!(
             view.participants.iter().any(|record| matches!(
@@ -2079,6 +2306,18 @@ impl AheadSessionHost {
             "Only a session participant can comment"
         );
         Ok(actor_id)
+    }
+
+    fn ensure_code_comments_supported(&self, session_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .store
+                .read()
+                .get_harness_binding(session_id)?
+                .is_some_and(|(_, backend)| backend.starts_with("external-agent")),
+            "Code comments are only available in managed AHEAD sessions"
+        );
+        Ok(())
     }
 
     pub(crate) fn shareable_session(&self, session_id: &str) -> Result<SessionView> {
@@ -2289,8 +2528,104 @@ impl AheadSessionHost {
             content: content.to_string(),
             status: "complete".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            voice_timing: None,
         };
         store.upsert_message(&message)?;
+        drop(store);
+        if let Some(sink) = self.notification_sink.read().clone() {
+            sink(
+                ahead_rpc::ahead::AheadNotification::ConversationMessageAdded {
+                    message: message.clone(),
+                },
+            );
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn record_voice_transcript(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        segment_id: &str,
+        speaker: VoiceTranscriptSpeaker,
+        start_ms: u64,
+        end_ms: u64,
+        content: &str,
+    ) -> Result<ConversationMessage> {
+        anyhow::ensure!(!content.trim().is_empty(), "Voice transcript is empty");
+        anyhow::ensure!(content.len() <= 64 * 1024, "Voice transcript is too long");
+        anyhow::ensure!(
+            !call_id.trim().is_empty()
+                && call_id.len() <= 256
+                && call_id.chars().all(|character| !character.is_control()),
+            "Voice call ID is invalid"
+        );
+        let segment_id = Uuid::parse_str(segment_id)
+            .context("Voice transcript segment ID is invalid")?
+            .to_string();
+        anyhow::ensure!(
+            start_ms <= end_ms
+                && i64::try_from(start_ms).is_ok()
+                && i64::try_from(end_ms).is_ok(),
+            "Voice transcript timing is invalid"
+        );
+
+        let view = self.managed_voice_session(session_id)?;
+        anyhow::ensure!(
+            matches!(view.session.lifecycle, SessionLifecycle::Active),
+            "Voice transcripts require an active session"
+        );
+        let actor_id = self.auth.read().get_active_user(None).login;
+
+        let (role, message_actor) = match speaker {
+            VoiceTranscriptSpeaker::Human => ("human", actor_id),
+            VoiceTranscriptSpeaker::Agent => ("agent", AHEAD_ACTOR_ID.to_string()),
+        };
+        let message_id = format!("voice-{segment_id}");
+        let store = self.store.write();
+        if let Some(existing) = store.get_message(&message_id)? {
+            anyhow::ensure!(
+                existing.session_id == session_id
+                    && existing.turn_id == format!("voice:{call_id}")
+                    && existing.role == role
+                    && existing.actor_id == message_actor
+                    && existing.content == content,
+                "Voice transcript segment ID was reused with different content"
+            );
+            let expected_timing = VoiceTranscriptTiming {
+                call_id: call_id.to_string(),
+                start_ms,
+                end_ms,
+            };
+            if let Some(existing_timing) = existing.voice_timing.as_ref() {
+                anyhow::ensure!(
+                    existing_timing == &expected_timing,
+                    "Voice transcript segment ID was reused with different timing"
+                );
+                return Ok(existing);
+            }
+            let mut existing = existing;
+            existing.voice_timing = Some(expected_timing);
+            store.upsert_voice_transcript(&existing)?;
+            return Ok(existing);
+        }
+        let message = ConversationMessage {
+            id: message_id,
+            session_id: session_id.to_string(),
+            turn_id: format!("voice:{call_id}"),
+            sequence: store.next_message_sequence(session_id)?,
+            role: role.to_string(),
+            actor_id: message_actor,
+            content: content.to_string(),
+            status: "complete".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            voice_timing: Some(VoiceTranscriptTiming {
+                call_id: call_id.to_string(),
+                start_ms,
+                end_ms,
+            }),
+        };
+        store.upsert_voice_transcript(&message)?;
         drop(store);
         if let Some(sink) = self.notification_sink.read().clone() {
             sink(
@@ -2320,6 +2655,8 @@ impl AheadSessionHost {
                 external_agent_id: None,
                 model: None,
                 model_provider: None,
+                model_context_window: None,
+                reasoning_effort: None,
                 user_message: content,
                 session_context: String::new(),
                 context: ahead_rpc::ahead::TurnEditorContext {
@@ -2362,40 +2699,270 @@ impl AheadSessionHost {
 
     fn durable_prediction_context(&self, session_id: &str) -> Result<String> {
         let store = self.store.read();
-        let items = store.list_work_items(session_id)?;
+        Self::build_durable_prediction_context(&store, session_id, usize::MAX)
+    }
+
+    fn cached_prediction_context(
+        &self,
+        session_id: &str,
+    ) -> Result<(PredictionSessionVersion, String)> {
+        self.cached_prediction_context_with_plan_compaction(session_id, false)
+    }
+
+    fn cached_compacted_prediction_context(
+        &self,
+        session_id: &str,
+    ) -> Result<(PredictionSessionVersion, String)> {
+        self.cached_prediction_context_with_plan_compaction(session_id, true)
+    }
+
+    fn can_compact_prediction_context(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            let message = cause.to_string();
+            message.contains("Prediction durable work exceeds its context budget")
+                || message.contains("Prediction summary exceeds its context budget")
+        })
+    }
+
+    fn cached_prediction_context_with_plan_compaction(
+        &self,
+        session_id: &str,
+        compact_plan: bool,
+    ) -> Result<(PredictionSessionVersion, String)> {
+        let store = self.store.read();
+        let version = PredictionSessionVersion {
+            format: 1,
+            revision: store.prediction_context_revision(session_id)?,
+        };
+        let mut contexts = self.prediction_contexts.lock();
+        if let Some(index) =
+            contexts
+                .iter()
+                .position(|(id, cached_version, compact, _)| {
+                    id == session_id
+                        && cached_version == &version
+                        && compact == &compact_plan
+                })
+        {
+            let entry = contexts
+                .remove(index)
+                .context("prediction cache entry disappeared")?;
+            let context = entry.3.clone();
+            contexts.push_back(entry);
+            return Ok((version, context));
+        }
+        let context = if compact_plan {
+            Self::build_compacted_prediction_context(
+                &store,
+                session_id,
+                MAX_PREDICTION_CONTEXT_BYTES,
+            )?
+        } else {
+            match Self::build_durable_prediction_context(
+                &store,
+                session_id,
+                MAX_PREDICTION_CONTEXT_BYTES,
+            ) {
+                Ok(context) => context,
+                Err(error) if Self::can_compact_prediction_context(&error) => {
+                    Self::build_compacted_prediction_context(
+                        &store,
+                        session_id,
+                        MAX_PREDICTION_CONTEXT_BYTES,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        anyhow::ensure!(
+            store.prediction_context_revision(session_id)? == version.revision,
+            "prediction session context changed during assembly"
+        );
+        contexts.retain(|(id, cached_version, compact, _)| {
+            id != session_id
+                || (cached_version == &version && compact != &compact_plan)
+        });
+        if contexts.len() >= 8 {
+            contexts.pop_front();
+        }
+        contexts.push_back((
+            session_id.to_string(),
+            version,
+            compact_plan,
+            context.clone(),
+        ));
+        Ok((version, context))
+    }
+
+    fn build_durable_prediction_context(
+        store: &SessionStore,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<String> {
+        Self::build_prediction_context_with_plan_mode(
+            store, session_id, max_bytes, false,
+        )
+    }
+
+    fn build_compacted_prediction_context(
+        store: &SessionStore,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<String> {
+        Self::build_prediction_context_with_plan_mode(
+            store, session_id, max_bytes, true,
+        )
+    }
+
+    fn build_prediction_context_with_plan_mode(
+        store: &SessionStore,
+        session_id: &str,
+        max_bytes: usize,
+        compact_plan: bool,
+    ) -> Result<String> {
+        let items = store.prediction_work_items(session_id, max_bytes)?;
         // Summaries have no audience metadata yet; after a human-only message,
         // do not trust them as model-facing context.
-        let summaries = if store.has_human_only_messages(session_id)? {
-            Vec::new()
-        } else {
-            store.list_conversation_summaries(session_id)?
-        };
+        let include_summaries = !store.has_human_only_messages(session_id)?;
         let mut context = String::new();
         if !items.is_empty() {
             context.push_str("Work items:\n");
             for item in &items {
                 context.push_str(&format!("- [{:?}] {}\n", item.status, item.title));
-                for event in store.list_work_item_events(&item.id, Some(4))? {
+                anyhow::ensure!(
+                    context.len() <= max_bytes,
+                    "Prediction durable work exceeds its context budget; no required context was dropped"
+                );
+                let remaining_bytes = max_bytes.saturating_sub(context.len());
+                let events = if compact_plan {
+                    store.compact_prediction_work_item_events(
+                        &item.id,
+                        remaining_bytes,
+                    )?
+                } else {
+                    store.prediction_work_item_events(&item.id, remaining_bytes)?
+                };
+                for event in events {
                     context.push_str(&format!(
                         "  - {}: {}\n",
                         event.kind, event.body_markdown
                     ));
+                    anyhow::ensure!(
+                        context.len() <= max_bytes,
+                        "Prediction durable work exceeds its context budget; no required context was dropped"
+                    );
+                }
+                anyhow::ensure!(
+                    context.len() <= max_bytes,
+                    "Prediction durable work exceeds its context budget; no required context was dropped"
+                );
+            }
+        }
+        let plan_budget = max_bytes.saturating_sub(context.len());
+        let plan = if compact_plan {
+            None
+        } else {
+            store.prediction_agent_plan(session_id, plan_budget)?
+        };
+        match plan {
+            Some(plan) if !plan.is_empty() => {
+                context.push_str("Current agent plan:\n");
+                for step in plan {
+                    context.push_str(&format!(
+                        "- [{}] {}\n",
+                        step.status, step.content
+                    ));
+                    anyhow::ensure!(
+                        context.len() <= max_bytes,
+                        "Prediction plan exceeds its context budget; no required context was dropped"
+                    );
+                }
+            }
+            Some(_) => {}
+            None => {
+                let summary =
+                    store.prediction_agent_plan_summary(session_id, plan_budget)?;
+                if !summary.status_counts.is_empty() {
+                    context.push_str(
+                        "Current agent plan (faithful compact summary):\n",
+                    );
+                    let has_active_steps = !summary.active_steps.is_empty();
+                    let total = summary.status_counts.values().sum::<usize>();
+                    let progress = summary
+                        .status_counts
+                        .iter()
+                        .map(|(status, count)| format!("{status}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    context.push_str(&format!(
+                        "Progress: {progress} ({total} steps).\n"
+                    ));
+                    if let Some(opening_step) = summary.opening_step {
+                        let label = if !has_active_steps
+                            && opening_step.status.eq_ignore_ascii_case("pending")
+                        {
+                            "Next plan step"
+                        } else {
+                            "Plan opening"
+                        };
+                        context.push_str(&format!(
+                            "{label}: [{}] {}\n",
+                            opening_step.status, opening_step.content
+                        ));
+                    }
+                    for step in summary.active_steps {
+                        context.push_str(&format!(
+                            "Active plan step: [{}; priority {}] {}\n",
+                            step.status, step.priority, step.content
+                        ));
+                    }
+                    if let Some(step) = summary.next_step {
+                        context.push_str(&format!(
+                            "Next plan step: [{}; priority {}] {}\n",
+                            step.status, step.priority, step.content
+                        ));
+                    }
+                    anyhow::ensure!(
+                        context.len() <= max_bytes,
+                        "Prediction plan summary exceeds its context budget; no required context was dropped"
+                    );
                 }
             }
         }
+        let summaries = if include_summaries {
+            store.prediction_summaries(
+                session_id,
+                max_bytes.saturating_sub(context.len()),
+            )?
+        } else {
+            Vec::new()
+        };
         if !summaries.is_empty() {
             context.push_str("Conversation summaries:\n");
-            for summary in summaries.iter().rev().take(4).rev() {
+            for summary in summaries {
                 context.push_str(&format!(
                     "- {}: {}\n",
                     summary.phase, summary.summary_markdown
                 ));
+                anyhow::ensure!(
+                    context.len() <= max_bytes,
+                    "Prediction summary exceeds its context budget; no required context was dropped"
+                );
             }
         }
         Ok(context)
     }
 
     fn durable_session_context(&self, view: &SessionView) -> Result<String> {
+        let durable = self.durable_prediction_context(&view.session.id)?;
+        self.session_context_with_work(view, &durable)
+    }
+
+    fn session_context_with_work(
+        &self,
+        view: &SessionView,
+        durable: &str,
+    ) -> Result<String> {
         let mut context = format!(
             "Session: {}\nTask intent: {}\nWork kind: {}\nPhase: {} ({}, visit {})\n",
             view.session.title,
@@ -2418,10 +2985,9 @@ impl AheadSessionHost {
             "Durable documentation root: {}/. When creating lasting documents, use topic-named Markdown under research/, design/, plans/, verification/, or reviews/. Session history expires 30 days after archive.\n",
             self.documentation_root()?,
         ));
-        let durable = self.durable_prediction_context(&view.session.id)?;
         if !durable.is_empty() {
             context.push_str("Durable work state:\n");
-            context.push_str(&durable);
+            context.push_str(durable);
         }
         Ok(context)
     }
@@ -2507,31 +3073,67 @@ impl AheadSessionHost {
 
     pub fn request_prediction(
         &self,
-        mut request: PredictionRequest,
+        request: PredictionRequest,
         open_buffers: &[OpenBufferContext],
     ) -> Result<PredictionResult> {
-        let requested_session = request.session_id.clone();
-        let session_id =
-            if requested_session.is_empty() || requested_session == "active" {
-                self.active_session_id.read().clone()
-            } else {
-                Some(requested_session.clone())
-            };
-        let view = session_id
+        let snapshot = self.prepare_prediction(request.clone(), open_buffers)?;
+        let result = PredictionEngine::predict(
+            &snapshot.work,
+            &snapshot.request,
+            open_buffers,
+            &snapshot.provider,
+        )?;
+        anyhow::ensure!(
+            self.prepare_prediction(request, open_buffers)? == snapshot,
+            "prediction context changed during inference"
+        );
+        Ok(result)
+    }
+
+    pub(crate) fn prepare_prediction(
+        &self,
+        request: PredictionRequest,
+        open_buffers: &[OpenBufferContext],
+    ) -> Result<PredictionContextSnapshot> {
+        self.prepare_prediction_with_model_context(request, open_buffers, None)
+    }
+
+    pub(crate) fn prepare_prediction_with_model_context(
+        &self,
+        mut request: PredictionRequest,
+        open_buffers: &[OpenBufferContext],
+        model_context: Option<&PredictionModelContext>,
+    ) -> Result<PredictionContextSnapshot> {
+        if let Some(session_id) = request.session_id.as_deref() {
+            anyhow::ensure!(
+                !self.store.read().is_session_archived(session_id)?,
+                "Archived sessions cannot provide prediction context"
+            );
+        }
+        let view = request
+            .session_id
             .as_deref()
             .map(|id| self.get_session(id))
             .transpose()?
             .flatten();
-        if !requested_session.is_empty()
-            && requested_session != "active"
-            && view.is_none()
-        {
+        if request.session_id.is_some() && view.is_none() {
             bail!("Session not found");
         }
 
-        let work = if let Some(view) = view {
-            let caller_context = std::mem::take(&mut request.work_context);
-            request.work_context = self.durable_session_context(&view)?;
+        let mut session_context_version = None;
+        let mut caller_context = String::new();
+        let work = if let Some(view) = view.as_ref() {
+            caller_context = std::mem::take(&mut request.work_context);
+            let (version, durable) =
+                match self.cached_prediction_context(&view.session.id) {
+                    Ok(context) => context,
+                    Err(error) if Self::can_compact_prediction_context(&error) => {
+                        self.cached_compacted_prediction_context(&view.session.id)?
+                    }
+                    Err(error) => return Err(error),
+                };
+            session_context_version = Some(version);
+            request.work_context = self.session_context_with_work(view, &durable)?;
             if !caller_context.trim().is_empty() {
                 request.work_context.push('\n');
                 request.work_context.push_str(&caller_context);
@@ -2543,6 +3145,7 @@ impl AheadSessionHost {
                 primary_issue: view
                     .workflow
                     .primary_work_item
+                    .as_ref()
                     .map(|i| format!("#{} {}", i.issue_number, i.title)),
                 active_invariants: Vec::new(),
             }
@@ -2571,14 +3174,58 @@ impl AheadSessionHost {
                 &target_paths,
             )?;
         if !instruction_context.is_empty() {
-            request.work_context = if request.work_context.trim().is_empty() {
-                instruction_context
-            } else {
-                format!("{instruction_context}\n\n{}", request.work_context)
-            };
+            request.work_context =
+                format!("{instruction_context}\n\n{}", request.work_context);
         }
-        let provider = PredictionProviderConfig::from_workspace(Some(&workspace))?;
-        PredictionEngine::predict(&work, &request, open_buffers, &provider)
+        let provider = PredictionProviderConfig::from_workspace_for_model(
+            Some(&workspace),
+            model_context,
+        )?;
+        if let Some(view) = view.as_ref() {
+            if !PredictionEngine::model_fim_context_fits(
+                &work,
+                &request,
+                open_buffers,
+                &provider,
+                model_context,
+            )? {
+                let (_, durable) =
+                    self.cached_compacted_prediction_context(&view.session.id)?;
+                let mut compacted_work_context =
+                    self.session_context_with_work(view, &durable)?;
+                if !caller_context.trim().is_empty() {
+                    compacted_work_context.push('\n');
+                    compacted_work_context.push_str(&caller_context);
+                }
+                if !instruction_context.is_empty() {
+                    compacted_work_context =
+                        format!("{instruction_context}\n\n{compacted_work_context}");
+                }
+                let mut compacted_request = request.clone();
+                compacted_request.work_context = compacted_work_context;
+                anyhow::ensure!(
+                    PredictionEngine::model_fim_context_fits(
+                        &work,
+                        &compacted_request,
+                        open_buffers,
+                        &provider,
+                        model_context,
+                    )?,
+                    "Required FIM context exceeds the selected model's safe input budget after faithfully compacting the active plan; no session constraints or instructions were dropped"
+                );
+                request = compacted_request;
+            }
+        }
+        PredictionEngine::validate_context_budget(&work, &request, open_buffers)?;
+        Ok(PredictionContextSnapshot {
+            work,
+            request,
+            provider,
+            model_context: model_context.cloned(),
+            session: view,
+            session_context_version,
+            workspace,
+        })
     }
 
     fn start_streamed_agent_turn(
@@ -2595,6 +3242,7 @@ impl AheadSessionHost {
         actor_id: &str,
         github_id: Option<u64>,
     ) -> Result<Id> {
+        dto.context.discard_stale_selection();
         let view = if github_id.is_some() {
             self.shareable_session(&dto.session_id)?
         } else {
@@ -2652,11 +3300,11 @@ impl AheadSessionHost {
                 }
             }
         }
-        if dto.session_context.trim().is_empty() {
-            dto.session_context = self.durable_session_context(&view)?;
-        }
-        dto.session_context
-            .push_str(&format!("\nCurrent message author: @{actor_id}"));
+        dto.session_context = compose_session_context(
+            self.durable_session_context(&view)?,
+            &dto.session_context,
+        );
+        set_current_message_author(&mut dto.session_context, actor_id);
         self.harness.start_turn(dto, actor_id)
     }
 
@@ -2819,18 +3467,158 @@ impl AheadSessionHost {
         Ok(latest)
     }
 
-    pub fn handle_voice_control(&self, control: VoiceControl) -> Result<()> {
-        let voice_map = self.active_voice_sessions.read();
-        for voice in voice_map.values() {
-            voice.handle_control(control.clone());
-        }
+    fn managed_voice_session(&self, session_id: &str) -> Result<SessionView> {
+        let view = self.get_session(session_id)?.context("Session not found")?;
+        let actor_id = self.auth.read().get_active_user(None).login;
+        anyhow::ensure!(
+            actor_id.eq_ignore_ascii_case(&view.session.owner_id)
+                && view.participants.iter().any(|record| {
+                    record.role == SessionRole::Owner
+                        && matches!(
+                            &record.participant,
+                            Participant::Human { id, .. }
+                                if id.eq_ignore_ascii_case(&actor_id)
+                        )
+                }),
+            "Only the session owner can manage voice calls"
+        );
+        anyhow::ensure!(
+            !self
+                .store
+                .read()
+                .get_harness_binding(session_id)?
+                .is_some_and(|(_, backend)| backend.starts_with("external-agent")),
+            "Voice calls require a managed AHEAD session"
+        );
+        Ok(view)
+    }
+
+    pub(crate) fn start_voice_call(
+        &self,
+        session_id: &str,
+    ) -> Result<VoiceCallLease> {
+        let view = self.managed_voice_session(session_id)?;
+        anyhow::ensure!(
+            matches!(view.session.lifecycle, SessionLifecycle::Active),
+            "Voice calls require an active session"
+        );
+        let voice = {
+            let mut voice_map = self.active_voice_sessions.write();
+            Arc::clone(voice_map.entry(session_id.to_string()).or_insert_with(
+                || {
+                    Arc::new(VoiceSession::new(
+                        session_id.to_string(),
+                        format!("voice-{session_id}"),
+                    ))
+                },
+            ))
+        };
+        voice.start_call()
+    }
+
+    pub(crate) fn end_voice_call(&self, lease: &VoiceCallLease) -> Result<bool> {
+        let _view = self.managed_voice_session(&lease.session_id)?;
+        let voice = self
+            .active_voice_sessions
+            .read()
+            .get(&lease.session_id)
+            .cloned();
+        Ok(voice.is_some_and(|voice| voice.end_call(lease)))
+    }
+
+    pub fn handle_voice_control(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        connection_epoch: u64,
+        control: VoiceControl,
+    ) -> Result<()> {
+        let _view = self.managed_voice_session(session_id)?;
+        let voice = self
+            .active_voice_sessions
+            .read()
+            .get(session_id)
+            .cloned()
+            .context("Voice call is not active")?;
+        anyhow::ensure!(
+            voice.matches_call(call_id, connection_epoch),
+            "Voice control belongs to a stale connection"
+        );
+        voice.handle_control(control);
         Ok(())
     }
+}
+
+fn compose_session_context(durable_context: String, turn_context: &str) -> String {
+    if turn_context.trim().is_empty() {
+        durable_context
+    } else if durable_context.trim().is_empty() {
+        turn_context.to_string()
+    } else {
+        format!("{durable_context}\n\n{turn_context}")
+    }
+}
+
+fn set_current_message_author(context: &mut String, actor_id: &str) {
+    if let Some((prefix, suffix)) = context.rsplit_once('\n')
+        && suffix.starts_with("Current message author: @")
+    {
+        context.truncate(prefix.len());
+    }
+    context.push_str(&format!("\nCurrent message author: @{actor_id}"));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    fn symlink_file(target: &Path, link: &Path) -> Result<()> {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link)?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retry_replaces_the_author_without_duplicating_context() {
+        let mut context = "Objective: keep the original snapshot".to_string();
+        set_current_message_author(&mut context, "alice");
+        set_current_message_author(&mut context, "bob");
+        assert_eq!(
+            context,
+            "Objective: keep the original snapshot\nCurrent message author: @bob"
+        );
+    }
+
+    #[test]
+    fn supplemental_turn_context_keeps_durable_session_state() {
+        assert_eq!(
+            compose_session_context(
+                "Session objective".into(),
+                "Voice teaching instructions"
+            ),
+            "Session objective\n\nVoice teaching instructions"
+        );
+        assert_eq!(
+            compose_session_context("Session objective".into(), "  "),
+            "Session objective"
+        );
+        assert_eq!(
+            compose_session_context(String::new(), "Voice teaching instructions"),
+            "Voice teaching instructions"
+        );
+    }
 
     #[test]
     fn mcp_approval_requests_are_bound_to_the_active_workspace() -> Result<()> {
@@ -2945,6 +3733,204 @@ mod tests {
     }
 
     #[test]
+    fn voice_transcripts_are_durable_session_messages() -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Voice work".into(),
+            "Explain the code".into(),
+            None,
+        )?;
+        let call_id = "voice-call-1";
+        let human_segment_id = Uuid::new_v4().to_string();
+        let agent_segment_id = Uuid::new_v4().to_string();
+
+        let human: ConversationMessage = serde_json::from_value(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id.clone(),
+                call_id: call_id.into(),
+                segment_id: human_segment_id.clone(),
+                speaker: VoiceTranscriptSpeaker::Human,
+                start_ms: 120,
+                end_ms: 740,
+                content: "Explain this function".into(),
+            })?,
+        )?;
+        let human_retry: ConversationMessage = serde_json::from_value(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id.clone(),
+                call_id: call_id.into(),
+                segment_id: human_segment_id.clone(),
+                speaker: VoiceTranscriptSpeaker::Human,
+                start_ms: 120,
+                end_ms: 740,
+                content: "Explain this function".into(),
+            })?,
+        )?;
+        assert_eq!(human_retry, human);
+        assert!(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id.clone(),
+                call_id: call_id.into(),
+                segment_id: human_segment_id.clone(),
+                speaker: VoiceTranscriptSpeaker::Human,
+                start_ms: 120,
+                end_ms: 740,
+                content: "different content".into(),
+            })
+            .is_err()
+        );
+        assert!(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id.clone(),
+                call_id: call_id.into(),
+                segment_id: human_segment_id.clone(),
+                speaker: VoiceTranscriptSpeaker::Human,
+                start_ms: 121,
+                end_ms: 740,
+                content: "Explain this function".into(),
+            })
+            .is_err()
+        );
+        let agent: ConversationMessage = serde_json::from_value(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id.clone(),
+                call_id: call_id.into(),
+                segment_id: agent_segment_id.clone(),
+                speaker: VoiceTranscriptSpeaker::Agent,
+                start_ms: 900,
+                end_ms: 1_300,
+                content: "This function validates the input.".into(),
+            })?,
+        )?;
+
+        assert_eq!(human.role, "human");
+        assert_eq!(human.actor_id, view.session.owner_id);
+        assert_eq!(
+            human.voice_timing,
+            Some(VoiceTranscriptTiming {
+                call_id: call_id.into(),
+                start_ms: 120,
+                end_ms: 740,
+            })
+        );
+        assert_eq!(agent.role, "agent");
+        assert_eq!(agent.actor_id, AHEAD_ACTOR_ID);
+        assert_eq!(
+            agent.voice_timing,
+            Some(VoiceTranscriptTiming {
+                call_id: call_id.into(),
+                start_ms: 900,
+                end_ms: 1_300,
+            })
+        );
+        assert_eq!(human.turn_id, agent.turn_id);
+        assert_eq!(agent.sequence, human.sequence + 1);
+        assert_eq!(
+            host.store.read().list_messages(&view.session.id)?,
+            vec![human.clone(), agent.clone()]
+        );
+        assert_eq!(
+            host.store
+                .read()
+                .list_messages_page(&view.session.id, None, 2)?
+                .messages,
+            vec![human.clone(), agent.clone()]
+        );
+        assert!(!host.harness().has_active_turn(&view.session.id));
+        host.active_sessions
+            .write()
+            .get_mut(&view.session.id)
+            .expect("active session")
+            .participants
+            .iter_mut()
+            .find(|record| record.participant.id() == view.session.owner_id)
+            .expect("owner participant")
+            .role = SessionRole::Reviewer;
+        assert!(
+            host.handle_request(AheadRequest::RecordVoiceTranscript {
+                session_id: view.session.id,
+                call_id: call_id.into(),
+                segment_id: Uuid::new_v4().to_string(),
+                speaker: VoiceTranscriptSpeaker::Human,
+                start_ms: 1_400,
+                end_ms: 1_800,
+                content: "a reviewer cannot add voice history".into(),
+            })
+            .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn voice_call_leases_are_session_owned_and_reject_stale_controls() -> Result<()>
+    {
+        let host = AheadSessionHost::in_memory()?;
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Voice call".into(),
+            "Explain the code".into(),
+            None,
+        )?;
+        let start = || AheadRequest::StartVoiceCall {
+            session_id: view.session.id.clone(),
+        };
+        let first: VoiceCallLease =
+            serde_json::from_value(host.handle_request(start())?)?;
+        assert_eq!(first.session_id, view.session.id);
+        assert!(first.connection_epoch > 0);
+        assert!(host.handle_request(start()).is_err());
+
+        let ended = host.handle_request(AheadRequest::EndVoiceCall {
+            lease: first.clone(),
+        })?;
+        assert_eq!(
+            ended.get("ended").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let second: VoiceCallLease =
+            serde_json::from_value(host.handle_request(start())?)?;
+        assert!(second.connection_epoch > first.connection_epoch);
+        assert!(
+            host.handle_request(AheadRequest::VoiceControl {
+                session_id: first.session_id.clone(),
+                call_id: first.call_id.clone(),
+                connection_epoch: first.connection_epoch,
+                control: VoiceControl::SetMicMuted { muted: true },
+            })
+            .is_err()
+        );
+        assert!(
+            host.handle_request(AheadRequest::VoiceControl {
+                session_id: second.session_id.clone(),
+                call_id: second.call_id.clone(),
+                connection_epoch: second.connection_epoch,
+                control: VoiceControl::SetMicMuted { muted: true },
+            })
+            .is_ok()
+        );
+
+        let stale_end =
+            host.handle_request(AheadRequest::EndVoiceCall { lease: first })?;
+        assert_eq!(
+            stale_end.get("ended").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            host.active_voice_sessions
+                .read()
+                .get(&view.session.id)
+                .is_some_and(|voice| {
+                    voice.matches_call(&second.call_id, second.connection_epoch)
+                })
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn team_manifest_only_invites_selected_verified_members() -> Result<()> {
         let temp = tempfile::tempdir()?;
         std::fs::create_dir(temp.path().join(".ahead"))?;
@@ -3026,6 +4012,82 @@ mod tests {
                 "bob",
                 42,
             )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn editor_code_comments_are_rejected_for_external_agent_sessions() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("src.rs"), "fn main() {}\n")?;
+        let host = AheadSessionHost::in_memory()?;
+        host.set_workspace(temp.path().to_path_buf());
+
+        let managed = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Managed comments".into(),
+            "Keep comments on the AHEAD session".into(),
+            None,
+        )?;
+        let range = DisplayRange {
+            start: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+            end: ahead_rpc::ahead::DisplayPosition { line: 0, col: 2 },
+        };
+        let managed_comment = host.create_code_comment(
+            &managed.session.id,
+            "src.rs".into(),
+            range.clone(),
+            "fn".into(),
+            "0".repeat(64),
+            "Managed comment".into(),
+        )?;
+        let listed: Vec<CodeComment> = serde_json::from_value(
+            host.handle_request(AheadRequest::ListCodeComments {
+                session_id: managed.session.id.clone(),
+            })?,
+        )?;
+        assert_eq!(listed, vec![managed_comment.clone()]);
+
+        let external = host.start_work(
+            Some(WorkKind::ProductChange),
+            "External comments".into(),
+            "External ACP must not expose editor comments".into(),
+            None,
+        )?;
+        host.store.read().set_harness_binding(
+            &external.session.id,
+            "acp-session",
+            "external-agent:pi-acp",
+        )?;
+        assert!(
+            host.create_code_comment(
+                &external.session.id,
+                "src.rs".into(),
+                range,
+                "fn".into(),
+                "0".repeat(64),
+                "Must be rejected".into(),
+            )
+            .is_err()
+        );
+        assert!(
+            host.handle_request(AheadRequest::ListCodeComments {
+                session_id: external.session.id.clone(),
+            })
+            .is_err()
+        );
+
+        let mut external_comment = managed_comment;
+        external_comment.id = "external-comment".into();
+        external_comment.session_id = external.session.id.clone();
+        host.store.read().insert_code_comment(&external_comment)?;
+        assert!(
+            host.handle_request(AheadRequest::ResolveCodeComment {
+                session_id: external.session.id,
+                comment_id: external_comment.id,
+            })
             .is_err()
         );
         Ok(())
@@ -3244,7 +4306,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn memory_read_refuses_a_symlinked_memory_file() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -3253,7 +4315,7 @@ mod tests {
         let external_path = temp.path().join("outside.md");
         std::fs::create_dir_all(memory_path.parent().context("memory parent")?)?;
         std::fs::write(&external_path, "leave this file alone")?;
-        std::os::unix::fs::symlink(&external_path, &memory_path)?;
+        symlink_file(&external_path, &memory_path)?;
         let host = AheadSessionHost::in_memory()?;
         host.set_workspace(workspace);
 
@@ -3377,7 +4439,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn memory_write_refuses_a_symlinked_memory_file() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -3386,7 +4448,7 @@ mod tests {
         let external_path = temp.path().join("outside.md");
         std::fs::create_dir_all(memory_path.parent().context("memory parent")?)?;
         std::fs::write(&external_path, "leave this file alone")?;
-        std::os::unix::fs::symlink(&external_path, &memory_path)?;
+        symlink_file(&external_path, &memory_path)?;
         let host = AheadSessionHost::in_memory()?;
         host.set_workspace(workspace);
 
@@ -3405,7 +4467,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn memory_write_refuses_a_symlinked_memory_directory() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -3414,7 +4476,8 @@ mod tests {
         let memory_directory = ahead_directory.join("memories");
         let external_directory = temp.path().join("outside-memories");
         std::fs::create_dir_all(&ahead_directory)?;
-        std::os::unix::fs::symlink(&external_directory, &memory_directory)?;
+        std::fs::create_dir_all(&external_directory)?;
+        symlink_dir(&external_directory, &memory_directory)?;
         let host = AheadSessionHost::in_memory()?;
         host.set_workspace(workspace);
 
@@ -3430,11 +4493,11 @@ mod tests {
                 .to_string()
                 .contains("must not resolve through a symlink")
         );
-        assert!(!external_directory.exists());
+        assert!(!external_directory.join("MEMORY.md").exists());
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn memory_directory_handle_survives_parent_symlink_swap() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -3452,7 +4515,7 @@ mod tests {
         let directory = AheadSessionHost::open_memory_directory(&path, false)?
             .context("memory directory is missing")?;
         std::fs::rename(&memory_directory, &original_directory)?;
-        std::os::unix::fs::symlink(&outside_directory, &memory_directory)?;
+        symlink_dir(&outside_directory, &memory_directory)?;
 
         assert_eq!(
             AheadSessionHost::read_memory_content_at(&directory, &path)?,
@@ -3626,6 +4689,7 @@ mod tests {
                 content: "Keep the public API unchanged.".into(),
                 status: "complete".into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                voice_timing: None,
             },
         )?;
         let context = host.implementation_handoff_context(
@@ -3689,7 +4753,6 @@ mod tests {
         );
         assert!(host.list_sessions()?.is_empty());
         assert!(host.active_sessions.read().is_empty());
-        assert!(host.active_session_id.read().is_none());
         assert!(host.active_voice_sessions.read().is_empty());
 
         host.store
@@ -3709,7 +4772,7 @@ mod tests {
                 .map(|(_, backend)| backend),
             Some("ahead-pending".to_string())
         );
-        assert_eq!(host.active_session_id.read().as_deref(), Some(session_id));
+        assert!(host.active_sessions.read().contains_key(session_id));
         Ok(())
     }
 
@@ -3730,7 +4793,7 @@ mod tests {
             .expect_err("unsupported ACP adapters must be rejected");
         assert!(error.to_string().contains("not supported by AHEAD"));
         assert!(host.list_sessions()?.is_empty());
-        assert!(host.active_session_id.read().is_none());
+        assert!(host.active_sessions.read().is_empty());
         Ok(())
     }
 
@@ -3816,7 +4879,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_resolves_the_active_durable_session() {
+    fn prediction_resolves_the_requested_durable_session() {
         let host = AheadSessionHost::in_memory().unwrap();
         let view = host
             .start_work(
@@ -3830,7 +4893,7 @@ mod tests {
             .request_prediction(
                 PredictionRequest {
                     request_id: "prediction-1".to_string(),
-                    session_id: "active".to_string(),
+                    session_id: Some(view.session.id.clone()),
                     path: "src/lib.rs".to_string(),
                     cursor: ahead_rpc::ahead::DisplayPosition { line: 0, col: 7 },
                     prefix: "pub fn".to_string(),
@@ -3915,7 +4978,7 @@ mod tests {
 
         let context = host.durable_prediction_context(&view.session.id).unwrap();
         assert!(context.contains("Preserve retry idempotency"));
-        assert!(!context.contains("Do not retry a request"));
+        assert!(context.contains("Do not retry a request"));
         assert!(context.contains("Earlier note 3"));
         assert!(context.contains("Earlier note 4"));
         assert!(
@@ -3923,6 +4986,394 @@ mod tests {
                 .contains("Latest decision: preserve the existing retry contract.")
         );
         assert!(context.contains("Use the existing idempotency key"));
+    }
+
+    #[test]
+    fn oversized_prediction_plan_keeps_goal_constraints_active_step_and_progress()
+    -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Compact plan context".to_string(),
+            "Preserve the retry contract".to_string(),
+            None,
+        )?;
+        let item = host.store.read().create_work_item(
+            &view.session.id,
+            "Keep retry behavior stable",
+            "human",
+        )?;
+        host.store.read().add_work_item_event(
+            &item.id,
+            &view.session.id,
+            "invariant",
+            "Never retry after a committed response.",
+            "human",
+        )?;
+        for index in 0..6 {
+            host.store.read().add_work_item_event(
+                &item.id,
+                &view.session.id,
+                "note",
+                &format!("Progress note {index}"),
+                "human",
+            )?;
+        }
+
+        let mut plan = vec![ahead_rpc::ahead::AgentPlanEntry {
+            content: "Preserve the retry contract".to_string(),
+            status: "completed".to_string(),
+            priority: "high".to_string(),
+        }];
+        for index in 0..260 {
+            plan.push(ahead_rpc::ahead::AgentPlanEntry {
+                content: format!(
+                    "Pending step {index}: {}",
+                    "follow-up detail ".repeat(16)
+                ),
+                status: "pending".to_string(),
+                priority: "medium".to_string(),
+            });
+        }
+        plan.push(ahead_rpc::ahead::AgentPlanEntry {
+            content:
+                "Update the retry path without changing its idempotency guarantee"
+                    .to_string(),
+            status: "in_progress".to_string(),
+            priority: "high".to_string(),
+        });
+        host.store.read().set_agent_runtime_state(
+            &view.session.id,
+            &ahead_rpc::ahead::AgentRuntimeState {
+                plan,
+                ..Default::default()
+            },
+        )?;
+
+        let (_, context) = host.cached_prediction_context(&view.session.id)?;
+        assert!(context.contains("faithful compact summary"));
+        assert!(context.contains("completed: 1"));
+        assert!(context.contains("pending: 260"));
+        assert!(context.contains("in_progress: 1"));
+        assert!(
+            context
+                .contains("Plan opening: [completed] Preserve the retry contract")
+        );
+        assert!(context.contains(
+            "Active plan step: [in_progress; priority high] Update the retry path"
+        ));
+        assert!(context.contains("Never retry after a committed response."));
+        assert!(!context.contains("Pending step 259"));
+
+        let (compact_version, compact_context) =
+            host.cached_compacted_prediction_context(&view.session.id)?;
+        assert!(compact_context.contains("Never retry after a committed response."));
+        assert_eq!(
+            (0..6)
+                .filter(|index| {
+                    compact_context.contains(&format!("Progress note {index}"))
+                })
+                .count(),
+            1
+        );
+        host.store.read().add_work_item_event(
+            &item.id,
+            &view.session.id,
+            "decision",
+            "Preserve the retry key across the compacted context.",
+            "human",
+        )?;
+        let (updated_version, updated_context) =
+            host.cached_compacted_prediction_context(&view.session.id)?;
+        assert!(updated_version.revision > compact_version.revision);
+        assert!(
+            updated_context
+                .contains("Preserve the retry key across the compacted context.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_recent_work_history_uses_compact_context_and_keeps_invariants()
+    -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Compact work history".to_string(),
+            "Keep the retry contract".to_string(),
+            None,
+        )?;
+        let item = host.store.read().create_work_item(
+            &view.session.id,
+            "Preserve retry behavior",
+            "human",
+        )?;
+        host.store.read().add_work_item_event(
+            &item.id,
+            &view.session.id,
+            "invariant",
+            "Never retry after a committed response.",
+            "human",
+        )?;
+        for index in 0..4 {
+            host.store.read().add_work_item_event(
+                &item.id,
+                &view.session.id,
+                "note",
+                &format!("large-note-{index}: {}", "x".repeat(20_000)),
+                "human",
+            )?;
+        }
+
+        let (_, context) = host.cached_prediction_context(&view.session.id)?;
+        assert!(context.contains("Never retry after a committed response."));
+        assert_eq!(context.matches("large-note-").count(), 1);
+        assert!(context.len() < MAX_PREDICTION_CONTEXT_BYTES);
+        assert_eq!(host.cached_prediction_context(&view.session.id)?.1, context);
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_session_cache_refreshes_across_connections_and_visibility()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let database_path = temporary.path().join("session.db");
+        let host = AheadSessionHost::new(SessionStore::open(&database_path)?);
+        host.set_workspace(temporary.path().to_path_buf());
+        let session = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Cache test".into(),
+            "Keep constraints".into(),
+            None,
+        )?;
+        let id = &session.session.id;
+        let (initial_version, _) = host.cached_prediction_context(id)?;
+        let writer = SessionStore::open(&database_path)?;
+        let item = writer.create_work_item(id, "Preserve idempotency", "human")?;
+        writer.add_work_item_event(
+            &item.id,
+            id,
+            "invariant",
+            "Never retry a committed request",
+            "human",
+        )?;
+        for index in 0..8 {
+            writer.add_work_item_event(
+                &item.id,
+                id,
+                "note",
+                &format!("Progress {index}"),
+                "human",
+            )?;
+        }
+        writer.save_conversation_summary(
+            id,
+            "plan",
+            "Public plan summary",
+            "1..2",
+        )?;
+        writer.set_agent_runtime_state(
+            id,
+            &ahead_rpc::ahead::AgentRuntimeState {
+                plan: vec![ahead_rpc::ahead::AgentPlanEntry {
+                    content: "Check the response before retrying".into(),
+                    status: "in_progress".into(),
+                    priority: "high".into(),
+                }],
+                ..Default::default()
+            },
+        )?;
+        let (version, context) = host.cached_prediction_context(id)?;
+        assert!(version.revision > initial_version.revision);
+        assert!(context.contains("Never retry a committed request"));
+        assert!(context.contains("Check the response before retrying"));
+        assert!(context.contains("Public plan summary"));
+        assert_eq!(host.cached_prediction_context(id)?.1, context);
+        assert_eq!(host.prediction_contexts.lock().len(), 1);
+
+        let other = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Other".into(),
+            "Unrelated".into(),
+            None,
+        )?;
+        writer.create_work_item(&other.session.id, "Other work", "human")?;
+        writer.record_recent_workspace_file("unrelated.rs", 1)?;
+        assert!(host.cached_prediction_context(id)?.0 == version);
+
+        writer.upsert_message(&ConversationMessage {
+            id: "private-message".into(),
+            session_id: id.clone(),
+            turn_id: "turn".into(),
+            sequence: 1,
+            role: "human_to:teammate".into(),
+            actor_id: "human".into(),
+            content: "Private discussion must not reach FIM".into(),
+            status: "complete".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            voice_timing: None,
+        })?;
+        let (private_version, private_context) =
+            host.cached_prediction_context(id)?;
+        assert!(private_version.revision > version.revision);
+        assert!(!private_context.contains("Public plan summary"));
+        assert!(!private_context.contains("Private discussion"));
+        assert!(private_context.contains("Never retry a committed request"));
+
+        writer.set_agent_runtime_state(id, &Default::default())?;
+        assert!(
+            !host
+                .cached_prediction_context(id)?
+                .1
+                .contains("Check the response before retrying")
+        );
+        host.set_workspace(temporary.path().to_path_buf());
+        assert!(host.prediction_contexts.lock().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_session_cache_bounds_sessions_and_rejects_oversized_work()
+    -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        for index in 0..9 {
+            host.cached_prediction_context(&format!("session-{index}"))?;
+        }
+        let contexts = host.prediction_contexts.lock();
+        assert_eq!(contexts.len(), 8);
+        assert!(!contexts.iter().any(|(id, _, _, _)| id == "session-0"));
+        drop(contexts);
+        host.cached_prediction_context("session-1")?;
+        host.cached_prediction_context("session-9")?;
+        assert!(
+            !host
+                .prediction_contexts
+                .lock()
+                .iter()
+                .any(|(id, _, _, _)| id == "session-2")
+        );
+
+        let session = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Large plan".into(),
+            "Preserve constraints".into(),
+            None,
+        )?;
+        host.store.read().set_agent_runtime_state(
+            &session.session.id,
+            &ahead_rpc::ahead::AgentRuntimeState {
+                plan: vec![ahead_rpc::ahead::AgentPlanEntry {
+                    content: "日本語".repeat(MAX_PREDICTION_CONTEXT_BYTES / 8),
+                    status: "in_progress".into(),
+                    priority: "high".into(),
+                }],
+                ..Default::default()
+            },
+        )?;
+        let error = host
+            .cached_prediction_context(&session.session.id)
+            .err()
+            .context("oversized plan was cached")?;
+        assert!(error.to_string().contains("context budget"));
+        assert!(
+            !host
+                .prediction_contexts
+                .lock()
+                .iter()
+                .any(|(id, _, _, _)| id == &session.session.id)
+        );
+        host.store.read().set_agent_runtime_state(
+            &session.session.id,
+            &ahead_rpc::ahead::AgentRuntimeState {
+                plan: vec![ahead_rpc::ahead::AgentPlanEntry {
+                    content: "Keep the active step".into(),
+                    status: "in_progress".into(),
+                    priority: "high".into(),
+                }],
+                warnings: vec!["unrelated runtime field".repeat(100_000)],
+                ..Default::default()
+            },
+        )?;
+        let cached = host.cached_prediction_context(&session.session.id)?.1;
+        assert!(cached.contains("Keep the active step"));
+        assert!(!cached.contains("unrelated runtime field"));
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_context_rejects_oversized_turso_rows_before_accumulating_them()
+    -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let session = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Large work record".into(),
+            "Preserve all constraints".into(),
+            None,
+        )?;
+        host.store.read().create_work_item(
+            &session.session.id,
+            &"日本語".repeat(MAX_PREDICTION_CONTEXT_BYTES / 8),
+            "human",
+        )?;
+        let error = host
+            .cached_prediction_context(&session.session.id)
+            .unwrap_err();
+        assert!(error.to_string().contains("context budget"));
+        assert!(
+            !host
+                .prediction_contexts
+                .lock()
+                .iter()
+                .any(|(id, _, _, _)| id == &session.session.id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_session_cache_reuses_large_durable_work() -> Result<()> {
+        let host = AheadSessionHost::in_memory()?;
+        let session = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Context timing".into(),
+            "Keep the full plan".into(),
+            None,
+        )?;
+        for index in 0..100 {
+            let item = host.store.read().create_work_item(
+                &session.session.id,
+                &format!("Work item {index}"),
+                "human",
+            )?;
+            host.store.read().add_work_item_event(
+                &item.id,
+                &session.session.id,
+                "invariant",
+                "Preserve the public retry contract",
+                "human",
+            )?;
+        }
+        let started = std::time::Instant::now();
+        let (version, expected) =
+            host.cached_prediction_context(&session.session.id)?;
+        let cold = started.elapsed();
+        let mut warm = Vec::new();
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            let (current, context) =
+                host.cached_prediction_context(&session.session.id)?;
+            warm.push(started.elapsed());
+            assert!(current == version);
+            assert_eq!(context, expected);
+        }
+        warm.sort();
+        eprintln!(
+            "100-work-item FIM context ({} bytes): cold {cold:?}, warm median {:?}, p95 {:?}",
+            expected.len(),
+            warm[50],
+            warm[94]
+        );
+        assert_eq!(host.prediction_contexts.lock().len(), 1);
+        Ok(())
     }
 
     fn turn_dto(
@@ -3937,6 +5388,8 @@ mod tests {
             external_agent_id: None,
             model: None,
             model_provider: None,
+            model_context_window: None,
+            reasoning_effort: None,
             user_message: msg.to_string(),
             session_context: String::new(),
             context: ahead_rpc::ahead::TurnEditorContext {
@@ -4083,6 +5536,7 @@ mod tests {
             content: "Keep the retry invariant.".to_string(),
             status: "complete".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            voice_timing: None,
         };
         host.store.read().upsert_message(&message).unwrap();
         let comment = CodeComment {
