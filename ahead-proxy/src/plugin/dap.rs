@@ -438,6 +438,17 @@ impl DapClient {
                 );
             }
             DapEvent::Stopped(stopped) => {
+                // A delayed stop event can arrive after the debugger moved on.
+                // Bail out before issuing stack/scopes requests so a stale event
+                // cannot block on the adapter or report its timeouts as errors.
+                {
+                    let lifecycle = self.dap_rpc.lifecycle.lock();
+                    if lifecycle.token() != token
+                        || lifecycle.state != DapSessionState::Stopped
+                    {
+                        return Ok(());
+                    }
+                }
                 let all_threads_stopped =
                     stopped.all_threads_stopped.unwrap_or_default();
                 let mut stack_frames = HashMap::new();

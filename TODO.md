@@ -45,9 +45,35 @@ managed-agent smokes, then native rendered behavior.
       CodeAnchors and staged commits. The smoke runs the Code Mode turn on the
       catalog model and the direct turn on a provider-model connection because
       AHEAD selects the tool mode from model metadata.
+- [x] 2026-10-23 `cargo test --locked --offline -p ahead-rpc -p ahead-viewmodel
+      --lib`: 28 and 12 passed.
+- [x] 2026-10-23 `cargo test --locked --offline -p ahead-proxy --lib`:
+      351 passed, 0 failed, 1 ignored. The suite needed its test module imports
+      repaired first (`git_commit_patch`, `git_worktree_file_patch`,
+      `git_status_bytes_are_conflicted`, `Path`, `PredictionBinding`,
+      `PredictionModelContext`). The failures it then exposed were real product
+      bugs, not test drift:
+      - `bounded_git_patch` dropped the `+`/`-`/space origin, so commit and
+        worktree patches had no line prefixes and the diff panel could not
+        classify added or removed lines.
+      - `git_stage_all` excluded conflicted paths with an `:(exclude)` pathspec,
+        which makes `git add` fail once a path is unmerged. It now stages the
+        non-conflicted paths explicitly.
+      - FIM open-buffer context resolved definition locations without the
+        non-canonical workspace fallback, so symlinked workspaces lost every
+        definition-based excerpt.
+      - A delayed DAP `Stopped` event issued blocking stack/scopes requests
+        against an adapter that had moved on, surfacing timeout errors. It now
+        checks the lifecycle token before talking to the adapter.
+      - Test fixtures assumed `main` was the initial branch and read a branch
+        shorthand where the full tracking ref was meant.
+
+The working tree is committed as `67f3fce7 breaking updates` (1876 files) as a
+local checkpoint so the in-progress work cannot be lost. It is not a reviewed or
+final state.
 
 Open: native rendered acceptance (macOS HIServices abort before render), the
-`ahead-app`/`ahead-proxy` suites after the latest edits, and clippy.
+`ahead-app` suite after the latest edits, and clippy.
 
 ## Zed source reuse and editor parity
 
