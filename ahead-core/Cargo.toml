@@ -20,7 +20,7 @@ globset      = { workspace = true }
 nucleo-matcher = { workspace = true }
 chardetng      = { workspace = true }
 encoding_rs    = { workspace = true }
-fs4            = "0.13.1"
+fs4            = "1.1.0"
 tempfile       = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
