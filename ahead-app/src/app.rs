@@ -1989,8 +1989,7 @@ impl Shell {
 
             for (panel, text, edits, preserve_code_action_request) in &targets {
                 panel
-                    .downgrade()
-                    .update_in(cx, |code, window, cx| {
+                    .update(cx, |code, cx| {
                         code.apply_workspace_text_edits(
                             text,
                             edits,
@@ -1999,7 +1998,7 @@ impl Shell {
                             cx,
                         )
                     })
-                    .map_err(|error| error.to_string())??;
+                    .map_err(|error| error.to_string())?;
             }
             Ok(targets.len())
         })();

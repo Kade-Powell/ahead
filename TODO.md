@@ -8356,6 +8356,14 @@ It also passed four source-matched app regressions: directory launch,
       F12 on a Rust usage opened its definition in `src/math.rs`; editor back
       navigation returned to `src/main.rs`. Rename, formatting and recovery
       acceptance remain open.
+      A 2026-11-06 native Rust rename reached the rename dialog but failed with
+      `entity has no current window` while applying the cross-file edit. The
+      app now applies workspace edits to inactive tabs through the shell's
+      current window, matching search/replace, and a GPUI regression covers
+      active plus inactive tabs. Formatting passes; the focused test could not
+      compile because the filesystem ran out of space in `target`. Re-run the
+      test and native rename after reclaiming disk space; the fix is not yet
+      runtime-verified.
       A 2026-11-02 comparison with Zed commit `d27ad54` found AHEAD exposed
       document formatting only. AHEAD now forwards static on-type trigger
       capabilities and formatting requests, waiting for the editor change

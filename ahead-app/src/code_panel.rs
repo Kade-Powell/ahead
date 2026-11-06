@@ -8606,9 +8606,6 @@ impl Render for CodePanel {
                                                                     .child(
                                                                         div()
                                                                             .debug_selector(move || format!("add-comment-marker-glyph-{ln}"))
-                                                                            .relative()
-                                                                            .left(px(2.))
-                                                                            .top(px(2.))
                                                                             .child(
                                                                                 gpui_kit::component::Icon::new(IconName::MessageSquarePlus)
                                                                                     .with_size(px(12.)),
@@ -17626,10 +17623,7 @@ mod tests {
         );
         assert_eq!(
             gutter_add_comment_glyph.center(),
-            gpui_kit::point(
-                gutter_add_comment_icon.center().x + gpui_kit::px(2.),
-                gutter_add_comment_icon.center().y + gpui_kit::px(2.),
-            )
+            gutter_add_comment_icon.center()
         );
         assert_eq!(gutter_add_comment.center(), gutter_actions.center());
         assert!(

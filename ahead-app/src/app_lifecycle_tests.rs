@@ -1436,6 +1436,79 @@ fn workspace_edit_subscription_reuses_its_shell_update(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn workspace_edits_apply_to_inactive_open_tabs(cx: &mut TestAppContext) {
+    use lsp_types::{Position, Range, TextEdit, Url, WorkspaceEdit};
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.rs", "other.rs"], cx);
+    let main_path = workspace.path().join("main.rs");
+    let other_path = workspace.path().join("other.rs");
+    let edit = WorkspaceEdit {
+        changes: Some(std::collections::HashMap::from([
+            (
+                Url::from_file_path(&main_path).expect("main file URL"),
+                vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    new_text: "renamed".into(),
+                }],
+            ),
+            (
+                Url::from_file_path(&other_path).expect("other file URL"),
+                vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    new_text: "renamed".into(),
+                }],
+            ),
+        ])),
+        ..WorkspaceEdit::default()
+    };
+
+    shell.update_in(cx, |shell, window, cx| {
+        let source = shell.code.clone();
+        let generation = source.read(cx).buffer_generation();
+        let documents = crate::code_panel::workspace_edit_text_edits(&edit)
+            .expect("workspace text edits");
+        let request = crate::code_panel::WorkspaceEditRequest {
+            edit,
+            source_path: main_path,
+            purpose: crate::code_panel::WorkspaceEditPurpose::Rename {
+                old_name: "saved".into(),
+                new_name: "renamed".into(),
+            },
+            generation,
+            completion: None,
+        };
+        shell.finish_workspace_edit(
+            source,
+            request,
+            documents,
+            workspace.path().to_owned(),
+            Ok(Vec::new()),
+            window,
+            cx,
+        );
+    });
+
+    let (status, texts) = shell.read_with(cx, |shell, cx| {
+        let texts = shell
+            .code_tabs
+            .iter()
+            .map(|panel| {
+                panel.read_with(cx, |panel, cx| {
+                    panel.workspace_edit_snapshot(cx).expect("open buffer").text
+                })
+            })
+            .collect::<Vec<_>>();
+        (shell.status_message.clone(), texts)
+    });
+    assert!(status.contains("Renamed saved to renamed in 2 files"));
+    assert_eq!(
+        texts,
+        vec!["renamed\n".to_string(), "renamed\n".to_string()]
+    );
+}
+
+#[gpui_kit::test]
 fn opening_a_fresh_editor_workspace_bootstraps_private_settings(
     cx: &mut TestAppContext,
 ) {
