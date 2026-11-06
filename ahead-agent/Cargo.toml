@@ -21,12 +21,12 @@ serde_json        = { workspace = true }
 semver            = "1.0"
 toml              = { workspace = true }
 tempfile          = { workspace = true }
-sha2              = "0.10"
-fs4               = "0.13.1"
+sha2              = "0.11"
+fs4               = "1.1.0"
 flate2            = { workspace = true }
 tar               = { workspace = true }
 zip               = { workspace = true }
-bzip2             = "0.5"
+bzip2             = "0.6"
 tracing           = { workspace = true }
 url               = { workspace = true }
 uuid              = { version = "1.5", features = ["v4", "serde"] }
@@ -52,7 +52,7 @@ codex-utils-path-uri = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 walkdir = { workspace = true }
-zstd = "0.13.3"
+zstd = "0.14.0"
 
 [dev-dependencies]
 codex-code-mode = { workspace = true }

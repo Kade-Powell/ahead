@@ -258,7 +258,7 @@ name = "action_macros"
 path = "tests/action_macros.rs"
 
 [dependencies.accesskit]
-version = "0.24.0"
+version = "0.25.2"
 features = ["enumn"]
 
 [dependencies.anyhow]
@@ -283,7 +283,7 @@ version = "=0.3.6"
 package = "gpui-pre-collections"
 
 [dependencies.criterion]
-version = "0.5"
+version = "0.8"
 features = ["html_reports"]
 optional = true
 
@@ -306,7 +306,7 @@ features = [
 ]
 
 [dependencies.etagere]
-version = "0.2"
+version = "0.3"
 
 [dependencies.futures]
 version = "0.3.34"
@@ -363,7 +363,7 @@ default-features = false
 version = "0.3.19"
 
 [dependencies.itertools]
-version = "0.14.0"
+version = "0.15.0"
 
 [dependencies.log]
 version = "0.4.16"
@@ -382,13 +382,13 @@ version = "1.13"
 version = "2.0.0"
 
 [dependencies.parking_lot]
-version = "0.12.1"
+version = "0.13.0"
 
 [dependencies.pin-project]
 version = "1.1.10"
 
 [dependencies.pollster]
-version = "0.4.0"
+version = "1.0.1"
 
 [dependencies.postage]
 version = "0.5"
@@ -404,7 +404,7 @@ optional = true
 package = "proptest"
 
 [dependencies.rand]
-version = "0.9"
+version = "0.10"
 
 [dependencies.raw-window-handle]
 version = "0.6"
@@ -462,7 +462,7 @@ features = [
 ]
 
 [dependencies.spin]
-version = "0.10.0"
+version = "0.12.3"
 
 [dependencies.stacksafe]
 version = "1.0"
@@ -477,7 +477,7 @@ version = "=0.3.6"
 package = "gpui-pre-sum-tree"
 
 [dependencies.taffy]
-version = "0.13.0"
+version = "0.15.1"
 
 [dependencies.thiserror]
 version = "2.0.12"
@@ -529,7 +529,7 @@ package = "zed-scap"
 version = "2.5.0"
 
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]
-version = "0.3.4"
+version = "0.4.3"
 features = ["wasm_js"]
 
 [target.'cfg(target_family = "wasm")'.dependencies.uuid]
@@ -543,7 +543,7 @@ features = [
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies.core-video]
-version = "0.5.2"
+version = "0.6.1"
 features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies.font-kit]
@@ -579,7 +579,7 @@ version = "0.3"
 optional = true
 
 [target.'cfg(target_os = "macos")'.build-dependencies.bindgen]
-version = "0.72"
+version = "0.73"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.62"
