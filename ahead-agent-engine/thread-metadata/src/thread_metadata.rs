@@ -11,46 +11,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
-
-/// The sort key to use when listing threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortKey {
-    /// Sort by the thread's creation timestamp.
-    CreatedAt,
-    /// Sort by the thread's last update timestamp.
-    UpdatedAt,
-    /// Sort by the thread's product recency timestamp.
-    RecencyAt,
-    /// Sort by the thread's stable position within its user-selected section.
-    SectionPosition,
-}
-
-/// Sort direction to use when listing threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
-
-/// Spawn-graph relationship used to filter thread listings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadRelationFilter {
-    /// Return only threads whose immediate parent is the given thread.
-    DirectChildrenOf(ThreadId),
-    /// Return every thread transitively descended from the given thread.
-    DescendantsOf(ThreadId),
-}
-
-/// A pagination anchor used for keyset pagination.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Anchor {
-    /// The timestamp component of the anchor.
-    pub ts: DateTime<Utc>,
-    /// The thread ID component used to disambiguate equal recency timestamps.
-    pub id: Option<ThreadId>,
-}
 
 /// Visual presentation metadata owned by a thread section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,51 +30,6 @@ pub struct ThreadSection {
     pub name: String,
     #[serde(default)]
     pub appearance: Option<ThreadSectionAppearance>,
-}
-
-impl ThreadSection {
-    pub fn from_row((id, name, appearance): (String, String, Option<String>)) -> Result<Self> {
-        Ok(Self {
-            id,
-            name,
-            appearance: appearance
-                .map(|appearance| serde_json::from_str(&appearance))
-                .transpose()?,
-        })
-    }
-}
-
-/// A cursor-paginated page of independently persisted thread sections.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadSectionsPage {
-    /// Sections in ascending identifier order.
-    pub sections: Vec<ThreadSection>,
-    /// Identifier after which the next page starts, if any.
-    pub next_cursor: Option<String>,
-}
-
-/// A single page of thread metadata results.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadsPage {
-    /// The thread metadata items in this page.
-    pub items: Vec<ThreadMetadata>,
-    /// Immediate parents for page items found through the persisted spawn graph.
-    pub parent_thread_ids: HashMap<ThreadId, ThreadId>,
-    /// The next anchor to use for pagination, if any.
-    pub next_anchor: Option<Anchor>,
-    /// The number of rows scanned to produce this page.
-    pub num_scanned_rows: usize,
-}
-
-/// The outcome of extracting metadata from a rollout.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtractionOutcome {
-    /// The extracted thread metadata.
-    pub metadata: ThreadMetadata,
-    /// The explicit thread memory mode from rollout metadata, if present.
-    pub memory_mode: Option<String>,
-    /// The number of rollout lines that failed to parse.
-    pub parse_errors: usize,
 }
 
 /// Canonical persisted thread metadata.
@@ -443,25 +359,6 @@ fn canonicalize_datetime(dt: DateTime<Utc>) -> DateTime<Utc> {
     epoch_millis_to_datetime(datetime_to_epoch_millis(dt)).unwrap_or(dt)
 }
 
-pub fn anchor_from_item(
-    item: &ThreadMetadata,
-    sort_key: SortKey,
-    include_thread_id_tiebreaker: bool,
-) -> Option<Anchor> {
-    let ts = match sort_key {
-        SortKey::CreatedAt => item.created_at,
-        SortKey::UpdatedAt => item.updated_at,
-        SortKey::RecencyAt => item.recency_at,
-        SortKey::SectionPosition => DateTime::<Utc>::from_timestamp_millis(item.section_position?)?,
-    };
-    Some(Anchor {
-        ts,
-        id: (include_thread_id_tiebreaker
-            || matches!(sort_key, SortKey::RecencyAt | SortKey::SectionPosition))
-        .then_some(item.id),
-    })
-}
-
 pub fn datetime_to_epoch_millis(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_millis()
 }
@@ -488,17 +385,6 @@ pub fn epoch_seconds_to_datetime(value: i64) -> Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp seconds: {value}"))
 }
 
-/// Statistics about a backfill operation.
-#[derive(Debug, Clone)]
-pub struct BackfillStats {
-    /// The number of rollout files scanned.
-    pub scanned: usize,
-    /// The number of rows upserted successfully.
-    pub upserted: usize,
-    /// The number of rows that failed to upsert.
-    pub failed: usize,
-}
-
 #[cfg(test)]
 mod tests {
     use super::ThreadMetadata;
@@ -522,7 +408,6 @@ mod tests {
             history_mode: ThreadHistoryMode::Legacy,
             thread_source: None,
             agent_nickname: None,
-            agent_role: None,
             agent_path: None,
             model_provider: "openai".to_string(),
             model: Some("gpt-5".to_string()),

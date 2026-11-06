@@ -39,6 +39,9 @@ members = [
     # Retained engine dependencies below bring the other engine crates into this workspace.
     "ahead-agent-engine/core",
     "ahead-agent-engine/protocol",
+    # Test and maintain the small upstream GPUI fixes carried in this fork.
+    "third_party/gpui-pre",
+    "third_party/gpui-base",
 ]
 default-members = [
     ".",
@@ -181,6 +184,7 @@ wasmtime          = { version = "48", default-features = false, features = [
     "parallel-compilation",
 ] }
 wasmtime-wasi     = { version = "48", default-features = false, features = ["p2"] }
+wasmparser        = "=0.254.0"
 
 lsp-types = { version = "0.95.1", features = ["proposed"] }                                                  # not following semver, so should be locked to patch version updates only
 
@@ -305,7 +309,6 @@ rustls-native-certs = "0.8"
 rustls-pki-types = "1.14"
 schemars = "0.8"
 seccompiler = "0.5"
-serde_ignored = "0.1"
 serde_path_to_error = "0.1"
 serde_with = "3.17"
 serde_yaml = "0.9"
@@ -349,9 +352,12 @@ gpui-kit = { version = "=0.6.6", features = [
     "tree-sitter-tsx",
     "tree-sitter-typescript",
 ] }
+gpui-base = "=0.6.6"
 gpui-util = { package = "gpui-pre-util", version = "=0.3.6" }
 
 [patch.crates-io]
+gpui-pre = { path = "third_party/gpui-pre" }
+gpui-base = { path = "third_party/gpui-base" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

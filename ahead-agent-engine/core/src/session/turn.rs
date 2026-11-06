@@ -11,6 +11,7 @@ use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::context::ContextualUserFragment;
+use crate::context_manager::estimate_item_token_count;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::mention_syntax::TOOL_MENTION_SIGIL;
@@ -124,11 +125,7 @@ pub(crate) async fn run_turn(
 ) -> CodexResult<Option<String>> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    // TODO(ccunningham): Pre-turn compaction runs before context updates and the
-    // new user message are recorded. Estimate pending incoming items (context
-    // diffs/full reinjection + user input) and trigger compaction preemptively
-    // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(
+    if let Err(err) = maybe_run_previous_model_inline_compact(
         &sess,
         &turn_context,
         &mut client_session,
@@ -136,15 +133,7 @@ pub(crate) async fn run_turn(
     )
     .await
     {
-        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-            record_inputs(&sess, &turn_context, &input, PersistContext::Standard).await;
-            return Err(err);
-        }
-        if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
-            return Err(err);
-        }
-        error!("Failed to run pre-sampling compact");
-        return Ok(None);
+        return handle_pre_sampling_compact_error(&sess, &turn_context, &input, err).await;
     }
 
     let user_input = turn_user_input(&input);
@@ -176,6 +165,7 @@ pub(crate) async fn run_turn(
         Err(err) => return Err(err),
     };
     // Keep the exact model-visible state used by this turn and its inline compactions.
+    // Persist context changes before measuring the pre-sampling budget.
     let (world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
         async {
@@ -203,6 +193,33 @@ pub(crate) async fn run_turn(
     let mut world_state = world_state?;
 
     let injection_items = build_skill_inputs(&sess, first_step_context.as_ref(), &user_input).await;
+
+    let pending_input_tokens = estimate_pending_turn_input_tokens(sess.as_ref(), &input)
+        .saturating_add(
+            injection_items
+                .iter()
+                .map(estimate_item_token_count)
+                .fold(0, i64::saturating_add),
+        );
+    let compacted = match run_pre_sampling_compact(
+        &sess,
+        Arc::clone(&first_step_context),
+        &mut client_session,
+        pending_input_tokens,
+    )
+    .await
+    {
+        Ok(compacted) => compacted,
+        Err(err) => {
+            return handle_pre_sampling_compact_error(&sess, &turn_context, &input, err).await;
+        }
+    };
+    if compacted {
+        // Pre-turn compaction clears the context baseline; restore it before sampling.
+        world_state = sess
+            .record_context_updates_and_set_reference_context_item(first_step_context.as_ref())
+            .await?;
+    }
 
     let mut can_drain_pending_input = input.is_empty();
     record_inputs(&sess, &turn_context, &input, PersistContext::TurnStart).await;
@@ -542,6 +559,22 @@ fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
         .collect()
 }
 
+fn estimate_pending_turn_input_tokens(sess: &Session, input: &[TurnInput]) -> i64 {
+    input
+        .iter()
+        .map(|item| match item {
+            TurnInput::UserInput { content, .. } => {
+                estimate_item_token_count(&sess.response_item_from_user_input(content.clone()))
+            }
+            TurnInput::ResponseItem(item) => estimate_item_token_count(&item.item),
+            TurnInput::FunctionCallOutput(item) => estimate_item_token_count(item),
+            TurnInput::InterAgentCommunication(communication) => estimate_item_token_count(
+                &ResponseItem::from(communication.to_response_input_item()),
+            ),
+        })
+        .fold(0, i64::saturating_add)
+}
+
 async fn required_mcp_servers_for_input(
     sess: &Arc<Session>,
     user_input: &[UserInput],
@@ -614,32 +647,46 @@ async fn build_skill_inputs(
 #[instrument(level = "trace", skip_all)]
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    step_context: Arc<StepContext>,
     client_session: &mut ModelClientSession,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
-    maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
-        .await?;
-    let token_status =
-        super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
-            .await;
-    // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if token_status.token_limit_reached {
-        // Pre-turn compaction runs before run_turn creates the normal sampling step.
-        let step_context = sess
-            .capture_step_context(Arc::clone(turn_context), cancellation_token)
-            .await?;
-        run_auto_compact(
-            sess,
-            step_context,
-            client_session,
-            InitialContextInjection::DoNotInject,
-            CompactionReason::ContextLimit,
-            CompactionPhase::PreTurn,
-        )
-        .await?;
+    pending_input_tokens: i64,
+) -> CodexResult<bool> {
+    let token_status = super::context_window::context_window_token_status(
+        sess.as_ref(),
+        step_context.turn.as_ref(),
+    )
+    .await;
+    // Compact before sampling if this input would cross the model's safe budget.
+    if !token_status.token_limit_reached_with_pending_tokens(pending_input_tokens) {
+        return Ok(false);
     }
-    Ok(())
+    run_auto_compact(
+        sess,
+        step_context,
+        client_session,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::PreTurn,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn handle_pre_sampling_compact_error(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+    err: CodexErr,
+) -> CodexResult<Option<String>> {
+    if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+        record_inputs(sess, turn_context, input, PersistContext::Standard).await;
+        return Err(err);
+    }
+    if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
+        return Err(err);
+    }
+    error!("Failed to run pre-sampling compact");
+    Ok(None)
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
@@ -702,10 +749,11 @@ async fn maybe_run_previous_model_inline_compact(
         .model_auto_compact_token_limit_scope
     {
         AutoCompactTokenLimitScope::Total => {
-            let new_auto_compact_limit = turn_context
-                .model_info()
-                .auto_compact_token_limit()
-                .unwrap_or(i64::MAX);
+            let new_auto_compact_limit = super::context_window::auto_compact_token_limit(
+                turn_context.config.model_auto_compact_token_limit,
+                turn_context.model_info().as_ref(),
+            )
+            .unwrap_or(i64::MAX);
             active_context_tokens > new_auto_compact_limit
                 || active_context_tokens >= new_context_window
         }
@@ -1901,10 +1949,18 @@ async fn try_run_sampling_request(
                     }),
                 )
                 .await;
-                let budget_result = sess
-                    .record_token_usage_info(&turn_context, token_usage.as_ref())
-                    .await;
-                should_emit_token_count = true;
+                let budget_result = if token_usage.is_some() {
+                    should_emit_token_count = true;
+                    sess.record_token_usage_info(&turn_context, token_usage.as_ref())
+                        .await
+                } else {
+                    // OpenAI-compatible providers may omit streamed usage. Keep
+                    // auto-compaction and the composer context meter working from
+                    // a local history estimate instead of retaining stale counts.
+                    sess.recompute_token_usage(&turn_context).await;
+                    should_emit_token_count = false;
+                    Ok(())
+                };
                 should_emit_turn_diff = true;
                 if let Err(err) = budget_result {
                     break Err(err);

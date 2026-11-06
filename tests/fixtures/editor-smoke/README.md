@@ -12,7 +12,7 @@ Manual smoke targets:
 | Bootstrap | Open the copy in AHEAD, complete first-time Settings, inspect `.ahead/` | Settings, config, ignore boundary |
 | Editor | Open `src/main.rs`, edit, undo, save, reopen | Dirty state, persisted text |
 | Recovery | Make unsaved edits in TS/Python; restart the dev loop; reopen the same copy. Repeat with a changed or missing disk file and a second window. Try File > Recover Unsaved Changes. | Last acknowledged text restored as dirty; no source-file write on restore; changed-baseline overwrite prompt; current dirty tabs and live windows preserved |
-| Search and replace | Find `AHEAD_SEARCH_NEEDLE`, then try Text, Word and Regex (exactly one mode selected; Case remains independent), include/exclude patterns, keyboard result paging, and opening a full match range. Replace matches in an unsaved editor buffer. | Results select the exact range; filtering and paging are correct; replacement is one undoable unsaved edit, opens affected tabs, and does not write the files to disk |
+| Search and replace | In Text mode, search for the literal `console.log(` and confirm it finds the JavaScript and TypeScript call sites without a regex error. Switch to Regex mode and confirm the unmatched `(` is reported as an invalid regex; switch back to Text and confirm literal results return. Then find `AHEAD_SEARCH_NEEDLE`, try Text, Word and Regex (exactly one mode selected; Case remains independent), include/exclude patterns, keyboard result paging, and opening a full match range. Replace matches in an unsaved editor buffer. | Parentheses are literal in Text mode and parsed only in Regex mode; switching modes clears stale results/errors. Results select the exact range; filtering and paging are correct; replacement is one undoable unsaved edit, opens affected tabs, and does not write the files to disk |
 | Command palette | Press Cmd/Ctrl+Shift+P or F1 from the editor and focused terminal; move past eight results, type `git`, use arrows and Enter to open Source Control; reopen and press Escape | Filtered commands, visible keyboard selection, execution, focus restoration and dismissal |
 | Language/LSP | With Rust Analyzer, complete `math::dou` to `math::double` in an unsaved edit; break/fix a call; test hover, signature help (Cmd/Ctrl+Shift+Space or Editor menu), definition/back, references, rename, Format Document (Shift+Alt+F or Editor menu), and code actions (Cmd+. / Ctrl+. or Editor menu); undo formatting and the code action; exercise a server-originated `workspace/applyEdit`; switch files during a pending reply. In TypeScript, remove the `calculate` import and test its quick fix. Open JSON for syntax highlighting. | Real suggestions and correct insertion; active signature parameter and overload switching; diagnostics clear; formatting and workspace/code-action edits are each one undoable change; advertised server commands run; verify the `workspace/applyEdit` response reports the actual applied result; resource create/rename/delete operations remain unsupported and fail closed; stale replies are ignored |
 | Completion popup and details | In `src/main.rs`, trigger completion on a line with room above the caret and type a common prefix that returns many matches. Move through and accept one suggestion. Then request signature help inside a function call and move between overloads/parameters. | The popup appears above the caret when there is room, shows no more than five ranked suggestions, and displays useful type/signature details beside each label. Signature help shows the active parameter and its type/documentation without obscuring the current line. |
@@ -30,12 +30,17 @@ Manual smoke targets:
 | FIM and managed agent edit | With a configured disposable test provider, request a small edit in a nested file and accept a completion at the caret. Inspect the agent-authored range in the gutter, then stage and commit it. | FIM includes live buffer and applicable session/instruction context; stale suggestions are discarded; accepted text lands at the caret; the managed edit has CodeAnchor attribution through the commit. No production credentials or real project files are used. |
 | Advanced integrations | Voice and debugger are separate milestones; exercise only with the required device/server and adapter | Record results separately; these are not core broad-use release gates |
 
-For local development use `just dev /absolute/path/to/disposable-copy` from
-the AHEAD repository root. Keep one shared Cargo build loop active.
-`just verify` runs the offline Rust, TypeScript/JavaScript and Python tests.
-It requires Cargo, Node 24+ with npm, and Python 3.9+; no npm or pip package
-installation is needed. The Node tests execute TypeScript but do not replace
-a type-checker or an LSP check.
+For local development, start the editor from the AHEAD repository root with
+`just dev /absolute/path/to/disposable-copy`. The copied project contains its
+own `justfile`; run `just verify` from that project directory. When starting
+from the AHEAD repository root, first change the terminal's working directory
+to the disposable copy with `cd /absolute/path/to/disposable-copy`, then run
+`just verify`. This runs the offline Rust, TypeScript/JavaScript and Python
+tests. Its Rust lane invokes Cargo, so stop the AHEAD dev watcher with Ctrl-C
+before verification and restart `just dev` on the same project afterward.
+The checks require Cargo, Node 24+ with npm, and Python 3.9+; no npm or pip
+package installation is needed. The Node tests execute TypeScript but do not
+replace a type-checker or an LSP check.
 
 `mcp_echo.py` is an offline stdio server for the Managed MCP row. Its default
 mode requires MCP `2026-07-28`; `--form` and `--url` intentionally return the
@@ -100,8 +105,10 @@ AHEAD_LSP_INSTALL_MISSING=1 AHEAD_LSP_LANGUAGES=typescript,python \
   AHEAD_LSP_INSTALL_ZED_HTML=1 node tests/lsp-smoke.mjs target/debug/ahead
 ```
 
-All app data, extension packages and npm caches stay in the generated OS-temp
-fixture; the script prints its path for inspection and cleanup. This is a
+All app data, extension packages and npm caches stay in a sibling OS-temp
+profile outside the generated project, so they do not pollute its file tree. A
+successful run removes the profile and retains the project for inspection; a
+failed run reports and retains both. This is a
 development-preview acceptance check, not production registry authorization
 or native Extensions-tab verification.
 
@@ -115,7 +122,7 @@ Repeat the Language/LSP row in each language before marking it verified:
 | Language | Files and completion | Diagnostic check |
 | --- | --- | --- |
 | Rust | `src/main.rs`, `src/math.rs`; `math::dou` | Pass a string to `double`, then undo |
-| TypeScript | `typescript/src/main.ts`, `math.ts`; `result.dou` | Call `calculate("21")`, then undo |
+| TypeScript | `typescript/src/main.ts`, `math.ts`; `result.dou`; in a new unsaved interface, type `extends Cal` and expect `Calculation` | Call `calculate("21")`, then undo |
 | JavaScript | `javascript/src/main.mjs`, `math.mjs`; `tri` | Call `triple("14")`, then undo |
 | Python | `python/main.py`, `arithmetic.py`; `dou` | Call `double("21")`, then undo |
 

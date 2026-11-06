@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use codex_protocol::config_types::ToolExposureSurface;
 use codex_utils_path_uri::LegacyAppPathString;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -18,7 +17,7 @@ use crate::RequirementSource;
 /// Effective MCP environment id when config omits `environment_id`.
 pub const DEFAULT_MCP_SERVER_ENVIRONMENT_ID: &str = "local";
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AppToolApproval {
     #[default]
@@ -70,8 +69,7 @@ impl fmt::Display for McpServerDisabledReason {
 }
 
 /// Per-tool settings for a single MCP server tool.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct McpServerToolConfig {
     /// Approval mode for this tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,7 +87,7 @@ impl McpServerToolConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct McpServerEnvVar(String);
 
@@ -191,8 +189,7 @@ impl McpServerConfig {
 /// Keep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively
 /// destructuring this struct so new TOML fields cannot be added here without
 /// updating the validation/mapping logic that produces [`McpServerConfig`].
-#[derive(Deserialize, Clone, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RawMcpServerConfig {
     // stdio
@@ -212,7 +209,6 @@ pub struct RawMcpServerConfig {
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
     #[serde(default, with = "option_duration_secs")]
-    #[schemars(with = "Option<f64>")]
     pub tool_timeout_sec: Option<Duration>,
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -305,7 +301,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged, deny_unknown_fields, rename_all = "snake_case")]
 pub enum McpServerTransportConfig {
     /// https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#stdio

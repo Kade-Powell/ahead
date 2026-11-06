@@ -99,12 +99,28 @@ fn start_mock_host_model() -> (
             }
         };
         socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
             .expect("model read timeout");
         let mut request = Vec::new();
         let mut buffer = [0; 8192];
         let (headers, body) = loop {
-            let read = socket.read(&mut buffer).expect("host model request");
+            let read = match socket.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "host model request timed out"
+                    );
+                    continue;
+                }
+                Err(error) => panic!("host model request: {error}"),
+            };
             assert_ne!(read, 0, "host model request ended early");
             request.extend_from_slice(&buffer[..read]);
             let Some(header_end) = request
@@ -140,7 +156,7 @@ fn start_mock_host_model() -> (
                     }
                 };
                 socket
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .set_read_timeout(Some(std::time::Duration::from_millis(250)))
                     .expect("model read timeout");
                 request.clear();
                 continue;
@@ -1387,7 +1403,36 @@ fn open_shell<'a>(
     let shell = root.update(cx, |root, _| {
         root.view().clone().downcast::<Shell>().ok().expect("shell")
     });
+    let session = shell.read_with(cx, |shell, _| shell.session.clone());
+    session.update(cx, |session, _| session.set_shell(shell.clone()));
     (shell, cx, proxy)
+}
+
+#[gpui_kit::test]
+fn workspace_edit_subscription_reuses_its_shell_update(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["src/main.rs"], cx);
+    let code = shell.read_with(cx, |shell, _| shell.code.clone());
+    shell.update_in(cx, |shell, window, cx| {
+        shell.configure_code(code.clone(), window, cx);
+    });
+    cx.run_until_parked();
+
+    code.update(cx, |_, cx| {
+        cx.emit(crate::code_panel::WorkspaceEditRequest {
+            edit: lsp_types::WorkspaceEdit::default(),
+            source_path: workspace.path().join("stale.rs"),
+            purpose: crate::code_panel::WorkspaceEditPurpose::Rename {
+                old_name: "before".into(),
+                new_name: "after".into(),
+            },
+            generation: 0,
+            completion: None,
+        });
+    });
+
+    let status = shell.read_with(cx, |shell, _| shell.status_message.clone());
+    assert!(status.contains("Rename canceled because the source buffer changed"));
 }
 
 #[gpui_kit::test]
@@ -1410,6 +1455,35 @@ fn opening_a_fresh_editor_workspace_bootstraps_private_settings(
         include_str!("../../defaults/settings.toml"),
     );
     assert!(!ahead_directory.join("config.toml").exists());
+}
+
+#[gpui_kit::test]
+fn language_server_config_opens_a_fresh_shareable_file(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (shell, cx, _) = open_shell(workspace.path(), &["src/main.rs"], cx);
+    let config = workspace.path().join(".ahead/config.toml");
+    assert!(!config.exists());
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_language_server_config(window, cx);
+    });
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("shareable config created"),
+        ""
+    );
+    assert_eq!(shell.read_with(cx, |shell, _| shell.code_tabs.len()), 2);
+    assert_eq!(
+        shell.read_with(cx, |shell, cx| shell.code.read(cx).file_path.clone()),
+        config
+            .canonicalize()
+            .expect("canonical shareable config")
+            .to_string_lossy()
+    );
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_language_server_config(window, cx);
+    });
+    assert_eq!(shell.read_with(cx, |shell, _| shell.code_tabs.len()), 2);
 }
 
 #[gpui_kit::test]
@@ -1563,10 +1637,31 @@ fn empty_agent_panel_routes_ahead_and_external_start_actions(
             panel.set_threads_visible(false, cx);
         });
         window.render_frame(cx);
+        assert!(
+            window.try_find("zoom-in").is_some(),
+            "the right dock should expose its zoom control"
+        );
+        window.click("zoom-in", cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(area.read(cx).is_zoomed(), "right dock should zoom in");
         window.click("empty_new_ahead", cx);
         window.render_frame(cx);
-        assert!(agent_workspace.read(cx).threads_visible);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(
+            agent_workspace.read(cx).threads_visible,
+            "New AHEAD click did not reveal Threads: status={:?}, setup_open={}",
+            session.read_with(cx, |panel, _| panel.status.clone()),
+            threads.read_with(cx, |panel, _| panel.is_new_session_open()),
+        );
         assert!(window.try_find("new_session_next").is_some());
+        assert!(area.read(cx).is_zoomed());
 
         window.click("cancel_new_session", cx);
         window.render_frame(cx);
@@ -1576,6 +1671,10 @@ fn empty_agent_panel_routes_ahead_and_external_start_actions(
         });
         window.render_frame(cx);
         window.click("empty_new_external", cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
         window.render_frame(cx);
         assert!(agent_workspace.read(cx).threads_visible);
         assert!(window.try_find("cancel_external_session").is_some());
@@ -1588,7 +1687,14 @@ fn empty_agent_panel_routes_ahead_and_external_start_actions(
             session.read(cx).status.as_ref(),
             "Paste the session invite JSON copied from the host."
         );
+        window.click("zoom-out", cx);
+        window.render_frame(cx);
     });
+    cx.run_until_parked();
+    assert!(
+        !cx.read(|cx| area.read(cx).is_zoomed()),
+        "right dock should zoom back out"
+    );
 }
 
 fn edit(
@@ -1777,6 +1883,400 @@ fn terminal_close_stops_backend_while_panel_is_retained(cx: &mut TestAppContext)
 
 #[cfg(unix)]
 #[gpui_kit::test]
+fn close_active_item_targets_the_focused_terminal(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py"], cx);
+    let first = add_terminal(&shell, workspace.path(), cx);
+    let second = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            18,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.terminals.push(second.clone());
+        shell.active_terminal = 0;
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        let focus = second.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        shell.run_shell_command(super::ShellShortcut::CloseActiveItem, window, cx);
+    });
+    assert!(second.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!first.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert_eq!(shell.read_with(cx, |shell, _| shell.code_tabs.len()), 1);
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn close_active_item_keeps_terminal_when_editor_is_focused(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py", "other.py"], cx);
+    let terminal = add_terminal(&shell, workspace.path(), cx);
+    shell.update_in(cx, |shell, window, cx| {
+        let focus = shell.code.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        assert!(focus.contains_focused(window, cx));
+        shell.run_shell_command(super::ShellShortcut::CloseActiveItem, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(shell.read_with(cx, |shell, _| shell.code_tabs.len()), 1);
+    assert!(!terminal.read_with(cx, |terminal, _| terminal.is_shutdown()));
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn terminal_close_to_right_shuts_down_only_the_tabs_to_the_right(
+    cx: &mut TestAppContext,
+) {
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py"], cx);
+    let left = add_terminal(&shell, workspace.path(), cx);
+    let right = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            18,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| shell.terminals.push(right.clone()));
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            17,
+            crate::terminal_panel::TerminalTabAction::CloseRight,
+            order,
+            window,
+            cx,
+        );
+    });
+
+    assert!(!left.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(right.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(shell.read_with(cx, |shell, cx| {
+        shell
+            .terminals
+            .iter()
+            .any(|terminal| terminal.read(cx).terminal_id() == 17)
+            && !shell
+                .terminals
+                .iter()
+                .any(|terminal| terminal.read(cx).terminal_id() == 18)
+    }));
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn terminal_tab_close_actions_close_the_requested_tabs(cx: &mut TestAppContext) {
+    use crate::terminal_panel::TerminalTabAction;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py"], cx);
+    let terminals = [17, 18, 19, 20]
+        .into_iter()
+        .map(|id| {
+            cx.new(|cx| {
+                crate::terminal_panel::TerminalPanel::new_with_shell(
+                    id,
+                    workspace.path().to_string_lossy().into_owned(),
+                    "/bin/sh",
+                    cx,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    shell.update(cx, |shell, _| {
+        shell.terminals.extend(terminals.iter().cloned());
+    });
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            18,
+            TerminalTabAction::CloseOthers,
+            order,
+            window,
+            cx,
+        );
+    });
+    assert!(terminals[0].read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!terminals[1].read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(terminals[2].read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(terminals[3].read_with(cx, |terminal, _| terminal.is_shutdown()));
+
+    let left = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            21,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    let right = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            22,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| {
+        shell.terminals.extend([left.clone(), right.clone()]);
+    });
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            21,
+            TerminalTabAction::CloseLeft,
+            order,
+            window,
+            cx,
+        );
+    });
+    assert!(terminals[1].read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!left.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!right.read_with(cx, |terminal, _| terminal.is_shutdown()));
+
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            21,
+            TerminalTabAction::CloseRight,
+            order,
+            window,
+            cx,
+        );
+    });
+    assert!(right.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            21,
+            TerminalTabAction::CloseAll,
+            order,
+            window,
+            cx,
+        );
+    });
+    assert!(left.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(shell.read_with(cx, |shell, _| shell.terminals.is_empty()));
+
+    let clean_terminals = [23, 24]
+        .into_iter()
+        .map(|id| {
+            cx.new(|cx| {
+                crate::terminal_panel::TerminalPanel::new_with_shell(
+                    id,
+                    workspace.path().to_string_lossy().into_owned(),
+                    "/bin/sh",
+                    cx,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    shell.update(cx, |shell, _| {
+        shell.terminals.extend(clean_terminals.iter().cloned());
+    });
+    let order = shell.read_with(cx, |shell, _| {
+        shell
+            .terminals
+            .iter()
+            .map(|terminal| terminal.entity_id().as_u64())
+            .collect::<Vec<_>>()
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.close_terminal_tab_action(
+            23,
+            TerminalTabAction::CloseClean,
+            order,
+            window,
+            cx,
+        );
+    });
+    assert!(clean_terminals.iter().all(|terminal| {
+        terminal.read_with(cx, |terminal, _| terminal.is_shutdown())
+    }));
+    assert!(shell.read_with(cx, |shell, _| shell.terminals.is_empty()));
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn terminal_tabs_close_from_the_tab_and_right_click_menu(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{MouseButton, MouseDownEvent, point, px};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py"], cx);
+    let first = add_terminal(&shell, workspace.path(), cx);
+    let second = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            18,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| shell.terminals.push(second.clone()));
+    shell.update_in(cx, |shell, window, cx| {
+        for terminal in shell.terminals.clone() {
+            shell.configure_terminal(terminal, cx);
+        }
+        shell.set_bottom_layout(false, window, cx);
+        let area = shell.area.clone();
+        area.update(cx, |area, cx| {
+            if !area.is_dock_open(DockPlacement::Bottom) {
+                area.toggle_dock(DockPlacement::Bottom, window, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close_terminal_tab_17").is_some());
+        assert!(window.try_find("close_terminal_tab_18").is_some());
+        assert!(window.find("close_terminal_tab_17").visible());
+        assert!(window.find("close_terminal_tab_18").visible());
+        window.click("close_terminal_tab_18", cx);
+        window.render_frame(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("close_terminal_tab_18").is_none(),
+            "closing a tab must remove it from the dock"
+        );
+    });
+    assert!(second.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!first.read_with(cx, |terminal, _| terminal.is_shutdown()));
+
+    let close_bounds = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.find("close_terminal_tab_17").bounds()
+    });
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: point(close_bounds.origin.x - px(24.), close_bounds.center().y),
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+    });
+    cx.simulate_keystrokes("down down down enter");
+    cx.run_until_parked();
+
+    assert!(first.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(shell.read_with(cx, |shell, _| shell.terminals.is_empty()));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close_terminal_tab_17").is_none());
+    });
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn terminal_tab_middle_click_closes_only_that_tab(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let (shell, cx, _) = open_shell(workspace.path(), &["main.py"], cx);
+    let first = add_terminal(&shell, workspace.path(), cx);
+    let second = cx.new(|cx| {
+        crate::terminal_panel::TerminalPanel::new_with_shell(
+            18,
+            workspace.path().to_string_lossy().into_owned(),
+            "/bin/sh",
+            cx,
+        )
+    });
+    shell.update(cx, |shell, _| shell.terminals.push(second.clone()));
+    shell.update_in(cx, |shell, window, cx| {
+        for terminal in shell.terminals.clone() {
+            shell.configure_terminal(terminal, cx);
+        }
+        shell.set_bottom_layout(false, window, cx);
+        let area = shell.area.clone();
+        area.update(cx, |area, cx| {
+            if !area.is_dock_open(DockPlacement::Bottom) {
+                area.toggle_dock(DockPlacement::Bottom, window, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+
+    let tab_position = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find("close_terminal_tab_18")
+            .expect("terminal tab close control is rendered")
+            .bounds()
+            .center()
+    });
+    cx.simulate_mouse_move(
+        tab_position,
+        None::<gpui_kit::MouseButton>,
+        Default::default(),
+    );
+    cx.simulate_mouse_down(
+        tab_position,
+        gpui_kit::MouseButton::Middle,
+        Default::default(),
+    );
+    cx.simulate_mouse_up(
+        tab_position,
+        gpui_kit::MouseButton::Middle,
+        Default::default(),
+    );
+    cx.run_until_parked();
+
+    assert!(second.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(!first.read_with(cx, |terminal, _| terminal.is_shutdown()));
+    assert!(shell.read_with(cx, |shell, _| shell.terminals.len() == 1));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close_terminal_tab_18").is_none());
+    });
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
 async fn just_tasks_open_fresh_named_terminals(cx: &mut TestAppContext) {
     let workspace = tempfile::tempdir().expect("disposable task workspace");
     let directory = workspace.path().join("task's directory");
@@ -1844,6 +2344,11 @@ async fn just_tasks_open_fresh_named_terminals(cx: &mut TestAppContext) {
         );
         assert!(!output.contains("WRONG_JUSTFILE"), "task output: {output}");
         assert_eq!(output.lines().next(), Some("smoke"));
+        assert_eq!(
+            terminal.read_with(cx, |terminal, _| terminal.terminal_title()),
+            "smoke",
+            "the recipe name remains the title after the PTY reports its shell title"
+        );
     }
     assert!(!original.read_with(cx, |terminal, _| terminal.is_shutdown()));
     shell.update_in(cx, |shell, window, cx| {

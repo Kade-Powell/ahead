@@ -51,30 +51,26 @@ where
     Notif: Serialize,
     Resp: Serialize,
 {
-    let value = match msg {
+    let bytes = match msg {
         RpcMessage::Request(id, req) => {
             let mut msg = serde_json::to_value(&req)?;
             msg.as_object_mut()
                 .ok_or(io::ErrorKind::NotFound)?
                 .insert("id".into(), id.into());
-            msg
+            serde_json::to_vec(&msg)?
         }
-        RpcMessage::Response(id, resp) => {
-            json!({
+        RpcMessage::Response(id, resp) => serde_json::to_vec(&json!({
                 "id": id,
                 "result": resp,
-            })
-        }
-        RpcMessage::Notification(n) => serde_json::to_value(n)?,
-        RpcMessage::Error(id, err) => {
-            json!({
+        }))?,
+        RpcMessage::Notification(n) => serde_json::to_vec(&n)?,
+        RpcMessage::Error(id, err) => serde_json::to_vec(&json!({
                 "id": id,
                 "error": err,
-            })
-        }
+        }))?,
     };
-    let msg = format!("{}\n", serde_json::to_string(&value)?);
-    out.write_all(msg.as_bytes())?;
+    out.write_all(&bytes)?;
+    out.write_all(b"\n")?;
     out.flush()?;
     Ok(())
 }

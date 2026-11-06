@@ -556,7 +556,6 @@ impl ApplyPatchHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
             step_context,
             tracker,
             call_id,
@@ -584,7 +583,7 @@ impl ApplyPatchHandler {
         match codex_apply_patch::verify_apply_patch_args_with_mode(
             args,
             turn_environment.cwd(),
-            apply_patch_file_update_mode(&turn),
+            apply_patch_file_update_mode(step_context.turn.as_ref()),
             fs.as_ref(),
             Some(&sandbox),
         )

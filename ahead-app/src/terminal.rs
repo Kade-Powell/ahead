@@ -13,7 +13,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell as PtyShell};
-use alacritty_terminal::vte::ansi::{Color as TerminalColor, CursorShape};
+use alacritty_terminal::vte::ansi::{
+    ClearMode, Color as TerminalColor, CursorShape, Handler as _,
+};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 const TERMINAL_COLUMNS: usize = 120;
@@ -100,6 +102,22 @@ fn select_all_terminal_content<T: EventListener>(terminal: &mut Term<T>) {
     let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
     selection.update(end, Side::Right);
     terminal.selection = Some(selection);
+}
+
+fn clear_saved_screen<T: EventListener>(terminal: &mut Term<T>) {
+    terminal.clear_screen(ClearMode::Saved);
+    let cursor = terminal.grid().cursor.point;
+    terminal.grid_mut().reset_region(..cursor.line);
+    let current_line =
+        terminal.grid()[cursor.line][..Column(terminal.grid().columns())].to_vec();
+    for (column, cell) in current_line.into_iter().enumerate() {
+        terminal.grid_mut()[Line(0)][Column(column)] = cell;
+    }
+    terminal.grid_mut().cursor.point = Point::new(Line(0), cursor.column);
+    if terminal.screen_lines() > 1 {
+        terminal.grid_mut().reset_region(Line(1)..);
+    }
+    terminal.selection = None;
 }
 
 #[derive(Clone)]
@@ -299,6 +317,10 @@ impl TerminalBackend {
         self.terminal.lock().selection = None;
     }
 
+    pub(crate) fn clear(&self) {
+        clear_saved_screen(&mut self.terminal.lock());
+    }
+
     pub(crate) fn display_offset(&self) -> usize {
         self.terminal.lock().grid().display_offset()
     }
@@ -432,32 +454,37 @@ fn terminate_pty_child(child_id: u32, file: &std::fs::File) {
         return;
     }
     // The IO thread has stopped and is no longer reaping. WNOWAIT verifies
-    // this is still our unreaped child and keeps its PID reserved until Drop.
+    // whether the direct child is still ours before signaling its PID.
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    if unsafe {
+    let child_is_unreaped = unsafe {
         libc::waitid(
             libc::P_PID,
             child_id,
             info.as_mut_ptr(),
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
-    } != 0
-    {
+    } == 0;
+    if !child_is_unreaped {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ECHILD) {
             eprintln!("Inspecting terminal child before shutdown: {error}");
         }
-        return;
     }
-    let foreground = unsafe { libc::tcgetpgrp(file.as_raw_fd()) };
     for signal in [libc::SIGTERM, libc::SIGKILL] {
-        for group in [foreground, child] {
-            // Never signal the editor's group or a PID from a different session.
-            if group > 1 && unsafe { libc::getsid(group) } == child {
+        let mut signaled = std::collections::HashSet::new();
+        for (pid, group) in terminal_session_process_groups(child) {
+            if group > 1
+                && group != unsafe { libc::getpgrp() }
+                && unsafe { libc::getsid(pid) } == child
+                && unsafe { libc::getpgid(pid) } == group
+                && signaled.insert(group)
+            {
                 signal_terminal_process(-group, signal);
             }
         }
-        signal_terminal_process(child, signal);
+        if child_is_unreaped {
+            signal_terminal_process(child, signal);
+        }
         if signal == libc::SIGTERM {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -471,6 +498,24 @@ fn terminate_pty_child(child_id: u32, file: &std::fs::File) {
             std::io::Error::last_os_error()
         );
     }
+}
+
+#[cfg(unix)]
+fn terminal_session_process_groups(session: i32) -> Vec<(i32, i32)> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    system
+        .processes()
+        .keys()
+        .filter_map(|pid| {
+            let pid = i32::try_from(pid.as_u32()).ok()?;
+            (unsafe { libc::getsid(pid) } == session)
+                .then(|| (pid, unsafe { libc::getpgid(pid) }))
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -527,6 +572,36 @@ mod tests {
         let text = terminal_history_text(&terminal);
         assert!(text.contains("one\ntwo\nthree\nfour\nfive"), "{text:?}");
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn clear_removes_scrollback_and_keeps_the_current_command_line() {
+        let mut terminal = Term::new(
+            Config {
+                scrolling_history: 10,
+                ..Config::default()
+            },
+            &TermSize::new(20, 3),
+            VoidListener,
+        );
+        let mut parser =
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        for byte in b"one\r\ntwo\r\nthree\r\nprompt> echo" {
+            parser.advance(&mut terminal, *byte);
+        }
+
+        clear_saved_screen(&mut terminal);
+        let cleared = terminal_history_text(&terminal);
+        assert!(cleared.contains("prompt> echo"), "{cleared:?}");
+        assert!(!cleared.contains("one"), "{cleared:?}");
+        assert!(!cleared.contains("two"), "{cleared:?}");
+        assert!(!cleared.contains("three"), "{cleared:?}");
+        assert_eq!(terminal.grid().cursor.point.line, Line(0));
+
+        for byte in b" ok" {
+            parser.advance(&mut terminal, *byte);
+        }
+        assert!(terminal_history_text(&terminal).contains("prompt> echo ok"));
     }
 
     #[test]
@@ -587,6 +662,42 @@ mod tests {
                 "pasted command did not reach the shell"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let shell_process = backend.process_id().expect("shell process ID") as i32;
+        assert_terminal_shutdown(backend, &[shell_process]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resizing_the_pty_reflows_output_without_losing_it() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let backend = TerminalBackend::new(
+            workspace.path().to_str().expect("workspace path"),
+            "/bin/sh",
+        )
+        .expect("start disposable shell");
+        let marker = "AHEAD_TERMINAL_REFLOW_1234567890";
+        backend
+            .paste("printf '%s%s\n' 'AHEAD_TERMINAL_' 'REFLOW_1234567890'\n")
+            .expect("print reflow marker");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !backend.shared_history_text().contains(marker) {
+            assert!(Instant::now() < deadline, "shell did not print the marker");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for (columns, rows) in [(10, 5), (80, 24)] {
+            backend.resize(columns, rows).expect("resize the PTY");
+            let terminal = backend.terminal.lock();
+            assert_eq!(terminal.grid().columns(), columns);
+            assert_eq!(terminal.grid().screen_lines(), rows);
+            let history = terminal_history_text(&terminal);
+            assert!(
+                history.replace('\n', "").contains(marker),
+                "resize to {columns} columns lost output: {history:?}"
+            );
         }
 
         let shell_process = backend.process_id().expect("shell process ID") as i32;
@@ -770,6 +881,45 @@ mod tests {
         assert_ne!(shell, foreground);
 
         assert_terminal_shutdown(backend, &[shell, foreground]);
+    }
+
+    #[test]
+    fn closing_terminal_stops_background_job_in_its_session() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let backend = TerminalBackend::new(
+            workspace.path().to_str().expect("workspace path"),
+            "/bin/sh",
+        )
+        .expect("start disposable shell");
+        backend
+            .send(b"trap '' HUP TERM; set -m; echo $$ > shell.pid; sh -c 'trap \"\" HUP TERM; echo $$ > background.pid; exec sleep 60' & wait\r".to_vec())
+            .expect("launch background job");
+        let shell = read_pid(&workspace.path().join("shell.pid"));
+        let background = read_pid(&workspace.path().join("background.pid"));
+        assert_eq!(unsafe { libc::getsid(background) }, shell);
+        assert_ne!(unsafe { libc::getpgid(background) }, unsafe {
+            libc::getpgid(shell)
+        });
+
+        assert_terminal_shutdown(backend, &[shell, background]);
+    }
+
+    #[test]
+    fn closing_terminal_stops_orphaned_background_job() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let backend = TerminalBackend::new(
+            workspace.path().to_str().expect("workspace path"),
+            "/bin/sh",
+        )
+        .expect("start disposable shell");
+        backend
+            .send(b"trap '' HUP TERM; set -m; echo $$ > shell.pid; sh -c 'trap \"\" HUP TERM; echo $$ > background.pid; exec sleep 60' & exit\r".to_vec())
+            .expect("launch orphaned background job");
+        let shell = read_pid(&workspace.path().join("shell.pid"));
+        let background = read_pid(&workspace.path().join("background.pid"));
+        assert_eq!(unsafe { libc::getsid(background) }, shell);
+
+        assert_terminal_shutdown(backend, &[shell, background]);
     }
 
     fn assert_terminal_shutdown(backend: TerminalBackend, processes: &[i32]) {

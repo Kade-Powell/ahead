@@ -36,6 +36,615 @@ managed-agent smokes, then native rendered behavior.
       graceful shutdown. `tests/lsp-smoke.mjs` now sends the
       `SignatureHelpContext` the protocol requires; without it the proxy drops
       the notification and the client waits forever.
+- [x] 2026-10-26 reran the Rust-only `tests/lsp-smoke.mjs` matrix against the
+      integrated binary: formatting, completion/navigation, semantic tokens,
+      hover/signature help, references/rename, unsaved diagnostics/recovery,
+      restart and graceful shutdown all passed with the already-installed
+      rust-analyzer 1.98.1. The default stable rustup shim lacked the analyzer
+      component, so the smoke used its explicit binary-path override; no install
+      or network access was used.
+- [x] 2026-10-26 reran the full managed LSP matrix against the integrated
+      binary in the disposable Rust/TypeScript/JavaScript/Python fixture.
+      Managed Vtsls, Basedpyright and Ruff acquisition, typed completions,
+      definitions, diagnostics/repair, semantic tokens, signatures, code
+      actions, formatting/config reload, cross-file rename in unsaved buffers,
+      restart/replay and graceful shutdown all passed. The process-group check
+      now allows a bounded OS teardown interval and reports remaining members;
+      its final cached run confirmed clean exit. No Cargo build or credentials
+      were used. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-NuD00Y`.
+- [x] 2026-10-26 moved the LSP smoke's isolated data, runtime, user, Cargo,
+      XDG-cache/config and Rust Analyzer alias into a sibling temporary profile,
+      keeping generated server data out of the disposable project. The
+      cache-seeded Rust/TypeScript/JavaScript/Python matrix passed against the
+      integrated binary with no Cargo build or package downloads. The retained
+      project had no `ahead-data`, runtime-home or server-bin directories; the
+      successful run removed its profile. First-run rendered editor bootstrap
+      remains a separate open acceptance gate. The smoke now also fails if
+      `ahead-data` appears inside the retained project; `node --check
+      tests/lsp-smoke.mjs` passes. On 2026-10-26, reran the Rust-only matrix
+      against the integrated binary with the installed Rust Analyzer 1.98.1
+      override. Formatting, completion/navigation, diagnostics/repair,
+      restart/replay and graceful shutdown passed, including the new
+      `ahead-data` absence assertion. No Cargo build or server download was
+      used. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-ocUYn6`.
+      The same fixture then opened in the current `just dev` app using an
+      isolated `AHEAD_DATA_HOME`; the fresh build completed in 12.4s. First
+      render bootstrapped workspace `.ahead`/Turso session storage without
+      creating `ahead-data` in the project. In the native editor, Rust Analyzer
+      reached Ready and Ctrl+Space returned `double` with `fn(i32) -> i32` in
+      the completion popup above the caret. The PTY rendered an interactive
+      shell and accepted input to dismiss its first-run shell-update prompt.
+      The New AHEAD Session flow advanced through review, started a local
+      session, and opened its searchable model picker. A temporary OpenRouter
+      connection discovered 468 models; `Nemotron` name filtering worked and
+      the model/effort popover rendered together. One authorized free-model
+      turn returned `OK` without invoking tools. The temporary provider and key
+      were removed afterward; a quiet scan confirms the disposable
+      `.ahead/settings.toml` no longer contains its URL, name, model ID, or
+      API-key prefix. Provider tool execution/cancellation remain unverified by
+      this native turn.
+- [x] 2026-10-28 reran `tests/lsp-smoke.mjs` across Rust, TypeScript,
+      JavaScript and Python against the watcher-built integrated binary.
+      Managed acquisition started Vtsls, Basedpyright, Ruff and Rust Analyzer;
+      the valid TypeScript prefix `interface ExtendedCalculation extends Cal`
+      returned the local `Calculation` suggestion. Completion, navigation,
+      diagnostics/repair, semantic tokens, formatting, signatures, code actions,
+      unsaved cross-file rename, live Python config changes, restart/replay and
+      graceful shutdown passed. No provider credentials or Cargo build were
+      used by the smoke. Disposable project:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-G58ouO`.
+- [x] 2026-10-30 reran the full Rust/TypeScript/JavaScript/Python
+      `tests/lsp-smoke.mjs` matrix against the integrated binary built at
+      08:58 EDT. AHEAD acquired Basedpyright and Ruff into the smoke's isolated
+      profile; seeded Vtsls and Rust Analyzer also initialized. Completion,
+      navigation, diagnostics/repair, semantic tokens, formatting, signatures,
+      code actions, unsaved cross-file rename, live Python config changes,
+      restart/replay and graceful proxy shutdown passed. No Cargo build or
+      provider credentials were used. Disposable project:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-P6AVrp`.
+      This verifies the live proxy/LSP path; native editor rendering and
+      first-run bootstrap remain separate acceptance gates.
+      Rechecked at 12:13 EDT against `target/debug/ahead` built at 11:58 with
+      isolated TypeScript, Python and Rust runs. TypeScript returned the local
+      `Calculation` completion after `extends`; its first matching response was
+      569 ms and later requests ranged from 17–105 ms. Python's completion
+      round trips measured 412 ms p50 and 918 ms p95; Rust measured 1.3–1.4 ms.
+      All three language smokes passed. These are proxy round-trip timings, not
+      native completion-popup latency.
+- [x] 2026-10-30 rechecked the live Zed extension and workspace-search paths
+      against the same 08:58 integrated binary. Zed's catalog installed HTML
+      0.3.2, grammar/highlight captures loaded, HTML completion passed, and the
+      server restarted and uninstalled cleanly. The 10,000-file search smoke
+      matched literal `console.log(`, multiline text, the 5,000-result cap and
+      rejected a stale-index symlink escape (280 ms indexing, 489 ms multiline,
+      236 ms capped results, 405 ms median no-hit). Both are proxy evidence;
+      native extension coloring and search-panel rendering remain separate.
+- [x] 2026-11-02 reran targeted live Zed catalog installs against the integrated
+      binary: HTML 0.3.2 returned `div` completion for `<di` in 7.5 ms and
+      loaded tag highlights; Proto 0.3.4 launched Buf in a valid v2 module,
+      completed `smoke/common.proto` in 20.3 ms and the local `Smoke` message
+      type in 7.0 ms, and returned a `type` capture. Restart, uninstall and
+      graceful shutdown passed for both in isolated profiles. These verify
+      catalog-to-package-to-server behavior, not native completion rendering
+      or first-run bootstrap. The latest Proto workspace is retained at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-vNhvzM`;
+      generated profiles were removed. Earlier disposable workspaces were
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-gF4SYb`
+      and `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-1d3jR4`.
+- [x] 2026-10-28 native TypeScript completion acceptance in the approved
+      `ahead-lsp-smoke-ocUYn6` project: with an active AHEAD session, typing
+      `interface ExtendedCalculation extend` and accepting Vtsls' `extends`
+      suggestion with Tab inserted exactly one `extends`. The unsaved test
+      buffer was discarded. The source-current completion test executable
+      passed 27 tests covering Tab ownership, stale inline replies and suffix
+      overlap; no authenticated FIM response was available from this fixture.
+- [x] 2026-10-30 native TypeScript completion follow-up: in the disposable
+      editor-smoke project, the live Vtsls popup offered `extends` for typed
+      `extend`; Tab inserted exactly one `extends`. I undid the temporary edit
+      and restored the fixture buffer. The focused GPUI suffix/delayed-FIM
+      regression passes. This rendered run had no configured model response,
+      so it does not verify an authenticated FIM race.
+- [x] 2026-10-28 source-current runner
+      `target/debug/deps/ahead_app-ae401acfe1bf5540` passed all 456 `ahead-app`
+      library tests serially in 141.22s, including editor/LSP ownership and
+      suffix races, session/model/slash pickers, Settings, Git, search/replace,
+      extensions, terminals and close/recovery flows. No `ahead-app/src` file
+      is newer than the runner. `cargo fmt --all -- --check` and
+      `git diff --check` also pass. The shared `just dev` loop stayed active on
+      the disposable LSP workspace. This is headless GPUI evidence, not native
+      rendered or authenticated-provider acceptance.
+- [x] 2026-10-29 source-current runner
+      `target/debug/deps/ahead_app-b63ac9873957e73d` (18:34:28, newer than
+      `code_panel.rs` at 18:33:30) passed all 462 `ahead-app` library tests
+      serially in 64.33s. This includes extension syntax, literal Text-mode
+      search, editor lifecycle, completion, settings, terminal and Git
+      regressions. The shared `just dev` loop was stopped for the run and
+      restarted on the same approved disposable project and Turso data home.
+      This is headless GPUI evidence, not native rendered or
+      authenticated-provider acceptance.
+- [x] 2026-10-29 reran `tests/agent-compaction-smoke.mjs` against the current
+      watcher-built integrated binary. Estimated usage, effective model limit,
+      automatic compaction, persisted summary and shutdown passed with the
+      isolated loopback provider. That run did not cover the authenticated
+      provider path; a later OpenRouter compaction smoke is recorded below.
+      Revalidated in this continuation at 10:48 EDT with the same PASS result.
+- [x] 2026-10-30 reran `rtk node tests/agent-compaction-smoke.mjs
+      target/debug/ahead` against the current integrated binary. Estimated
+      usage, selected-model limit, automatic compaction, persisted summary and
+      shutdown passed with the isolated loopback provider. No Cargo build or
+      external provider request ran in this particular check. Authenticated
+      compaction was subsequently verified by the OpenRouter smoke recorded in
+      the broad-use section; rendered chat remains separate acceptance.
+      Rechecked at 02:45 EDT against the same binary: PASS again; the smoke
+      removed its disposable workspace and profile.
+      Rechecked at 04:02 EDT after tracing the config path: the model-derived
+      compaction smoke still passes. An exploratory `AHEAD_HOME/config.toml`
+      threshold did not apply because the managed runtime intentionally ignores
+      retained Codex user config; this confirms that file is outside AHEAD's
+      managed-session settings contract.
+      Rechecked against the 05:29 integrated binary after the latest native
+      source edits: estimated usage, selected-model limit, automatic compaction,
+      summary persistence and shutdown all passed again with the local provider.
+- [x] 2026-11-02 reran `tests/agent-compaction-smoke.mjs` against the current
+      integrated binary. Estimated usage, effective model limit, automatic
+      compaction, summary persistence and clean shutdown passed with the
+      isolated loopback provider; no Cargo build or external model request ran.
+- [x] 2026-10-30 reran managed Code Mode, project/user memory and MCP smokes
+      against the restarted integrated binary. Delegated search/cancellation
+      and Turso reopen/retry passed; memory append/search/review/reopen passed;
+      MCP discovery/resources, retry, approvals, identified cancellation and
+      continuation passed. All used disposable local fixtures, with no model
+      credentials or user projects.
+- [x] 2026-10-30 at 14:24 EDT, after the active `just dev` loop rebuilt
+      `target/debug/ahead`, reran the disposable loopback compaction, Code Mode,
+      project/user memory, MCP and session-bound FIM smokes. Automatic
+      compaction/summary persistence, concurrent delegated search/cancellation,
+      Turso reopen/retry, memory review/reopen, MCP approval/cancellation and
+      FIM instruction hierarchy all passed. No Cargo build or external model
+      request ran. This updates managed-runtime evidence only; rendered UI and
+      authenticated-provider acceptance remain separate.
+- [x] 2026-10-30, the source-current app test runner
+      `target/debug/deps/ahead_app-a22d426232bf3801` passed 105 CodePanel,
+      79 session-panel, 36 Settings and 15 terminal-panel tests serially. This
+      includes the comment-glyph optical-alignment assertion, LSP completion
+      and insertion behavior, searchable model/effort selection, provider-
+      scoped visibility and terminal tab/input behavior. The focused comment
+      gutter test passed 1/1. The shared `just dev` loop rebuilt and relaunched
+      AHEAD on the same disposable project; formatting and diff checks pass.
+      These are headless GPUI/build checks. The running app was brought forward
+      on 2026-10-30 and a native screenshot confirmed the comment glyph's
+      optical center aligned with the purple gutter button in both axes in that
+      build. The user's 2026-11-02 screenshot showed the message-square-plus
+      glyph still appearing upper-left of the purple button despite centered
+      frame bounds. Replaced the nested icon frame with gpui-kit's icon-only
+      Button, whose content layout centers the icon. The focused gutter test,
+      formatting and diff checks pass, and `just dev` rebuilt the integrated
+      app. The Mac is locked, so a fresh native screenshot remains pending.
+      This is internal verification, not the final screenshot-backed feature
+      guide.
+      Follow-up on 2026-11-02: the icon-only Button change still looked
+      upper-left in the user's screenshot despite the centered layout bounds.
+      The current source keeps the centered hit target and wrapper, with a
+      2px down-right optical correction on the glyph. The shared `just dev`
+      rebuild completed in 18.04s and the proxy entered its main loop; the
+      Impeccable layout scan and `git diff --check` are clean. The Mac is
+      locked, so this latest optical adjustment still needs a fresh native
+      screenshot before its appearance is accepted.
+      Rechecked during the current continuation: replaced the optical offset
+      with a full-size flex wrapper that centers the glyph on both axes. The
+      focused gutter test now asserts exact center alignment and passes 1/1;
+      `git diff --check` is clean. A fresh native screenshot remains pending
+      because the Mac is locked.
+      Follow-up on 2026-11-03: the user's new screenshot again showed the
+      visible glyph high-left despite the centered frame bounds. Restored the
+      centered full-size frame and restored a 3 logical-pixel down-right
+      optical correction to the glyph. The GPUI assertion now checks both the
+      centered frame and glyph offset. `cargo fmt --all -- --check` and
+      `git diff --check` pass. Clearing only the generated language-server
+      cache in the disposable profile let the shared watcher compile
+      `ahead-app`; the final `ahead` executable link still failed with
+      `ENOSPC`. The rendered result and focused GPUI test remain unverified.
+      Follow-up after the user's latest screenshot: removed the 3px glyph
+      translation and changed the existing GPUI assertion to require exact glyph
+      and purple-button center alignment. Formatting/diff checks and a source-
+      current app rebuild remain pending because the volume has 242 MiB free;
+      native pixel confirmation is still required.
+      Follow-up on 2026-11-06: after build space was freed, the shared `just dev`
+      watcher completed a clean workspace build and launched AHEAD in the
+      disposable Rust/TypeScript/JavaScript/Python project. The initial native
+      workspace rendered with an interactive PTY shell at its prompt. The linker
+      emitted an `__eh_frame` compact-unwind warning. This launch check did not
+      exercise a session or render the comment gutter; those acceptance checks
+      remain open.
+- [x] 2026-10-30, against that watcher-built binary, ran the LSP smoke with
+      managed server acquisition in a disposable profile. Rust Analyzer,
+      Vtsls, BasedPyright and Ruff initialized; Rust, TypeScript, JavaScript
+      and Python completion/navigation, diagnostics/repair, formatting,
+      semantic tokens, signatures, code actions, unsaved cross-file rename,
+      live Ruff settings, restart/replay and graceful shutdown passed. The
+      profile was removed. This is proxy/server evidence, not rendered native
+      popup acceptance.
+- [x] 2026-10-30, refreshed local Git and workspace search against the same
+      binary. The disposable Git workflow passed status/diff, per-file and
+      bulk staging, commit/history, push to a local bare remote, branch
+      lifecycle, and conflict protection/resolution. On 10,000 files, workspace
+      indexing took 843 ms, multiline search 975 ms, and returning the 5,000
+      result cap 520 ms. Five alternating no-hit samples measured AHEAD at a
+      median 855 ms and `rg --count-matches --fixed-strings` at 915 ms; the
+      symlink escape check passed. This is a local macOS benchmark and protocol
+      evidence, not native search-panel rendering. Rechecked on 2026-11-02
+      against the current watcher-built binary: literal `console.log(`,
+      multiline matching, the 5,000-result cap and stale-index symlink
+      rejection passed. The first fresh fixture indexed in 5.3 s; a repeat
+      indexed in 282 ms. In the repeat, median no-hit was 340 ms for AHEAD and
+      358 ms for ripgrep, and AHEAD returned the capped results in 201 ms.
+      The cold-index outlier did not reproduce; this remains a local synthetic
+      measurement, not native search-panel or concurrent-load acceptance.
+- [x] 2026-10-30 reran disposable editor recovery, CodeAnchor attribution and
+      Git source-control smokes against the restarted binary; Unicode crash
+      recovery/discard fencing and database permissions, tool-write denial,
+      AHEAD-authored/human-committed session attribution, and local Git
+      stage/commit/push/branch/conflict workflows passed. The current app test
+      runner also passed all 14 terminal-panel tests. These do not replace
+      native rendered terminal/attribution checks.
+- [x] 2026-10-30 native Search and terminal clipboard follow-up in the shared
+      `just dev` disposable project: typing `console.log` and then `(` left
+      Text mode selected and showed the two literal matches without a regex
+      error. Rechecked at 12:13 EDT against the 11:58 integrated binary:
+      `console.log(` stayed literal in Text mode, produced the match, produced
+      the expected parse error in Regex mode, and returned to a match with the
+      error cleared after switching back to Text. Pasted and ran a harmless
+      `printf` command in the integrated PTY,
+      then copied its complete output with Cmd+C and pasted it into the chat
+      composer; the temporary draft was cleared and no project file changed.
+      The integrated binary (10:18 EDT) also passed local loopback Code Mode
+      (eight concurrent searches, cancellation, Turso reopen/retry, shutdown),
+      compaction, FIM, project/user memory, and MCP smokes. No external model
+      credentials or requests were used.
+- [x] 2026-11-02 native LSP and terminal checks in the disposable
+      `ahead-memory-review.bJ5FaU/project`: Vtsls surfaced the local
+      `Calculation` interface for `extends Calcu`; Tab inserted
+      `Calculation` once without duplicating the typed prefix. Signature help
+      rendered `double(value: number): number` and its documentation. In the
+      integrated PTY, right-click exposed New/Rename and the full close menu;
+      Close removed the tab, reopening created a fresh terminal, and pasting
+      then running a harmless `printf` printed `AHEAD_TERMINAL_PASTE_OK`.
+      On 2026-11-03, the source-current GPUI interaction regression passed after
+      opening the context menu from the tab-title area (left of its close
+      button), then closing the tab through that menu. These specific native
+      native interactions passed on 2026-11-02; latency profiling and the
+      remaining LSP navigation/refactor/diagnostic acceptance stay open. After
+      the focused test, the shared `just dev` loop rebuilt in 2.77s on the same
+      disposable project and its proxy re-entered the main loop. The Mac is
+      locked, so a fresh rendered interaction check is still pending.
+- [x] 2026-11-02, the source-current app test runner
+      `target/debug/deps/ahead_app-2867482f11cd4168` passed all 499 tests
+      serially in 65.30s. Coverage includes editor/session lifecycle, LSP
+      completion and navigation, comment-gutter geometry, settings, terminal
+      input/tabs, Git and search/replace. This is headless GPUI evidence;
+      native rendering and authenticated-provider acceptance remain separate.
+      Rechecked the session-panel slice against this runner: all 82 tests passed
+      serially in 2.27s, including session-start actions, model/effort search,
+      provider-scoped visibility, slash-skill selection, cancellation fencing,
+      bounded file context and streaming responsiveness. The independent
+      `model_list_scroll_does_not_scroll_settings_page` regression also passed
+      (1/1) against the same runner.
+- [x] 2026-11-02, the current integrated binary passed Code Mode, compaction,
+      project/user memory, MCP, CodeAnchor/Git attribution and SIGKILL recovery
+      smokes using isolated local fixtures. These verified delegated search and
+      cancellation, retry after Turso reopen, automatic compaction and summary
+      persistence, reviewed memory writes, MCP continuation, AHEAD-authored
+      staged edits and durable recovery. A separate live Zed HTML catalog smoke
+      passed install, grammar/highlights, completion, restart and uninstall.
+      These are local/proxy/runtime checks, not native extension-gallery or
+      authenticated-provider acceptance.
+- [x] 2026-11-02, the current integrated binary passed the session-bound FIM
+      smoke with instruction hierarchy and provider round-trip; workspace search
+      over 10,000 files passed multiline matching, the 5,000-result cap and
+      stale-index symlink rejection (350ms index, 375ms multiline, 374ms median
+      no-hit); disposable Git passed staging, commit/history, local push, branch
+      lifecycle and conflict resolution. No Cargo build or user project was
+      involved. These are protocol/local-fixture results, not native rendering.
+      Rechecked on the binary rebuilt at 19:43 on 2026-11-02: session-bound
+      FIM instruction hierarchy/provider round-trip, Code Mode concurrent
+      search and cancellation, Turso reopen/retry, automatic compaction,
+      project/user memory review, MCP continuation, and CodeAnchor-to-staged-
+      GitCommit attribution all passed. The 10,000-file search smoke passed
+      literal punctuation, multiline matching, result capping and symlink
+      rejection. Its first fresh index was a 5.3 s outlier; a repeat took
+      282 ms, with AHEAD's no-hit median at 340 ms versus ripgrep's 358 ms.
+      No Cargo build or external model request ran.
+- [x] 2026-10-29 reran the source-current model metadata regressions directly
+      from the existing app test binary: OpenAI-compatible context metadata
+      parsing, discovered-model precedence over the provider fallback, and
+      merging discovered models into the picker all passed (3/3). This verifies
+      catalog handling, not the live endpoint's reported value or native meter.
+- [x] 2026-10-29, after adding the nested OpenRouter context-limit fallback,
+      the rebuilt source-current `ahead_app` test runner passed all 456 tests
+      serially in 76.98s. This includes the literal Text-mode search regression
+      for `console.log(` and the model catalog parser precedence/fallback test.
+      Headless app coverage does not replace native rendered acceptance.
+- [x] 2026-10-29 rebuilt the native app through `just dev` on the approved
+      disposable `ahead-lsp-smoke-ocUYn6` project. Text-mode search for the
+      literal `console.log(` returned two matches without a regex error. A
+      temporary TypeScript warning rendered as an editor squiggle and message;
+      undo restored the buffer and the source file on disk was unchanged. The
+      new focused GPUI test passed 1/1, verifying LSP diagnostic ranges reach
+      the editor and clear after an empty publish. This does not establish
+      every server's rendered diagnostic details or quick-fix flow.
+- [x] 2026-10-29 tightened the `console.log(` Text-mode regression to focus the
+      real search input and type the query through GPUI keystrokes (no direct
+      `refresh()` call). It passes with one literal match and no regex error.
+      The app test binary, then newer than `workspace_panels.rs`, passed all
+      456 app tests serially in 77.14s, including this typed
+      input case. This is headless GPUI evidence, not native rendering.
+      On 2026-10-29, after the later `app.rs` and `workspace_panels.rs` edits,
+      the focused search test rebuilt the app runner from current source and
+      passed 1/1. Running that runner directly then passed all 457 app tests
+      serially in 62.51s, including lifecycle, editor/LSP, CodeAnchor, terminal,
+      settings, agent-panel and search coverage. The same `just dev` loop was
+      restarted on `ahead-lsp-smoke-ocUYn6`; the app rebuilt and the proxy
+      entered its main loop. These are source-current headless checks; native
+      rendered verification remains separate while macOS is locked.
+      On 2026-10-29, the source-current runner
+      `target/debug/deps/ahead_app-b63ac9873957e73d` passed all 460 app tests
+      serially in 66.87s; it is newer than every `ahead-app/src/*.rs` file.
+      This includes integrated session-start routing, canonical-path buffer
+      reuse, LSP completion insertion/placement, literal Text-mode search,
+      Settings, Git, and terminal clipboard behavior. It ran directly while
+      the shared `just dev` watcher remained active, without a Cargo build.
+      This is headless GPUI evidence; native pointer behavior and authenticated
+      provider acceptance remain separate.
+      Re-ran this source-current test executable on 2026-10-29 while the shared
+      `just dev` watcher stayed live: all 463 `ahead-app` tests passed serially
+      in 64.15s, including the typed literal `console.log(` regression,
+      editor/LSP, settings, chat/model selection, Git, search/replace, and
+      terminal behavior. The runner postdates both `workspace_panels.rs` and
+      `ahead-core/src/search.rs`. This remains headless GPUI evidence; native
+      rendered verification requires an unlocked desktop.
+      The rebuilt integrated binary also passed
+      `tests/workspace-search-scale-smoke.mjs`: 10,000 indexed files, literal
+      `console.log(` matching, multiline search, capped results and stale-index
+      symlink rejection. This is backend evidence, not a rendered search-panel
+      check. The current-source locked/offline core search suite also passed
+      50 tests after rebuilding its test target; the shared `just dev` loop was
+      restored on the same disposable project afterward.
+      A later screenshot exposed the matcher bug: Text mode called
+      `RegexMatcherBuilder::build_literals` without enabling its
+      `fixed_strings` option, so punctuation such as `(` still reached the
+      regex parser. Added `.fixed_strings(true)`. The source-current typed-input
+      GPUI regression passes (1/1), and the rebuilt integrated binary passes
+      the 10,000-file search smoke with one literal `console.log(` match,
+      multiline matching, the 5,000-result cap and stale-index symlink
+      rejection. Five alternating no-hit scans measured AHEAD at 379 ms median
+      and ripgrep at 436 ms; AHEAD counted 10,000 hot matches in 418 ms. The
+      current `just dev` loop is restored on the same disposable project.
+      Native rendered search-panel acceptance remains separate.
+      Rechecked on 2026-10-29 against the integrated binary rebuilt by the
+      restored `just dev` loop: the exact literal `console.log(` assertion,
+      multiline search, 5,000-result cap and stale-index symlink rejection all
+      passed across 10,000 disposable files. Index build took 439 ms, multiline
+      search 406 ms, capped results 401 ms, and median no-hit search 442 ms
+      across three samples. This remains backend evidence, not rendered-panel
+      acceptance.
+      Rechecked on 2026-10-30 against the watcher-built integrated binary:
+      literal `console.log(` matched once across the 10,000-file fixture,
+      multiline matching and capped results passed, and the stale-index
+      symlink escape was rejected. Indexing took 277 ms, multiline search
+      458 ms, capped results 222 ms, and median no-hit search 402 ms. The
+      matcher regression is verified in source, GPUI input and the integrated
+      search path. A live AHEAD Dev window rendered Text mode with the exact
+      `console.log(` query and two matches, without a regex error.
+      Completion ranking now retains only its best five candidates using
+      partial selection, preserving server sort/preselect order and limiting
+      keyboard navigation to visible rows. The focused ranking test passes;
+      rendered latency still needs a live unlocked-window check.
+- [x] 2026-10-29 reran `tests/agent-acp-install-smoke.mjs` against the rebuilt
+      integrated binary using isolated temporary profiles. Pi ACP 0.0.34 and
+      Codex ACP 2.5.0 launched and requested authentication; Claude ACP 0.99.1
+      exposed five config options and accepted a live model change to Opus 5.5.
+      No prompt or model request was sent, and the script removed its profiles.
+      This verifies curated installation, startup and option wiring, not
+      authenticated external-agent turns or native picker rendering.
+      Repeated against the integrated binary rebuilt for the current shared
+      `just dev` loop: Pi 0.0.34, Codex 2.5.0 and Claude ACP 0.99.1 installed
+      and launched from isolated profiles; Claude again accepted the alternate
+      model setting. No user prompt was sent; temporary profiles were removed.
+      Rechecked on 2026-10-30 against the current integrated binary: all three
+      curated adapters installed and launched in isolated profiles; Pi and
+      Codex requested authentication, and Claude exposed five options and
+      accepted the Opus 5.5 model change. No prompt was sent; profiles were
+      removed. Rechecked at 08:37 EDT against the 08:33 integrated binary:
+      Pi, Codex and Claude all passed again, including Claude's alternate-model
+      update. Authenticated ACP turns and native picker rendering remain open.
+      Rechecked on 2026-10-30 against `target/debug/ahead` built at 11:58 EDT:
+      all three adapters installed, launched, survived proxy restart and
+      uninstalled from isolated profiles. Pi and Codex reached the expected
+      authentication-required state; Claude exposed five config options and
+      accepted the Opus 5.5 model update. No API key or user prompt was sent,
+      and the temporary profiles were removed. Authenticated ACP turns and
+      native picker rendering remain open.
+      Rechecked on 2026-11-02 against the integrated binary rebuilt at 19:07:54
+      by the shared `just dev` loop: the live catalog installed Pi 0.0.34,
+      Codex ACP 2.5.0 and Claude Code ACP 0.100.0 in
+      isolated profiles. All launched and reconnected after proxy restart;
+      Claude exposed five options and accepted the Opus 5.5 model update.
+      Each was removed and its temporary profile cleaned. On the same
+      integrated binary, the opt-in Pi ACP turn then passed with the free
+      OpenRouter model: the agent returned the requested response, the selected
+      model survived proxy restart, and Pi was uninstalled from its isolated
+      profile. The first run exposed a smoke-test checkpoint bug after switching
+      from its generic alternate model to the OpenRouter model; tracking the
+      final selection fixed the reconnect assertion. Native picker rendering
+      remains open.
+- [x] 2026-10-29 the fresh integrated binary passed the managed runtime smokes:
+      Code Mode with root/nested `AGENTS.md`, a project skill, shared search,
+      eight delegated searches, cancellation and Turso retry; project/user
+      memory append/search/review/reopen; MCP resources, retry and cancellation;
+      shell-write denial and `apply_patch` through Turso CodeAnchors to staged
+      Git commit metadata/cleanup; automatic compaction and summary persistence;
+      and explicit, EOF and SIGKILL shutdown recovery. These isolated loopback
+      runs used no external provider credentials or model requests. They verify
+      runtime behavior, not native chat rendering or authenticated inference.
+      After the 2026-10-29 source-current rebuild, the managed Code Mode smoke
+      again passed concurrent delegated search, cancellation, Turso reopen and
+      retry against the integrated binary.
+- [x] 2026-10-29 revalidated managed-runtime behavior against
+      `target/debug/ahead` (built 11:06; no retained-runtime Rust source is
+      newer): automatic compaction and persisted summary; concurrent Code Mode
+      searches/cancellation/Turso retry; project and user memory operations;
+      MCP discovery, resources, retry and cancellation; shell-write denial and
+      CodeAnchor attribution through staged Git commit metadata; and explicit,
+      EOF and SIGKILL recovery. All disposable loopback smokes passed without
+      Cargo builds or provider credentials. This does not establish native chat
+      rendering or authenticated inference.
+- [x] 2026-10-29 rebuilt the `ahead-agent` library test target after the
+      retained-runtime edits and ran it locked/offline, serially:
+      183 passed, 4 ignored. The shared `just dev` loop was restarted on the
+      same disposable multi-language workspace and the app/proxy returned to
+      their run state. This is current-source runtime coverage; it does not
+      replace authenticated-provider or rendered chat acceptance.
+- [x] 2026-10-29 rebuilt and ran the `ahead-proxy` library suite after the
+      current extension/LSP routing edits, locked/offline and serially:
+      355 passed, 1 ignored. The shared `just dev` loop was restarted on the
+      same disposable workspace afterward. This validates proxy behavior from
+      current source, not native extension/settings rendering.
+- [x] 2026-10-29 reran the source-current proxy runner
+      `target/debug/deps/ahead_proxy-cdf6288b8da2959d` directly from
+      `ahead-proxy/`: 361 passed, 1 ignored, in 83.27s. Its build timestamp
+      postdates every Rust source file under `ahead-proxy/src` and `tests`.
+      Running from the crate directory supplies the package-relative fixture
+      path used by `cli::tests::test_relative_path`; no Cargo build ran and the
+      shared `just dev` loop stayed live.
+- [x] 2026-10-29 reran the Rust, TypeScript/JavaScript and Python LSP matrix
+      against the same fresh integrated binary. The 52 MiB server cache was
+      copied into an isolated profile and AHEAD's managed acquisition path
+      loaded Vtsls, BasedPyright, Ruff and Rust Analyzer 1.98.1; completion,
+      navigation, diagnostics/repair, formatting, signatures, imports,
+      unsaved cross-file rename, live Python configuration changes,
+      restart/replay and graceful shutdown passed. The stable rustup shim on
+      PATH lacked Rust Analyzer, so the smoke used the installed 1.98.1 binary
+      explicitly. No server download or provider request was needed. The
+      disposable workspace is
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-uMEqlX`.
+      This is live proxy/LSP evidence, not native completion-popup rendering.
+- [x] 2026-10-29 the fresh integrated binary queried Zed's live catalog, installed
+      HTML extension 0.3.2 into an isolated profile, loaded its grammar and
+      highlight captures, started the real `vscode-html-language-server`, and
+      passed HTML completion, restart and uninstall. No project or global
+      extension state was changed. This verifies the live catalog-to-package-
+      to-server path, not the native gallery presentation or endpoint terms.
+- [x] 2026-10-29, after the shared `just dev` rebuild, the source-current
+      `ahead-app` runner passed all 462 tests serially. The current integrated
+      binary also passed the extension-only TOML grammar smoke using a copied
+      package in an isolated profile; syntax lookup, proxy restart and shutdown
+      passed. The shared app/proxy remain live on the disposable multi-language
+      project. The Mac was locked during this follow-up, so it adds no new
+      rendered-window evidence.
+- [x] 2026-10-29 reran
+      `target/debug/deps/ahead_app-b63ac9873957e73d` directly: all 463 app
+      tests passed serially in 63.76s. The runner is newer than every Rust
+      source file in the workspace, including the latest search, LSP and
+      extension changes. Coverage includes editor/session lifecycle, completion
+      placement and insertion, diff/gutter behavior, search/replace, settings,
+      model and command pickers, terminal input/clipboard, and workspace
+      panels. The shared `just dev` process stayed live; no Cargo build ran.
+      This is headless GPUI evidence; macOS was locked, so no rendered-window
+      acceptance was added.
+- [x] 2026-10-29 reran the source-current extension-host runner
+      `target/debug/deps/ahead_extension_host-a4537adb26b6fea5` from its crate
+      directory: 47 passed, 3 ignored. The runner postdates `host.rs`; active
+      coverage includes extension ABI rejection, capability grants, safe
+      archive install/uninstall, language settings, Node runtime selection,
+      and Zed configuration parsing. The ignored tests require installed real
+      extensions and remain separately covered by opt-in probes.
+- [x] 2026-10-29 reran managed-runtime acceptance after the shared `just dev`
+      rebuild against the current `target/debug/ahead`: Code Mode delegated
+      search/cancellation/Turso retry, automatic compaction and summary
+      persistence, MCP discovery/resources/retry/cancellation, CodeAnchor to
+      staged Git commit attribution, and project/user memory operations all
+      passed with disposable local fixtures. No authenticated model request
+      was made; rendered chat and provider acceptance remain separate.
+- [x] 2026-10-29 reran `tests/lsp-smoke.mjs` with the current integrated binary
+      against a fresh disposable TypeScript/JavaScript workspace. Vtsls passed
+      completion after `extends`, cross-file completion/navigation/rename,
+      diagnostics/repair, formatting, signature help, import fixes, restart and
+      graceful shutdown. The cached Vtsls package was copied into an isolated
+      profile; no downloads or provider credentials were used. Workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-hYQwD4`.
+      This is live protocol evidence, not native popup-rendering acceptance.
+- [x] 2026-10-30 reran `rtk env AHEAD_LSP_INSTALL_MISSING=1 node
+      tests/lsp-smoke.mjs target/debug/ahead` against the watcher-built binary.
+      Managed acquisition initialized Rust Analyzer, Vtsls, BasedPyright and
+      Ruff. Rust, TypeScript, JavaScript and Python completion/navigation,
+      diagnostics and fixes, formatting, cross-file rename in unsaved buffers,
+      live Python configuration changes, restart/replay and graceful shutdown
+      passed. The disposable workspace remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-pbjszA`.
+      No Cargo build or model provider request ran. This is integrated protocol
+      and server-acquisition evidence, not native popup rendering.
+- [x] 2026-10-30 reran `rtk node tests/git-source-control-smoke.mjs
+      target/debug/ahead` against the current integrated binary. A fresh
+      disposable repository passed status/diff, per-file and all-file
+      stage/unstage, commit/history, pushes to two local bare remotes, branch
+      lifecycle, and merge-conflict protection/resolution. No Cargo build or
+      external service was used; the successful fixture was removed.
+- [x] 2026-10-28 reran the current integrated binary's TypeScript/JavaScript
+      LSP smoke with an isolated copy of the cached Vtsls server. Local
+      `extends Calculation`, completion/resolve, diagnostics and repair,
+      navigation, unsaved cross-file rename, formatting, signatures, import
+      fixes, restart/replay and graceful shutdown passed. No server download or
+      provider credential was used. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-QDB3KH`.
+- [x] 2026-10-28 reran the live Zed HTML extension smoke against the current
+      integrated binary. It installed HTML 0.3.2 from the live catalog, loaded
+      the grammar/highlight captures, started `vscode-html-language-server`,
+      completed HTML, restarted and uninstalled the extension. The disposable
+      workspace was retained at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-Q6ibSA`.
+      This verifies catalog-to-package-to-proxy behavior, not the native gallery
+      presentation or editor-rendered colors.
+- [x] 2026-10-28 `cargo test --locked --offline -p ahead-proxy --lib -j 1`
+      passed 355 tests with one ignored in 54.27s against the current source.
+      The same `just dev` loop then rebuilt the integrated app in 2.28s and its
+      proxy re-entered the main loop. This is proxy/runtime evidence, not native
+      rendered or authenticated-provider acceptance.
+- [x] 2026-10-28 reran `tests/agent-code-mode-smoke.mjs` against the
+      watcher-built integrated binary. A managed Code Mode cell completed
+      eight concurrent delegated file searches; cancellation, retry after
+      Turso reopened, and clean shutdown passed. The mock model uses local
+      loopback and isolated disposable data, with no provider credentials.
+- [x] 2026-10-29 reran `rtk node tests/agent-code-mode-smoke.mjs
+      target/debug/ahead` against the rebuilt binary. Managed Code Mode,
+      eight concurrent delegated file searches, cancellation, retry after
+      Turso reopen, and clean shutdown passed again with the local mock
+      provider and disposable workspace. This does not verify authenticated
+      provider behavior, rendered chat, or CodeAnchor-to-gutter-to-commit.
+- [x] 2026-10-30 reran `rtk node tests/agent-code-mode-smoke.mjs
+      target/debug/ahead` against the shared watcher-built integrated binary.
+      Managed Code Mode, eight concurrent delegated searches, cancellation,
+      retry after Turso reopen, and clean shutdown passed. No Cargo build or
+      external provider request ran; the shared `just dev` session remained
+      live afterward. This is runtime smoke evidence, not rendered chat or
+      authenticated-provider acceptance.
+      Rechecked at 02:41 EDT on the same binary: PASS again; the disposable
+      workspace and profile were removed by the smoke.
+- [x] 2026-10-26 the opt-in live Zed catalog smoke selected HTML extension
+      0.3.2, downloaded and installed it into an isolated AHEAD data home,
+      started its real `vscode-html-language-server`, and returned `div` for
+      `<di`. The full Rust/TypeScript/JavaScript/Python matrix, restart/replay,
+      extension uninstall, and graceful process-group shutdown passed. The
+      smoke uninstalls only after the restart assertions, so it does not
+      incorrectly expect an uninstalled server to restart. This verifies live
+      catalog-to-package-to-server behavior. On 2026-10-28, the live catalog
+      also loaded in the native Extensions tab; filtering `html` listed HTML
+      0.3.2, Install populated an isolated profile, the Language Servers panel
+      showed `vscode-html-language-server` Ready, and typing `v` after `<di`
+      offered `div` in the editor. This closes native HTML gallery/install/
+      completion acceptance. No credentials were used. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-Xn4pJE`.
 - [x] 2026-10-23 TypeScript, JavaScript and Python LSP with
       `AHEAD_LSP_INSTALL_MISSING=1`: managed acquisition installed Vtsls,
       Basedpyright and Ruff into a disposable home, and the full matrix passed,
@@ -45,6 +654,312 @@ managed-agent smokes, then native rendered behavior.
       CodeAnchors and staged commits. The smoke runs the Code Mode turn on the
       catalog model and the direct turn on a provider-model connection because
       AHEAD selects the tool mode from model metadata.
+- [x] 2026-10-26 reran deterministic managed-runtime smokes against
+      `target/debug/ahead` (built 13:46): Code Mode with eight concurrent
+      delegated searches, cancellation, Turso retry and shutdown; source-write
+      denial, Code Mode and direct `apply_patch` through Turso CodeAnchors to
+      staged commit metadata/cleanup; project/user memory append, search,
+      reviewed replacement and reopen; MCP discovery/resources/approval/
+      cancellation; explicit/EOF/SIGKILL shutdown recovery; and Unicode buffer
+      recovery, live-owner fencing, durable discard and owner-only database
+      permissions all passed. Editor-recovery fixture retained at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-recovery-smoke-JNxECO`.
+      These use isolated loopback fixtures; authenticated-provider and native
+      rendered acceptance remain separate gates.
+- [x] 2026-10-26 reran `tests/agent-code-mode-smoke.mjs` against the current
+      integrated binary (built 16:52): managed Code Mode, eight concurrent
+      delegated file searches, cancellation, retry after Turso reopen and clean
+      shutdown passed. This uses a local mock provider and disposable workspace;
+      no credentials or external model requests were used.
+- [x] 2026-10-28 reran `tests/agent-openrouter-smoke.mjs` against the integrated
+      binary with the user-authorized OpenRouter free model and an isolated
+      temporary profile. The authenticated streaming turn completed managed
+      `file_search` and `read_editor_buffer`, then a Code Mode patch; it did not
+      invoke shell. The smoke verified one Turso CodeAnchor, staged and
+      committed the edit with `ahead` as author, the human as committer, and an
+      `Ahead-Session` trailer, then verified anchor cleanup and clean shutdown.
+      It then cancelled an authenticated response after streamed output,
+      retried that durable turn, observed retry output and cancelled it.
+      Its temporary project/profile (including the provider credential) were
+      removed. Authenticated compaction and rendered chat behavior remain open.
+      Re-ran the offline `tests/agent-compaction-smoke.mjs` against the current
+      watcher-built binary after extending it to assert nonzero estimated
+      context usage, the effective 95% model window, and the streamed
+      compaction notification when the provider omits usage metadata. Automatic
+      compaction, summary persistence, refreshed instructions and shutdown
+      passed. Authenticated compaction was still unverified at that time; this
+      shell had no `OPENROUTER_API_KEY` set, so the external request was not
+      replayed then.
+      A follow-up run after changing snapshot replies to read the live synthetic
+      file reached managed `file_search` and `read_editor_buffer`, then OpenRouter
+      returned HTTP 429 on the model continuation. The smoke removed its
+      temporary project/profile in `finally`; rerun after the provider limit
+      resets to verify this fixture-only adjustment end to end.
+      On 2026-10-29 at 10:52 EDT, reran the authenticated smoke against the
+      current 10:24 dev binary with the same free model; it passed managed
+      search/edit, Turso anchor persistence, attributed Git commit and cleanup,
+      streamed cancellation, retry and shutdown. This supersedes the prior
+      follow-up 429 for the current source. Later on 2026-10-29, extended the
+      smoke with a synthetic 10,000-token context limit and 6,000 repeated
+      disposable instruction tokens. The authenticated model emitted its
+      compaction event and completed the post-compaction reply. The expanded
+      `tests/agent-openrouter-smoke.mjs` passed all managed edit/CodeAnchor/Git,
+      compaction, streaming, cancellation and retry assertions against the
+      rebuilt binary; its temporary workspace/profile were removed.
+      The same integrated binary (built 16:52) also passed
+      `tests/agent-memory-smoke.mjs` and `tests/agent-mcp-smoke.mjs`: project/user
+      memory search, reviewed replacement and Turso reopen; plus MCP discovery,
+      resources, approval, cancellation and model continuation. Both smokes
+      cleaned their disposable state. `tests/agent-shutdown-smoke.mjs` also
+      passed on that binary: explicit shutdown and stdin EOF preserved partial
+      answers and cancellation across Turso reopen; SIGKILL preserved partial
+      output/instruction provenance and one explicit retry completed.
+- [x] 2026-10-26 revalidated the deterministic Code Mode, CodeAnchor/Git,
+      project/user memory, MCP and explicit/EOF/SIGKILL recovery smokes against
+      `target/debug/ahead` (built 17:35, newer than the touched Rust sources).
+      All five passed with isolated profiles; no Cargo build, provider request
+      or user credential was used.
+- [x] 2026-10-26 after the ACP adapter rebuild, reran
+      `tests/agent-code-mode-smoke.mjs` against `target/debug/ahead` (built
+      18:34, newer than `ahead-agent/src/adapters.rs`). Managed Code Mode,
+      eight concurrent delegated searches, cancellation, retry after Turso
+      reopen and clean shutdown passed with its isolated loopback provider.
+- [x] 2026-10-27 reran `tests/agent-code-mode-smoke.mjs` against the current
+      `target/debug/ahead` from the live `just dev` build. The managed cell
+      advertised `exec` and `wait`, used eight concurrent delegated searches,
+      returned 42, and included root/nested `AGENTS.md` plus the project skill
+      in its first request. Cancellation prevented model continuation; retry
+      after Turso reopen completed and shutdown was clean. The test used only
+      its isolated workspace and loopback mock model; no credentials or
+      external model request were used.
+- [x] 2026-10-27 rechecked `tests/agent-code-mode-smoke.mjs` against the
+      rebuilt `target/debug/ahead` (22:20): managed Code Mode, eight concurrent
+      delegated searches, cancellation, Turso reopen/retry and shutdown passed
+      again with an isolated loopback provider.
+- [x] 2026-10-27 reran `tests/agent-file-attribution-smoke.mjs` against that
+      same integrated binary. Shell writes and generated Cargo output were
+      denied; Code Mode and standard function-schema `apply_patch` edits each
+      produced Turso CodeAnchors, staged commits attributed to `ahead`, a human
+      committer and `Ahead-Session` trailer, then cleared anchors. The isolated
+      Git workspace and profile were removed after success; no provider or
+      credential was used.
+- [x] 2026-10-27 reran the project/user memory, MCP and shutdown-recovery
+      smokes against that same integrated binary. Memory append/search,
+      reviewed replacement and Turso reopen passed; MCP discovery/resources,
+      legacy tool fallback, approval, cancellation and request-state retry
+      passed; explicit shutdown, stdin EOF and SIGKILL recovery preserved
+      partial answers and instruction provenance across Turso reopen. All used
+      disposable profiles and loopback fixtures; no external provider or
+      credentials were used.
+- [x] 2026-10-28 reran `tests/agent-memory-smoke.mjs` against
+      `target/debug/ahead` (built 22:40, newer than the memory/session Rust
+      sources). Project and user memory append/search, reviewed replacement,
+      stale-snapshot rejection and Turso reopen passed with isolated disposable
+      profiles. No Cargo build, provider request or credential was used.
+- [x] 2026-10-28 ran `tests/workspace-search-scale-smoke.mjs` against the same
+      integrated binary with the in-process ripgrep comparison. On 10,000 files
+      in nested directories, indexing took 849 ms, multiline search 535 ms,
+      and returning AHEAD's capped 5,000 rich matches 327 ms. Five alternating
+      no-hit samples had a 557 ms AHEAD median versus 518 ms for ripgrep; this
+      small synthetic-fixture gap remains a profiling target, not a UI parity
+      claim. The stale-index symlink escape was rejected. No Cargo build was
+      started; the disposable fixture and profile were cleaned.
+- [x] 2026-10-29 reran `tests/workspace-search-scale-smoke.mjs` against the
+      integrated binary built after the current search sources. The exact
+      `console.log(` query returned one literal match across 10,000 files;
+      multiline search, the 5,000-result cap, and stale-index symlink rejection
+      also passed. No Cargo build or external provider was used; the disposable
+      fixture and profile were cleaned. Native UI reproduction remains open.
+- [x] 2026-10-28 reran `tests/agent-mcp-smoke.mjs`,
+      `tests/agent-shutdown-smoke.mjs`, and
+      `tests/agent-file-attribution-smoke.mjs` against `target/debug/ahead`
+      (built 22:40, newer than their Rust paths). MCP discovery/resources,
+      approval, cancellation and continuation passed. Explicit shutdown, stdin
+      EOF and SIGKILL preserved partial answers and instruction provenance
+      across Turso reopen, with one explicit retry. Shell/generated-output
+      denial and managed Code Mode/`apply_patch` edits produced Turso
+      CodeAnchors, a staged commit attributed to `ahead` with the human as
+      committer and an `Ahead-Session` trailer, then anchor cleanup. All three
+      used disposable profiles/workspaces; no Cargo build, provider request or
+      credential was used.
+- [x] 2026-10-26 `cargo check --locked --offline -p ahead-proxy --lib -j 1`
+      passed with 0 errors across 257 crates and one build-script metadata
+      warning. This compiles the latest `dispatch.rs`, which postdates the
+      integrated binary above. After the separate Cargo check exited and free
+      space recovered, `git_create_branch_selects_local_and_unborn_branches`
+      passed (1 passed, 351 filtered out). The test link emitted the same
+      compact-unwind table warning as the app suite.
+- [x] 2026-10-26 rebuilt and ran the source-current `ahead-app` suite serially
+      with an isolated AHEAD data/user profile: 423 passed, 0 failed, 0 ignored.
+      This includes the model-ID picker regression and the above-caret LSP
+      completion popup test, plus lifecycle, PTY, editor/LSP, Settings,
+      search/replace, Git and extension-gallery coverage. The first full run
+      exposed a test-only geometry expectation that omitted the gutter offset;
+      it now matches the rendered overlay coordinate space. Headless GPUI
+      evidence does not replace native rendered acceptance. The linker emitted
+      its compact-unwind table size warning; compilation and tests succeeded.
+- [x] 2026-10-26 reran the source-current 423-test app binary (built 16:58,
+      newer than `session_panel.rs` at 16:51 and `app_lifecycle_tests.rs` at
+      16:57) with isolated data, user and runtime homes: 423 passed. The first
+      run hit a transient macOS `EAGAIN` in the shared-process mock's 5-second
+      socket read; the mock now retries transient reads until its existing
+      60-second deadline. The focused interprocess test passed, then the full
+      suite passed serially. This is headless evidence.
+- [x] 2026-10-27 source-current app test runner `ahead_app-a284c6e65a113f9b`:
+      all 424 tests passed serially. The focused slash palette, model picker,
+      exclusive search modes, empty-session start actions, session-only code
+      comments and stable Git gutter marker tests also passed. Headless GPUI
+      results do not replace native rendered acceptance.
+- [x] 2026-10-27 ran source-current app test runner
+      `ahead_app-b6526016c2642312` (built 19:26:58; newer than all
+      `ahead-app/src` files, latest `settings_panel.rs` at 19:25:30) serially
+      with isolated data, user and runtime homes: 437 passed, 0 failed,
+      0 ignored in 111.82s. This covers the current lifecycle, editor/LSP,
+      agent chat/model picker, settings, search/replace, Git, extension,
+      terminal and task behavior in the GPUI harness. This is headless evidence;
+      native rendered and authenticated-provider acceptance remain separate.
+- [x] 2026-10-29 reran the source-current `ahead-app` test binary
+      `ahead_app-ae401acfe1bf5540` serially without Cargo while the shared
+      `just dev` watcher stayed active: 456 passed, 0 failed, 0 ignored in
+      59.89s. The test executable is newer than every Rust source under
+      `ahead-app/src`; this is headless GPUI/PTY evidence and does not replace
+      native rendered or authenticated-provider acceptance.
+- [x] 2026-10-27 focused GPUI regression
+      `visible_lsp_completions_prefetch_detail_and_fence_stale_replies` passed
+      (1 passed, 0 failed). A fake completion-resolve response that mutates its
+      label leaves the original popup suggestion intact while adding the
+      resolved signature. The dev app rebuilt successfully and the shared
+      `just dev` loop restarted on the same disposable project and data home.
+- [x] 2026-10-27 focused context-chip regression passed:
+      `editor_context_attachment_shows_relative_path_and_selected_lines`
+      (1 passed, 424 filtered out). The shared `just dev` loop restarted on the
+      same approved disposable project and isolated AHEAD data home; its app
+      build passed in 2.67s. In the rebuilt native app, selecting line 4 of
+      `src/main.rs` rendered `src/main.rs · line 4 · selected code`; no message
+      was sent.
+- [x] 2026-10-27 `cargo test --locked --offline -p ahead-proxy --lib -j 1`:
+      352 passed, 0 failed, 1 ignored. This is source-current proxy coverage,
+      including Turso persistence, FIM, search, Git, LSP and extension behavior.
+- [x] 2026-10-27 the first `ahead-agent` test build stopped before compiling
+      AHEAD tests because the filesystem ran out of space while creating
+      `target/debug/deps/libstarlark-447c96e2d70fbb21.rlib`. After space was
+      recovered, the dangling-user-home regression passed and the rebuilt
+      `ahead-agent` suite passed serially: 182 passed, 0 failed, 4 ignored.
+      Serial execution avoids transient socket/subprocess timeouts seen in the
+      initial parallel run. This is source-current unit-test evidence.
+- [x] 2026-10-26 ran the source-current proxy test executable directly (no new
+      Cargo build): all eight `turso`-filtered tests passed in 47.35s, covering
+      file-backed reopen, session CRUD, replay history, crash/reconnect,
+      subagent spawn/resume and current-thread runtime use. Source audit found
+      `ahead-proxy` is the only product crate with a `libsql` dependency; the
+      session store initializes tables/indexes/triggers directly and has no
+      `ALTER TABLE`, schema-version or migration-table path. The only legacy
+      session import is the scoped one-time rollout import in `ahead-agent`.
+      This is macOS storage evidence, not cross-platform validation.
+- [x] 2026-10-26 native `just dev` acceptance in the disposable
+      `ahead-lsp-smoke-ocUYn6` project: Rust Analyzer reached Ready; Ctrl+Space
+      on `math::double` showed the completion above the caret with
+      `fn(i32) -> i32`; pasting a `printf` command into the integrated terminal
+      printed `AHEAD_PASTE_SMOKE`. The terminal command made no project edits.
+- [x] 2026-10-28 rechecked terminal paste in the current native `just dev`
+      app on the same disposable project: pasting `printf 'AHEAD_PTY_PASTE_OK\n'`
+      into the integrated PTY and pressing Return printed
+      `AHEAD_PTY_PASTE_OK`; the project contents were not changed.
+- [x] 2026-10-29 rechecked clipboard paste in the restarted native `just dev`
+      app on the same disposable project: pasted a harmless `printf` command
+      into the integrated terminal, ran it, and observed the expected output.
+      No project files were changed.
+- [x] 2026-10-27 restarted the single `just dev` watcher on the user-approved
+      `ahead-lsp-smoke-ocUYn6` project with an isolated `AHEAD_DATA_HOME`.
+      After allowing this exact project, the native editor opened `src/main.rs`;
+      `rust-analyzer` started from the isolated app cache and Ctrl+Space rendered
+      the completion popup above the caret. The project stores session data in
+      `.ahead/session.db`; neither the repository nor this fixture contains an
+      `ahead-data/` directory. This confirms current startup and popup placement,
+      not the full LSP action matrix or authenticated chat; the restored test
+      session's OpenAI-compatible endpoint is unavailable and its settings were
+      left untouched. The first relaunch's durable-session request timed out
+      while an orphaned AHEAD app from 08:31 still owned the same fixture. Once
+      that stale process was stopped, the watcher-launched app restored the
+      durable session and showed only the expected unavailable-endpoint model
+      discovery warning. No prompt was sent and no project files were edited.
+      In the same rendered Python editor, Ctrl+Space on line 4 showed `double`
+      with `def double(value: int) -> int` above the caret; line 1 has no room
+      above and uses the below-caret fallback. This matches the adaptive
+      placement pattern in `../zed/crates/editor/src/element.rs`:
+      `layout_popovers_above_or_below_line` evaluates available space and flips
+      the menu when needed. No source or fixture files were edited.
+      The native Search tab queried `double` with `python/*.py` and displayed
+      nine results. Replace Match changed only the selected `def double` match,
+      reported one occurrence in one file, and selected the next match; Cmd+Z
+      restored the clean buffer. The model picker search filtered to
+      `gpt-5.2-pro` as typed. This restored session's provider endpoints are
+      unavailable, so it did not return reasoning metadata or show the effort
+      slider; the connected OpenRouter render above remains the evidence for
+      that combined control. Typing `/smoke` in the chat showed the two matching
+      project skills, and clearing the query left no draft or selection. A
+      selected editor range produced a file-context chip; clicking into an
+      unselected blank line removed it, confirming a merely focused file is
+      not added to the composer. In `javascript/src/math.mjs`, typing `dou`
+      showed the cross-file `double` completion with its `value: number`
+      detail above the caret; accepting it displayed signature help with the
+      parameter type and documentation. Three undo steps restored the original
+      clean buffer. In Settings → AI Integration, the 142-model provider group
+      rendered as a virtual list with a visible scrollbar. Wheel scrolling and
+      dragging the thumb moved only its rows while the settings page stayed in
+      place, including at the top boundary. Toggling `tts-1` off and on updated
+      only that provider's preference and restored its original visible state.
+      No turn was sent and no editor buffer remains changed.
+- [x] 2026-10-27 native session-pane control smoke in the same disposable
+      workspace: `+` opened the New AHEAD Thread wizard, typing a goal and
+      selecting Next advanced to Review, Back returned to Describe with the
+      text preserved, and closing exited without creating a session. This
+      verifies those rendered controls respond. The disposable ACP bridge
+      install/launch smoke is recorded below; native ACP setup rendering and
+      authenticated chat cancellation remain open.
+- [x] 2026-10-27 reran `node tests/agent-acp-install-smoke.mjs target/debug/ahead`
+      after the source-current `just dev` rebuild; Pi, Codex and Claude Code
+      passed using the current live ACP registry.
+      Each bridge installed into a temporary AHEAD data home and launched with
+      an isolated user home; the smoke sent no prompt and removed its profile.
+      Pi 0.0.34 and Codex 2.3.0 reported the expected authentication boundary.
+      Claude Code 0.97.0 exposed five config options and accepted a change to
+      the Opus 5.5 model. `node --check` also passed. This is proxy/ACP evidence;
+      authenticated turns and the rendered native install flow remain open.
+- [x] 2026-10-28 reran the isolated curated ACP install smoke against the
+      latest integrated binary (`target/debug/ahead`, built at 12:50:51). The
+      live registry installed and launched Pi 0.0.34, Codex ACP 2.3.0, and
+      Claude ACP 0.99.0. Pi and Codex reached the expected authentication-
+      required state; Claude exposed five config options and accepted a live
+      change to Opus 5.5. The smoke sent no prompts and removed its temporary
+      profile. Authenticated turns and the rendered native install flow remain
+      open.
+- [x] 2026-10-29 reran the curated ACP install smoke against the integrated
+      binary built at 03:15 EDT. Pi ACP 0.0.34 and Codex ACP 2.3.0 installed
+      and launched in isolated profiles, then reported their expected
+      authentication requirement. Claude ACP 0.99.0 exposed five options and
+      accepted a live model change to Opus 5.5. No prompt was sent and each
+      profile was removed. This verifies the install/configuration protocol;
+      authenticated turns and native install-flow rendering remain open.
+- [x] 2026-10-30 reran the full curated ACP install smoke against the current
+      watcher-built binary. Pi 0.0.34 and Codex ACP 2.5.0 installed, launched,
+      reconnected after proxy restart and reported authentication required;
+      Claude ACP 0.99.1 exposed five options and accepted a model change to
+      Opus 5.5. All adapters were removed from the AHEAD catalog and their
+      isolated profiles were deleted. No prompt or provider key was used.
+      This does not replace native ACP setup/reconnect UI or authenticated-turn
+      acceptance.
+- [x] 2026-10-27 restarted the shared `just dev` loop from the current source
+      with `AHEAD_DATA_HOME=/private/tmp/ahead-dev-data-ocUYn6`. The integrated
+      build completed in 21.77s and the proxy entered its main loop. After
+      approving the same disposable `ahead-lsp-smoke-ocUYn6` workspace, the
+      native app opened it and restored its durable session; model discovery
+      reports the fixture's unavailable endpoint. No prompt was sent and no
+      project file was edited. The watcher remains running for further work.
+- [x] 2026-10-26 documented the `just dev <workspace>` flow in
+      `docs/building-from-source.md`: run from the repository root to retain
+      source watching while opening a copied disposable editor-smoke fixture.
+      The instructions call out the per-project language-server trust prompt.
 - [x] 2026-10-23 `cargo test --locked --offline -p ahead-rpc -p ahead-viewmodel
       --lib`: 28 and 12 passed.
 - [x] 2026-10-23 `cargo test --locked --offline -p ahead-proxy --lib`:
@@ -72,10 +987,233 @@ The working tree is committed as `67f3fce7 breaking updates` (1876 files) as a
 local checkpoint so the in-progress work cannot be lost. It is not a reviewed or
 final state.
 
-Open: native rendered acceptance (macOS HIServices abort before render), the
-`ahead-app` suite after the latest edits, and clippy.
+Open: finish remaining native chat/session checks, including multi-client
+comment visibility, a provider-backed external ACP turn, and authenticated
+compaction; run Clippy after the shared dev loop can be paused. On 2026-10-27,
+the native command palette's “Start External Agent” opened the rendered external
+thread setup with Pi, Codex and Claude Code install options in the disposable
+workspace. This exposed a re-entrant Shell update in `SessionPanel::open_thread`:
+the parent Shell was updated before its command dispatch returned. Deferring
+the parent visibility update through `window.defer` fixed the abort; the
+source-current app rebuilt in 20.44s and the command opened the setup without a
+panic. The native setup then installed Pi's ACP bridge into the isolated
+`AHEAD_DATA_HOME`, launched a Pi side thread, and reached “External ACP agent
+ready.” The model picker exposed provider/model options and the reasoning
+slider; selecting `Nova Micro (US)` updated the composer and reported that the
+option was saved as Pi's default. Searching for OpenRouter returned no models
+in this Pi profile. No model turn was sent. A provider-backed external ACP
+turn remains open; authenticated managed-runtime turn, cancellation and retry
+are verified below.
+On 2026-10-26, the shared
+`just dev` app and proxy were confirmed live on the trusted disposable project
+`/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-ocUYn6`.
+Native completion was exercised in TypeScript (`confirm` and `console`, with
+type/documentation detail), JavaScript (`confirm` with signature and MDN detail),
+and Python (`def`/`del` suggestions and `print` signature help). Basedpyright,
+Ruff, and Vtsls showed Ready. Each temporary edit was undone; fixture contents
+are restored. In the rendered app, a fresh managed session opened, switching
+threads updated the conversation, and a selected JavaScript line accepted a
+session-scoped comment that was then resolved. A previously restored session
+rejected the comment because the current user was not a participant. This
+verifies local comment creation/resolution, not the multi-client comment flow.
+The completion checks verify rendering/signature behavior, not native
+navigation or edits in these languages. The initial default-workspace restart
+opened the source checkout briefly; no session or file edits were made there,
+and the stale orphaned app was stopped.
+The earlier `_run-dev` orphan was identified and stopped; why it survived its
+watcher remains unknown. `just dev-lock-smoke` refuses a duplicate before
+Cargo, and a disposable Watchexec `SIGTERM` check exited without leaving its
+dummy child. One authorized OpenRouter free-model
+request returned `OK` without tool calls. On 2026-10-28 the authenticated
+managed smoke below also verified tool execution, streamed cancellation and
+durable retry. The chat model picker searches endpoint model IDs
+as aliases while keeping display names clean; the source-current suite covers
+ID-only search and selection. The 423-test `ahead-app` suite passed on
+2026-10-26. In the currently running native app on the disposable
+`ahead-lsp-smoke-ocUYn6` workspace, clicking the Threads-pane `+` opens the
+New AHEAD Thread wizard; closing it returns to the thread list/session. This
+confirms the main button action responds. The source-current GPUI lifecycle
+test `app::lifecycle_tests::empty_agent_panel_routes_ahead_and_external_start_actions`
+also passes when run directly (1/1): from the integrated Shell it clicks both
+empty-state start buttons, verifies they reveal Threads and open the matching
+AHEAD/ACP setup wizard, and checks the join-invite action. Native rendered
+behavior remains unavailable while macOS is locked; installing and launching
+an external agent remain separate acceptance gates.
+On 2026-10-27, the chat picker moved model/provider/ID fuzzy matching to the
+GPUI background executor, with model-name matches ranked before metadata as in
+Zed `065d7ae`. Managed context usage prefers the selected model's discovered
+window and falls back to the harness-reported window only when the selected
+model has no known limit; external ACP uses its reported window. The provider
+catalog parser accepts both `context_length` and `context_window`. The
+source-current app runner `ahead_app-b6526016c2642312` (built 21:10, newer than
+both model-panel sources) passed all 77 `session_panel::tests` and 34
+`settings_panel::tests` serially, including catalog parsing/merge, selected
+model window precedence, fuzzy search, and provider-scoped refresh/visibility.
+These headless checks do not verify an authenticated provider's catalog values
+or native meter rendering. The retained runtime estimates history usage when
+an OpenAI-compatible response omits streamed usage so pre-turn compaction can
+still run. Its managed-runtime regression passed (1/1) after pausing the shared
+watcher; the same watcher then rebuilt and relaunched the app on the disposable
+project. The private-interface warning from the picker delegate was removed by
+narrowing the field. The composer hides the numeric usage label below 800 px.
+On 2026-10-28, the source-current app runner `ahead_app-ae401acfe1bf5540`
+(built 12:29, newer than `session_panel.rs`) passed the selected-model context
+window precedence and discovered-model metadata merge regressions (1/1 each).
+The authenticated catalog value and rendered meter remain unverified.
+The retained model manager's generic unknown-model metadata also previously
+treated its 272,000-token fallback as a hard maximum, clipping explicit
+provider/model context windows. That guessed maximum is now unset; the focused
+`codex-models-manager::provider_context_window_replaces_generic_unknown_model_fallback`
+regression and the full `codex-models-manager --lib` suite passed (50 tests),
+resolving a 1,050,000-token model limit and its 945,000-token auto-compaction
+threshold. Authenticated catalog/rendered-meter acceptance remains open; the
+retained `codex-core` test target also remains unbuildable after the product
+pruning changes.
+The retained `codex-core` test target still fails with 259 compile errors,
+including duplicate `#[tokio::test]` attributes, missing test-only crates, and
+imports of removed Codex APIs. AHEAD's managed runtime intentionally sets
+`ignore_user_config: true`, so a retained Codex `config.toml` auto-compact
+override is outside the managed-session contract. Keep managed-runtime
+acceptance on the selected model's context metadata: the AHEAD loopback smoke
+verifies estimated usage, the effective model limit, automatic compaction,
+persisted summary and the resumed turn. Repair the retained test harness
+separately if generic config behavior needs direct coverage.
+On 2026-10-28, choosing a different model now clears the previous runtime-
+reported context window, preventing the meter from carrying a stale denominator
+when the newly selected model has no catalog limit. The shared `just dev`
+watcher rebuilt the app after this change; `cargo fmt --all -- --check` and
+`git diff --check` passed. A GPUI assertion was added, but its test runner has
+not been rebuilt because the live shared watcher owns the Cargo loop. The
+macOS lock still prevents native rendering, and actual provider-supplied model
+limits remain unverified. The Settings model now preserves a connection's
+`context_window` through saves and layer overrides; discovered models inherit
+that provider fallback only when their own catalog entry omits a limit. The
+guide documents the override, and regressions cover config round-trip and
+per-model precedence. The live watcher rebuilt and relaunched the app; the new
+test runner has not been rebuilt while the shared Cargo loop is active.
+The shared `just dev` build compiled and relaunched these changes on the same
+disposable project. An earlier focused GPUI retry was interrupted with exit 130
+when a separate COLA `cargo clippy` started; the source-current serial suites
+above supersede that interrupted run. Native rendering could not be inspected
+because macOS is locked. On 2026-10-27,
+`tests/agent-compaction-smoke.mjs` passed against the integrated binary using a
+loopback Responses provider: with a 4,096-token model window, the first turn's
+reported usage was 2,820, below the model-derived 90% compaction threshold
+(3,686). A long pending user message then crossed the threshold and triggered
+compaction before normal sampling. The returned summary persisted and the next
+model request contained both that summary and the pending user message;
+shutdown was clean. This verifies the model-derived pre-sampling trigger and
+next-turn history on a disposable project, not authenticated provider behavior
+or native meter rendering. The fixture's earlier 1,520-token usage did not
+reach the threshold; its runtime config file was ignored by design and has
+been removed from the smoke. Rechecked after the 22:20 shared-dev rebuild;
+model-derived auto-compaction, summary persistence, next-turn context and
+shutdown passed again. Reran the same isolated loopback smoke during the
+current continuation against the still-running integrated binary; the same
+four assertions passed with no Cargo build or external provider.
+On 2026-10-28, reran `tests/agent-compaction-smoke.mjs` against the current
+integrated binary; the model-derived trigger, persisted summary, next-turn
+context and clean shutdown passed again without Cargo or external network
+access. Configured-limit behavior remains separately unverified because the
+retained engine's current lib-test target still fails to compile.
+On 2026-10-30, native acceptance in the unlocked `just dev` app used a
+loopback-only OpenAI-compatible fixture advertising a 1,050,000-token model
+window. The rendered meter showed estimated usage at 3.6k/1050k; saving a
+per-model 3,000-token override changed it to 4.3k/3k. A subsequent managed
+turn made a separate compaction request before the final reply. The Turso
+session store contains the persisted `compacted` item, `ContextCompaction`
+event and summary, and the follow-up completed. This verifies native meter
+rendering and configured-limit compaction with a local fixture. The original
+workspace provider settings were restored and the mock server stopped.
+Authenticated Luna/OpenRouter catalog metadata and provider behavior remain
+unverified. The deliberately tiny 3,000-token cap remained saturated after
+compaction; because it is below the durable prompt/context floor in this
+fixture, it does not establish whether a realistic post-compaction meter
+should reset. Recheck with a production-sized limit.
+The composer also no longer carries a separate unused 32,768-token
+`ModelSpec.context_window` fallback: unknown discovered models keep their
+optional `model_context_window` unset. The focused catalog-merge and selected
+model-window tests pass, and the shared app build succeeds. This removes a
+misleading duplicate value but does not validate the live catalog's reported
+Luna window.
+The same disposable smoke now omits provider usage entirely, then expands the
+workspace `AGENTS.md` between turns; the rebuilt integrated binary still
+compacts before sampling, carries the summary and updated instructions into
+the next request, and shuts down cleanly. This covers the usage-estimation
+fallback end to end against the loopback provider, not authenticated provider
+behavior or native context-meter rendering.
+Rechecked on 2026-10-28 against `target/debug/ahead` (built 12:29, newer than
+the managed-runtime sources): estimated-usage compaction, summary persistence,
+next-turn context and shutdown passed. No Cargo build, credentials or external
+provider request was used.
+Reran `tests/agent-compaction-smoke.mjs` after the current shared `just dev`
+relaunch against `target/debug/ahead`; estimated usage, model-limit-triggered
+compaction, summary persistence, next-turn context and clean shutdown passed.
+The test used a loopback provider and a disposable project/profile.
+On 2026-10-29, reran the same smoke against the current integrated binary; all
+assertions passed without starting Cargo or using an external provider. The
+loopback test does not close authenticated-provider compaction or native meter
+rendering acceptance.
+On 2026-10-30, `AgentUsage` began coalescing panel-update notifications after
+the current-turn cache is updated. The GPUI panel test verifies that usage and
+context-window values refresh; accepted/stale notification and panel tests
+passed 4/4. The shared `just dev` app rebuilt and its proxy entered the main
+loop. This verifies state delivery, not native meter rendering; the Mac is
+locked.
+AHEAD's
+managed runtime intentionally ignores user Codex config files, so an
+`AHEAD_HOME/config.toml` auto-compact override is not a supported settings
+path. Separately, the
+configured `model_auto_compact_token_limit` was being ignored in Total-scope
+and model-downshift paths; both now prefer the configured limit, and the shared
+`just dev` build compiled that correction. The focused
+`cargo test --locked --offline -p codex-core --lib` attempt stopped before
+running its regression: the retained engine's existing lib-test target
+currently fails with 260 compile errors from missing test-only crates and
+stale test APIs. Keep repairing that test target as an independent follow-up.
+On 2026-10-27, `CARGO_INCREMENTAL=0 cargo clippy -p ahead-agent -p ahead-rpc
+--lib -j 1` passed. The production-library lint findings in `ahead-agent` and
+`ahead-rpc` were fixed. The same packages with `--all-targets` still fail on 31
+deny-level findings confined to `ahead-agent` test code; retained-engine
+warnings remain. Full workspace/all-target Clippy is still open.
+The local OpenAI-compatible endpoint is unavailable in this fixture; a separate
+temporary OpenRouter check discovered 468 models and exercised the combined
+model/effort picker. Since the last successful build, source review moved stale
+ACP registry refresh off the serialized proxy dispatcher and changed renamed-
+file reads to use a secure handle anchored to the canonical workspace while
+preserving the lexical tab path. Their focused Rust regressions still need a
+source-current tests. One locked offline all-target check of the changed
+app/proxy/agent/core crates stopped while compiling dependency `wit-parser`
+with `No space left on device`, before reaching AHEAD crates; only 117 MiB
+remained afterward. On 2026-10-26, one guarded `just dev
+/private/tmp/ahead-mvp.vYFXRc/project` loop compiled the changed AHEAD crates
+and reached the final `ahead` link, which failed with `No space left on device`.
+After removing only language-server caches from two inactive disposable
+profiles outside `target`, the same watcher retried and failed at that link
+again. Its `watchexec`/`lockf` session remains alive with no Cargo child. The
+Mac is locked, so the app did not launch and rendered acceptance was not
+possible. The fresh fixture and app data are isolated under
+`/private/tmp/ahead-mvp.vYFXRc`; do not start another Cargo loop while this
+watcher owns the shared lock.
+The existing `target/debug/ahead` binary (built 19:16, newer than
+`ahead-core/src/search.rs` and `secure_fs.rs` but older than the subsequent
+ACP, proxy-dispatch and editor-shell edits) passed `tests/workspace-search-scale-smoke.mjs`
+on 10,000 files, including the capped-result path and stale-index symlink
+rejection. It also passed the isolated managed Code Mode, project/user memory,
+MCP, explicit/EOF/SIGKILL shutdown, and CodeAnchor-to-staged-commit smokes.
+These runs used local fixtures and mocks; they do not verify the later source
+changes or rendered UI. The test runner built 16:58 also passed eight focused
+GPUI checks for provider-grouped model visibility and scroll containment,
+exclusive search modes, next-match replacement, just-task dispatch, terminal
+paste, empty-chat actions, and failed session creation. `cargo fmt --all --
+--check`, `git diff --check`, and JavaScript syntax checks passed.
+The Code Mode smoke now seeds root and nested `AGENTS.md` files plus a project
+`.agents/skills/smoke-skill/SKILL.md`, starts the turn with `/smoke-skill`, and
+asserts all three instruction/skill sentinels appear in the first real
+loopback-provider request. The smoke passed on the same linked runtime,
+including its cancellation, Turso reopen and retry path.
 
-## Zed source reuse and editor parity
+## Core editor MVP and Zed parity
 
 - [ ] Finish unsupported-file tab verification (`ahead-app/src/code_panel.rs`).
       In the 2026-10-02 rebuilt, uniquely identified native app, disposable
@@ -91,8 +1229,12 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       and managed-agent source regressions pass on 2026-10-03. Verify opening
       UTF-16 through a reused preview tab in the native app; the headless GPUI
       file-open test already replaces UTF-8 with UTF-16 in the same preview
-      panel and verifies editable content reaches the proxy snapshot. Keep
-      binary data safe. On 2026-10-07, reran
+      panel and verifies editable content reaches the proxy snapshot. On
+      2026-10-26, the active `just dev` app opened a disposable UTF-8 file and
+      then BOM-marked UTF-16LE in the same preview tab, rendering `café` and
+      Japanese text correctly. A binary SQLite fixture showed the
+      unavailable-text explanation. Both temporary files were removed without
+      edits. Keep binary data safe. On 2026-10-07, reran
       `code_panel::tests::file_open_recovery_preserves_missing_text_without_unlocking_binary_files`
       directly from the app test binary; it passed, and the binary was newer
       than `ahead-app/src/code_panel.rs`. Later that day, the source-current app
@@ -100,7 +1242,11 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       `code_panel::tests`, including file-open recovery, diff preview, gutter,
       blame, completion, navigation and formatting regressions. No Cargo build
       was started. Native rendered verification remains open while the desktop
-      is locked. On 2026-10-09, the source-current `ahead_app` test runner passed
+      is locked. Rechecked on 2026-10-27 with the current app runner:
+      `file_open_accepts_utf8_and_preserves_read_failures` and
+      `file_open_recovery_preserves_missing_text_without_unlocking_binary_files`
+      both pass (1/1 each), confirming supported text loads/saves and recovery
+      cannot unlock a binary file. On 2026-10-09, the source-current `ahead_app` test runner passed
       all 61 `code_panel::tests`. A fresh `just dev` build then aborted before
       drawing with macOS `hiservices-xpcservice` connection errors; `open -a`
       also reported `kLSNoExecutableErr` although `Contents/MacOS/ahead` exists.
@@ -152,6 +1298,36 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       including the session-switch reset/generation and draft-isolation
       assertions in `code_comment_actions_require_a_session_and_fit_the_gutter`.
       Native rendered behavior remains open.
+      On 2026-10-30, the centered gutter-button and icon-alignment assertions
+      passed in the focused GPUI test; the rebuilt app test runner
+      `target/debug/deps/ahead_app-a22d426232bf3801` passed all 471 tests
+      serially. Follow-up: the inline glyph now uses gpui-kit Button's centered
+      icon slot. The shared `just dev` process rebuilt and relaunched the app;
+      on 2026-11-02, the unlocked disposable project rendered the rebuilt
+      button with the comment glyph centered in both axes within the purple
+      gutter control.
+      On 2026-11-02, a new screenshot showed the inline glyph visually offset
+      despite that earlier capture. Replaced gpui-kit Button's dedicated icon
+      slot with a full-size centered icon child; the focused GPUI test now
+      asserts the icon-child and button centers match and passes (1/1). The
+      shared `just dev` build completed and the proxy returned to its main loop.
+      The Mac is currently locked, so a fresh rendered screenshot is still
+      needed to confirm the visible SVG strokes. Source review found the glyph
+      still had a manual 3 px translation inside its centered container; that
+      translation is now removed, and the focused GPUI regression passes 1/1.
+      `just dev` rebuilt and relaunched the app on the disposable fixture; a new
+      screenshot is still needed for rendered confirmation.
+      After the next screenshot showed the glyph visually high and left, nudged
+      only the icon glyph two logical pixels right and down while retaining the
+      centered 20px button. `cargo fmt --all -- --check`, `git diff --check`,
+      and the shared `just dev` rebuild pass; the Mac is locked, so this optical
+      adjustment still needs a fresh rendered check.
+      Follow-up on 2026-11-02: replaced the button's icon slot with a 14px
+      icon inside a full-size centered child, and extended
+      `code_comment_actions_require_a_session_and_fit_the_gutter` to assert the
+      glyph container center matches the button center. The focused test passes
+      (1/1), and `just dev` rebuilt; native screenshot confirmation remains
+      pending while the Mac is locked.
       The fresh macOS report at
       `~/Library/Logs/DiagnosticReports/ahead-2026-10-13-111131.ips` locates
       the abort in AppKit/LaunchServices app registration while GPUI creates
@@ -259,6 +1435,12 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       and distinct, then clicks AHEAD, external-agent and shared-session
       actions. CUA currently reports Ahead is not running while shared watcher
       7363 remains live; rendered native acceptance is still open.
+      Rechecked on 2026-10-30 with the source-current app runner
+      `ahead_app-a22d426232bf3801`: both
+      `empty_agent_panel_routes_ahead_and_external_start_actions` and
+      `empty_chat_renders_session_start_actions` passed. The integrated Shell
+      test confirms the three actions receive clicks inside the right dock;
+      native rendered hit testing remains open while macOS is locked.
       On 2026-10-13, stopped session 28171 for the isolated ACP session/model
       option probe, then restarted `just dev` on the same disposable project
       with fresh `AHEAD_DATA_HOME=/private/tmp/ahead-dev-data.20261014.TgYMfc`.
@@ -372,6 +1554,10 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       GPUI test now resizes the agent panel to a 396px chat column, verifies the
       AHEAD, external-agent, and join buttons remain in bounds and vertically
       separated, and exercises their action transitions; it passed 1/1.
+      Re-ran this test on 2026-10-27 after the source-current runner initially
+      exposed an assertion racing the deferred Threads visibility update. The
+      click opened the wizard immediately; draining GPUI's queued work revealed
+      the pane, and New AHEAD, External agent and Join session all passed.
       Restarted the shared loop on the same disposable project with isolated
       AHEAD data at `/private/tmp/ahead-dev-smoke.7T4vXa/data`; the integrated
       build passed in 9.26s, then the app again aborted before rendering with
@@ -507,6 +1693,513 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       headless GPUI/unit evidence; native rendered behavior remains open.
 - [ ] Broad-use readiness (scope refreshed 2026-10-05): prove AHEAD works
       end to end in disposable Rust, TypeScript/JavaScript and Python projects.
+      On 2026-10-30, the reusable disposable project
+      `/private/tmp/ahead-editor-smoke.0Hepwq/project` passed `just verify`:
+      Rust 1/1 offline, Node 3/3 (JavaScript, TypeScript and provider catalog),
+      and Python 1/1. The shared `just dev` watcher was stopped per the fixture
+      instructions and restarted on the same project; the integrated build
+      completed in 2.40s and the proxy entered its main loop. This verifies the
+      project test lanes, not editor rendering or LSP behavior.
+      On 2026-11-02, the same disposable project
+      `/private/tmp/ahead-memory-review.bJ5FaU/project` passed `just verify`:
+      Rust 1/1 offline, Node 3/3 (JavaScript, TypeScript and provider catalog),
+      and Python 1/1. The shared `just dev` loop was stopped for verification,
+      restarted on the same project, stopped for the focused comment-gutter
+      regression, and restarted again after the updated app rebuilt and its
+      proxy entered the main loop. This refreshes project test-lane evidence
+      only, not native editor or LSP acceptance.
+      After the 2026-11-02 icon-centering adjustment, the source-current
+      `rtk cargo test -p ahead-app --lib -j 1` suite passed all 502 tests in
+      18.52s. The shared `just dev` loop was restarted on the same disposable
+      project; its build completed and the proxy entered the main loop. The
+      test suite is headless evidence; native rendered behavior remains open.
+      On 2026-11-03, the source-current `rtk cargo test -p ahead-app --lib
+      -j 1` suite passed all 502 tests. The disposable project's `just verify`
+      lanes passed Rust 1/1 offline, Node 3/3 (JavaScript, TypeScript and
+      provider catalog), and Python 1/1. The same `just dev` watcher rebuilt
+      and relaunched the integrated app on that project, and the proxy entered
+      its main loop. The Mac was locked, so native rendered acceptance remains
+      open.
+      Against that integrated binary, managed Code Mode, MCP, project/user
+      Turso memory, compaction, FIM, Git source control and CodeAnchor
+      attribution smokes passed on isolated state. The live LSP smokes passed
+      Rust, TypeScript/JavaScript, Python and Zed HTML 0.3.2 install/restart/
+      uninstall. The curated ACP smoke installed and removed Pi 0.0.34,
+      Codex ACP 2.5.0 and Claude ACP 0.100.0; Claude exposed five options and
+      accepted Opus 5.5. These are backend/protocol checks, not rendered UI or
+      authenticated ACP turns.
+      The same binary passed the 10,000-file workspace-search smoke: index
+      build 270 ms, multiline search 409 ms, 200 ms to return the 5,000-match
+      cap, stale-index symlink escape rejected, and median no-hit 326 ms.
+      This verifies the shared scanner/index path, not native result-panel UX.
+      The current source app-test binary
+      `target/debug/deps/ahead_app-2867482f11cd4168` passed all 502 GPUI/app
+      tests serially in 64.57s. Coverage includes
+      editor completion and comments, Git diff markers, model/settings flows,
+      session routing, search/replace, named Just-task terminals, terminal
+      tabs/right-click/clipboard and PTY input. This remains headless evidence;
+      native rendering and interaction are separate.
+      On 2026-11-02, the full managed `tests/lsp-smoke.mjs` matrix also passed
+      against the integrated binary for Rust, TypeScript/JavaScript and Python
+      (BasedPyright plus Ruff), including on-type Rust formatting and LSP
+      restart recovery. See the native LSP acceptance entry for completion
+      timings and remaining native checks.
+      Against the integrated binary rebuilt at 19:07:54 on 2026-11-02, the
+      disposable LSP matrix passed for Rust, TypeScript, JavaScript and Python;
+      Code Mode/delegated search, cancellation/scope denial, compaction, FIM,
+      MCP, project/user Turso memory, CodeAnchor-to-Git attribution, Git
+      workflows, and editor recovery also passed their loopback smokes. Curated
+      Pi/Codex/Claude ACP installation and model-option wiring passed on that
+      binary. These are integration checks with isolated profiles and local
+      providers; native UI and authenticated turns remain separate.
+      On 2026-11-02, `tests/agent-openrouter-smoke.mjs` passed against the
+      current integrated binary using the authorized free model and synthetic
+      disposable workspace. The authenticated managed turn streamed, searched
+      and read the fixture, edited it through Code Mode, persisted its Turso
+      CodeAnchor, committed with AHEAD attribution, compacted context, and
+      exercised cancellation and retry. The temporary profile was removed.
+      This closes authenticated backend/provider behavior for that smoke, not
+      rendered chat controls or native provider setup.
+      Re-ran `tests/agent-code-mode-smoke.mjs` against the current integrated
+      binary on 2026-11-02: managed Code Mode, eight concurrent delegated
+      searches, cancellation, retry after Turso reopen, read-only and scoped
+      patch denials, complete memory review, and shutdown passed in a disposable
+      workspace with the isolated local provider.
+      On the same 2026-11-02 integrated binary, `tests/agent-compaction-smoke.mjs`
+      passed estimated context usage, effective model limit, automatic
+      compaction, summary persistence, and shutdown with an isolated provider.
+      `tests/agent-fim-smoke.mjs` also passed on that binary, covering the
+      session-bound prompt, instruction hierarchy, and provider round-trip.
+      `tests/agent-acp-install-smoke.mjs` passed on the same build: Pi 0.0.34
+      and Codex ACP 2.5.0 launched to authentication-required states; Claude
+      ACP 0.100.0 exposed five options and accepted Opus 5.5. All three
+      recovered after proxy restart and uninstalled cleanly without a model
+      prompt.
+      The same binary passed `tests/agent-mcp-smoke.mjs` for discovery,
+      resources, fallback, retry, approvals, cancellation and continuation;
+      `tests/agent-memory-smoke.mjs` passed project/user append, search,
+      reviewed replacement, stale-snapshot rejection and Turso reopen. Both
+      used isolated disposable state.
+      Also on the same binary, `tests/git-source-control-smoke.mjs` passed
+      status/diff, per-file and all-file staging, commit/history, publish/push,
+      branch lifecycle, and conflict protection/resolution. The local
+      `tests/agent-file-attribution-smoke.mjs` passed shell-write denial, Code
+      Mode edits, streamed `apply_patch`, Turso CodeAnchor persistence, staged
+      Git commit attribution and anchor cleanup.
+      The current binary also passed `tests/lsp-smoke.mjs` across Rust,
+      TypeScript/JavaScript, Python, and live Zed HTML/Proto extensions. It
+      covered completion, navigation, diagnostics/repair, formatting, rename,
+      code actions, server routing/restart, unsaved-buffer replay, extension
+      grammar/highlights, uninstall, and graceful shutdown. Across 22 completion
+      requests, p50 was 57.6 ms and p95 390.2 ms; this is proxy round-trip time,
+      not native popup latency. The isolated profile was removed; workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-AQGDtR`.
+      On 2026-10-30, `target/debug/deps/ahead_app-b63ac9873957e73d` passed all
+      465 app tests serially in 68.84s. It includes the typed literal
+      `console.log(` search regression, LSP popup/insert behavior, chat model
+      and skill pickers, terminal, Git and search/replace. The runner postdates
+      all `ahead-app`, `ahead-core`, `ahead-agent`, `ahead-proxy` and `ahead-rpc`
+      Rust sources, but predates current extension-host and retained-engine
+      edits; count it as app/UI evidence only. The current `just dev` build
+      compiled through the final app link and failed for lack of disk space, so
+      fresh integrated-runtime verification remains open.
+      Later on 2026-10-30, after restarting the shared `just dev` loop and
+      allowing Cargo to reclaim space, the source-current
+      `target/debug/deps/ahead_app-a22d426232bf3801` runner passed all 465 app
+      tests serially in 66.53s. This includes the current CodePanel extension
+      scope test and the separate-keystroke literal `console.log(` regression.
+      The integrated app and proxy were relaunched on the same disposable
+      project. This updates headless app evidence; integrated runtime smokes,
+      native rendered acceptance and remaining engine changes stay separate.
+      On the same 2026-10-30 binary, `agent-code-mode-smoke` passed managed
+      tools, eight concurrent delegated searches, cancellation, Turso reopen/
+      retry and shutdown; `agent-compaction-smoke` passed model-limit
+      estimation, automatic compaction and summary persistence;
+      `agent-memory-smoke` passed project/user append, search, reviewed replace
+      and reopen; `agent-mcp-smoke` passed discovery/resources, retry,
+      approvals, identified cancellation and continuation. Each used an
+      isolated local fixture without an external model request. Authenticated
+      provider and rendered-chat acceptance remain separate.
+      On 2026-10-30, the current integrated binary was also exercised through
+      the user-authorized OpenRouter free API in disposable profiles. The
+      NVIDIA model completed managed searches, a buffer read and an attributed
+      file change before its continuation received HTTP 429; a second
+      tool-capable free model received HTTP 429 before tool activity. Both
+      temporary projects/profiles were removed. This confirms current request
+      routing reaches OpenRouter, but authenticated-turn acceptance remains
+      open under the provider's rate limit.
+      On 2026-10-30, the shared `just dev` loop rebuilt the integrated app and
+      Code Mode host successfully in 12.79s; its binary timestamp is 06:45 EDT,
+      after the 06:25 retained-config cleanup. `cargo fmt --all -- --check` and
+      `git diff --check` pass. Against this rebuilt binary, the managed-agent
+      smoke set passed Code Mode/delegated search/cancellation/Turso retry;
+      selected-model context estimation, automatic compaction and summary
+      persistence; project/user memory append/search/review/reopen; MCP
+      discovery/resources/approval/cancellation; CodeAnchor attribution through
+      an AHEAD-authored, human-committed staged Git change; and local Git
+      stage/commit/push/branch/conflict workflows. These used loopback or local
+      fixtures and no provider credentials.
+      Re-ran `tests/agent-code-mode-smoke.mjs` against that 06:45 binary at
+      07:45 EDT: the managed Code Mode cell, eight concurrent delegated
+      searches, explicit cancellation, retry after Turso reopen and shutdown
+      passed again. The smoke used its isolated local provider and disposable
+      project/profile; no Cargo build or external credentials were used.
+      Re-ran `rtk node tests/agent-code-mode-smoke.mjs target/debug/ahead` on
+      2026-11-02 against the integrated binary built at 17:03. Managed Code
+      Mode, eight concurrent delegated searches, cancellation, Turso reopen
+      and retry, read-only and path-scope write denials, complete 24 KiB memory
+      review, and clean shutdown all passed with the isolated loopback provider.
+      No Cargo build or external credentials were used.
+      `tests/agent-fim-smoke.mjs` also passed on 2026-11-02 against the same
+      binary, verifying the hierarchical project instruction context, active
+      session objective/decision updates and isolation when switching sessions.
+      On 2026-11-02, the same integrated binary passed MCP discovery/resources,
+      fallback, retry, approvals and cancellation; project/user memory append,
+      search, reviewed replacement and Turso reopen; 10,000-file search with
+      literal/multiline matches, the 5,000-result cap and stale-index symlink
+      rejection; and the disposable Git stage/commit/push/branch/conflict
+      workflow. These loopback smokes used no external model credentials.
+      The managed LSP and curated ACP refreshes are recorded in their focused
+      acceptance items below.
+      On the same binary, `tests/agent-compaction-smoke.mjs` passed selected-
+      model context estimation, automatic compaction, summary persistence and
+      shutdown; `tests/agent-fim-smoke.mjs` passed session-bound FIM prompt,
+      instruction hierarchy and provider round-trip. Both used disposable
+      loopback fixtures without external provider credentials. Native FIM
+      rendering and authenticated overlap remain separate.
+      Re-ran `tests/agent-compaction-smoke.mjs` at 07:56 EDT against the same
+      integrated binary: estimated usage, effective model limit, automatic
+      compaction, summary persistence and shutdown passed with a loopback
+      provider and a disposable profile.
+      Re-ran `rtk node tests/agent-compaction-smoke.mjs` against the current
+      `just dev` binary: estimated usage without provider usage metadata,
+      effective 9.5k context limit, automatic pre-sampling compaction before
+      the next turn, summary reuse and clean proxy shutdown all passed. The
+      script used only its disposable loopback provider/profile and made no
+      external requests or Cargo builds.
+      On 2026-11-02, reran that smoke against the 17:24 integrated binary;
+      estimated usage, effective model limit, automatic compaction, summary
+      persistence and clean shutdown passed. Authenticated-provider behavior
+      and the rendered composer meter remain open.
+      Also re-ran `tests/workspace-search-scale-smoke.mjs` and
+      `tests/git-source-control-smoke.mjs` against that binary. Search passed
+      literal `console.log(` and multiline matching across 10,000 files, the
+      5,000-result cap, and stale-index symlink rejection (288 ms index build,
+      397 ms multiline search, 221 ms for 5,000 capped matches, and 434 ms
+      median no-hit across three runs); Git passed status, diff, stage/unstage,
+      commit/history, pushes to disposable bare remotes, branch lifecycle and
+      conflict handling. These are isolated backend smokes, not native rendered
+      acceptance.
+      The same binary passed `tests/lsp-smoke.mjs` with managed acquisition for
+      Vtsls, BasedPyright, Ruff and Rust Analyzer 1.98.1 across TypeScript,
+      JavaScript, Python and Rust: typed `extends Cal` completion, formatting,
+      signatures, navigation, diagnostics/repair, cross-file rename, import
+      fixes, live Ruff configuration/routing reload, restart/replay and
+      graceful shutdown. A live Zed-catalog smoke installed HTML extension
+      0.3.2, verified HTML completion and WASM grammar/highlight captures,
+      restarted the server and uninstalled the extension. The curated ACP
+      smoke installed Pi 0.0.34 and Codex 2.5.0 (both requested authentication
+      without a prompt); Claude ACP 0.99.1 exposed five config options and
+      accepted a live model change to Opus 5.5. These smokes used disposable
+      profiles and no provider credentials.
+      Rechecked against `target/debug/ahead` built at 08:33 EDT on 2026-10-30
+      with `AHEAD_LSP_INSTALL_MISSING=1` and
+      `AHEAD_LSP_INSTALL_ZED_HTML=1`. Managed Rust, TypeScript/JavaScript and
+      Python completion/navigation/diagnostics/repair/formatting/rename,
+      live configuration changes, restart/replay and shutdown passed; local
+      `Calculation` completion after `extends` passed. The live Zed HTML 0.3.2
+      gallery install served completion and grammar/highlight captures, then
+      uninstalled cleanly. The disposable workspace remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-eihuP4`;
+      its profile was removed. No Cargo build or model request ran. Native
+      popup rendering and authenticated-provider acceptance remain open.
+      Re-ran the managed runtime smoke set against that same 08:33 integrated
+      binary: Code Mode delegated searches/cancellation/Turso reopen; project
+      and user memory append/search/review/reopen; MCP discovery/resources,
+      approvals, cancellation and continuation; model-limit estimation and
+      automatic compaction; session-bound FIM with instruction hierarchy;
+      Git stage/commit/push/branch/conflict handling; and workspace search over
+      10,000 files all passed. Search measured a 301 ms index build, 425 ms
+      multiline search, 336 ms for the 5,000-result cap, and 418 ms median
+      no-hit search; stale-index symlink rejection passed. These used isolated
+      fixtures and loopback providers, with no Cargo build or external model
+      request. They verify runtime behavior, not native rendered acceptance.
+      Rechecked against the integrated binary built at 08:58 EDT on
+      2026-10-30: Code Mode delegated-search/cancellation/Turso retry, project
+      and user memory append/search/review/reopen, MCP discovery/resources/
+      approval/cancellation/continuation, selected-model compaction and
+      summary persistence, session-bound FIM/instruction hierarchy, curated
+      Pi/Codex/Claude ACP install and model-option changes, and local Git
+      status/diff/stage/commit/push/branch/conflict workflows all passed.
+      The full Rust/TypeScript/JavaScript/Python LSP matrix also passed after
+      managed installation of Basedpyright and Ruff. These used disposable
+      profiles; no Cargo build or authenticated model request ran. Native
+      rendered UI and authenticated provider turns remain open.
+      The source-current GPUI regression for typing literal `console.log(`
+      passed 1/1. Native rendered confirmation remains open because macOS is
+      locked; the pre-fix app/proxy pair remains untouched until its unsaved
+      state can be checked. Also reran the current `ahead_app-a22d426232bf3801`
+      test binary's Tab completion regressions: three typed-prefix/inline
+      suffix cases and the late inline-reply race passed (4/4). The runner is
+      newer than `code_panel.rs` and predates later `session_panel.rs` edits;
+      this verifies the completion path only, not which native window showed
+      the screenshot.
+      On 2026-10-30 at 15:09, the source-current app runner (newer than both
+      `code_panel.rs` and `session_panel.rs`) passed all 471 tests serially in
+      70.96s. This includes the comment-gutter center assertion, completion
+      popup placement and Tab/Enter acceptance, model/provider picker tests,
+      extension gallery contracts, search/replace, terminal-tab close actions
+      and window lifecycle. This is headless app evidence; native picker
+      interaction, authenticated provider behavior and the remaining rendered
+      acceptance gates stay open.
+      On 2026-11-02, the source-current serial app suite passed all 499 tests
+      in 70.71s. The run includes the explicit Add Comment icon-container
+      center assertion. The provider-name picker test now asserts that its two
+      configured fixture models remain present without assuming the total list
+      excludes endpoint-discovered or user-configured models. These remain
+      headless checks; the Mac was locked, so the icon still needs a fresh
+      rendered screenshot.
+      After replacing the button icon slot with an explicitly centered child,
+      the current test runner passed all 499 app tests serially in 65.49s;
+      the four focused file-open tests also passed (4/4). The test suite now
+      exercises the icon-container center assertion, but native pixel
+      confirmation remains pending while the Mac is locked.
+      On 2026-11-02, `just test-all` passed after replacing four stale proxy
+      extension fixtures with valid API 0.7 component headers; the production
+      discovery validator remains strict about `zed:api-version`. The run
+      included 499 app tests, 361 proxy tests (one ignored), 185 agent tests
+      (four ignored), the managed Code Mode host/runtime, RPC, viewmodel,
+      voice, extension host, storage, and the final Codex API error-context
+      target. The recipe exited 0. This is headless coverage; rendered and
+      authenticated-provider acceptance remain separate.
+      Re-ran `tests/workspace-search-scale-smoke.mjs` against the 06:45
+      integrated binary at 07:54 EDT: literal `console.log(` matching,
+      multiline search, the 5,000-result cap and stale-index symlink rejection
+      passed across 10,000 files (495 ms index build, 365 ms multiline search,
+      337 ms to return the capped results, 402 ms median no-hit). This is
+      proxy/search evidence; it does not identify which native app window
+      produced the screenshot's regex error.
+      On 2026-10-29, the mock model server now switches accepted sockets to
+      blocking mode before bounded reads. The subsequent full `just test-all`
+      run exited 0: 462 app tests, 183 agent tests, 356 proxy tests, and the
+      harness-session integration's 2 tests passed; 1 external-agent test was
+      ignored for credentials. Other maintained package suites also passed.
+      On 2026-10-28, source-current runner
+      `ahead_app-b6526016c2642312` passed all 438 app tests serially; it was
+      newer than every `ahead-app/src/*.rs` file. This includes both
+      separate-process shared-session tests, editor/LSP, model and slash
+      pickers, ACP configuration, Settings, terminal, Git and extension
+      gallery coverage. Ran the existing test binary without Cargo while the
+      shared `just dev` watcher remained active. This is headless evidence and
+      does not close native rendered or authenticated-provider acceptance.
+      On 2026-10-28, `tests/agent-code-mode-smoke.mjs` passed against
+      `target/debug/ahead` (built at 22:40, newer than the latest agent/backend
+      source). Its loopback model verified root and nested `AGENTS.md`, a
+      project `.agents/skills` entry in the first request, Code Mode tool
+      execution, eight concurrent delegated searches, cancellation, retry
+      after reopening Turso, and clean shutdown. The fixture and profile are
+      disposable; this is managed-runtime evidence, not native or authenticated
+      provider acceptance.
+      On 2026-10-28, the rebuilt integrated binary also passed
+      `tests/agent-compaction-smoke.mjs`: estimated usage, effective model
+      limit, automatic compaction, summary persistence, and shutdown. The
+      current-binary `tests/agent-file-attribution-smoke.mjs` passed shell-write
+      denial, generated-output handling, managed Code Mode apply_patch, Turso
+      CodeAnchor persistence, staged Git commit, AHEAD author/human committer,
+      session trailer, and anchor cleanup. These disposable local-mock runs
+      verify managed runtime and attribution, not authenticated provider or
+      rendered gutter behavior.
+      On 2026-10-28, the rebuilt integrated binary also passed
+      `tests/agent-mcp-smoke.mjs`: discovery/resources, legacy fallback,
+      request-state retry, approvals, identified cancellation, and model
+      continuation. `tests/agent-memory-smoke.mjs` passed project/user memory
+      append, search, reviewed replacement, stale-snapshot rejection, and
+      Turso reopen. `tests/editor-recovery-smoke.mjs` passed acknowledged
+      Unicode recovery after SIGKILL, discard recovery with stale-snapshot
+      fencing, and owner-only database permissions. These were disposable
+      local runs; authenticated-provider and rendered-app acceptance remain
+      separate. The editor fixture also passed Node `npm test` (3/3) and
+      Python `unittest` (1/1). No `OPENROUTER_API_KEY` was available in the
+      process and no keyed OpenRouter connection was present in user settings,
+      so the authenticated-provider turn remains unverified.
+      On 2026-10-29, after the current `just dev` rebuild, the integrated
+      binary passed `agent-code-mode-smoke`, `agent-compaction-smoke`,
+      `agent-file-attribution-smoke`, `agent-mcp-smoke` and
+      `agent-memory-smoke`. Together they cover standards-based instructions
+      and skills, managed tools and delegated search, cancellation/retry after
+      Turso reopen, automatic compaction and summary persistence, CodeAnchor
+      attribution through staged Git commit, MCP discovery/resources/cancel,
+      and project/user memory operations. All used disposable local fixtures
+      and mock/no model requests; authenticated provider and rendered UI
+      acceptance remained open at that point. Later on 2026-10-29,
+      `tests/agent-openrouter-smoke.mjs` passed against the rebuilt integrated
+      binary with the authorized disposable OpenRouter connection: managed
+      search/edit, Turso CodeAnchor persistence, AHEAD-authored/human-committed
+      Git attribution with the session trailer, synthetic-limit automatic
+      compaction, streaming, cancellation and retry. The script removed its
+      temporary profile and project. Native rendered acceptance remains open.
+      After the subsequent 2026-10-29 rebuild, `agent-code-mode-smoke` passed
+      again; the cache-seeded `tests/lsp-smoke.mjs` matrix passed across Rust,
+      TypeScript, JavaScript and Python, including local `Calculation` completion
+      after `extends`, restart/replay and graceful shutdown. The disposable
+      project `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-TNn7RY`
+      also passed `just verify` (Rust 1/1, Node 3/3, Python 1/1). The shared
+      `just dev` watcher was stopped only for that Cargo lane and restarted on
+      the same approved project. Native rendered acceptance remains open while
+      macOS is locked.
+      On 2026-10-29, the rebuilt integrated binary also passed
+      `tests/editor-recovery-smoke.mjs`: acknowledged Unicode buffer recovery
+      after SIGKILL with live-owner protection, discard fencing across restart,
+      and owner-only permissions on new and reopened Turso databases. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-recovery-smoke-KUCJK3`.
+      `tests/git-source-control-smoke.mjs` also passed against this binary:
+      status/diff, per-file and all-file stage/unstage, commit/history, pushes
+      to two local bare remotes, branch lifecycle, conflict protection and
+      resolution. The script removed its disposable repositories.
+      The current `tests/agent-acp-install-smoke.mjs` also passed for all three
+      curated adapters using isolated temporary profiles: Pi ACP 0.0.34 and
+      Codex ACP 2.3.0 launched and correctly requested authentication; Claude
+      ACP 0.99.0 exposed five options and accepted a live model change to
+      Opus 5.5. No prompt was sent and profiles were removed after each run.
+      Also on 2026-10-28, the same integrated binary passed the managed LSP
+      smoke with Vtsls, BasedPyright, Ruff and Rust Analyzer across Rust,
+      TypeScript, JavaScript and Python. It covered the valid local
+      `interface ExtendedCalculation extends Cal` completion, diagnostics and
+      repair, cross-file rename in unsaved buffers, formatting, TypeScript
+      import fixes, live Ruff configuration changes, restart/replay and clean
+      shutdown. A separate live Zed-catalog run installed HTML 0.3.2, loaded
+      its WASM grammar/highlight captures, completed `<di`, then restarted and
+      uninstalled it. Model-derived compaction and the Pi 0.0.34, Codex ACP
+      2.3.0 and Claude ACP 0.98.0 installs also passed; Claude exposed five
+      config options and accepted an alternate model selection. All profiles
+      were disposable and no provider credentials or inference calls were
+      used. These protocol/install smokes do not close native rendered or
+      authenticated-provider acceptance.
+      On 2026-10-28, the latest shared `just dev` build passed the complete
+      `tests/lsp-smoke.mjs` matrix against a fresh disposable Rust,
+      TypeScript/JavaScript and Python workspace. The smoke seeded its isolated
+      server cache from an earlier disposable install and needed no downloads;
+      completion, cross-file navigation/rename, diagnostics/repair, formatting,
+      import fixes, live Ruff configuration, restart/replay and graceful
+      shutdown passed. The successful run retained
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-ywMNHq`
+      for inspection and removed its generated profile. The initial PATH-only
+      preflight correctly reported absent system servers; it was not an AHEAD
+      test failure. This validates current proxy/LSP behavior, not native
+      rendered editor acceptance.
+      On 2026-10-30, reran the complete `tests/lsp-smoke.mjs` matrix against
+      the restarted integrated binary with an isolated copy of the installed
+      server cache and explicit Rust Analyzer/Ruff paths. TypeScript's local
+      `Calculation` completion after `extends`, JavaScript, Python/BasedPyright
+      and Ruff, and Rust Analyzer all passed completion, navigation, diagnostics
+      and repair, formatting, signatures, code actions, unsaved cross-file
+      rename, live Ruff configuration, restart/replay and graceful shutdown.
+      The retained disposable workspace is
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-fUVO1f`;
+      no server download or credential forwarding was used. Native editor
+      rendering remains a separate acceptance gate.
+      A later cache-seeded full matrix again passed on the integrated binary:
+      19 completion round trips had a 62.7 ms median and 857 ms maximum.
+      A direct BasedPyright probe on the same machine took 892 ms, 205 ms,
+      then 4.8 ms on successive requests, identifying server warm-up as a
+      major source of cold Python latency. `ahead-app/src/code_panel.rs` now
+      shows matching current-file words after an 80 ms wait while the LSP
+      request is pending; the focused headless GPUI test passed both the
+      early local result and the merged server reply. Native menu timing and
+      visual behavior remain to be checked when the desktop is available.
+      On 2026-10-26, the shared `just dev` loop rebuilt the integrated binary
+      in 2.43s on the same disposable multi-language project/profile. The
+      rebuilt binary passed `tests/agent-code-mode-smoke.mjs`: managed Code
+      Mode, eight concurrent delegated searches, cancellation, retry after
+      Turso reopen and clean shutdown. This uses a local mock model and
+      exercises the shared search path through the harness; it is not native
+      rendered or authenticated-provider acceptance.
+      On 2026-10-26, the source-current headless GPUI app runner
+      `ahead_app-a284c6e65a113f9b` passed all 423 tests serially. The
+      source-current proxy runner `ahead_proxy-1699264ce39d6f81` passed 351
+      tests with one ignored when run from `ahead-proxy/`, matching Cargo's
+      package working directory. A direct run from the workspace root first
+      failed only `cli::tests::test_relative_path` because its `../Cargo.toml`
+      fixture is package-relative; the exact test and full suite passed from
+      the package directory. No Cargo build was started for these reruns.
+      On 2026-10-27, the rebuilt source-current app test runner passed all 424
+      tests serially, including the session-pane action regression after it
+      began draining GPUI's deferred visibility update. This is headless app
+      evidence and used no model provider.
+      In the current continuation, the same source-current runner passed all
+      425 app tests serially. The managed Code Mode smoke also passed its
+      disposable loopback-model turn, concurrent delegated searches, cancel,
+      Turso reopen/retry and shutdown. The four-language real-server LSP smoke
+      passed through Rust, TypeScript, JavaScript and Python; a separate live
+      Zed HTML extension install/grammar/completion/restart/uninstall smoke
+      passed against the current binary. These are source-current app/proxy
+      results; native bridge attachment still times out, and authenticated
+      model-provider acceptance remains separate.
+      On 2026-10-27, `rtk cargo test --locked --offline --jobs 1 -p ahead-app
+      --lib -- --test-threads=1` passed all 435 tests, including the three
+      stale-remote Git push feedback regressions. A parallel full-suite run
+      intermittently missed the Just-task PTY output marker; that test passed
+      alone and in the serial suite. The same `just dev` watcher restarted on
+      this disposable project and isolated data home, compiled in 3.48s and
+      entered the proxy main loop. Native inspection is currently unavailable
+      because macOS is locked.
+      On 2026-10-27, the rebuilt native app stayed attached to the disposable
+      multi-language project. `verify-python`, `verify-typescript`, and
+      `verify-rust` launched in separate named PTY tabs; Python passed 1/1,
+      `npm test` passed 3/3 for TypeScript, JavaScript and the provider-catalog
+      fixture, and the Rust recipe passed 1/1.
+      In `math.mjs`, manual completion filtered to `triple(value: number):
+      number`, signature help showed the parameter type above the caret, and
+      Undo restored the clean buffer. In `main.rs`, completion at an unsaved
+      call site returned `double` with `fn(i32) -> i32`; Undo restored the
+      original clean source. The Add Comment toolbar action appeared
+      with the managed AHEAD session selected and disappeared on the Pi ACP
+      thread. A selected JS line attached a composer context chip labeled with
+      the relative path, line and selected code; moving the caret without a
+      selection removed it. Typing `@currentFile` showed the explicit current-
+      file context preview, then the unsent draft was cleared. The managed
+      provider endpoint is unavailable in this fixture; no model turn was
+      submitted. These are native workflow checks, not full Rust editor
+      acceptance or authenticated-provider acceptance.
+      On 2026-10-27, a cache-seeded TypeScript LSP smoke returned the local
+      `Calculation` interface for a valid `interface ExtendedCalculation
+      extends Cal` buffer, then passed TypeScript/JavaScript completion,
+      navigation, diagnostics/fixes, formatting, imports, restart/replay and
+      graceful shutdown. In the app, complete LSP lists now retain all
+      candidates and `is_incomplete`; a complete list filters on a background
+      executor as the same token grows, while incomplete lists still query the
+      server. Five suggestions remain the render cap. The completion subset
+      passed 17/17 GPUI tests. Presentation notes now sit at the editor's
+      right edge below their quoted line, shrink to the panel width and expose
+      a close button; the bounds/dismissal GPUI test passed 1/1. The full
+      app-suite rerun after the last test-fixture adjustment remains open.
+      On 2026-10-27, complete cached lists now filter without the former 180 ms
+      wait, while uncached automatic requests use a 50 ms debounce. The
+      focused local-filter GPUI regression passed (1/435) from a test runner
+      newer than `code_panel.rs`. The managed context meter now prefers the
+      selected model's window over usage data from a prior model, falling back
+      to runtime-reported capacity only when model metadata is unavailable;
+      `context_usage_prefers_selected_model_window_for_managed_sessions`
+      passed (1/435). The shared `just dev` loop restarted on the same
+      disposable project and isolated data home; the integrated build passed
+      in 57.96s and the proxy entered its main loop. Native rendered acceptance
+      is unavailable while macOS is locked. The source-current app test runner
+      then passed all 435 tests serially in 118.76s, including both regressions.
+      Also on 2026-10-26, `tests/lsp-smoke.mjs` installed the live Zed HTML
+      extension 0.3.2 from the catalog into an isolated profile, initialized
+      its real HTML language server, verified HTML completion, and uninstalled
+      the extension. A focused HTML-only rerun requested `get_extension_syntax`
+      for an opened unsaved buffer and received the expected `tag` capture for
+      `div` from the installed grammar and highlights query. The same full
+      disposable run installed and exercised
+      TypeScript/JavaScript, BasedPyright/Ruff and Rust Analyzer: completion,
+      definitions, diagnostics/repair, formatting, references and
+      cross-file rename in unsaved buffers, code actions, server restart and
+      graceful shutdown passed. It also confirmed app data stayed outside the
+      project (`ahead-data/` was absent). The profile was removed; the
+      disposable workspace was removed after the run. This is live
+      proxy/server evidence, not theme resolution or native rendered editor
+      acceptance.
       On 2026-10-20, `just --unstable --fmt --check` and `just --dry-run dev`
       passed. I held the exact per-repository OS lock and verified `just dev`
       returned 75, reported the lock owner, and stopped before starting
@@ -518,6 +2211,12 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       app build or rendered startup.
       Added `just dev-lock-smoke` as a repeatable guard regression; it passes
       on macOS using the actual repository lock and inert `watchexec` stub.
+      On 2026-10-28, stopped the active disposable-project watcher, reran the
+      smoke successfully (exit 75 before Cargo), then restarted
+      `just dev /private/tmp/ahead-lsp-smoke-ocUYn6`. The integrated binary
+      rebuilt in 2.92s and its proxy entered the main loop. The native
+      accessibility bridge still times out, so rendered verification remains
+      open.
       Linux's `flock -E 75` and macOS `lockf` paths are now wired into Ubuntu
       and macOS CI jobs; both workflow results remain pending. The PR path
       filter now includes `tests/**`, so edits to the lock-smoke and fixture
@@ -637,6 +2336,21 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       TypeScript/JavaScript and provider-catalog tests, and
       `python3 -m unittest discover -s python -p 'test_*.py'` passed 1/1. These
       remain fixture tests, not editor bootstrap or rendered app acceptance.
+      On 2026-10-26, the current provider-catalog fixture passed 1/1 and the
+      extension publisher suite passed 4/4, both offline. The shared `just dev`
+      run compiled `ahead-proxy` and `ahead` after fixing an unborn-branch name
+      lifetime, but final app linking failed with `errno=28` (no space left on
+      device). A focused `ahead-proxy --tests` check was interrupted after a
+      separate `cola-v2` Cargo check became active; the AHEAD watcher remains
+      stopped to avoid competing for Cargo. The branch regression and native
+      rendering remain unverified. After that Cargo check finished, a retry of
+      the non-linking proxy test check was stopped before compiling the test
+      target when free space fell below 1 GiB; the partial target artifacts are
+      preserved.
+      The disposable `/private/tmp/ahead-mvp-smoke.U1cTFd` project also passed
+      its JavaScript, TypeScript and Python test lanes independently; its Rust
+      lane remains deferred until the separate Cargo check finishes. These
+      checks do not verify editor bootstrap or rendered behavior.
       The maintained `just test-all` recipe now also includes the AHEAD graph-
       store, skills, model-auth and runtime-api packages and the Code Mode host
       and runtime; `just --dry-run test-all` renders the expected commands.
@@ -689,12 +2403,17 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       provider advertises standard OpenAI-compatible tool support and exercises
       both nested Code Mode patching and a direct function-schema `apply_patch`
       through Turso CodeAnchor, staged commit, AHEAD author/session metadata and
-      anchor cleanup. Node syntax validation passes; the integration smoke has
-      not run because the AHEAD binary is absent after `cargo clean` and disk
-      headroom remains insufficient for a clean build. This verifies dispatch
-      independently of model tool-choice quality, not authenticated provider
-      acceptance. The check is exposed as `just agent-attribution-smoke`; it
-      uses an existing shared-target binary and does not start Cargo.
+      anchor cleanup. On 2026-10-28, `just agent-attribution-smoke` passed
+      against the rebuilt integrated binary. In its disposable workspace, it
+      verified scoped root/source `AGENTS.md` and selected skill context,
+      denied a managed-shell source write while allowing generated Cargo
+      output, applied both Code Mode and standard function-schema patches,
+      persisted and displayed each `ahead` CodeAnchor, then staged and committed
+      with the `ahead` author, human committer and matching session trailer;
+      both anchors cleared after commit. This verifies deterministic dispatch
+      independently of model tool-choice quality, not authenticated-provider
+      acceptance. The check is exposed as `just agent-attribution-smoke` and
+      reuses the already-built shared-target binary.
       Source follow-up: the managed runtime now starts its retained model
       manager against the chat's selected connection, rebinds it when the
       connection changes, and avoids the shared-home Core model cache that
@@ -722,8 +2441,10 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       `Chat only` in the searchable chat model picker when capability is known;
       unknown models remain available without a capability claim. The fixture's
       provider-catalog test passed on 2026-10-20 with `node --test
-      tests/fixtures/editor-smoke/javascript/model-catalog.test.mjs` (1/1). The
-      Rust model-picker regressions remain unrun against this source.
+      tests/fixtures/editor-smoke/javascript/model-catalog.test.mjs` (1/1).
+      At that point, the Rust model-picker regressions were unrun against the
+      latest source. The 2026-10-26 source-current suite later passed 423/423,
+      including model-ID-only search and selection.
       The managed chat selector is one compact searchable GPUI-kit combobox:
       its trigger stacks reasoning effort above the model name and muted
       provider, and one click opens the model results with the effort slider
@@ -752,12 +2473,15 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       transient per-tool-call preview, clipped to eight files and 2,000 Unicode
       characters per diff. The app cache clears it on the next turn and does
       not persist each streamed update to Turso; final `FileChange` events still
-      own CodeAnchor recording. Added bounded-preview, stale-turn/upsert, and
-      GPUI rendering regressions; they have not been run. The retained parser's
-      own tests remain in `ahead-agent-engine/core`, whose library disables
-      tests, so the streaming decoder and full native event-to-render path still
-      need a source-current test run. Authenticated edit/CodeAnchor/commit
-      acceptance remains open. On 2026-10-20, managed turn context now tells
+      own CodeAnchor recording. On 2026-10-30, the source-current scoped `patch`
+      test run passed two agent and six app tests, including bounded Unicode
+      previews, per-call upsert/stale-turn rejection and GPUI card rendering.
+      The disposable `agent-file-attribution-smoke.mjs` now streams the standard
+      function-call patch arguments in 11-byte chunks and verifies that the
+      managed loop sends the matching patch-preview notification before its
+      attributed edit reaches Turso and a staged Git commit. This loopback
+      smoke passes; rendered native chat and authenticated-provider acceptance
+      remain open. On 2026-10-20, managed turn context now tells
       the integrated harness to use `file_search`/`read_editor_buffer` for
       source inspection and `apply_patch` for edits, reserving `exec_command`
       for requested terminal work; external ACP prompts are unchanged. A
@@ -780,6 +2504,11 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       command and its output rendered. This confirms native paste-to-shell for
       this path; clipboard copy-out and broader interactive shell behavior
       remain unverified.
+      On 2026-10-27, selected terminal output, copied it with Cmd+C, pasted
+      into the shell prompt, and cancelled with Ctrl+C. The copied text reached
+      the PTY input and cancellation returned to a clean prompt without running
+      the pasted command. This verifies native terminal copy/paste/cancel for
+      the selected-text path; broader interactive shell behavior remains open.
       Rechecked on 2026-10-20 from the disposable fixture: `just verify` passed
       Rust (1/1), TypeScript/JavaScript plus provider-catalog (3/3), and Python
       (1/1), offline. This confirms fixture code only; editor/LSP behavior was
@@ -1869,7 +3598,15 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       database integration run. Rechecked on 2026-10-21: workspace manifests
       declare `libsql` as the only SQL client, and `Cargo.lock` contains no
       `rusqlite`, `sqlx` or `libsqlite3-sys`; this is dependency evidence, not a
-      runtime database acceptance test.
+      runtime database acceptance test. Rechecked on 2026-11-03 against the
+      current source and `cargo tree -p ahead`: `libsql` remains the only
+      database client; `NativeClient::spawn` injects `TursoThreadStore`, whose
+      persisted backend is AHEAD's `HarnessStore`. The wrapped in-memory thread
+      store is its runtime cache/test implementation, not an alternate durable
+      store. SQLite references in the production adapter are libSQL schema/open-
+      flag details; other source matches are binary/text fixtures, a test URI,
+      or an explanatory no-SQLite-dependency comment. This is source/graph
+      evidence, not a fresh local or remote database integration run.
       Rechecked on 2026-10-12: startup runs one unversioned transactional
       initial-schema DDL using `CREATE ... IF NOT EXISTS`; there is no schema
       inspection, version marker, migration runner or compatibility path.
@@ -1981,9 +3718,15 @@ Open: native rendered acceptance (macOS HIServices abort before render), the
       tamper rejection. `../zed` is clean at the exact revision in
       `extensions/sources.json`; its `target/debug` directory and the pinned
       `zed-extension` executable are absent. No package was built or published.
-      The checked-in AHEAD feed is still empty, direct `api.zed.dev` access is
-      still limited to the development preview pending endpoint-terms review,
-      and live release-catalog installation remains open.
+      This 2026-10-12 preview-only status was superseded by the user's
+      2026-10-14 decision to use Zed's live catalog in releases with a
+      compatibility/non-endorsement disclosure. `ahead-app/src/extensions_panel.rs`
+      now fetches the Zed catalog in both debug and release builds; the live
+      2026-10-30 integrated-binary smoke installed HTML 0.3.2, exercised HTML
+      completion/restart, and uninstalled it. AHEAD's own release-feed publisher
+      remains unrun and its checked-in feed is empty. Native gallery rendering,
+      a published-release smoke, and endpoint-specific authorization for broad
+      commercial distribution remain open.
       Rechecked on 2026-10-12 using the same app runner: all 61
       `code_panel::tests`, 29 `settings_panel::tests`, 10 `terminal::tests`,
       14 `terminal_panel::tests` and 15 `workspace_panels::tests` passed
@@ -3565,6 +5308,25 @@ It also passed four source-matched app regressions: directory launch,
       OS input. AHEAD Dev is listed as running, but attaching to its window
       still times out, so the user's rendered unresponsive-buttons report
       remains open.
+      Rechecked on 2026-10-27 with the rebuilt source-current app test runner:
+      `empty_chat_renders_session_start_actions` and
+      `empty_agent_panel_routes_ahead_and_external_start_actions` both pass.
+      Their synthetic GPUI clicks verify the session-start and invite-validation
+      routing. On 2026-10-28, the shared `just dev` app on
+      `/private/tmp/ahead-lsp-smoke-ocUYn6` received native clicks for all three
+      empty-state actions: New opened the AHEAD session wizard, External opened
+      the Pi/Codex/Claude Code setup, and Join displayed its malformed-invite
+      guidance after a disposable invalid value was entered. The test value was
+      cleared. This verifies native pointer delivery and visible validation in
+      the current window; installing/starting an agent and joining a real invite
+      remain open.
+      On 2026-10-29, the source-current test runner
+      `ahead_app-b63ac9873957e73d` (17:30, newer than `session_panel.rs` at
+      13:49 and `app_lifecycle_tests.rs` from 2026-10-27) passed both
+      `empty_chat_renders_session_start_actions` and
+      `empty_agent_panel_routes_ahead_and_external_start_actions` (2/2).
+      This confirms current GPUI hit testing and routing; rendered verification
+      in a freshly launched native window remains open.
       Its Git panel previously showed a raw repository
       NotFound error with no initialization action. It now identifies the
       uninitialized workspace, offers the existing Git-init RPC, and disables
@@ -4189,8 +5951,14 @@ It also passed four source-matched app regressions: directory launch,
       `curated_acp_agents_initialize_with_isolated_homes` test: Pi, Codex and
       Claude Code each initialized through their curated adapters using
       isolated homes and no model turns (1/1). The authenticated Pi turn remains
-      unrun because `OPENROUTER_API_KEY` is unset in this execution environment;
-      no credential was copied from chat into a shell command. Stopped
+      a separate check. Later on 2026-10-29, ran the current
+      `ahead_agent-034732eec90cac70` test runner's ignored
+      `pi_registry_adapter_completes_an_acp_turn` against the user-authorized
+      OpenRouter model (1/1). Pi selected the provider-qualified model and
+      returned `PONG` through ACP. The test used its disposable Pi home and
+      workspace; the credential was passed via stdin and no normal Pi settings
+      were touched. This verifies a live external Pi conversation, not proxy-
+      level ACP cancellation/resume or native chat rendering. Stopped
       watcher 43803 before Cargo checks, then restarted `just dev` as session
       7925 on the same disposable project and isolated Turso home. Its
       integrated build passed in 2.62s, then macOS again aborted the app child
@@ -4326,6 +6094,67 @@ It also passed four source-matched app regressions: directory launch,
       is 3.8 GiB, 6.0 GiB is free, and no app binary or render was produced.
       The macOS desktop is unlocked. The shared-loop regression passed again:
       a duplicate watcher exits 75 before Cargo.
+      Current follow-up on 2026-10-26: the pre-existing shared `just dev`
+      watcher still holds the repository lock and its app/proxy processes are
+      live on `/private/tmp/ahead-mvp-smoke.U1cTFd`; no second Cargo loop was
+      started. Against its integrated binary, the live Zed HTML extension
+      install/completion/uninstall and the full Rust/TypeScript/JavaScript/
+      Python LSP restart/replay/shutdown matrix passed. The disposable project's
+      Node, TypeScript and Python tests passed. Its existing Rust test runner
+      was newer than `src/main.rs` and `Cargo.toml`, and passed directly (1/1)
+      without invoking Cargo. The desktop is currently locked, so these results
+      do not prove rendered behavior. `OPENROUTER_API_KEY` is absent from this
+      shell, so authenticated provider acceptance remains unverified.
+      On 2026-10-26, the existing shared `just dev` watcher recompiled the
+      current `ahead-app` and `ahead` sources, then failed only at final linking
+      with `No space left on device`; the integrated binary was not replaced.
+      The filesystem has 765 MiB free. The previously authorized disposable
+      language-server cache is already absent, and no safe outside-`target`
+      cleanup candidate was found in the active dev profile. This confirms
+      source compilation, not a fresh app launch or rendered acceptance.
+      Follow-up later on 2026-10-26: after clearing one authorized 164 MiB
+      language-server cache from an inactive disposable profile, the existing
+      watcher completed the app link at 20:21 and the proxy entered its
+      mainloop. The fresh integrated binary passed the Code Mode, memory, MCP,
+      shutdown, file-attribution and 10,000-file search smokes. The full
+      Rust/TypeScript/JavaScript/Python LSP smoke also passed with isolated
+      server installs. The curated ACP install smoke passed Pi 0.0.34 and
+      Codex ACP 2.3.0 through authentication discovery, and Claude ACP 0.97.0
+      through five config options and a live model change; no provider prompt
+      or credentials were used. The macOS desktop is locked, so rendered
+      acceptance remains open. These results supersede the failed final link
+      above; no Cargo build was started for the smokes.
+      On 2026-10-26, paused that watcher for one focused offline test build;
+      the source-current slash-palette tests passed 8/8 and the complete
+      source-current app suite passed 424/424 serially in 79.48s. Focused
+      checks from that runner also passed the 9 model-picker tests, exclusive
+      search modes, empty-session start actions, session-required comments,
+      breakpoint isolation and stable diff-marker geometry. Restarted the same
+      watcher on the same disposable project; `ahead` rebuilt in 3.14s and its
+      proxy entered the mainloop. Native rendering is still unverified while
+      the Mac is locked.
+      The source-current `ahead-proxy --lib` suite also passed 352/353 tests
+      serially (1 ignored) in 52.61s, including ACP catalog dispatch,
+      session-scoped comments, Turso history/memory, shared search, Git,
+      language-server and extension-host behavior. Restarted the same watcher
+      afterward; `ahead` rebuilt in 3.17s and the proxy re-entered its mainloop.
+      This is headless/runtime evidence, not native rendered acceptance.
+      On 2026-10-29, the current integrated `target/debug/ahead` binary passed
+      the isolated Code Mode, automatic-compaction, MCP, project/user-memory,
+      and CodeAnchor-to-Git smokes. They covered delegated search and retry
+      after Turso reopen; compaction summaries; MCP discovery/resources,
+      approval and cancellation; memory append/search/reviewed replacement;
+      and managed edits persisted as Turso CodeAnchors through staged Git
+      commit metadata and cleanup. All used disposable profiles and local
+      mock services; no external provider request or Cargo build was made.
+      These validate the managed runtime after the pruning edits, not native
+      rendered acceptance.
+      On 2026-10-30, the already-open native Source Control panel in the
+      disposable `ahead-editor-smoke.0Hepwq` project refreshed without a manual
+      refresh after external file create, tracked-file edit, and file removal.
+      An external Git commit appeared immediately in the History tab. I reset
+      the disposable repository to its original commit and confirmed the
+      Source Control count returned to its prior two changes.
 - [ ] Finish AHEAD-owned Clippy warning cleanup before calling the build
       production-ready. On 2026-10-01,
       `cargo clippy --locked --offline -p ahead-agent -p ahead-app -p ahead-proxy --lib -j 1`
@@ -4413,6 +6242,55 @@ It also passed four source-matched app regressions: directory launch,
       rebuilt `ahead`/`ahead-app` with stable in 14.73s. The app then hit the
       same pre-render HIServices XPC abort. This does not verify compilation or
       Clippy at the declared 1.95 minimum.
+      On 2026-10-26, a `just dev` rebuild exposed `InstallLock::try_acquire` as
+      library dead code because only ACP lock tests use it; it is now gated by
+      `cfg(test)`. The `ahead-agent` crate compiled without that warning, but
+      the final app link failed with `No space left on device`; this is not a
+      completed app build or Clippy pass.
+      On 2026-10-27, focused `cargo clippy -p ahead-agent -p ahead-rpc --lib
+      -j 1` passed after fixing the AHEAD production-library findings. The
+      initial `--all-targets` run reported 31 deny-level findings in
+      `ahead-agent` tests. On 2026-10-27, fixed those without lint suppressions;
+      the focused `ahead-agent --all-targets` Clippy run now passes with zero
+      errors and 270 warnings across the retained dependency closure. The full
+      serial `ahead-agent --lib` suite passes (182 passed, 4 ignored), and
+      scoped rustfmt plus `git diff --check` pass. Full workspace warning
+      cleanup and all-target Clippy remain open.
+      On 2026-10-30, the scoped stable `cargo clippy --locked --offline
+      -p ahead-agent -p ahead-app -p ahead-proxy --lib -j 1` pass completed with
+      zero errors. It reports two `ahead-core`, 49 `ahead-proxy` and 109
+      `ahead-app` warnings; `ahead-agent` has none. The pass first exposed five
+      deny-level `ahead-voice` findings in the dependency graph, now fixed
+      without lint allowances. Three mechanical `ahead-core` warnings are also
+      fixed; its remaining two are long search-function signatures. Four
+      focused voice resampling tests pass. Warning cleanup, all-targets and
+      full-workspace Clippy remain open.
+      On 2026-10-30, the literal and regex search workers now share a
+      per-file source argument instead of passing the same workspace/cache
+      inputs separately. `cargo clippy --locked --offline -p ahead-core --lib
+      -j 1` reports no AHEAD source warnings, and all 50 `search::tests` pass.
+      The broader app/proxy warnings and workspace gate remain open.
+      On 2026-11-02, the scoped all-target pass first surfaced four deny-level
+      test findings in `ahead-agent`: unchecked signed/width casts and a clone
+      of a `Copy` context. Replaced the casts with checked conversions and
+      removed the redundant clone. The same scoped Clippy command now exits 0
+      across `ahead-agent`, `ahead-app` and `ahead-proxy`; this incremental
+      pass still reports 269 dependency warnings, mostly in retained Codex
+      code. The initial pass reported 141 `ahead-app` test warnings (110 also
+      present in its lib target), 49 `ahead-proxy` lib warnings and two
+      extension-host warnings. Those warning cleanups remain open; this is not
+      a warning-free or full-workspace Clippy result.
+      A 2026-11-02 current-source app-only pass with
+      The app-only Clippy pass identified two clear AHEAD fixes: use
+      `slice::from_ref` for the selected model and `to_vec()` for terminal grid
+      cells. The complete app suite passes again (502 tests). Current
+      `rtk env CARGO_INCREMENTAL=0 cargo clippy -p ahead-app --all-targets
+      --locked -j 1` exits 0 with 109 library warnings (106 duplicated in
+      tests) and 140 test-target warnings. Many are structural callback/type
+      complexity; other mechanical findings still need focused review. With
+      1.7 GiB free, the full workspace/all-targets pass was deferred to avoid
+      exhausting shared build space. No bulk `clippy --fix` edits were applied;
+      the shared `just dev` loop rebuilt and re-entered its proxy main loop.
 - [ ] Finish cross-platform storage privacy verification in
       `ahead-proxy/src/ahead/store.rs::SessionStore::open`. Unix creation and
       supported-store reopen now enforce mode 0600 for the database and
@@ -4444,8 +6322,14 @@ It also passed four source-matched app regressions: directory launch,
       data intact and never silently replace an unavailable database with
       in-memory state. Disposable
       pre-production stores may be recreated when the initial schema changes;
-      no schema-upgrade path is required yet.
-- [ ] Fix cross-language editor highlighting in `ahead-app/src/code_panel.rs`:
+      no schema-upgrade path is required yet. A 2026-10-29 workspace and
+      production-call-site audit confirms `libsql` is the only session-storage
+      database dependency; there are no `rusqlite` or SQLx backends. Production
+      opens the workspace Turso store directly and disables sessions on open
+      failure; in-memory stores are selected only when no workspace exists or
+      in tests.
+- [ ] Expand native highlighting coverage for installed extension grammars in
+      `ahead-app/src/code_panel.rs`:
       language selection now follows the file type on creation and preview
       reuse, with a passing GPUI switch regression and a dynamic status footer.
       The normal build now enables gpui-kit's JavaScript/JSX,
@@ -4459,10 +6343,146 @@ It also passed four source-matched app regressions: directory launch,
       reuse across Rust, TypeScript/TSX, JavaScript/JSX, Python, JSON and plain
       text. A rebuilt native AHEAD Dev render in the disposable
       `ahead-comment-ui` project showed Python syntax coloring in `main.py`.
-      Native switching across all languages and extension-provided grammar
-      rendering remain unverified. The gallery can install Zed packages with
-      grammar assets; confirm the installed-package-to-rendered-editor path in
-      a live disposable project.
+      On 2026-10-28, the live native app switched among Rust, TypeScript,
+      JavaScript and Python fixture tabs; each showed language-appropriate
+      syntax colors and its expected language label, with no file edits during
+      this check. Built-in rendering is verified for these four languages.
+      Installed extension grammar names now propagate through `CodePanel` when
+      the built-in editor falls back to `text`. On 2026-10-30, the existing
+      app runner passed `extension_syntax_applies_only_the_current_proxy_response`
+      (1/1): stale syntax leaves the label as `text`, the current HTML response
+      sets it to `HTML`, and refreshed extension syntax updates the open buffer.
+      On 2026-11-02, a live Zed Swift 0.4.11/API 0.6 install returned Swift
+      grammar captures through the extension host and proxy; the same run got
+      `Calculation` completion from `sourcekit-lsp`. This verifies the real
+      extension data path, not native rendered Swift colors.
+      This is headless GPUI evidence. The gallery can install Zed packages with
+      grammar assets. On 2026-10-27, the live gallery installed the
+      Zed TOML extension into the isolated dev profile and Taplo reached Ready;
+      Ctrl+Space in `Cargo.toml` returned schema-backed `resolver` completion.
+      At that point the editor still reported `text` and showed no TOML coloring;
+      this is historical evidence before the renderer follow-up below. Tombi was
+      uninstalled after its completion check.
+      On 2026-10-27, the installed TOML WASM grammar/query probe returned 15
+      expected captures for `Cargo.toml`. AHEAD's dark and light theme test now
+      verifies that the matching property, number, string and punctuation
+      scopes resolve to foreground colors; the focused test passed (1/1, 424
+      filtered out). This confirms capture and theme-style inputs, not native
+      rendered colors; the Mac is locked during this check.
+      The current app test target then passed all 425 library tests serially in
+      77.72s. Restarted the same shared `just dev` loop on the same disposable
+      project and isolated data home; the app compiled and its proxy re-entered
+      the main loop. On 2026-10-29, the rebuilt native app opened `Cargo.toml`
+      with the installed Zed TOML extension; the matching response applied 18
+      decorations, the status bar showed `TOML`, and TOML strings were visibly
+      highlighted. This verifies one installed grammar through gallery,
+      extension host and native editor. Broader extension grammar/color coverage
+      remains open.
+      Source audit on 2026-10-27: `TextDecorationCollection::set` notifies the
+      editor state, and gpui-kit composes extension decoration layers even
+      when the built-in highlighter is absent. The `text` language label does
+      not itself suppress extension captures. The existing GPUI response test
+      verifies current-buffer ranges and the theme test verifies foreground
+      styles, but neither proves rendered colors. On 2026-10-28, the live app
+      still showed `text` and plain styling when the already-open `Cargo.toml`
+      was first revisited. After installing the TOML extension in the active
+      dev profile, closing and reopening the file visibly applied its syntax
+      colors to TOML string values; the footer still reports `text`. This
+      confirms installed TOML grammar captures reach native editor decorations.
+      A later 2026-10-28 recheck in the disposable `ahead-lsp-smoke-ocUYn6`
+      workspace contradicts that result: the Extensions page still shows TOML
+      as installed and the package manifest, language config, WASM grammar and
+      highlight query are present in the app's active default data profile, but
+      closing and reopening `Cargo.toml` leaves it monochrome and labeled
+      `text`. The app and proxy processes share that profile. Keep this gate
+      open and trace the app-side response acceptance/rendering; the installed
+      package and proxy matching boundary are now independently verified.
+      `CodePanel::request_extension_syntax` previously discarded proxy errors;
+      it now logs the file path and error so an unopened-buffer or host failure
+      is visible in the shared dev output. The shared watcher rebuilt the app
+      in 20.52s and the proxy returned to its main loop; rustfmt and
+      `git diff --check` pass. Desktop automation still times out when binding
+      the rebuilt window, so this improves diagnosis but does not resolve or
+      verify the native highlighting symptom.
+      The shared dev output also exposed an empty-path syntax request from a
+      pathless editor panel. `schedule_extension_syntax` now skips it; the
+      focused GPUI regression passed 1/1, and `just dev` restarted on the same
+      disposable workspace. This removes a spurious unopened-buffer RPC error,
+      but does not explain the app-side TOML highlighting mismatch.
+      On 2026-10-28, a direct probe against the installed TOML package returned
+      `TOML` and nine captures. `tests/lsp-smoke.mjs` now accepts
+      `AHEAD_LSP_TOML_EXTENSION_SEED`; with an empty language selection it
+      copies the package into an isolated data home and tests
+      `get_extension_syntax` through the real proxy. That smoke passed and
+      returned TOML string captures, narrowing the remaining discrepancy to
+      the CodePanel response/rendering path. Native interaction remains
+      unverified because desktop binding times out.
+      An opt-in `AHEAD_EXTENSION_SYNTAX_TRACE=1` now reports the live response
+      language/capture count, stale-response rejection, and applied decoration
+      count. The shared `just dev` app rebuilt in 29.89s and restarted on the
+      same disposable workspace with tracing enabled; the rendered CodePanel
+      result still needs inspection. The source-current
+      `extension_syntax_applies_only_the_current_proxy_response` GPUI test
+      passed 1/1; `just dev` rebuilt in 3.23s and re-entered its proxy loop
+      with tracing enabled afterward.
+      On 2026-10-29, restored the missing `AHEAD_EXTENSION_SYNTAX_TRACE=1`
+      implementation in `CodePanel`: it reports stale request/generation/path
+      rejection, or response language/revision, byte lengths, capture count,
+      response/request paths, current-buffer match and applied decoration
+      count, without logging source text. The shared watcher rebuilt and
+      relaunched the app successfully;
+      `cargo fmt --all -- --check` and `git diff --check` pass. The desktop is
+      still locked, so the opt-in trace has not yet been observed against the
+      native TOML buffer and rendered highlighting remains open.
+      On 2026-10-28, reran the extension-only `tests/lsp-smoke.mjs` against the
+      current integrated binary using the installed TOML package from the
+      isolated `ahead-dev-data` profile. The real proxy returned TOML string
+      captures; process restart and shutdown also passed. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-F4z7pI`.
+      This reconfirms the package-to-proxy path, not rendered CodePanel colors.
+      On 2026-10-29, reran that extension-only smoke against the rebuilt
+      integrated binary, seeding the TOML package from the active disposable
+      dev profile. The real proxy returned TOML syntax captures and cleanly
+      restarted and shut down; no download or provider was used. Workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-CPKGwB`.
+      The Mac is locked, so rendered CodePanel highlighting remains unverified.
+      Rechecked on 2026-10-29 in the running AHEAD Dev app and the approved
+      disposable workspace: opening `Cargo.toml` showed the `TOML` language
+      label and installed-extension syntax colors on its string values. This
+      confirms the current native package-to-CodePanel path for TOML; wider
+      installed-grammar coverage remains open.
+      On 2026-10-30, the rebuilt shared `just dev` app again showed TOML's
+      string highlighting and `TOML` footer in the disposable editor-smoke
+      project. The Extensions page showed the TOML v1.1.0 package installed.
+      This revalidates one installed grammar end to end; coverage of other
+      extension grammars remains open.
+      On 2026-10-29, extension-host syntax lookup now caches parsed language
+      definitions per installed-extension root (bounded to eight roots) rather
+      than rescanning and reparsing each extension manifest/config for every
+      syntax request. Install, uninstall and extension discovery/restart
+      invalidate the cache. The focused host regression passed 1/1, covering
+      reuse and invalidation after discovery observes an extension-directory
+      change. This follows Zed's registry update lifecycle but does not change
+      AHEAD's separate parser boundary or prove native coloring for more
+      grammars.
+      The current `ahead_app-ae401acfe1bf5540` runner (newer than
+      `code_panel.rs`) passed all three `code_panel::tests::extension_syntax`
+      regressions. The TOML package was copied into the existing disposable
+      `ahead-ext-native` profile and the shared `just dev` watcher restarted;
+      the desktop remains locked, so rendered colors are still unverified.
+      Rechecked against the current source-matched app test binary
+      `ahead_app-b63ac9873957e73d` (18:34:28, newer than `code_panel.rs` at
+      18:33:30): all four `code_panel::tests::extension_syntax` tests passed,
+      including stale-response fencing, UTF-8 ranges, scope mapping and the
+      current-proxy response path. This confirms editor decoration state, not
+      fresh-install colors in the rendered native window.
+      On 2026-10-28, extension syntax responses began carrying their matched
+      Zed language name through the host and proxy. The status footer now uses
+      that name only when the built-in editor reports `text`, and rejects
+      stale path/length responses. The editor/proxy syntax tests passed 3/3 and
+      the extension-host language-config test passed 1/1. Native rendered
+      verification for extension language labels and other installed grammars
+      remains open.
       `ahead-extension-host` now retains each Zed language's `grammar` entry,
       accepts grammar-only extension packages, and exposes bounded WASM plus
       optional highlights/injections query assets with symlink checks.
@@ -4584,10 +6604,47 @@ It also passed four source-matched app regressions: directory launch,
       buffers re-request extension-provided syntax after install/restart rather
       than waiting for a file edit or reopen. The existing mounted GPUI syntax
       test now also delivers that notification and asserts the open buffer
-      requests and applies the refreshed capture. This source-current extension
-      refresh regression has not yet been run in test mode.
+      requests and applies the refreshed capture. On 2026-10-26, the source-
+      current `ahead_app` test runner passed
+      `code_panel::tests::extension_syntax_applies_only_the_current_proxy_response`
+      (1/1); the runner was built at 12:24 and is newer than the editor source
+      at 11:09. This verifies the refresh through the mounted GPUI test, not
+      native rendered extension colors.
       The shared `just dev` rebuild compiled the integrated app in 8.99s and
       the proxy entered its main loop; no test-mode Cargo command was started.
+      On 2026-10-28, native tracing isolated a startup race: the syntax request
+      was scheduled at editor generation 0, then buffer initialization advanced
+      the generation before the debounce elapsed, silently discarding the only
+      request. `CodePanel` now reschedules when that broad generation changes
+      while the path-specific request remains current. The shared `just dev`
+      rebuild passed; reopening `Cargo.toml` in the disposable
+      `ahead-lsp-smoke-ocUYn6` project visibly applied TOML colors and reported
+      `TOML` in the status bar. The temporary trace was removed after verifying
+      the clean rebuild. The source-current GPUI response test now invalidates
+      the editor generation during the debounce, asserts that the stale task
+      sends no RPC, and verifies the rescheduled request; the focused test
+      passed (1/1). The same dev loop rebuilt in 25.03s and returned the proxy
+      to its main loop. Broader installed-grammar coverage remains open.
+      Rechecked the source-current runner `ahead_app-ae401acfe1bf5540`
+      directly on 2026-10-28; the generation-invalidation/reschedule regression
+      passed again (1/1), with no Cargo build started. The shared `just dev`
+      app and proxy are still running on the disposable LSP project. The
+      startup race is resolved; macOS is currently locked, so this turn could
+      not repeat the rendered check. Keep only broader installed-grammar
+      coverage and any future rendered regressions open.
+      Revalidated the current binaries without Cargo: all four app-side
+      `extension_syntax` tests passed, and both installed-HTML host tests passed
+      against the cached Zed package, including combined script injections.
+      The app runner postdates `code_panel.rs`, and the host runner postdates
+      `ahead-extension-host/src/host.rs`; this verifies parser and response
+      behavior, not native rendered colors.
+      Fresh native trace on 2026-10-29 in the approved
+      `ahead-lsp-smoke-ocUYn6` project: opening `Cargo.toml` returned
+      `language=TOML`, 18 captures, `matched_current_text=true`, and 18 applied
+      decorations. The status bar displayed `TOML`, and the editor visibly
+      colored TOML strings. This re-confirms the full installed-package to
+      native-render path for TOML; broader extension grammar coverage remains
+      open.
 - [ ] Verify Settings autosave and close/quit in the rebuilt native app.
       `ahead-app/src/settings_panel.rs::save_config` now serializes writes on a
       background worker with one coalesced pending edit. It holds the lock
@@ -4598,10 +6655,31 @@ It also passed four source-matched app regressions: directory launch,
       Constructor/bootstrap and external reload now use background tasks;
       provider controls stay disabled until initial loading finishes. The
       existing workspace watcher drives reloads, with no render-time reads.
+      On 2026-10-27, changed the disposable workspace provider name, closed and
+      reopened the Settings tab, and confirmed the value persisted. Restored the
+      original `OpenAI` name and confirmed it persisted after another reopen.
+      This verifies workspace autosave and tab reload.
+      On 2026-11-02, in the rebuilt native app on the disposable
+      `/private/tmp/ahead-memory-review.bJ5FaU/project`, changed the local
+      connection name and immediately quit with Cmd+Q. After the app exited,
+      `.ahead/settings.toml` retained both the edited active connection and its
+      name, verifying macOS quit flush. Restored the original name before the
+      existing `just dev` loop relaunched the app; the restored connection was
+      visible again. Its localhost endpoint was unavailable as expected. Native
+      startup/loading presentation and Linux/Windows lock release remain open.
+      On 2026-10-28, in the live disposable `ahead-lsp-smoke-ocUYn6` app, a
+      temporary local OpenAI-compatible endpoint discovered two models with
+      distinct context metadata. An unreachable provider remained labeled on
+      its own row as “Could not reach model endpoint” while the healthy
+      provider's models stayed visible. After refreshing the formerly
+      unreachable provider against the local endpoint, its row cleared and its
+      models appeared. The test connection was removed; AHEAD confirmed the
+      workspace settings were saved. No credentials or external requests were
+      involved. Native startup/loading and window close/quit flush remain open.
       Verify that startup/loading presentation in the native app too. The lock
       explicitly unlocks on scope exit so a fork-inherited handle cannot delay
       release; verify Linux/Windows behavior.
-- [ ] Verify model-picker loading in the rebuilt native app. Initial reads,
+- [ ] Finish native model-picker and model-visibility acceptance. Initial reads,
       Settings callbacks and watcher timestamp checks in
       `ahead-app/src/session_panel.rs` now run off the UI thread. GPUI tests
       cover unsent drafts during initial loading, selection changes during a
@@ -4615,14 +6693,123 @@ It also passed four source-matched app regressions: directory launch,
       model and muted endpoint label were visible in the picker. On 2026-10-20,
       the single chat-picker trigger was tightened to place the active effort
       above the model name and muted provider, keeping the searchable model
-      combobox and GPUI slider together in its popover. The source passes
-      rustfmt and the design detector; this visual adjustment still needs a
-      GPUI/native render check. A focused
+      combobox and GPUI slider together in its popover. On 2026-10-30, a live
+      native smoke used a temporary loopback
+      OpenAI-compatible endpoint: discovery added its model to the provider's
+      virtualized visibility list, the provider-scoped switch hid and restored
+      that model, and the searchable chat picker showed its model name with the
+      provider muted below it. Selecting it updated the session display. The
+      endpoint was restored to the fixture's original localhost URL afterward;
+      no chat completion or external request was sent. A second native smoke on
+      2026-10-30 used two local loopback catalogs with the same model ID: hiding
+      it under Catalog B left Catalog A enabled, and the chat picker listed only
+      Catalog A's model. Both provider sections collapsed independently; the
+      121-model list scrolled inside its own viewport. Searching for the shared
+      ID reduced the picker to the Catalog A result, and its advertised effort
+      levels rendered in the combined picker footer. Restored the original
+      workspace settings afterward; server traces contained catalog GETs only,
+      with no chat completion or external requests. Narrow-width layout,
+      managed/external transitions and native context-meter/compaction rendering
+      remain open. The combined picker and virtualized provider list are now
+      native-rendered at the current window size; narrow-width and
+      managed/external transitions remain open. The source passes rustfmt and
+      the design detector. On 2026-10-26, the existing source-current app
+      test runner passed
+      `session_panel::tests::chat_model_select_filters_by_provider_name`
+      (1/1); it covers the combined effort/model trigger and provider-filtered
+      selection. This remains headless evidence, not a native render check.
+      Rechecked on 2026-10-27 using the existing source-current runner
+      `ahead_app-a284c6e65a113f9b`: both
+      `chat_model_select_filters_by_provider_name` and
+      `model_selector_searches_model_and_provider_names` passed (2/2). The
+      combined searchable model/effort control is covered; native narrow-width
+      and managed/external transition rendering remain open.
+      A 280px headless GPUI render exposed an 18px overlap between the fixed
+      160px model selector and context ring. The selector now shrinks with its
+      footer column, and the chat-only warning truncates to the same width.
+      The narrow composer regression passes with the effort label visible and
+      the selector, ring and Send button inside the panel without overlap.
+      Rendered narrow-width acceptance remains open.
+      AI Integration now provides per-model context-limit overrides in the
+      virtualized provider list. Verify the inline editor in native Settings,
+      then select that model in a managed session and confirm the meter and
+      automatic compaction use the override ahead of endpoint metadata.
+      The first source-current app suite compiled and ran 465 tests: 464 passed;
+      one visibility assertion still expected three rows after the new
+      configured-only override row was added. That expected count/index is fixed
+      in source but awaits a rerun. The AHEAD watcher is paused for the test lane;
+      restart it after the concurrent external Cargo job releases disk space.
+      The same source-matched runner passed all 72 `session_panel::tests`
+      serially on 2026-10-26, including model/provider options, ACP model
+      configuration, slash-skill filtering and keyboard selection, stop/retry
+      races, and delayed-history streaming responsiveness. This remains
+      headless evidence and does not close the rendered chat checks.
+      The source changed after that runner, so on 2026-10-27 I stopped the
+      shared watcher and rebuilt the current `ahead-app` test target. All 72
+      `session_panel::tests` passed serially, including the combined model /
+      effort picker. I restarted `just dev` with the same disposable workspace
+      and data home; the app build completed in 2.83s and its proxy entered the
+      main loop. Native picker focus and narrow-width rendering remain open.
+      The managed composer now uses only the selected model's discovered or
+      configured context limit. Its cached runtime usage has no model identity
+      and can describe the previous selection, so it no longer supplies a
+      misleading denominator when model metadata is unknown. A focused unit
+      regression passed (1/1); scoped rustfmt passed, and the shared `just dev`
+      app/proxy rebuilt in 14.39s. The current binary again passed
+      `tests/agent-compaction-smoke.mjs`: estimated context usage, the effective
+      model limit, automatic compaction, summary persistence and shutdown. On
+      2026-10-30, reran `tests/agent-compaction-smoke.mjs` against the
+      watcher-built `target/debug/ahead` (newer than the context-window,
+      model-info and session-panel sources); it passed again. This uses a local
+      mock provider; native rendering and authenticated-provider compaction
+      remain open.
+      The current app runner's configured model-window precedence,
+      selected-model usage denominator and discovered-limit-over-provider-
+      fallback regressions also passed (3/3). Together with the compaction
+      smoke, this verifies the app/runtime budget contract headlessly; editing
+      the override and seeing it drive a native managed turn remains open.
+      On 2026-11-02, the source-current app runner built at 19:07:32 passed all
+      37 model-picker/settings tests and all 3 context-meter tests serially.
+      The runner is newer than `session_panel.rs`; coverage includes combined
+      model/effort selection, provider-scoped visibility and search, narrow
+      composer bounds, context-limit precedence, selected-model denominator,
+      and hiding the numeric usage label when the panel is narrow. Native
+      managed/external transitions and rendered narrow-width behavior remain
+      open.
+      Against the integrated binary rebuilt at 21:09 on 2026-11-02,
+      `tests/agent-compaction-smoke.mjs` passed again with an isolated local
+      mock provider that omits usage fields: estimated context, effective
+      model limit, automatic compaction, persisted summary, and clean shutdown.
+      This confirms the runtime path without external credentials; native meter
+      rendering and authenticated-provider compaction remain open.
+      On 2026-10-30 at 08:49 EDT, the source-matched app runner also passed
+      `settings_panel::tests::normalizes_model_catalogs_and_openai_model_responses`
+      (1/1). Its OpenRouter-shaped GPT-6 Luna fixture resolves the model's
+      `context_length` of 1,050,000 ahead of `top_provider.context_length` of
+      262,144. This verifies catalog parsing, not the configured live endpoint
+      or the rendered meter in a managed session.
+      A documentation audit corrected `docs/guide/connections-and-settings.md`:
+      the managed meter uses the selected model's discovered/configured context
+      limit, default compaction begins near 90%, and the runtime hard cap is
+      95%. Native meter and compaction rendering remain open.
+      On that rebuilt runner, all 33 `settings_panel::tests` also passed,
+      including provider-scoped virtual model visibility and scroll isolation,
+      reasoning preference persistence, and the default-on inline-blame toggle.
+      The earlier focused
       `chat_model_select_filters_by_provider_name` test build on 2026-10-20
       was stopped before reaching the test when free space fell to 2.2 GiB; no
       GPUI assertions ran. Native verification must still cover loading at
-      narrow widths and managed/external transitions; no provider
-      turn has been verified against these changes. On 2026-10-21, a retry
+      narrow widths and managed/external transitions. On 2026-10-29,
+      `tests/agent-openrouter-smoke.mjs` passed against the rebuilt integrated
+      binary using the authorized disposable OpenRouter connection. The managed
+      turn searched a synthetic marker, edited only `src/main.py`, persisted a
+      CodeAnchor, and committed with the AHEAD author, human committer and
+      `Ahead-Session` trailer. Streaming was observed; cancellation and retry
+      both reached their cancelled terminal states. The smoke removed its
+      temporary profile and project. This verifies authenticated managed tool
+      execution, compaction and cancellation/retry at the proxy boundary;
+      native chat rendering remains a separate acceptance gate. On
+      2026-10-21, a retry
       began with 6.7 GiB free but rebuilt the retained engine/Wasmtime test
       dependency graph; a separate `cola-v2` Cargo test started concurrently.
       I stopped only the AHEAD compile at 3.7 GiB free to avoid exhausting the
@@ -4640,6 +6827,104 @@ It also passed four source-matched app regressions: directory launch,
       now key by stable provider ID, so reordering or refreshing settings does
       not transfer one server's UI state to another. A reorder regression was
       added but has not been run.
+      On 2026-10-26, the current `just dev` native app discovered 468 models
+      from the disposable OpenRouter connection. The chat picker exposed a
+      bounded 12-row window, grouped rows under the provider name, filtered
+      display names as `Nemotron` was typed, and kept the effort slider in the
+      same popover. Searching the exact provider model ID initially returned
+      no match while display-name search succeeded. `ModelSpec::matches` now
+      includes the provider model ID as a search alias without changing the
+      displayed label. The GPUI picker regression now uses a distinct display
+      name and model ID, searches an ID-only fragment, and selects that result.
+      On 2026-10-26, `chat_model_select_filters_by_provider_name` passed directly
+      against the source-current `ahead_app-a284c6e65a113f9b` runner (1/1).
+      It covers model-ID-only filtering and effort controls inside the combined
+      searchable model selector. This is headless GPUI evidence. One minimal
+      provider turn returned `OK`; the temporary
+      provider and credential were removed afterward. On 2026-10-26,
+      populated the disposable provider with 120 synthetic fallback models. Its
+      expanded visibility list rendered eight rows with its own scrollbar;
+      scrolling inside it moved the virtual rows from 001-008 to 056-063 while
+      the provider header and outer Settings page stayed in place. Toggling
+      model 056 off and back on updated provider-scoped visibility. Restored the
+      original `deepseek-coder` fallback and verified `models = ["deepseek-coder"]`
+      and `hidden_models = []` in the disposable settings file. Remaining
+      native checks: narrow widths and managed/external session transitions.
+      On 2026-10-27, native chat search narrowed to `gpt-5.6-luna` under OpenAI
+      without changing the selected model. AI Integration showed collapsible
+      provider sections and a 143-entry OpenAI virtual list with its own
+      scrollbar; scrolling inside advanced model rows while the Settings page
+      stayed in place. The provider endpoint was unavailable, so this run could
+      not display native reasoning metadata or the effort slider. GPUI covers
+      the slider; native narrow-width and managed/external transition checks
+      remain open.
+      On 2026-10-29, the running disposable app filtered `Luna` to the two
+      matching model choices. I selected `gpt-5.6-luna` to inspect the native
+      effort footer, but the session exposed no effort options; I restored its
+      original `deepseek-coder` OpenAI-compatible selection. The combined
+      reasoning slider remains unverified in a provider session that reports
+      supported effort metadata.
+      On 2026-10-29, traced the stale full-list result to model discovery
+      replacing the combobox items while its query text remained set; gpui-kit
+      does not rerun the active query when `set_items` replaces the delegate.
+      `replace_model_select_items` now reapplies a non-empty query after model
+      configuration or discovery refreshes. The rebuilt native picker narrowed
+      `compatible server` to `deepseek-coder` under “OpenAI-compatible server”.
+      The source-current regression
+      `session_panel::tests::chat_model_select_filters_by_provider_name` passed
+      1/1 from `target/debug/deps/ahead_app-b63ac9873957e73d` (15:40, newer than
+      `session_panel.rs` at 13:49); it filters by model ID, replaces the
+      discovered list while the query is active, and confirms the result
+      remains filtered. Managed effort metadata and narrow-width rendering
+      remain open.
+      In the current native session, opening the existing Pi ACP thread showed
+      its searchable, provider-grouped model list and the combined trigger with
+      model first and muted effort (`Nova Micro (US) off`). Selecting
+      `Claude Opus 4.6` showed `high` beside the model and the reasoning slider
+      in the same picker; searching `Nova Micro` exposed the regional variants.
+      Restored the original `Nova Micro (US) off` default and confirmed the
+      trigger returned to it. This verifies the external ACP model/effort
+      transition and restore path; managed native endpoint discovery and
+      narrow-width rendering remain open.
+      On 2026-10-28, the native managed-session picker opened in the current
+      disposable workspace and filtering for `deepseek` narrowed the visible
+      result to `deepseek-coder` under its provider. The configured model
+      remained selectable while discovery reported that the endpoint was
+      unavailable. This verifies native search/filter rendering only; fresh
+      endpoint discovery, managed reasoning metadata/effort rendering and
+      narrow-width behavior remain open.
+      On 2026-10-29, the rebuilt managed picker rendered its searchable catalog;
+      selecting `gpt-5.6-luna` updated the selected model/provider without
+      sending a turn. The endpoint was unavailable, so this did not render
+      managed reasoning metadata or the effort slider. In AI Integration, three
+      provider tabs clipped the Add/Remove controls; `settings_panel.rs` now
+      wraps that row. The shared `just dev` build relaunched the app, but native
+      post-fix layout verification remains open.
+      Rechecked on 2026-10-29 in the current native `just dev` app: the OpenAI
+      provider expanded to 143 models with a visible scrollbar. Scrolling inside
+      its virtual list moved model rows while keeping the provider heading and
+      Settings page fixed. Hiding `deepseek-coder` under OpenAI left the
+      same-named OpenAI-compatible-server entry enabled; restoring the OpenAI
+      toggle returned it to the visible state. The disposable settings file
+      contains empty `hidden_models` arrays for both providers after cleanup.
+      Managed reasoning metadata, narrow-width rendering and managed/external
+      transitions remain open.
+      On 2026-10-27, the 143-model native list reproduced scroll chaining: a
+      wheel event over model rows also moved the enclosing Settings page. Added
+      a viewport-sized GPUI capture mask based on Zed's `CarouselScrollMask`
+      pattern; it applies wheel deltas to the virtual model-list handle and
+      stops propagation, including at list edges. The focused
+      `model_list_scroll_does_not_scroll_settings_page` test passed (1/1).
+      Rechecked in the rebuilt `just dev` app: scrolling inside the list changed
+      visible model IDs while the provider heading and page stayed fixed;
+      scrolling outside moved the page; a model visibility switch toggled off
+      and back on. Narrow-width and managed/external transition checks remain.
+      On 2026-10-27, discovered per-model `/models` context limits now override
+      a generic connection-level context fallback, so the meter and managed
+      compaction use the selected model's actual catalog value. The regression
+      sets a 32,768 connection fallback and verifies that discovered 131,072
+      model metadata wins; the focused GPUI test passed (1/1). Native provider
+      confirmation remains open.
       On 2026-10-07, an offline Cargo run against current source passed all 24
       `settings_panel::tests` and all 7 `model_picker` tests, including the
       duplicate-provider identity regressions. This continuation re-ran the
@@ -4868,6 +7153,10 @@ It also passed four source-matched app regressions: directory launch,
       32,768 only when context metadata is absent. The focused regression covers
       both field names, string-only catalogs, deduplication, and missing/zero
       values; it passed in the current focused app test run. Per-model context
+      discovery also falls back to `top_provider.context_length` when the model
+      entry has no root context value. The 2026-10-29 focused parser regression
+      passed (1/1), confirming root context metadata takes precedence and a
+      nested-only OpenRouter limit is retained.
       is now carried in the turn request through Turso retry persistence and
       into the managed runtime's per-thread model settings; clearing a model
       override falls back to the runtime startup setting. Regressions cover
@@ -4931,11 +7220,14 @@ It also passed four source-matched app regressions: directory launch,
       picker startup/reload and stale-result fencing, provider-scoped hidden
       models, and virtual-list scroll containment. This was run directly
       without Cargo while the shared dev watcher was idle after app startup.
-      The disposable-project checklist now matches the implemented refresh
-      contract: discovery runs when the agent panel loads and when Settings
-      reloads; opening or rerendering the picker does not issue duplicate
-      catalog requests. Per-open refresh would require an open-change hook not
-      currently exposed by gpui-kit Select.
+      The earlier startup/settings-only refresh note was superseded: the
+      searchable model picker now observes its open transition and refreshes
+      configured provider catalogs on every open/reopen, while coalescing
+      rerenders and search typing. On 2026-10-26, the source-current app test
+      runner passed all 72 `session_panel::tests`, including the rendered
+      picker test for startup, open/reopen refresh, provider search and model
+      selection. This verifies headless GPUI behavior; live endpoint discovery
+      and native rendering remain separate acceptance checks.
       Rechecked against the rebuilt 20:09 app test runner on 2026-10-14:
       all 16 tests matching `model_` passed serially, including provider-name
       search, hidden-model scoping, model catalog normalization, failed/stale
@@ -5001,6 +7293,63 @@ It also passed four source-matched app regressions: directory launch,
       checking the effort-first combined trigger, provider search, Escape close,
       and the effort slider in the same popover. Native focus-ring appearance
       and rendered layout remain open.
+      On 2026-10-26, the active `just dev` app discovered 121 models from a
+      loopback-only catalog in the disposable Rust/TypeScript/Python fixture.
+      The searchable picker grouped them under the provider and showed the
+      gpui-kit reasoning slider for the model carrying reasoning metadata;
+      moving it to High updated the displayed value. No model turn was sent.
+      After closing the picker, the compact composer trigger showed the model
+      and muted provider but did not visibly show High in this capture. The
+      gpui-kit Combobox default frame was 32px high with 8px vertical padding,
+      clipping its 38px custom trigger inside an overflow-hidden child. Set the
+      frame to 44px with 2px vertical padding and added a layout assertion that
+      the effort-first trigger body fits. The source-current focused GPUI test
+      `chat_model_select_filters_by_provider_name` passes 1/1. Native visual
+      recheck remains open because the Mac locked during this pass. Restored the
+      fixture's original localhost endpoint and fallback model, removed the
+      loopback server, and removed the exact test-only user-level reasoning
+      preference written by this dev run. On 2026-10-26, the source-current
+      app runner passed all nine `model_picker` tests, provider-scoped model
+      visibility, virtual-list scroll containment, reasoning-slider ordering
+      and persistence, and both model/provider search-selection regressions.
+      These GPUI tests do not replace the still-open native narrow-width and
+      locked-session visual checks.
+      On 2026-10-27, the source-matched app test binary (10:18, newer than
+      `session_panel.rs` at 09:44) passed
+      `chat_model_select_filters_by_provider_name` (1 passed, 423 filtered),
+      including the current effort-first model/provider trigger layout. In the
+      running disposable app, the ACP picker showed its search field and
+      provider-grouped models, and the managed composer showed the selected
+      model with its muted provider. That managed session's OpenAI-compatible
+      catalog endpoint was unavailable, so no effort value was advertised and
+      this visual pass could not confirm the selected effort label. No model
+      request was sent; native narrow-width and effort-label rendering remain
+      open.
+      Rechecked on 2026-10-27 in the rebuilt disposable app with the connected
+      Pi ACP session: the model picker search and provider groups work, and the
+      composer trigger now shows the model first with its current effort in
+      muted text. Selecting Claude Opus 4.6 displayed `high`; restoring Nova
+      Micro (US) displayed `off`. No prompt was sent, and the original Pi
+      default was restored. The focused rendered ACP model-option GPUI test
+      passed 1/1 after the trigger change. Native narrow-width rendering and an
+      authenticated model turn remain open.
+      On 2026-10-28, the source-matched runner
+      `target/debug/deps/ahead_app-ae401acfe1bf5540` passed all 26 `model_`
+      tests, including `/models` response normalization, stale-discovery
+      rejection, per-provider catalog replacement, hidden-model scoping,
+      virtual-list rendering/scroll isolation, model/provider search, and
+      selection preservation during reload. The current native rendered
+      narrow-width check remains open.
+      On 2026-10-29, the running native managed picker filtered the OpenAI
+      provider group to `gpt-5.6-luna` and `gpt-6-luna` for the query `Luna`,
+      without changing the selected model. The endpoint was unavailable, so
+      this confirms rendered search only; managed effort metadata and
+      narrow-width rendering remain open.
+      On 2026-10-30, the current rebuilt native picker exposed its
+      “Search models or providers…” field; typing `deepseek` filtered to
+      `deepseek-coder` under the OpenAI-compatible provider without changing
+      selection or sending a turn. Its endpoint remained unavailable, so this
+      confirms live search rendering only, not catalog refresh or effort data.
 - [ ] Verify advisory-lock release on Linux/Windows and in rebuilt native
       process-lifecycle checks. MCP approval and ACP cache/defaults/install
       guards in `ahead-agent/src/runtime_support.rs` and `adapters.rs` now
@@ -5009,8 +7358,28 @@ It also passed four source-matched app regressions: directory launch,
       owner's lifetime and unlocks temporary claim leases after each claim.
       Duplicate-descriptor regressions verify exclusion while held and release
       while an inherited handle remains open; live recovery rows stay protected.
-      Recheck native concurrent process creation and abrupt proxy exit. Keep
-      lock inodes in place; do not treat these fixes as old-lock-file cleanup.
+      On 2026-10-30, process-tree inspection found the prior Watchexec command
+      had orphaned its `_run-dev` shell and app/proxy. `just dev` now wraps the
+      watched `_run-dev` command in `scripts/run-dev-watcher.sh`, so shutdown
+      signals reach the app-owning shell. The expanded `just dev-shutdown-smoke`
+      exercises real Watchexec hot restart and shutdown; both passed.
+      A subsequent interrupted `wait` still left an old `_run-dev` instance.
+      Both watcher and app reapers now check whether their child survived an
+      interrupted wait before clearing its PID. The shutdown smoke passed and
+      a real disposable-project Ctrl-C left no watcher, app, or proxy PIDs;
+      the single dev loop was restarted afterward.
+      `just dev-lock-smoke` passed after stopping the shared loop. A fresh
+      integrated loop then rebuilt in 2.20s; PTY Ctrl-C left no new watcher,
+      app or proxy processes. One pre-existing orphan remains and is tracked
+      above because the locked desktop prevents checking its unsaved state.
+      A real macOS PTY Ctrl-C against the disposable dev app left no watcher,
+      app or proxy processes. Reconfirmed 2026-10-29 on the approved
+      `/private/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-ocUYn6`
+      fixture: `just dev` rebuilt in 60 seconds, launched AHEAD and its proxy,
+      and Ctrl-C left no watcher/app/proxy process; the same single loop was
+      restarted on that fixture. Linux/Windows lock-release checks and native
+      recovery concurrent-process/abrupt-proxy checks remain open. Keep lock
+      inodes in place; do not treat these fixes as old-lock-file cleanup.
 - [ ] Investigate the separate parent/child shutdown startup failure in
       `ahead-agent/src/native_client.rs::tests::native_shutdown_waits_for_parent_and_child_termination`.
       An earlier run timed out before its child reached the mock model. Its
@@ -5030,7 +7399,10 @@ It also passed four source-matched app regressions: directory launch,
       its mock model, alongside six other mock-turn timeouts; the focused
       test, serial 145-test suite and repeated parallel suite passed. The
       fixture now records accepted connections and bytes received as well as
-      complete requests on failure. Capture its next failing trace before
+      complete requests on failure. On 2026-10-30, the existing source-current
+      agent runner passed the focused test (1/1) and the full parallel suite
+      (183 passed, 4 ignored); the intermittent failure was not reproduced,
+      so its cause remains unknown. Capture its next failing trace before
       changing the timeout or shutdown policy.
 - [ ] Use `tests/fixtures/editor-smoke/` as the reusable disposable-project
       template. Copy it outside this repository, initialize Git in the copy,
@@ -5056,9 +7428,30 @@ It also passed four source-matched app regressions: directory launch,
       1/1. These validate only the disposable fixture and mocks, not AHEAD's
       native setup or model selector; the Rust fixture remains unrun because a
       separate Cargo build is active and shared disk headroom is low.
+      Rechecked on 2026-10-26 after updating the fixture's model-catalog
+      request to include `client_version`: `npm test` passed 3/3 and Python
+      `unittest` passed 1/1. The dev watcher was live, so I did not start a
+      competing Cargo run; this does not close Rust-fixture or editor-bootstrap
+      acceptance. Workspace `cargo fmt --all -- --check` and `git diff --check`
+      pass. The most recent shared `just dev` build completed and the proxy
+      entered its main loop, but the Mac is locked, so native rendered
+      acceptance could not be inspected.
+      On 2026-10-26, the existing app test runner
+      `ahead_app-a284c6e65a113f9b` passed the source-current editor, chat,
+      settings and workspace-panel suites serially: 81 + 72 + 33 + 27 tests
+      (213 total). This covers the LSP completion cap/details, combined model
+      and effort picker, provider-scoped model visibility and wheel isolation,
+      search-mode exclusivity, and replace-current behavior. The runner is
+      older than the later app-lifecycle, terminal-panel and core-config edits;
+      those changes are not covered by this result. Headless GPUI tests do not
+      replace native rendered acceptance.
       The fixture README also calls out above-caret completion placement, the
       five-result cap, and typed completion/signature details; those native
-      popup interactions remain part of the unrun UI matrix.
+      popup interactions remain part of the unrun UI matrix. On 2026-10-30,
+      `npm test` passed 3/3 and `just verify-python` passed 1/1. The Search and
+      replace smoke row now covers literal `console.log(` in Text mode and the
+      unmatched-parenthesis error only in Regex mode; native rendered search
+      remains a separate acceptance check.
       On 2026-10-16, the approved disposable copy at
       `/private/tmp/ahead-broad-e2e.ikS0ar/project` now has a synthetic Git
       baseline (`234a4ec`) from fixture files only; `target/` and `.ahead/`
@@ -5101,6 +7494,13 @@ It also passed four source-matched app regressions: directory launch,
       scope checks and target-instruction loading, dropping stale implicit
       focus while retaining explicit attachments; regression coverage was
       added but not run.
+      On 2026-10-27 in the live disposable editor, the status bar showed
+      `No active session` and the gutter offered breakpoints without Add
+      Comment. With no message context before selection, dragging across line 3
+      of `python/main.py` added a composer chip labeled
+      `python/main.py · line 3 · selected code`; the relative path keeps the
+      selected range visible. No message was sent. This confirms native
+      selection labeling and the no-session comment gate, not provider receipt.
       On 2026-10-02 a fresh Git-initialized copy at
       `/private/tmp/ahead-broad-smoke-8dh22Q/project` opened without
       `.ahead/`; AHEAD created its ignore file, private settings and Turso
@@ -5175,79 +7575,64 @@ It also passed four source-matched app regressions: directory launch,
       TypeScript/JavaScript 2/2 under Node 24.15.0, and Python 1/1 passed.
       This confirms the sample projects themselves, not editor bootstrap or
       rendered behavior.
-- [ ] Verify the chat `/` picker in the rebuilt disposable app. It now groups
-      AHEAD actions, agent-provided commands and managed project/user skills,
-      fuzzy-filters while the unfinished command token changes, and inserts a
-      selected skill or command without sending the turn; rendered GPUI tests
-      cover those cases and hide managed skills for external ACP sessions.
-      The current 10-test `ahead-app --lib slash` sweep passes (2026-10-03).
-      On 2026-10-07, `target/debug/deps/ahead_app-bcbfa40f10585a2b` (05:07:54,
-      newer than `session_panel.rs` at 05:07:23) passed all 10 slash-filtered
-      tests directly, including skill-metadata filtering/insertion and
-      mouse/keyboard selection. No Cargo build was started. This remains
-      headless evidence;
-      native skill invocation is separate from palette selection.
-      The native fixture showed the project skill, but still needs a rebuilt
-      check for filtering, Up/Down/Enter/Escape, and skill execution after
-      selection. A 2026-10-05 isolated `just dev` build completed in 2m24, but
-      the launched debug app could not be attached through CUA. LaunchServices
-      returned `kLSNoExecutableErr` for the app bundle even after ad-hoc signing;
-      the native picker behavior remains unverified.
-      On 2026-10-05, the existing `ahead-app-7b8796618af5560b` test harness,
-      newer than `session_panel.rs`, passed all eight focused `slash_palette`
-      GPUI tests, including skill metadata/filter/selection and keyboard/mouse
-      navigation. No Cargo build was started. Native skill selection and
-      invocation remain unverified. On 2026-10-06, the isolated app-only native
-      run typed `/skill`, displayed the project `/smoke-skill`, moved selection
-      with Down, and Enter inserted `/smoke-skill ` into the composer. Escape
-      closed the picker and kept the draft; the draft was cleared without
-      sending and context stayed at 0.0k. Native filtering, Down/Enter selection
-      and Escape are verified; Up-navigation and a provider-backed skill turn
-      remain unverified. A source-current rerun at 19:36 on 2026-10-07 from
-      `ahead_app-601e2b645b3fbe4a` passed all eight `slash_palette_` tests and
-      `composer_slash_input_tracks_the_partial_command` (newer than
-      `session_panel.rs` at 19:36:32); native filtering/selection remains a
-      separate acceptance gate.
-      On 2026-10-13, the source-current `ahead_app-e1173e43572818d7` test
-      binary passed all 54 `session_panel::tests`, including all 10 slash
-      palette/input tests and the model-search/selection cases. This is
-      headless GPUI evidence; native skill activation/provider execution is
-      still a separate gate.
-- [ ] Visually confirm `ahead-app/src/workspace_panels.rs` Source Control file
-      rows at narrow and resized sidebar widths in the disposable project:
-      long paths should show a leading ellipsis while Git status and the
-      per-file stage control remain visible. The path is now a keyboard-
-      accessible button that opens the workspace-relative file; the focused
-      path-opening and 260px GPUI layout tests pass on 2026-10-04. The row
-      start-ellipsizes its single line before the fixed status/stage controls.
-      Direct execution of the current 2026-10-07 app test binary passed
-      `workspace_panels::tests::narrow_git_row_keeps_status_and_staging_visible`;
-      it does not replace a native resize check.
-      The 2026-10-01 native
-      screenshot feed stayed on an older Explorer frame despite Source Control
-      being present
-      in the accessibility tree; a later isolated app showed one long-ish
-      changed path, status and stage control at 480px, but the 260px
-      rendered row is not yet confirmed. On 2026-10-06, three temporary long
-      nested paths rendered with ellipses in the native Source Control pane;
-      statuses, stage checkboxes, Stage All and Commit Staged remained visible.
-      Source Control now refreshes when
-      opened and via its refresh button, and Explorer refreshes when selected.
-      `ahead-app/src/workspace_panels.rs` and `ahead-app/src/explorer_panel.rs`
-      now background-refresh the active panel on the proxy's debounced Git
-      generation notification, keeping selected Source Control rows intact.
-      On 2026-10-06, direct execution of the current app test binary passed
-      `proxy_client::tests::git_metadata_notifications_invalidate_identical_status_and_wake_views`
-      and `explorer_panel::tests::git_badges_refresh_after_external_edit`.
-      They cover notification fanout and Explorer badge refresh separately;
-      no current test drives a Git-generation notification through the active-
-      panel router into an already-open Source Control panel. Verify that path
-      in a fresh native window after unlock.
-      Explorer now also rebuilds its tree on proxy file-set generations, while
-      preserving expanded folders and selection; a focused headless regression
-      covers external create/remove and skips content-only notifications.
-      Verify these live open-panel updates after an external edit, create,
-      remove and commit once the desktop is unlocked.
+      Rechecked on 2026-10-27 in the active disposable `just dev` workspace
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-ocUYn6`:
+      the documented `just verify` recipe passed Rust 1/1, TypeScript/JavaScript
+      3/3 and Python 1/1 offline. I paused and restarted the same watcher with
+      the same project and data home; the integrated build completed in 2.72s
+      and the proxy entered its main loop. This confirms the fixture setup
+      command and dev-loop recovery, not a rendered feature pass.
+      Rechecked on 2026-10-29 with `rtk just verify` in this repository's
+      fixture: offline Rust 1/1, TypeScript/JavaScript 3/3 and Python 1/1.
+      This reconfirms the fixture checks only; first-open editor setup and the
+      manual native smoke matrix remain open. Corrected the README's alternate
+      invocation after Just 1.46 rejected `--directory`; the valid `just verify`
+      recipe was dry-run from the disposable project root. Node passed 3/3 and
+      Python passed 1/1 again; the Cargo lane was left to the existing dev
+      session rather than started concurrently.
+      Rechecked on 2026-10-30 from a fresh copy at
+      `/private/tmp/ahead-editor-smoke.JbWfVC`: initialized Git while leaving
+      `.ahead/` absent, then `just verify` passed offline (Rust 1/1,
+      TypeScript/JavaScript 3/3, Python 1/1). This validates the project copy
+      and language fixture only; AHEAD bootstrap and native smoke rows remain
+      open.
+      The source-current GPUI test
+      `opening_a_fresh_editor_workspace_bootstraps_private_settings` also
+      passed (1/1): an empty `.ahead/` was created with default private
+      settings and no workspace config. This is headless Shell evidence; the
+      new copy still needs opening in the native editor to verify the full
+      bootstrap and ignore boundary.
+      On 2026-10-30, stopped the shared watcher and ran `rtk just verify` in
+      the fixture root: offline Rust 1/1, TypeScript/JavaScript 3/3 and Python
+      1/1 passed. I copied the fixture to
+      `/private/tmp/ahead-editor-smoke.0Hepwq/project`, initialized Git, and
+      confirmed `.ahead/` was absent before launching `just dev` on that copy
+      with the same isolated data home. The rebuilt native process bootstrapped
+      `.ahead/`, created `settings.toml` and `session.db` with mode 0600, and
+      Git reported only `.ahead/.gitignore` as untracked. The shared watcher,
+      app and proxy were restarted on this copy. The Mac remains locked, so
+      visible first-open UI and the README's interactive smoke rows are still
+      unverified.
+- [ ] Finish the chat `/` picker in `ahead-app/src/session_panel.rs`: verify
+      live project/user skill-file refresh, active ACP commands and invocation,
+      and narrow-width layout in the disposable native app. The grouped
+      AHEAD-command/skill/ACP menu filters as the token changes; source-matched
+      GPUI tests cover fuzzy ranking, metadata matches, keyboard/mouse selection,
+      insertion without sending, and hiding managed skills in ACP threads.
+      Native checks on 2026-10-30 confirmed project skill filtering and
+      selection. A local loopback provider turn loaded the selected project
+      skill into the managed model request and rendered the reply. Repeat that
+      turn with an authenticated provider before closing this item. On
+      2026-11-02, ACP command input hints from `AvailableCommandInput` are now
+      searchable in the picker and remain visible below the composer until the
+      user types an argument, following Zed's
+      `crates/agent_ui/src/message_editor.rs::command_hint` behavior. Parser
+      and rendered-picker regressions were added. The shared `just dev` build
+      compiled the app and reached the proxy main loop; format/diff checks
+      passed. The app test target was not rebuilt while the shared watcher
+      remained active; native narrow-width layout, actual ACP command
+      invocation and authenticated-provider skill acceptance remain open.
+
 - [ ] Expand the initial GPUI command palette in
       `ahead-app/src/command_palette.rs` beyond the shipped shell commands to
       editor/buffer, Git and task actions with availability-aware dispatch.
@@ -5281,7 +7666,14 @@ It also passed four source-matched app regressions: directory launch,
       The palette now exposes the existing group-aware Close Other/Left/Right,
       Close All Editors, and Move Editor to Other Group actions; the split
       action is shown only when another file is open. Source added availability
-      and fuzzy-filter regressions; they have not been run.
+      and fuzzy-filter regressions. On 2026-10-27, the source-current app
+      runner `ahead_app-b6526016c2642312` passed all six
+      `command_palette::tests`, covering availability-aware editor/debug and
+      Git actions, language-service actions, fuzzy filtering, keyboard
+      selection, and discovered Just tasks. Rendered verification remains open.
+      Go to Line now uses a focused Ctrl+G picker for absolute or relative
+      line/column navigation in the active text editor and records the jump in
+      editor history. Verify the picker and restored focus in the native app.
       On 2026-10-15 the source-current command-palette tests passed (5/5).
       `app::lifecycle_tests::just_tasks_open_fresh_named_terminals` also passes
       with real PTYs: repeated launches use independent processes, focus the
@@ -5322,24 +7714,86 @@ It also passed four source-matched app regressions: directory launch,
       rendered app. A scroll-handle regression and native pass confirm that
       keyboard selection remains visible past the first eight results.
       The legacy `defaults/keymaps-*.toml` files are not loaded by the GPUI
-      shell.
+      shell. On 2026-10-30, the rebuilt native app filtered `verify-python`,
+      opened a focused terminal titled `verify-python`, and completed the
+      disposable task with `OK`. The first automation attempt used accessibility
+      text insertion, which displayed a query without exercising the palette's
+      normal change events; retrying with native key events confirmed filtering
+      and dispatch work as expected.
 - [ ] Prune only proven-unused Codex product integrations from the retained
       runtime. Preserve useful model/tool handlers and loop behavior; do not
       perform a blanket clean-room rewrite. Remove a package or feature only
       after tracing its call sites and dependency closure. `ahead-agent-engine`
-      has no nested workspace manifest; the repository root is the sole Cargo
-      workspace, but the retained subtree still contains dozens of crate
-      manifests and Codex-named packages. Root workspace integration is not the
-      same as pruning/rebranding that retained dependency closure.
+      has no nested workspace. Production crates use the repository's root
+      Cargo workspace; `tests/fixtures/editor-smoke/Cargo.toml` intentionally
+      declares a standalone workspace so copied acceptance projects behave
+      like user projects. Locked offline metadata reports 68 root packages and
+      9 default members and excludes the fixture. Root integration is not the
+      same as pruning/rebranding the retained dependency closure.
       Rechecked 2026-10-20: locked offline Cargo metadata reports one root
       workspace with 67 members and 9 default members; all 52 packages under
       `ahead-agent-engine` occur in `ahead-agent`'s transitive dependency tree.
       `codex-core` receives only its empty default feature, and
       `cargo-machete` reports no unused direct dependencies. No package is
       removable on orphan/manifest evidence alone; continue tracing dead
-      product-specific code paths inside required crates. A source trace also
-      confirms `codex-otel` is live runtime plumbing: session, tool, MCP and
-      exec paths use its trace-context and metrics interfaces. AHEAD's native
+      product-specific code paths inside required crates. On 2026-10-29, a
+      post-pruning `rtk cargo machete` rerun again found no unused direct
+      dependencies. This does not prove each retained source path is required.
+      On 2026-10-30, removed the copied legacy-feature usage ledger and its
+      session-start deprecation notices after tracing their only runtime
+      consumer. The configured feature switches, including Linux sandbox and
+      web-search behavior, remain active. The focused `codex-features --lib`
+      suite passed 18/18; the locked offline `ahead-agent --lib` check completed
+      with zero errors across 532 crates. The shared `just dev` build completed
+      in 41.90s and its proxy entered the main loop. Against that binary, the
+      disposable managed Code Mode smoke passed tool execution, eight concurrent
+      searches, cancellation, Turso reopen/retry and shutdown. Native sandbox
+      behavior remains a separate platform check.
+      On 2026-10-30, removed the two retired Windows sandbox feature keys and
+      their legacy config fallback. Current `windows.sandbox` selection and
+      administrator requirements still feed the existing Windows execution
+      path. The removed variants had no independent sandbox implementation;
+      the shared `just dev` build passed, `codex-features --lib` passed 19/19,
+      and `cargo fmt --all -- --check` passed. Windows launch behavior still
+      needs verification on a Windows host.
+      On 2026-10-30, removed the zero-caller project CRUD methods and DTOs
+      from `ahead-agent-engine/thread-store` and the corresponding project-only
+      metadata types. The live section-move path and `project_id` thread
+      metadata remain. The shared `just dev` build passed, and locked offline
+      library tests for `codex-thread-store` and `codex-thread-metadata` passed
+      (34 tests). The test fixtures were updated for previously removed fields.
+      A subsequent call-site trace removed additional zero-caller thread-store
+      APIs: section CRUD and section DTOs, content/occurrence search DTOs,
+      pending-metadata stubs, the paginated-history capability flag, and bulk
+      archive/delete wrappers. The live thread list/search-term filter,
+      metadata, replay, archive/delete and section-move paths remain. The
+      integrated `just dev` build and locked offline thread-store/metadata
+      library suites passed (34 tests).
+      Another zero-caller trace removed thread-metadata's copied
+      pagination/backfill result types, sort/anchor helpers and section row
+      decoder. The same two locked offline library suites passed (34 tests)
+      after this removal; the integrated `just dev` app build passed and the
+      proxy entered its main loop.
+      A later tool-router caller trace removed a dispatch wrapper used only by
+      disabled upstream test sources. Tool-plan inspection helpers and their
+      saved name map are now test-only; the live dispatch route and model-facing
+      specs are unchanged. The shared production `just dev` build passed. The
+      integrated binary then passed `tests/agent-code-mode-smoke.mjs` with
+      delegated search, cancellation, Turso reopen/retry, read-only and scoped
+      patch denials, and shutdown; this uses an isolated loopback model.
+      On 2026-10-30, a repository-wide search trace confirmed AHEAD's managed
+      `file_search` and editor workspace search both call `ahead_core::search`.
+      Retained Codex `tool_search` discovers model-visible tools; it is not
+      filesystem search. The remaining ripgrep call in `deny_read_resolver`
+      performs an exec-policy path scan. No second agent filesystem-search
+      engine was found; preserve these separate behaviors.
+      A focused source trace reconfirmed that `codex-utils-audio` is required
+      outside the opt-in realtime-voice feature: the native runtime uses it for
+      audio token estimation, response-item normalization, and Code Mode tool
+      context. Keep it; removing the separate voice feature does not make this
+      package dead. A source trace also confirms `codex-otel` is live runtime
+      plumbing: session, tool, MCP and exec paths use its trace-context and
+      metrics interfaces. AHEAD's native
       client explicitly sets log (`exporter`), trace (`trace_exporter`) and
       metric (`metrics_exporter`) exporters to `None` and `log_user_prompt =
       false` before initializing the retained runtime, while ignoring
@@ -5378,6 +7832,11 @@ It also passed four source-matched app regressions: directory launch,
       `cargo fmt --all -- --check`, `git diff --check`, and `cargo machete`
       pass; defer broader Cargo compilation while `cola-v2`'s workspace
       `cargo sqlx prepare` check is active.
+      On 2026-11-03, the current pruned `codex-config` source passed its full
+      library suite (`rtk cargo test -p codex-config --lib -j 1`: 141/141).
+      The shared `just dev` watcher was restarted afterward; the integrated
+      app rebuilt in 1.91s and its proxy re-entered the main loop. This verifies
+      config behavior, not that every retained runtime symbol is necessary.
       The 2026-10-20 Codex plugin check found no marketplace integration to
       prune: `codex-core` does not declare a `plugins` module, its plugin
       source directory has no files, and there are no `plugins::` call sites
@@ -5392,6 +7851,76 @@ It also passed four source-matched app regressions: directory launch,
       so preserve that path for Pi/Codex/Claude adapters. The surviving
       `codex_home` path name is still used for agent instructions, policy and
       runtime state; it is not evidence of a user login dependency.
+      On 2026-10-29, removed the zero-caller `reload_user_config` operation,
+      handler and session method after a whole-repository call-site search.
+      AHEAD retains `refresh_runtime_config` for host-materialized settings;
+      removed only the legacy file-based loader and its two tests.
+      The shared `just dev` build then showed `session.rs` still needs
+      `CONFIG_TOML_FILE` to label a startup warning; its import now lives in
+      that module. The corrected app build passed in 37.62s and the proxy
+      entered its main loop. The Mac is locked, so rendered acceptance remains
+      open.
+      Rechecked 2026-10-26 across the retained engine: no Guardian module,
+      feature, or runtime call site remains. Remaining `guardian` references
+      are regression fixtures proving retired config keys stay rejected and a
+      test-only file URI; approval/reviewer protocol metadata is separate and
+      remains part of the active human decision boundary.
+      On 2026-10-27, an enum-use audit found 17 feature registry switches with
+      no consumer outside the registry: Codex desktop/browser/computer-use
+      toggles, TUI mentions/terminal guidance, persisted Codex goals/artifacts,
+      and idle-sleep prevention, plus unconsumed skill-search, voice-toggle and
+      workspace-dependency flags. Removed those switches from the feature enum,
+      defaults, beta header and generated config schema; added a regression
+      that their retired keys are no longer recognized. A follow-up call-site
+      trace found the browser/computer-use config and requirements trees were
+      only parsed, merged and discarded; removed those unused config types,
+      requirements projection and tests as well. Model confirmation-policy
+      metadata for `node_repl` remains because it has a live wire-level
+      consumer. With no experimental-stage feature left, removed the unused
+      `/experimental` metadata and kept only the explicit remote-compaction
+      beta header that the managed runtime still sends.
+      On 2026-10-27, the retired-product feature/config regressions passed
+      across `codex-features` and `codex-config` (2 tests). I paused the AHEAD
+      watcher for the focused Cargo run, then restarted the same disposable
+      `just dev` loop; the integrated build completed in 2.24s and its proxy
+      entered the main loop.
+      On 2026-10-28, a whole-repository call-site trace found
+      `Feature::TranscriptV2` / `transcript_v2` only in the feature registry
+      and its config-resolution test, with no runtime consumer. Removed the
+      enum variant, config key and orphan test. The existing `just dev` watcher
+      rebuilt `ahead` successfully, whole-repository search found no remaining
+      references, and the managed Code Mode smoke passed with eight delegated
+      searches, cancellation, Turso reopen/retry and shutdown. This is one
+      proven dead flag removed; package-level pruning remains constrained by
+      the live runtime dependency closure.
+      On 2026-10-28, a repository-wide trace found the `test_sync_tool` was
+      registered only when a model advertised a metadata sentinel that AHEAD
+      never populates (`experimental_supported_tools` is initialized empty,
+      and no AHEAD assignment adds it). Its own spec labels it an internal
+      Codex integration-test synchronization helper. Removed its handler,
+      registration and spec/tests while preserving production shell, patch,
+      MCP and editor tools. Formatting, diff checks and the post-removal
+      reference search pass; the shared `just dev` watcher is rebuilding
+      this runtime edit.
+      The private `TurnMetadataState::wait_for_git_enrichment` helper has only
+      test callers; it is now compiled only for tests. The shared dev build
+      recompiled `codex-core`, `ahead-agent`, `ahead-proxy` and `ahead` without
+      the prior `codex-core` dead-code warning. Runtime pruning stays limited
+      to traced dead paths.
+      On 2026-10-29, a whole-repository trace found the retained
+      `Feature::MemoryTool` switch had no tool or runtime consumer: it only
+      labeled Codex telemetry, and AHEAD explicitly disables the retained
+      runtime's memory generation, lookup and dedicated-tool settings. Removed
+      that flag and its memory-only telemetry tags/state while keeping AHEAD's
+      Turso-backed project/user memory operations and user-visible memory
+      citation parsing. The shared `just dev` watcher rebuilt and relaunched
+      the app; `tests/agent-memory-smoke.mjs` passed append, search, reviewed
+      replacement, stale-snapshot rejection and Turso reopen against the new
+      binary, then passed again after the 2026-10-29 source-current rebuild.
+      The locked/offline `codex-features` library suite then passed
+      19/19, including the retired `memory_tool` and other Codex-feature-key
+      regressions. The shared `just dev` watcher was restored on the same
+      disposable multi-language project and rebuilt successfully.
       A 2026-10-04 `cargo machete` audit found one genuinely unused direct
       dependency (`base64` in `codex-rmcp-client`), which was removed from its
       manifest and lock entry. A follow-up audit reports only intentional
@@ -5457,20 +7986,78 @@ It also passed four source-matched app regressions: directory launch,
       keeps editor completion/snippet test helpers out of release code. The
       shared `just dev` rebuild completed without Codex-core or AHEAD-owned
       unused-import/dead-code warnings; the optional voice-enabled build remains
-      unchecked.
+      unchecked. Revalidated on 2026-10-27 after pruning unused feature switches
+      and browser/computer configuration: `codex-features` and `codex-config`
+      passed 175/175 library tests, the shared `just dev` app rebuilt and
+      relaunched, and the managed Code Mode smoke passed delegated search,
+      cancellation, Turso reopen/retry and shutdown.
+      Also removed AHEAD's generated Codex `installation_id` file and omit the
+      identifier from outgoing provider metadata. AHEAD's only construction
+      path had no need for this Codex-specific ID; the updated managed Code
+      Mode smoke verified its absence from both the HTTP header and turn
+      metadata while preserving the managed tool/cancellation/retry flow. The
+      2026-10-27 follow-up also removed UUID creation and propagation from
+      `ThreadManagerState`, `SessionSpawnArgs`, `Session`, and request metadata;
+      caller-supplied legacy identifier keys remain filtered. The integrated
+      app rebuilt through the shared `just dev` loop, and the updated managed
+      Code Mode smoke passed with both identifier assertions plus delegated
+      search, cancellation, Turso reopen/retry and shutdown. The `codex-core`
+      library disables its standalone test harness (`test = false`), so the
+      attempted direct unit-test command did not run tests; the production
+      build and integration smoke are the available evidence for this change.
+      On 2026-10-29, reran `tests/agent-code-mode-smoke.mjs` against the current
+      integrated binary after the retained-runtime pruning. Managed Code Mode,
+      eight concurrent delegated searches, cancellation, retry after Turso
+      reopen, and clean shutdown passed; no Cargo build or external provider
+      was used.
+      A source-wide UI/error-message trace also replaced the remaining Codex
+      host/runtime labels in shell, permission-path, rollback and shutdown
+      diagnostics with AHEAD terminology. Attachment/encoding and sandbox
+      configuration errors now use AHEAD product language too. Model-facing
+      tool names and descriptions were left unchanged.
+      Follow-up tracing caught one missed managed-setup error message that
+      called the retained feature flags "Codex product" features. It now uses
+      AHEAD agent/runtime wording; the shared `just dev` watcher rebuilt and
+      relaunched the app on the same disposable workspace.
+      Against that rebuilt binary, `tests/agent-code-mode-smoke.mjs` passed
+      managed Code Mode, eight concurrent delegated searches, cancellation,
+      retry after Turso reopen, and shutdown.
+      On 2026-10-29, removed the unread `FinalizedTurnItemFacts.memory_citation`
+      duplicate after a whole-workspace call-site search found no readers. The
+      citation remains on the `AgentMessage` turn item and its parser/consumer
+      path is unchanged. The shared `just dev` rebuild compiled `codex-core`,
+      `ahead-agent`, `ahead-proxy` and `ahead`; the proxy entered its main loop
+      with no Codex-core dead-code warning.
+      On 2026-11-02, removed the retained `allow_remote_control` and
+      `allow_appshots` requirement fields after workspace-wide traces showed
+      they were parsed/layered but explicitly discarded when `codex-core`
+      builds effective runtime configuration. AHEAD has no matching product
+      surfaces. Removed their config-layer plumbing and obsolete parsing and
+      precedence assertions. `cargo test -q -p codex-config --lib` passed
+      141/141; workspace format and diff checks passed; the shared `just dev`
+      build completed and the proxy re-entered its main loop. Tool execution,
+      approvals and sandbox requirements were not changed. This does not imply
+      that remaining remote-environment or remote-compaction paths are unused.
+      Rechecked on 2026-11-03: `rtk cargo machete` found no unused direct
+      dependencies. The retired runtime-requirement key denylist is intentional:
+      `ConfigRequirementsToml` ignores unknown TOML fields, so removing the
+      explicit rejection would silently accept settings that AHEAD does not
+      enforce. This trace does not justify source removal; continue pruning
+      only after proving a product path has no live consumer.
       Until done, preserve per-file copyright notices and ship license texts
       with builds.
-- [ ] Port Zed's mature multi-file editor behavior: buffers, tabs, splits,
-      selections, multi-cursor, undo/redo, IME, external-change handling and
-      document-model synchronization. Validate real unsaved files before
-      replacing the current single-file `CodePanel`. Code tabs can now be moved
+- [ ] Close core multi-file editor behavior: buffers, tabs, splits, selections,
+      undo/redo, IME, external-change handling and document-model
+      synchronization. Validate real unsaved files with the existing per-buffer
+      `CodePanel` architecture. Code tabs can now be moved
       between side-by-side editor groups while keeping one `CodePanel` per open
-      buffer; dock reparenting now updates side membership, but duplicate views
-      of one buffer and saving editor-group layouts remain unfinished. A
+      buffer; dock reparenting now updates side membership. Multi-cursor,
+      duplicate views of one buffer and persistent editor-group layouts are
+      tracked separately as advanced editing below. A
       file opened through a different canonical path spelling now reuses its
       existing `CodePanel`; LSP workspace edits and search replacement share the
-      same file-identity check. A GPUI regression covers a `src/../src` alias
-      and has not been run in this source-only pass.
+      same file-identity check. The `src/../src` alias regression passed in the
+      source-current 463-test app suite on 2026-10-29.
       disposable native-window
       pass exposed a false modified marker after Undo restored saved content;
       `CodePanel` now compares the current rope with its saved snapshot, and
@@ -5508,12 +8095,53 @@ It also passed four source-matched app regressions: directory launch,
       (including open descendants of a renamed directory) after checking the
       destination remains inside the workspace; dirty text is retained and the
       LSP/recovery path is updated. A focused GPUI regression covers a dirty
-      file rename. Run that regression and exercise rapid concurrent writes.
+      file rename. Run that regression and exercise rapid writes in rendered
+      GPUI.
+      On 2026-10-26, the source-current app test runner passed the path-alias
+      reuse, clean-buffer reload/caret rebase, dirty-buffer retention, rename
+      with unsaved edits, ignored-file reload and delete/cancel regressions
+      (6/6). On 2026-10-29, the source-current GPUI regression
+      `rapid_external_disk_changes_leave_clean_buffer_at_latest_version`
+      passed (1/1): three disk revisions delivered before the panel pumped
+      events left the clean buffer at the final version without setting a dirty
+      or conflict flag. Rendered rapid-write behavior and close flows remain
+      open.
+      A follow-up review replaced the renamed-file check-then-read with a
+      workspace-root handle and secure relative open, so a symlink/path swap
+      cannot redirect content reads outside the project. The Unix symlink
+      escape regression passed on 2026-10-27 in source-current app runner
+      `ahead_app-b6526016c2642312` (1/1).
       Workspace trust stayed blocked
       and no provider was used. The full serial `ahead-app --lib` suite passed
       239 tests with local loopback; its restricted run's only two failures
       were mock-server bind denials.
-      Profile same-length edits on large files.
+      Profile same-length edits on large files: `ropey::Rope` equality returns
+      immediately when lengths differ but scans chunks when lengths match.
+      `ahead-app/src/code_panel.rs` now debounces merge-conflict parsing by 75 ms
+      and runs it on the background executor, following Zed's snapshot-publish
+      pattern. A generation check discards stale results; markers stay visible
+      until the replacement is ready, and conflict resolution reparses the
+      current text before applying a choice. The focused rapid-edit, silent
+      shared-snapshot and resolve-action GPUI tests passed on 2026-10-30 (3/3).
+      A 2026-10-30 isolated debug-profile microprobe of the same Rope equality
+      operation measured a same-length edit at the end of 10 MiB at 1.82 ms
+      median and 40 MiB at 7.23 ms median (101 samples each). Skipping byte
+      comparisons for shared chunks improved the 40 MiB median only to 6.40 ms,
+      so that experimental shortcut was not added. The probe excludes GPUI
+      events, rendering, Git and LSP work; ordinary length-changing edits hit
+      Rope equality's length fast path. No native typing-latency conclusion
+      follows from this microprobe.
+      Measure native typing latency on large files before changing dirty-state
+      comparison; preserve Undo-to-saved behavior and stable marker placement.
+
+### Advanced editing milestone (post-MVP)
+
+- [ ] Add multi-cursor editing, multiple views of one buffer, and persistent
+      editor-group layouts, following Zed. These are separate from the core
+      multi-buffer editing and dirty/saved lifecycle acceptance above.
+
+### Core editor lifecycle acceptance
+
 - [ ] Verify the save/discard/cancel close flows in rendered GPUI:
       Close, Close Others, Close Left/Right and Close All must retain a buffer
       after Cancel, a failed save or an edit made while a decision/save is
@@ -5531,6 +8159,12 @@ It also passed four source-matched app regressions: directory launch,
       diagnostic pulls, then reopen with current content. The rebuilt real
       Vtsls/BasedPyright proxy smoke passed close/reopen/error/repair on
       2026-09-30; the native shell/prompt journey still needs verification.
+      Focused rerun on 2026-10-27 from the source-current app runner passed the
+      discard gate and three full-shell close cases: delayed/failed/newer save,
+      save timeout with late acknowledgement, and Cancel followed by successful
+      window removal (4/4). These confirm headless buffer retention and release;
+      native shortcuts, OS close controls, and the system Trash journey remain
+      open.
 - [ ] Verify dirty-buffer recovery in the native app across OS termination
       and dev-watcher restarts. `ahead-app/src/{app,code_panel}.rs` now uses
       the initial Turso `editor_recoveries` table, with coalesced snapshots,
@@ -5570,6 +8204,16 @@ It also passed four source-matched app regressions: directory launch,
       stale-write fencing and owner-only permissions on create/reopen all
       passed. This exercises the working initial schema's recovery behavior,
       not schema-version compatibility or the native recovery UI.
+      Re-ran on 2026-10-27 against the rebuilt shared-dev binary in disposable
+      `ahead-recovery-smoke-KHmg2G`: acknowledged Unicode content survived
+      SIGKILL, live-owner and disk-file protection held, discard and stale
+      snapshots stayed fenced across restart, and new/reopened database files
+      remained owner-only. This still does not verify the native recovery UI.
+      On 2026-10-30, reran the smoke against the current integrated binary in
+      disposable `ahead-recovery-smoke-8u5HRb`: Unicode recovery after SIGKILL,
+      live-owner exclusion, discard/stale-write fencing, and owner-only
+      permissions on create/reopen passed. This is current Turso/proxy evidence;
+      native recovery rendering remains open.
       The last unacknowledged edits can be lost:
       periodic capture is 250 ms and GPUI's shutdown flush has a 200 ms budget.
       Test disk-full/disconnect behavior in the native UI, profile serialized
@@ -5599,9 +8243,20 @@ It also passed four source-matched app regressions: directory launch,
       updated on buffer line-count changes; rendering only looks up visible
       rows. Same-line keystrokes no longer compare or rebuild hunk geometry in
       the render path, and diff payload changes that do not affect the gutter
-      are ignored. A source regression covers stable geometry, baseline-payload
-      changes, and line-count clipping; it has not been run. Live typing and
-      caret flicker still need the user's rendered check.
+      are ignored. On 2026-10-27, the source-current runner
+      `ahead_app-b6526016c2642312` (19:26:58; newer than `code_panel.rs` at
+      19:04:19) passed the stable-geometry/baseline-payload regression, visible
+      gutter-row bound, marker/breakpoint isolation, modified/deleted preview,
+      and Git metadata debounce, coalescing, stale-reply and invalidation tests.
+      These are headless checks. Live typing and caret flicker still need the
+      user's rendered check.
+      On 2026-10-29, the source-current
+      `git_change_marker_stays_stable_during_rapid_typing` GPUI test passed:
+      three 100 ms same-line edits preserved the marker row bounds and cached
+      hunk mapping, with no Git metadata request before the 600 ms idle window.
+      The shared `just dev` loop was restarted on the disposable LSP project;
+      the native window rendered, but CUA input returned `noWindowsAvailable`,
+      so native per-keystroke flicker remains unverified.
       On 2026-10-09, the source-matched app test runner
       `ahead_app-5b00065cae9bc61c` (12:20:14; newer than `code_panel.rs` at
       11:37:41) passed the visible-row bound test and both Git-metadata tests
@@ -5644,6 +8299,19 @@ It also passed four source-matched app regressions: directory launch,
       `agent_anchor_gutter_rows_include_the_full_range_and_ignore_other_actors`.
       These remain headless checks; inline diff layout and gutter tooltip still
       need a fresh native render.
+      Rechecked on 2026-10-27 from the current app runner: typing debounce,
+      stable diff-marker geometry, click separation from breakpoints, in-editor
+      modified/deleted hunk preview, and inline author/time placement pass
+      (5/5). The GPUI source also supplies a breakpoint-only tooltip and
+      pointer target; native hover, cursor, and per-keystroke flicker remain
+      open because the app window is inaccessible here.
+      On 2026-11-02, a screenshot showed the selected-code comment glyph was
+      optically off-center despite the button bounds being centered. Replaced
+      the bespoke nested icon frame with gpui-kit's icon-only Button, sized so
+      its built-in 0.75 scale renders a 12px glyph. The focused GPUI test
+      asserts the button is centered in the gutter action area and still fits
+      the gutter. Native pixel confirmation remains open while the Mac is
+      locked.
       Zed renders hunk controls through its editor diff rows, while AHEAD uses
       an anchored overlay; compare the native interaction and presentation
       before deciding whether deeper display-row integration is warranted.
@@ -5651,14 +8319,417 @@ It also passed four source-matched app regressions: directory launch,
       per coalesced revision; closing a view discards its result but does not
       interrupt an already-running libgit2 calculation. Add a shared HEAD
       baseline cache or cancellable worker if measurements require it.
-- [ ] Make the editor's LSP path production-ready through the existing
-      proxy/RPC boundary. In `tests/fixtures/editor-smoke/` with a real Rust
-      language server, verify automatic and manual completion, filtering and
-      acceptance at the correct unsaved-buffer range (separate from FIM);
-      diagnostics appearing and clearing after a fix; hover, signature help,
-      go-to-definition/back, references, cross-file rename, formatting and
-      code actions. Implement missing routes, reject stale replies after edits
-      or file switches, and verify server restart/recovery in the native app.
+- [ ] Finish native LSP editor acceptance against the existing proxy/RPC path.
+      The disposable protocol smoke now passes across Rust, TypeScript,
+      JavaScript and Python. Use the native editor to verify completion
+      filtering, type details, insertion/undo and above-caret placement;
+      diagnostics and gutter refresh; navigation/back, rename, formatting and
+      code-action undo; stale replies after file switches; and server
+      restart/recovery. Keep FIM separate from LSP completion.
+      A 2026-11-02 comparison with Zed commit `d27ad54` found AHEAD exposed
+      document formatting only. AHEAD now forwards static on-type trigger
+      capabilities and formatting requests, waiting for the editor change
+      before reading the post-autoindent cursor. The GPUI regression now passes
+      for newline auto-indent and applying the returned edit; the focused
+      `ahead-proxy` trigger-routing tests also pass. A real Rust Analyzer
+      `tests/lsp-smoke.mjs` run now confirms its advertised member-access
+      trigger returns and applies the method-chain indentation edit through the
+      proxy. Native editor verification of newline formatting and applying or
+      undoing typed-trigger edits remains open.
+      The 2026-11-02 managed-install LSP matrix passed for Rust,
+      TypeScript/JavaScript and Python (BasedPyright plus Ruff), including
+      completion, diagnostics/repair, navigation, formatting, rename, code
+      actions, configuration reload and restart recovery. Nineteen completion
+      requests measured p50 74.7 ms and p95 467.9 ms; Vtsls's repeated
+      `Calculation` completion fell from 468 ms cold to 184 ms and 89 ms.
+      These are proxy round trips during server initialization, not native
+      typing-to-popup latency. Zed only reuses complete completion lists;
+      AHEAD mirrors that rule, so incomplete lists are not cached as complete.
+      On 2026-11-03, source-current Rust, managed Vtsls, BasedPyright and Ruff
+      LSP smokes passed, as did a live Zed HTML 0.3.2 catalog install,
+      completion, restart and uninstall. The TypeScript `Calculation` result
+      after `extends Cal` took 454.6 ms cold, 213.2 ms repeated, and 89.2 ms
+      settled. The combined TypeScript/Python run measured 89.2 ms p50 and
+      793.0 ms p95 across 17 proxy round trips; the slow replies were
+      incomplete Python batches, which Zed also re-requests. These are
+      protocol timings, not native typing-to-popup measurements. Native
+      keystroke latency and the current desktop's rendered popup remain open.
+      On 2026-11-02, bounded current-buffer word completion to Zed's 5,000-row
+      caret window, retaining AHEAD's 512 KiB cap for very large byte ranges.
+      The shared `just dev` app rebuild succeeded; all four `local_word`
+      regressions passed, including a nearby-only candidate test. Formatting
+      and `git diff --check` passed. This limits per-keystroke background
+      scanning; native keystroke-to-popup latency still needs measurement.
+      On 2026-10-30, `CodePanel` cursor conversion and LSP completion query
+      extraction now read only the current GPUI rope line instead of
+      materializing the whole document on each request, following Zed's
+      range-based editor reads. The integrated `just dev` build passed, and
+      focused UTF-16 cursor and typed-request regressions passed (1/1 each).
+      The edit-sync path now keeps rope snapshots and derives its RPC delta
+      directly from them; normal typing no longer materializes the entire
+      document for proxy sync. Conflict-marker parsing also reads rope lines,
+      and completion trigger/query checks use the current line. The source-current
+      CodePanel suite passed 108/108; both proxy edit-delta regressions passed.
+      Saved-content comparison and debounced Git refresh still scan or copy
+      large buffers. Measure native keystroke-to-menu latency before claiming a
+      responsiveness improvement.
+      On 2026-10-30, AHEAD now keeps matching visible completions open while
+      it filters a complete cached result set in the background, following
+      Zed's menu lifecycle in `../zed/crates/editor/src/completions.rs`.
+      Cached LSP edit ranges now advance with the typed suffix before acceptance;
+      zero-width suffix insertions trim already typed text. The source-current
+      GPUI edit-event regression and cached-acceptance regression passed 1/1
+      each, including UTF-16 range movement; the completion filter passed
+      33/33. The shared `just dev` link initially ran out of space; clearing
+      generated Node compile caches outside `target` let the same watcher
+      rebuild and relaunch the disposable app. Verify the
+      native TypeScript popup no longer blinks between keystrokes and measure
+      end-to-end latency before closing the responsiveness concern.
+      Proxy edit sync now compares long common prefixes and suffixes by Rope
+      chunks instead of decoding every character on each keystroke. Focused
+      delta tests cover multichunk Unicode/CRLF, leading Unicode insertion,
+      changed Unicode characters with a long shared suffix, and equal text
+      after a Rope edit/revert.
+      Signature-help checks now read the editor rope directly when the caret
+      moves. After a content edit, the delayed request uses the captured edit
+      generation and caret position instead of copying and rescanning the
+      entire document. The open-call check now walks backward from the caret
+      and stops at the first unmatched opening parenthesis, avoiding a full
+      file scan for nearby calls. The focused signature-help tests pass 3/3,
+      including nested calls, UTF-16 and multiline positions. Verify native
+      signature-help latency with the editor unlocked.
+      A 2026-10-29 source comparison with Zed's
+      `crates/editor/src/completions.rs` confirms AHEAD already reuses a
+      complete same-prefix LSP batch and filters it on the background executor.
+      AHEAD's extra 50 ms wait before uncached requests is removed, matching
+      Zed's immediate input-triggered provider request. A source-current GPUI
+      regression confirms typing dispatches an uncached request without waiting
+      on a timer. Completion cancellation carries the request ID through the
+      proxy and sends `$/cancelRequest` to the selected language server;
+      bounded pre-dispatch tombstones cover edits racing server selection.
+      Both focused cancellation tests and the full `ahead-proxy` library suite
+      passed (361 passed, 1 ignored) serially.
+      On 2026-10-30, the cached TypeScript smoke measured six proxy/LSP
+      completion round trips: p50 96 ms, p95/max 572 ms. The first local
+      `Calculation` result took 572 ms after Vtsls reported ready; subsequent
+      replies ranged from 16 to 103 ms. `tests/lsp-smoke.mjs` now reports these
+      timings. This excludes editor rendering; measure native keystroke-to-menu
+      latency before changing ranking or cache policy.
+      On 2026-10-30, the current TypeScript-only smoke repeated the identical
+      `extends Cal` completion three times: 531.8 ms, 228.0 ms, then 157.7 ms;
+      the returned batches were complete (`isIncomplete = false`). A later
+      `doubled` completion took 2.7 ms. The smoke now reports incomplete-batch
+      status and repeated-query latency. A direct probe of the same cached
+      Vtsls server returned the same 1,694 candidates in 392.7, 15.2 and
+      12.1 ms. Removing extra JSON value conversions in completion routing
+      and notification writing brought the integrated repeat requests to
+      207.6 and 100.3 ms (first 471.6 ms); all TypeScript/JavaScript smoke
+      paths still pass. This separates server warm-up from measurable proxy
+      overhead. AHEAD's editor cache already reuses complete results while
+      the typed prefix grows; measure native keystroke-to-menu latency before
+      further changes. Moving successful LSP `result` values instead of deep
+      cloning their completion arrays left settled proxy latency at 92.7 ms
+      (eight-request TypeScript/JavaScript p50 61.8 ms). Zed's
+      `crates/lsp/src/input_handler.rs` retains raw response bodies until the
+      response handler; inspect that path before further proxy deserialization
+      changes.
+      AHEAD now follows Zed's buffer-word completion approach: nearby local
+      identifiers join the five ranked suggestions, skip duplicate server
+      labels and insert without a server resolve request. Scanning is bounded
+      around the caret in files larger than 512 KiB. Two focused app tests
+      pass, including `Calculation` after `extends Calcu` with an unrelated
+      LSP result and in a large file. Verify menu ranking and insertion in the
+      unlocked native editor; headless checks do not measure popup latency.
+      On 2026-11-02, the rebuilt native editor in a disposable TypeScript
+      project showed `Calculation` for `extends Calcu` and inserted it with
+      Tab without duplicating the prefix. The completion menu appeared above
+      the active line. A separate native call showed the signature and docs
+      for `double(value: number): number`. Native keystroke-to-menu latency,
+      repeated-typing stability, and the remaining LSP navigation/refactor/
+      diagnostic checks are still open.
+      Re-ran `AHEAD_LSP_INSTALL_MISSING=1 rtk node tests/lsp-smoke.mjs
+      target/debug/ahead` on 2026-11-02. Managed Vtsls, BasedPyright, Ruff and
+      Rust Analyzer passed the TypeScript/JavaScript/Python/Rust matrix for
+      completion, navigation, diagnostics/repair, semantic tokens, formatting,
+      signatures, code actions, unsaved cross-file rename, config reload,
+      restart/replay and graceful shutdown. `Calculation` was suggested after
+      `extends Cal`; direct proxy/LSP completion round trips had p50 80 ms and
+      p95 470 ms (first and repeated exact-prefix requests were 470, 224 and
+      98 ms). These are protocol timings, not CodePanel cache or rendered-popup
+      timings. Source review of Zed's `completions.rs` confirms it filters a
+      complete response as the query prefix grows; AHEAD's `CompletionCache`
+      follows that behavior. The current desktop is locked, so no new native
+      popup or keystroke-latency observation was possible this run.
+      The latest review of Zed commit `37faef8` found that AHEAD's lazy
+      completion-detail replies also need candidate identity fencing: context
+      checks alone do not protect a same-caret list replacement. The editor now
+      applies resolved details only when the provider and original item still
+      match that row. The focused GPUI regression replaces the list without
+      changing caret/request context and passes (1/1); the shared `just dev`
+      app/proxy rebuild also succeeded. Native popup latency and remaining
+      navigation/refactor/diagnostic acceptance stay open.
+      Re-ran the full managed matrix against the latest integrated binary:
+      Rust, TypeScript, JavaScript and Python passed, including the local
+      `Calculation` completion after `extends`, live Python configuration
+      changes, unsaved cross-file rename, restart/replay and graceful shutdown.
+      Across 19 completion round trips, p50 was 84.8 ms and p95 was 466.5 ms;
+      the repeated `extends Cal` requests settled from 466.5 to 191.0 to
+      89.0 ms. These are proxy timings and do not establish native popup
+      latency. The smoke used its isolated profile and disposable workspace,
+      which it retained at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-Acp8VQ`.
+      A full 2026-10-30 clean-profile run also passed Rust,
+      TypeScript/JavaScript, Python and live Zed HTML 0.3.2 extension
+      completion, restart and uninstall. Across 20 proxy completion requests,
+      p50 was 101.9 ms and p95 was 409.3 ms. Repeated `extends Cal` requests
+      took 576.7, 221.8 and 156.1 ms; all three batches were complete.
+      Python and Rust returned some incomplete batches, so the editor must
+      still requery those prefixes. These timings exclude native popup work.
+      Rechecked the current watcher-built binary on 2026-10-30 with managed
+      acquisition enabled: the full Rust, TypeScript, JavaScript and Python
+      matrix passed, including local `Calculation` completion, code actions,
+      unsaved-buffer rename, configuration refresh, restart and shutdown.
+      Across 19 completion requests, p50 was 95.0 ms and p95 was 539.1 ms;
+      repeated `extends Cal` replies took 539.1, 209.0 and 157.4 ms. The
+      test used a disposable project and profile. Native keystroke-to-popup
+      latency remains unmeasured while the desktop is locked.
+      The rebuilt native Language Servers panel now keeps Config and Restart
+      visible at the fixture's narrow sidebar width after removing its
+      redundant in-panel title. Native definition navigation remains untested
+      in this fixture while its project-specific server trust choice is blocked.
+      On 2026-10-29, ran `tests/lsp-smoke.mjs` against the current integrated
+      binary with managed acquisition enabled in disposable homes. Rust
+      Analyzer, Vtsls, BasedPyright and Ruff passed readiness; Rust,
+      TypeScript/JavaScript and Python completion, navigation, diagnostics and
+      repair, formatting, semantic tokens, signatures, unsaved cross-file
+      rename, import/code actions, live Ruff configuration changes, restart
+      and graceful shutdown passed. The local `Calculation` completion after
+      `extends` passed. No Cargo build or model provider was used. This is
+      protocol/editor-service evidence; native popup rendering, insertion/undo
+      and the active-session FIM race remain separate acceptance.
+      After the 2026-10-29 dev rebuild, reran the smoke with managed LSP
+      acquisition enabled and a fresh isolated profile. Vtsls, BasedPyright,
+      Ruff and Rust Analyzer initialized; TypeScript/JavaScript, Python and Rust
+      completion, navigation, diagnostics/repair, formatting, semantic tokens,
+      signatures, cross-file rename, import/code actions, live Ruff settings,
+      restart/replay and graceful shutdown passed. The TypeScript local
+      `Calculation` completion after `extends` passed. The profile was removed;
+      the disposable workspace remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-WleuE0`.
+      This verifies the current integrated protocol path, not native popup
+      rendering or active-session FIM overlap.
+      Rechecked against the current integrated binary on 2026-10-29 with
+      `AHEAD_LSP_INSTALL_MISSING=1` and a fresh isolated profile. AHEAD acquired
+      Rust Analyzer, Vtsls, BasedPyright and Ruff, then passed the Rust,
+      TypeScript/JavaScript and Python completion, navigation, diagnostics,
+      repair, formatting, rename, configuration-reload, restart and graceful
+      shutdown checks. The profile was removed after success; the disposable
+      project remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-P0a9Cl`.
+      No Cargo build or authenticated provider was used. Native rendering is
+      still a separate acceptance gate.
+      After the current shared `just dev` rebuild, reran the full smoke against
+      `target/debug/ahead` with managed acquisition enabled. Rust Analyzer,
+      Vtsls, BasedPyright and Ruff initialized; Rust, TypeScript/JavaScript and
+      Python completion, navigation, diagnostics/repair, formatting, rename,
+      configuration reload, restart/replay and graceful shutdown passed. The
+      `Calculation` completion after `extends` passed. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-8vy9G7`.
+      This confirms current protocol behavior, not native popup rendering or
+      authenticated provider/FIM overlap.
+      On 2026-10-30, reran the clean-profile acquisition path against the
+      latest integrated binary. AHEAD acquired Vtsls, BasedPyright and Ruff;
+      installed Rust Analyzer also started successfully. Rust,
+      TypeScript/JavaScript and Python completion, local `Calculation` after
+      `extends`, navigation, diagnostics/repair, semantic tokens, formatting,
+      code actions, cross-file rename, live Python configuration changes,
+      restart/replay and graceful shutdown all passed. The script removed its
+      isolated profile; its disposable project remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-p6zbgF`.
+      No model provider was used. This refreshes protocol/acquisition evidence,
+      not rendered popup behavior or session-bound FIM.
+      On 2026-10-29, fixed the smoke preflight so `AHEAD_LSP_CACHE_SEED` can
+      satisfy Vtsls/BasedPyright availability from validated managed npm
+      package entrypoints instead of requiring those servers on `PATH`. The
+      cache-only TypeScript/JavaScript smoke passed against the rebuilt
+      integrated binary without `AHEAD_LSP_INSTALL_MISSING`; local
+      `Calculation` completion after `extends`, navigation, diagnostics,
+      formatting, rename, code actions, restart and graceful shutdown passed.
+      Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-UYzmLH`.
+      This validates the offline smoke path and protocol behavior, not native
+      popup rendering or active-session FIM overlap.
+      On 2026-10-28, reran the TypeScript/JavaScript subset of
+      `tests/lsp-smoke.mjs` against the current integrated binary using a copied
+      language-server cache in an isolated AHEAD profile. Vtsls returned the
+      local `Calculation` interface for a valid
+      `interface ExtendedCalculation extends Cal` declaration; TypeScript and
+      JavaScript completion, diagnostics/repair, semantic tokens, cross-file
+      rename in unsaved buffers, navigation, formatting, signature help,
+      import quick fix, auto-import resolve, close/reopen, restart/replay and
+      graceful shutdown passed. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-jsElNm`.
+      On 2026-10-28, the shared `just dev` watcher rebuilt the integrated
+      binary after the extension-host/proxy changes; the full managed Rust,
+      TypeScript/JavaScript and Python smoke passed. In a valid interface
+      declaration, Vtsls returned `Calculation` after the typed prefix
+      `interface ExtendedCalculation extends Cal`. The smoke also verified
+      completion, navigation, diagnostics/repair, formatting, code actions,
+      unsaved cross-file edits, live Ruff configuration changes, restart/replay
+      and shutdown. Disposable project:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-G58ouO`.
+      The source-matched `ahead_app` test executable (built 22:20 from
+      `code_panel.rs` at 22:11) also passed all 19 completion-filtered tests,
+      including cache-prefix gating, fuzzy ranking, stale resolve fencing,
+      popup placement, null-response retry and late-result rejection. No Cargo
+      build was started; the shared `just dev` watcher remains active.
+      The reported screenshot's bare top-level `extends Cal` is correctly a
+      parse error. On 2026-10-28, native testing in the same disposable project
+      typed the valid `interface ExtendedCalculation extends Cal` declaration.
+      Vtsls showed local `Calculation` in the popup above the caret with its
+      import/type detail; Down+Tab inserted `extends Calculation` and the
+      import once. Two undos restored `main.ts` to clean. This verifies native
+      TypeScript suggestion, placement, acceptance and undo, but not simultaneous
+      FIM ghost text in an active AHEAD session.
+      On 2026-10-29, retested the reported `extend` completion in the running
+      native app: Vtsls showed `extends`; Tab produced exactly `extends` (no
+      duplicated `tends`). Typing `Cal` also showed the local `Calculation`
+      interface with its auto-import detail, and Tab inserted the type and
+      import once. Undo restored the disposable TypeScript buffer to its
+      original contents. The active Vtsls server showed Ready.
+      Follow-up rendered acceptance in the same approved disposable project on
+      2026-10-29: `Cal` showed the local `Calculation` completion above the
+      caret; Down+Tab inserted the type and import once. Typing `calculate(`
+      rendered `calculate(input: number): Calculation` above the caret with the
+      active parameter highlighted. Go to Definition opened `math.ts`, and Go
+      Back returned to the call site. Undo restored `main.ts` byte-for-byte;
+      the tab is clean. This adds native completion detail, signature-help and
+      navigation-history evidence. FIM overlap, native diagnostics/gutter
+      refresh, rename, formatting, code actions and server recovery remain open.
+      On 2026-10-29, the prepared FIM request now includes the latest bounded,
+      model-visible session discussion and work-item artifact IDs alongside
+      root/nested `AGENTS.md` instructions and durable decisions. Its focused
+      proxy regression verifies those values arrive in the actual prediction
+      snapshot while addressed private messages, their summaries and partial
+      streaming messages stay excluded. The test passed 1/1. Live provider
+      overlap remains unverified because no OpenRouter key was available in
+      the test environment. On 2026-10-30, added and ran
+      `tests/agent-fim-smoke.mjs` against the integrated binary. Its local
+      OpenAI-compatible endpoint received the actual FIM prompt with the active
+      session title/objective, caller context, root/nested `AGENTS.md`, and
+      bounded editor prefix/suffix, then returned a completion. The smoke now
+      also appends a session decision and confirms the next outbound prompt
+      includes it. The editor's `get_inline_completions` route also supplied an
+      unsaved related `helper.md` buffer in the actual provider prompt and
+      returned its consumed path with a bound prediction. The smoke then
+      switches sessions and verifies the previous session's objective and
+      decisions are absent. No external provider request or Cargo build ran,
+      and the temporary project/profile were removed. This confirms the
+      session/editor-to-provider path; native ghost text overlap and
+      authenticated-provider behavior remain open.
+      After the 2026-10-29 shared `just dev` rebuild, the source-current app
+      runner `ahead_app-b63ac9873957e73d` passed all 462 tests serially. The
+      rebuilt integrated binary also passed the full managed LSP smoke with
+      managed acquisition enabled: Vtsls, BasedPyright, Ruff and Rust Analyzer
+      initialized, then Rust, TypeScript/JavaScript and Python completion,
+      navigation, diagnostics/repair, formatting, rename, code actions, live
+      Ruff configuration changes, restart/replay and graceful shutdown passed.
+      The local `Calculation` completion after `extends` passed. This run used
+      an isolated profile and disposable workspace
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-p0eab2`;
+      the profile was removed. The shared dev watcher remained active. Native
+      window acceptance remains separate while macOS is locked.
+      On 2026-10-30, the current integrated app binary passed the cache-seeded
+      TypeScript/JavaScript LSP smoke in a fresh isolated profile. Vtsls
+      initialized; local `Calculation` completion after `extends`, completion
+      resolve/auto-import, diagnostics and repair, formatting, signature help,
+      cross-file rename, close/reopen, restart/recovery and graceful shutdown
+      passed. The disposable project remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-9ElSWv`.
+      This confirms protocol behavior, not native popup latency or rendering.
+      On 2026-10-29, the native Vtsls session rendered `Cannot find name 'Cal'`
+      with a red underline during the temporary `extends Cal` probe; undoing
+      the scratch line cleared the diagnostic. The on-disk `typescript/src/math.ts`
+      still matches the disposable fixture. This confirms diagnostic render and
+      clear, but not gutter-marker refresh.
+      On 2026-10-28, implemented inline completion range preservation in
+      `ahead-app/src/proxy_client.rs` and range-aware Tab insertion plus
+      duplicate-suffix suppression in `ahead-app/src/code_panel.rs`. The
+      shared `just dev` build and formatting/diff checks passed. Focused GPUI
+      regressions were added, but their test harness could not link because
+      the filesystem ran out of space; native inspection also timed out.
+      After disk space recovered, a cold shared `just dev` rebuild succeeded
+      in 8m36s. The focused ranged-completion GPUI regression passed 1/1, and
+      the `inline` test filter passed 12/12, including popup/ghost exclusivity
+      and duplicate-suffix coverage. Native standard LSP Tab acceptance was
+      then verified in the disposable TypeScript project: completing `extend`
+      produced exactly `extends`, with no duplicated suffix, and the scratch
+      buffer was discarded without saving. This did not exercise an active
+      AHEAD session with simultaneous FIM ghost text; keep that rendered
+      overlap case open. The popup/ghost ownership regression is covered by the
+      GPUI tests, but still needs native confirmation with an active session.
+      On 2026-10-28, guarded LSP popup handling against late inline replies and
+      made Tab clear any remaining ghost before accepting the selected item;
+      added a focused GPUI regression for `extends` plus a stale `tends` suffix.
+      After the watcher stopped, the focused regression passed 1/1 and the
+      completion-filtered app suite passed 23/23. The shared `just dev` watcher
+      was restarted on the same disposable project and rebuilt successfully.
+      Native active-session confirmation remains open because the inspected
+      test app had no session.
+      New user report: Tab produced `extendstends`. The checkout has two AHEAD
+      processes: one launched at 11:16 before this fix and the current `just
+      dev` app launched at 12:29 after the rebuild. The native accessibility
+      bridge timed out, so which window showed the report is unconfirmed.
+      Focused source-current Tab, stale-suffix and late-inline-reply regressions
+      pass (1/1 each); confirm the same sequence in the rebuilt app with an
+      active session before closing this overlap issue.
+      On 2026-10-28, fixed the inline preview/accept path in
+      `ahead-app/src/code_panel.rs`: it now accounts for identifier text to the
+      right of the caret and trims the overlap from both the displayed
+      suggestion and accepted edit. This handles a fully present `extends`
+      token as a no-op and inserts only the missing middle when a partial
+      suffix is already present. The source-matched
+      `target/debug/deps/ahead_app-ae401acfe1bf5540` completion filter passed
+      27/27, including the new mid-token regression. The shared watcher rebuilt
+      and relaunched the app on the disposable LSP project. The desktop bridge
+      timed out again, so active-session rendered acceptance remains open.
+      The LSP popup now bolds fuzzy-matched label characters, deriving ranges
+      from the current label each render and converting Unicode indices to
+      UTF-8 byte ranges, following Zed's completion-menu safeguard at
+      `../zed/crates/editor/src/code_context_menus.rs`. The shared `just dev`
+      rebuild launched at 12:50; rustfmt and diff checks pass. Its new focused
+      GPUI helper test has not run because the shared watcher is active; native
+      popup rendering remains to be confirmed.
+      A queued FIM reply could still arrive after Tab closed the LSP popup but
+      before the resolved LSP edit was applied. Inline cancellation now advances
+      a separate request generation, and
+      `inline_reply_during_lsp_resolution_cannot_restore_ghost_suffix` passes;
+      native confirmation with an active AHEAD session remains open.
+      On 2026-10-28, added a regression that dispatches the actual Tab keybinding
+      with an `extends` LSP item and stale `tends` ghost; it passes along with all
+      five suffix-filtered GPUI tests. This covers the keybinding path, while
+      rendered confirmation with an active AHEAD session remains open.
+      `CodePanel::accept_ghost_text` now has a final ownership guard: if the LSP
+      completion popup is visible, it accepts the selected LSP item instead of
+      inserting inline text. The new active-session GPUI regression directly
+      invokes that path with a stale `tends` ghost and confirms the buffer ends
+      at exactly `extends`; it and all five suffix-race tests pass. The shared
+      `just dev /private/tmp/ahead-lsp-smoke-ocUYn6` loop rebuilt the app and
+      returned its proxy to the main loop. Native rendered confirmation with a
+      live AHEAD session remains open. Re-ran both the direct ownership and
+      actual-Tab regressions from `ahead_app-ae401acfe1bf5540` (built 12:29,
+      newer than `code_panel.rs`); each passed 1/1 without starting Cargo.
+      On 2026-10-29, reproduced the TypeScript prefix in the rebuilt native app
+      with an AHEAD session active. Vtsls offered `extends`; Tab inserted it
+      exactly once. Two undos restored the disposable `main.ts` buffer. The
+      configured model endpoint was unavailable, so this did not exercise a
+      simultaneous live FIM suggestion; keep that race open.
+      Rechecked at 21:52 EST on 2026-11-02 with the current app test runner:
+      the actual Tab keybinding accepted a suffix-only `tends` edit for an
+      already typed `extends` label without changing the buffer, stale inline
+      text did not duplicate the resolved `extends` completion, and Enter
+      replaced an unsaved LSP prefix correctly (3 focused GPUI tests passed).
+      The current desktop is locked, so rendered confirmation remains open.
       `AheadDelta::contiguous_replacement` now converts selection replacements
       and multi-part edits into one precise changed range for incremental LSP
       sync; malformed deltas still fall back to a full snapshot. Buffer and
@@ -5668,6 +8739,43 @@ It also passed four source-matched app regressions: directory launch,
       and RPC notification DTOs. This does not compile the managed-agent or
       editor event-to-render paths; those remain unverified in this source
       state.
+      On 2026-10-28, in the rebuilt native app with an AHEAD session active,
+      Vtsls showed `extends` for `interface ExtendedCalculation extend`, and
+      Tab inserted exactly `extends`. The temporary unsaved edit was discarded.
+      The configured provider was unavailable, so this does not verify a live
+      FIM reply racing the LSP popup; the active-session stale-ghost GPUI test
+      remains the evidence for that case.
+      On 2026-10-28, added acceptance-time revalidation for insertion-only
+      inline ghosts against the current buffer. A stale `tends` suffix is now
+      cleared if the word already ends with it, instead of being appended to
+      `extends`. Added an actual-Tab GPUI regression for that exact state. The
+      shared dev loop rebuilt the app and formatting/diff checks pass; this new
+      GPUI test and rendered active-session behavior remain unverified.
+      After the repeated report, the active AHEAD Dev process start time
+      (14:06:54) preceded the app binary's reported modification time
+      (14:07:29), making a stale loaded executable plausible; its process image
+      or inode was not captured, so this does not prove the cause. Restarted the
+      same `just dev` loop on the disposable LSP project. The current source passes
+      `tab_accepts_lsp_completion_once_when_inline_suffix_is_stale` and all six
+      suffix-filtered GPUI tests. The test build also exposed and fixed missing
+      imports for the model-discovery tests. The new native window is running
+      from the rebuilt binary; active-session rendered confirmation is still
+      open because the desktop automation connection timed out.
+      Follow-up: an LSP zero-width text edit could append `tends` even when the
+      current identifier already equals its `extends` completion label. The
+      completion edit now treats only that already-complete suffix case as an
+      empty insertion. Its actual-Tab GPUI regression passes, the completion
+      test filter passes 27/27, formatting and diff checks pass, and the shared
+      dev loop rebuilt in 14.27s with the proxy back in its main loop. Native
+      rendered confirmation of this suffix-only server edit remains open.
+      On 2026-10-29, aligned completion resolve with Zed's
+      `../zed/crates/project/src/lsp_store.rs`: resolved completion text can
+      update, but AHEAD keeps the original insert/replace and additional-edit
+      ranges because resolve responses may return stale ranges. The focused
+      GPUI regression models a resolved zero-width range and passes 1/1; the
+      shared `just dev` loop rebuilt on the approved disposable project. Native
+      rendered Vtsls resolve behavior and overlap with a live FIM reply remain
+      open.
       On 2026-10-20, the editor now measures caret bounds whenever completion,
       signature help, code actions, FIM ghost text or snippet choices are
       visible, positions them against the measured caret, and clamps each
@@ -5688,7 +8796,14 @@ It also passed four source-matched app regressions: directory launch,
       LSP definition and result-selection jumps now share per-window Go Back /
       Go Forward history, with title-bar controls, menu items, shortcuts and
       context-aware Command Palette entries; native interaction remains to be
-      verified. On 2026-10-19, the shared `just dev` build compiled the
+      verified. On 2026-10-28, in the rebuilt native app, Command-clicking
+      `calculate` in `typescript/src/main.ts` opened its definition in
+      `typescript/src/math.ts`; the window's Back control returned to
+      `main.ts`. The definition selection also appeared as a chat context chip.
+      On 2026-10-28, native JavaScript navigation also passed: F12 on `triple`
+      in `javascript/src/main.mjs` opened `javascript/src/math.mjs`, and Back
+      returned to the call site. The disposable fixture remained unchanged.
+      On 2026-10-19, the shared `just dev` build compiled the
       integrated app after importing gpui-kit's `Disableable` trait for the
       navigation controls; no rendered navigation check was performed.
       On 2026-10-15, fixed optional rename preparation following Zed's
@@ -5813,17 +8928,53 @@ It also passed four source-matched app regressions: directory launch,
       Focused proxy and GPUI save tests pass. A native pass in
       `/private/tmp/ahead-save-smoke-caPdPX` saved `math::missing_symbol(21)`,
       showed E0425, then restored `math::double(21)` and cleared Problems.
+      Revalidated on 2026-10-27 against the current integrated binary with
+      fresh managed installs: TypeScript, JavaScript, Python and Rust passed
+      completion/navigation, diagnostics and fixes, semantic tokens, formatting,
+      code actions, cross-file rename on unsaved buffers, live config reload,
+      restart/replay and graceful shutdown. The separate live Zed HTML extension
+      smoke installed catalog version 0.3.2, started its language server,
+      verified grammar/highlights and completion, restarted it, then uninstalled
+      it. The isolated profiles and disposable workspaces were removed. These
+      are proxy/server checks; native editor popup and gallery rendering remain
+      open.
+      A separate 2026-10-27 Rust-only rerun against the rebuilt app executable
+      used the already-installed Rust Analyzer from the disposable AHEAD cache
+      (the global rustup shim has no such component). Formatting, completion,
+      definition, semantic tokens, hover, signature help, references,
+      cross-file rename, diagnostics/repair, close/reopen, restart/replay and
+      graceful shutdown passed. The temporary workspace remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-y3vjQS`
+      for inspection; the isolated AHEAD profile was cleaned. No provider or
+      package download was used. This still does not verify native editor UI.
+      The TypeScript-only protocol rerun on 2026-10-27 also confirmed that
+      Vtsls suggests the local `Calculation` interface after `extends Cal`;
+      completion, diagnostics, navigation, rename, formatting, code actions,
+      restart/replay and shutdown passed. It used the integrated binary and a
+      copied disposable language-server cache, with no provider or package
+      download. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-XOnzj7`.
+      This verifies the protocol suggestion path, not the native popup's
+      ranking, responsiveness or placement.
       Protocol tracing confirmed `didSave` and the compiler replies. That pass
       exposed two repaired bugs: an empty pull reply replaced pushed compiler
       errors, and the static capability check ignored dynamic save registration.
       Diagnostics now merge by server and pushed/pulled source; regressions
       cover independent clearing and dynamic save support. Dynamic `didSave`
-      registrations now merge by registration ID, including overlapping
-      `includeText` requests; absent/null selectors use the host's configured
+      registrations retain selector and `includeText` options per ID;
+      absent/null selectors use the host's configured
       document selector and `unregisterCapability` removes only its matching
-      ID/method. A focused regression covers overlaps, null options and
-      targeted removal; run it in the shared Cargo loop and verify against a
-      real server. Stopped-server diagnostics now clear
+      ID/method. Save registrations now preserve registration order: the
+      latest matching selector controls `includeText`, a later nonmatching
+      registration does not mask it, and unregistering restores the previous
+      match or static capability. Focused regressions cover overlap precedence,
+      null options and fallback; they passed on 2026-10-27, though a
+      real-server confirmation remains open. On 2026-10-27, dynamic `didChange`
+      registrations gained selector-aware sync-kind routing, same-ID
+      replacement, and method/ID-scoped unregistration. Absolute file globs
+      also match after stripping the filesystem root, so selectors such as
+      `**/*.toml` cover project-root files. The focused regression passed.
+      Stopped-server diagnostics now clear
       by process instance; other servers' diagnostics remain, and late updates
       from retired processes are ignored. Verify this in the native Problems
       view after desktop unlock.
@@ -6135,12 +9286,29 @@ It also passed four source-matched app regressions: directory launch,
       languages, even when no grammar is installed; declared fields override
       filename fallbacks while missing fields retain them. Host, snippet and
       stale-response regressions were added but not run.
-      Before calling this production-ready, implement synchronized editing of
-      repeated tabstop ranges (gpui-kit currently exposes only one selection),
-      then verify the real HTML completion, choice popup and Undo path in the
-      native disposable project. Do not import Zed's
-      GPL-3.0-or-later `crates/snippet`. Completion commands and large-span edit
-      performance still need review. The focused GPUI test covers insertion,
+      Repeated tabstops now select every range through the locally patched
+      `gpui-base` multi-selection API. One editor transaction edits all mirrors;
+      the snippet session rebases later tabstops and cycles repeated choices.
+      The focused `gpui-base` edit/Undo test and 23 snippet tests pass.
+      Before calling this production-ready, verify the real HTML completion,
+      choice popup and Undo path in the native disposable project. Do not import Zed's
+      GPL-3.0-or-later `crates/snippet`. Completion commands now run after text
+      insertion through the existing server-scoped RPC, and the focused GPUI
+      ordering regression plus 26 completion tests pass. Resolved
+      `additionalTextEdits` now survive the completion merge, while original
+      edits remain a fallback when resolve omits them; the client advertises
+      resolvable commands. The focused auto-import insertion/Undo and proxy
+      capability regressions both pass (1/1 each) after disk space recovered.
+      The shared `just dev` app build passed. An offline TypeScript/JavaScript
+      `tests/lsp-smoke.mjs` run against that binary passed resolved Vtsls
+      auto-import, import-command routing and the rest of the LSP protocol
+      matrix in `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-TnOXnU`.
+      It did not exercise editor insertion or Undo. Run the focused tests when
+      build space permits, then verify real server command side effects and
+      large-span edit performance. Zed's `editor.rs`
+      selects every range in
+      the active tabstop so its multi-cursor edit keeps mirrors in one undo
+      transaction. The focused GPUI test covers insertion,
       one-step Undo, choice cycling, placeholder selection/editing, Tab/Shift+Tab,
       final-caret exit and normal Tab indentation; the proxy capability
       regression passes.
@@ -6516,6 +9684,10 @@ It also passed four source-matched app regressions: directory launch,
       occupied the shared disk during this pass, leaving 852 MiB free after it
       exited, and no AHEAD test runner is present. The Mac is locked, so native
       rendered placement also remains unverified.
+      Follow-up on 2026-10-26: the current `ahead-app` test build ran all 423
+      tests successfully, including this popup's rendered-bounds assertion.
+      That GPUI frame test verifies placement above the caret and accounts for
+      the editor gutter. Native rendered placement remains unverified.
       Zed's `document_selector_matches` also checks URI schemes
       case-insensitively. AHEAD now retains the LSP selector scheme and applies
       the `file` constraint to both startup selectors and dynamic save
@@ -6526,8 +9698,175 @@ It also passed four source-matched app regressions: directory launch,
       so long LSP signatures and argument/return types can wrap. The shared
       `just dev` loop rebuilt and relaunched the integrated app; the focused
       GPUI wrapping assertion and rendered popup still need verification.
-- [ ] Finish Zed language-extension configuration lifecycle. AHEAD now
-      advertises and answers `workspace/configuration` from the extension's
+      On 2026-10-27, the source-current integrated binary passed the managed
+      TypeScript, JavaScript, Python and Rust LSP smoke with
+      `AHEAD_LSP_INSTALL_MISSING=1`: completion/navigation, diagnostics and
+      fixes, semantic tokens, TypeScript auto-import/quick-fix, combined
+      BasedPyright/Ruff actions, formatting, live config edits, cross-file
+      rename with unsaved buffers, close/reopen, restart/replay, per-method
+      routing and graceful shutdown. No model provider was used. Its isolated
+      install profile was removed after success; disposable project fixture
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-vztl7P`
+      was retained. This is proxy/server evidence; native popup acceptance is
+      still open. In a later native run against the same disposable workspace,
+      opened `javascript/src/math.mjs`, typed `tri` on a blank line, and
+      confirmed the LSP popup filtered to `triple` with
+      `function triple(value: number): number`. Accepting it and typing `(`
+      showed signature help `triple(value: number): number` above the caret.
+      Undo restored the clean buffer without saving. Native JavaScript
+      completion, type details and signature placement are now confirmed;
+      remaining editor actions and Rust/Python popup journeys are still open.
+      On 2026-10-27, completion rows now prioritize one typed signature,
+      omit namespace/documentation prose, and truncate long signatures on one
+      line; the renderer also enforces the five-suggestion limit. The focused
+      GPUI signature formatter and popup-frame tests pass, including the
+      compact height bound and above-caret placement. Native rerender remains
+      unverified because the desktop accessibility connection timed out.
+      Re-ran the managed-install matrix against the 21:24 integrated binary
+      with Vtsls, BasedPyright and Ruff acquired into the isolated test profile
+      and Rust Analyzer taken from Zed's cache. The first run requested TypeScript
+      completion before Vtsls reported ready and therefore got no `Calculation`
+      item; this was a smoke-test startup race, not evidence of a server result
+      after initialization. The smoke now waits for Vtsls readiness and includes
+      returned labels in assertion failures. The retry passed TypeScript,
+      JavaScript, Python and Rust completion/navigation, diagnostics/fixes,
+      semantic tokens, formatting, config reload, cross-file rename, restart
+      with unsaved-buffer replay, routing and graceful shutdown. Fixture:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-H1GS4Z`.
+      This confirms server/proxy behavior after readiness; native first-use
+      completion timing and popup acceptance remain unverified.
+      An empty completion response received while a language server is starting
+      now stays pending and is retried when that server becomes Ready, provided
+      the file, caret and request are still current. The focused GPUI regression
+      and all 86 `code_panel::tests` passed on 2026-10-27. This closes the
+      startup race between first-use completion and managed server acquisition;
+      native first-use completion and popup acceptance remain unverified.
+      On 2026-10-28, reran the full cache-seeded
+      `tests/lsp-smoke.mjs` matrix against the rebuilt `target/debug/ahead`
+      binary using an isolated profile copied from the existing AHEAD language-
+      server cache. Vtsls, BasedPyright, Ruff, and Rust Analyzer all passed
+      initialization and readiness. Completion, navigation, diagnostics and
+      repair, semantic tokens, formatting, cross-file rename in unsaved
+      buffers, TypeScript import/code actions, live Ruff configuration changes,
+      server restart/replay, routing, and graceful shutdown passed across Rust,
+      TypeScript, JavaScript, and Python. The valid
+      `interface ExtendedCalculation extends Cal` completion returned the
+      local `Calculation` interface. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-PRdSuI`.
+      This is protocol/server evidence; native popup rendering and insertion
+      remain the separate open UI acceptance.
+      On 2026-10-29, in the running native app with an AHEAD session active on
+      disposable `ahead-lsp-smoke-ocUYn6`, Vtsls showed `extends` above the
+      caret for `interface ExtendedCalculation extend`; Tab inserted exactly
+      `extends`. Typing `Cal` showed the local `Calculation` suggestion with
+      `interface Calculation` detail, and Tab inserted the identifier once.
+      Escape and undo restored the editor buffer; the on-disk `math.ts` remains
+      its original 303 bytes. The configured provider was unavailable, so this
+      does not verify a live FIM reply overlapping LSP completion.
+      On 2026-10-29, the 21:45 watcher-built `target/debug/ahead` passed the
+      full `tests/lsp-smoke.mjs` matrix with managed server acquisition enabled
+      and an isolated Vtsls cache seed. Rust Analyzer, Vtsls, BasedPyright and
+      Ruff initialized; Rust, TypeScript, JavaScript and Python completion,
+      navigation, diagnostics/repair, formatting, unsaved cross-file rename,
+      live Ruff config reload, restart/replay and graceful shutdown passed.
+      The local `Calculation` suggestion after `extends` passed. Disposable
+      workspace: `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-iNcMHA`.
+      This is current protocol/server evidence, not native popup or FIM
+      overlap acceptance; the temporary install profile was removed.
+      On 2026-10-30, the shared `just dev` watcher rebuilt the integrated
+      binary from current sources, then `tests/lsp-smoke.mjs` passed with
+      managed acquisition enabled for Rust, TypeScript/JavaScript and Python.
+      Rust Analyzer, Vtsls, BasedPyright and Ruff initialized. The run verified
+      typed completion (including local `Calculation` after `extends`),
+      navigation, diagnostics/repair, formatting, signatures, import actions,
+      cross-file rename in unsaved buffers, live Ruff routing/configuration,
+      restart/replay and graceful shutdown. Its isolated profile and generated
+      workspace were removed. This is current protocol/editor-service evidence;
+      the Mac is locked, so native rendered acceptance remains open.
+      On 2026-10-30, replaced CodePanel's hard-coded extension highlight-scope
+      allowlist with active-theme lookup that falls back through dotted parent
+      scopes, matching Zed's longest-prefix `SyntaxTheme` behavior and allowing
+      extension scopes without a parallel AHEAD list. Added a regression for
+      custom nested scopes and parent fallback. The watcher compiled
+      `ahead-app`, but the final `ahead` link failed with `ENOSPC`; 528 MiB
+      remained and no target/cache cleanup was done. Workspace formatting and
+      diff checks pass; the new test and rendered extension colors remain
+      unverified. After the shared `just dev` loop recovered 3.2 GiB of free
+      space, it linked and relaunched the integrated app. The source-current
+      app runner passed `extension_syntax_uses_zeds_longest_theme_prefix` and
+      all 465 app tests. Theme-prefix lookup and editor decoration behavior are
+      headless-tested; native installed-extension colors remain unverified
+      while macOS is locked.
+      On 2026-10-30, the source-current runner
+      `target/debug/deps/ahead_app-a22d426232bf3801` passed all 30
+      completion-filtered tests serially. Coverage includes server-preferred
+      sort keys and fuzzy ranking, typed signatures, cache-prefix reuse,
+      auto-import/undo, stale replies, Tab suffix deduplication, immediate
+      uncached requests and above-caret popup layout. This is headless GPUI
+      evidence; native multi-language completion and edit acceptance remain
+      separate checks.
+      On 2026-10-30 in the unlocked `just dev` app, the disposable TypeScript
+      editor showed the imported `Calculation` interface first for
+      `interface ExtendedCalculation extends Cal`, with its interface/import
+      detail in the popup above the caret. Tab inserted `Calculation` once;
+      undo restored the partial prefix. The screenshot's bare top-level
+      `extends Cal` is invalid TypeScript and correctly reports a parse error.
+      I restored and saved the fixture's original `main.ts`. This verifies a
+      native LSP response and acceptance path, but does not measure
+      keystroke-to-menu latency or an authenticated FIM overlap.
+      On 2026-10-30, the newly watcher-built `target/debug/ahead` then passed
+      the managed-acquisition matrix for Rust, TypeScript, JavaScript and
+      Python in a disposable profile. Completion, navigation, diagnostics and
+      repair, formatting, signatures, code actions, cross-file rename in
+      unsaved buffers, live Ruff configuration, restart/replay and graceful
+      shutdown passed. Completion round trips measured p50 96.4 ms and p95
+      555.6 ms: the first local `Calculation` completion took 555.6 ms, while
+      later TypeScript requests ranged from 15.9–96.4 ms. Python requests ranged
+      from 22.7–445 ms; Rust requests were 1.2–2.1 ms. This proxy timing does
+      not include native popup rendering. The isolated install profile was
+      removed; the disposable workspace remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-BdmN0T`.
+      On 2026-11-02, the live `just dev` binary rebuilt at 19:07:54 passed the
+      full real-server Rust/TypeScript/JavaScript/Python matrix in
+      `tests/lsp-smoke.mjs`. The default shell lacked language servers on PATH;
+      the retry stayed offline and used the existing Zed Vtsls, BasedPyright,
+      Ruff and Rust Analyzer cache. Completion, navigation, diagnostics/repair,
+      semantic tokens, formatting, signatures, TypeScript import actions,
+      cross-file rename over unsaved buffers, Ruff configuration changes,
+      server restart/replay and graceful shutdown passed. TypeScript's local
+      `Calculation` suggestion after `extends` measured 477.9 ms first, 195.6 ms
+      repeated, then 91.2 ms settled; overall LSP completion p50 was 79.5 ms and
+      p95 784.6 ms. These are proxy round trips, not native popup-render latency;
+      popup rendering, insertion/undo and navigation in the editor remain open.
+- [ ] Finish Zed language-extension configuration lifecycle. AHEAD now parses
+      Zed's `opt_in_languages` manifest setting: those servers stay available
+      but do not start by default or through `...`; an explicit server ID
+      enables them. The extension-host and proxy routing regressions passed on
+      2026-10-28 (2 proxy tests): wildcard selection excludes opt-in servers,
+      while an explicit server ID selects one. The ignored
+      `installed_zed_html_extension_refreshes_settings_and_uses_a_real_server`
+      probe now passes against a copied, installed Zed HTML extension and its
+      cached `vscode-html-language-server` in isolated temporary homes. It
+      confirms the extension stays dormant by default, starts after explicit
+      routing, and serves diagnostics, completion, formatting, rename, live
+      settings updates and restart after initialization-options change. On
+      2026-10-29, default server ordering
+      and exclusions were aligned with Zed's `assets/settings/default.json`
+      for its declared language preferences, including TypeScript/JavaScript,
+      Python, Ruby, Proto, Kotlin, PHP and the other explicitly configured
+      languages. AHEAD built-in BasedPyright is the Python fallback when the
+      extension's `basedpyright` server is unavailable. Opt-in adapters remain
+      dormant unless explicitly named in workspace routing. Focused proxy
+      regressions pass for preferred adapter selection, opt-in behavior and
+      explicit Proto selection. The later source-current package-root proxy
+      suite on 2026-10-29 passed 361 tests with 1 ignored; see active-goal
+      evidence above. Following Zed's settings-driven
+      approach, the Language Servers panel's Config action opens tracked
+      `.ahead/config.toml`; server order, `...`, `!` and opt-in behavior remain
+      configured in `[languages.<name>] language_servers`, not a duplicate
+      picker. Verify this native flow with an installed opt-in server and open
+      unsaved buffers after a routing change. AHEAD
+      also advertises and answers `workspace/configuration` from the extension's
       startup snapshot. `ahead-extension-host/src/host.rs::get_settings`
       previously returned `{}` for every category. It now reads the requested
       `[lsp.<server-id>]` from bounded, symlink-safe workspace config layers:
@@ -6594,6 +9933,25 @@ It also passed four source-matched app regressions: directory launch,
       unsupported-category error instead of silently returning `{}` for
       settings categories outside `language` and `lsp`. Other Zed settings
       categories and rendered acceptance remain open.
+      Zed's v0.8 WIT also exposes
+      `language_server_initialization_options_schema` and
+      `language_server_workspace_configuration_schema`; Zed calls both from
+      `ExtensionLspAdapter` and serves them through its JSON schema store.
+      The host now calls the Zed 0.8 initialization-options and
+      workspace-configuration schema callbacks and parses valid JSON, matching
+      Zed's behavior of ignoring absent or malformed schemas. These schema
+      values are carried with the resolved server command and routed to the
+      app. The Language Servers panel now provides an expandable per-server
+      preview of schema fields and descriptions and points to that server's
+      `[lsp.<server-id>]` table in tracked `.ahead/config.toml`. Its Config
+      action now creates that file safely on first use and opens it in the
+      editor, where edits use the existing configuration watcher and refresh
+      path. The focused core config suite passes 8 tests, including idempotent
+      creation and symlink rejection; the app's config-open and panel-click
+      tests pass. Native first-click acceptance remains open. The schema
+      preview itself remains read-only;
+      schema-backed controls and rendered native acceptance remain open. Do
+      not claim full Zed extension-configuration parity until those are done.
       The pinned Zed extension WIT's
       `language_server_additional_workspace_configuration` callback is now
       invoked on other installed adapters when resolving an extension server,
@@ -6602,7 +9960,15 @@ It also passed four source-matched app regressions: directory launch,
       initialization options and workspace configuration; a focused host
       regression covers merging, an initially empty target, and explicit AHEAD
       initialization options overriding adapter-contributed values. This
-      source change has not been built or run here.
+      source-current test runner passed
+      `host::adapter_configuration_tests::additional_adapter_configuration_uses_zed_union_semantics`
+      (1/1) without Cargo on 2026-10-28. The shared `just dev` build later
+      compiled and launched the integrated app; editable schema controls and
+      native rendered acceptance remain open. On 2026-10-28, the complete
+      source-current extension-host runner passed 47 tests with three
+      installed-extension probes ignored; this included Zed-compatible
+      configuration merging, settings layering, schema parsing, archive
+      validation, and installation recovery.
       Rechecked on 2026-10-16 against the current integrated binary: the
       cache-seeded Rust/TypeScript/JavaScript/Python LSP smoke observed live
       create/edit/rename/delete of Ruff and pyproject configuration and changed
@@ -6719,17 +10085,64 @@ It also passed four source-matched app regressions: directory launch,
       app startup before rendering with `com.apple.hiservices-xpcservice`
       (signal 6). The dev watcher remains active; native UI verification is
       still unavailable in this desktop session.
-- [ ] Support the Zed extension ABI used by real installed language adapters
-      before claiming extension installation works. The host now dispatches
-      declared API 0.6/0.7 to Zed's pinned `since_v0.6.0` WIT and API 0.8
-      to `since_v0.8.0`; missing/unknown versions are rejected at install and
-      discovery. The ignored real-extension smoke packages installed Proto
-      and HTML into disposable archives and passes each through AHEAD's
+      Rechecked on 2026-10-28 with the source-current proxy runner
+      `ahead_proxy-1699264ce39d6f81` (newer than `catalog.rs` and
+      `host.rs`): the opt-in real Zed HTML-server lifecycle test passed 1/1
+      without Cargo. It verified default dormancy, explicit routing, real
+      diagnostics, settings refresh without restart, and an initialization-
+      options change that restarts the server. The test used an isolated
+      temporary profile and the locally installed Zed HTML guest/server; both
+      the profile and child process were removed afterward. This does not
+      verify extension-settings schemas or the native UI.
+      On 2026-10-29, copied Zed's Proto language-server preference from
+      `../zed/assets/settings/default.json`: Buf is selected by default, while
+      `protols` and `protobuf-language-server` remain available for explicit
+      workspace routing. The focused proxy regression passes. In the native
+      app, installing Zed's live Proto 0.3.4 extension into the isolated
+      profile starts only `buf language server`, which reaches Ready; the
+      unused alternatives no longer appear as errors. This verifies Proto's
+      default and explicit server choice, not the rest of Zed's per-language
+      defaults or full extension-settings parity.
+      On 2026-10-30, the current watcher-built `target/debug/ahead` fetched
+      the live Zed catalog and installed HTML 0.3.2 into an isolated profile.
+      The real server started, HTML completion and grammar/highlight captures
+      passed, restart recovery passed, and uninstall removed the extension.
+      The install profile was removed; this verifies the catalog-to-package-to-
+      server path, not native gallery rendering or all supported extension ABIs.
+      Rechecked on 2026-11-02 against the integrated binary rebuilt at
+      19:07:54: the live Zed catalog returned HTML 0.3.2, AHEAD installed it,
+      loaded its grammar/highlight captures, initialized
+      `vscode-html-language-server`, completed `<di`, recovered after restart,
+      and uninstalled the extension. The completion round trip measured 9ms;
+      the disposable install profile was removed. This verifies current live
+      catalog/download/proxy behavior, not native gallery rendering or the
+      other supported extension ABIs.
+- [ ] Finish production verification for the supported Zed extension ABIs.
+      AHEAD intentionally supports API 0.6/0.7 through Zed's pinned
+      `since_v0.6.0` WIT and API 0.8 through `since_v0.8.0`; older APIs are
+      outside scope under the no-backwards-compatibility decision. Missing and
+      unknown versions are rejected at install and discovery.
+      On 2026-11-02, `diff -qr` against `../zed/crates/extension_api/wit`
+      confirmed the API 0.6 and 0.8 WIT interface files are identical; the only
+      omitted file is Zed's Rust-side `settings.rs` convenience types, while
+      AHEAD implements the same language/LSP settings payloads at its host
+      boundary. This check found no ABI drift. The open work is real-package
+      API 0.8 coverage plus native gallery/editor activation and insertion/undo.
+      On 2026-11-02, the live Zed language-server catalog had no API 0.8
+      packages. The current HTML 0.3.2 package uses API 0.7.0; its isolated
+      live install passed grammar/highlight loading, HTML completion, server
+      restart, uninstall and graceful shutdown (7.3 ms completion round trip).
+      This validates the available ABI and catalog path; API 0.8 still needs a
+      real package when one appears.
+      The ignored real-extension smoke packages install Proto and HTML into
+      disposable archives and pass each through AHEAD's
       installer, then reads changed workspace settings offline. The HTML
       0.7 guest built from `../zed/extensions/html` now also passes the
       disposable loopback download-to-install-to-discovery-to-settings smoke
-      (2026-10-02); its source manifest needs `[lib].version = '0.7.0'`,
-      which Zed's extension builder writes after compiling. Proto also
+      (2026-10-02); that run used `[lib].version = '0.7.0'` in its fixture to
+      select the guest ABI. Current Zed main embeds the version in the
+      `zed:api-version` WASM custom section instead; AHEAD's updated handling
+      and its pending current-package smoke are recorded below. Proto also
       resolves its real command and initialization options through a
       disposable local binary override, without network access. An opt-in
       proxy test now detects an HTML file, opens it through the real installed
@@ -6747,7 +10160,14 @@ It also passed four source-matched app regressions: directory launch,
       This closes live catalog-to-package-install-to-server coverage, not the
       native gallery install/activation UI. Still test gallery UI activation,
       watcher-to-editor refresh, completion resolve/insertion/Undo in the native
-      app, and other real extension packages. The
+      app, and other real extension packages. On 2026-10-30, the watcher-built
+      binary passed a second live-catalog smoke for Proto 0.3.4 (API 0.7):
+      install, Buf startup, grammar type capture, restart and uninstall in an
+      isolated profile. That earlier message-type probe returned `null` because
+      it lacked a configured Buf module. On 2026-11-02, a valid v2 module passed
+      live import-path and local message-type completion (20.3 ms and 7.0 ms);
+      this clears the proxy-level Proto completion gap, while native popup and
+      insertion/undo acceptance remain open.
       Offline recheck on 2026-10-13: the source-matched proxy test binary
       (17:08, newer than `catalog.rs` at 08:49) passed the ignored real-server
       smoke (1/1) against the locally installed Zed HTML guest and its matching
@@ -6757,6 +10177,35 @@ It also passed four source-matched app regressions: directory launch,
       access; native gallery activation and rendered editor insertion remain
       open. A separate live-catalog/npm-acquisition retry could not resolve
       `api.zed.dev` / npm from this environment (`ENOTFOUND`).
+      On 2026-10-30, comparison with current `../zed/extensions/html` exposed
+      that Zed removed `[lib].version` from extension manifests and embeds the
+      ABI version in the `zed:api-version` WASM custom section. AHEAD now reads
+      that section during discovery, install validation and interrupted-update
+      recovery; the shared `just dev` rebuild succeeded. The source-current
+      proxy runner passed `installed_zed_html_extension_refreshes_settings_and_uses_a_real_server`
+      (1/1) against the Zed HTML guest, verifying readiness, completion,
+      embedded-CSS diagnostics and clearing after settings refresh without
+      restart, formatting and paired-tag rename. A separate integrated
+      `tests/lsp-smoke.mjs` run installed live Zed HTML 0.3.2 and passed
+      completion, grammar/highlight captures, restart recovery, uninstall and
+      shutdown. Both used isolated profiles; the cached matching server avoided
+      npm downloads. Native gallery activation, watcher-to-editor rendering,
+      completion insertion/Undo and other real extension packages remain open.
+      On 2026-11-02, the current integrated binary passed the extension-only
+      live-catalog smoke again: HTML 0.3.2 installed from Zed's catalog,
+      loaded its grammar/highlights, returned `div` completion, recovered after
+      restart and uninstalled cleanly. Completion round-trip was 8.2 ms. This
+      closes the current proxy/install path, not native gallery activation.
+      Rechecked the broader ABI matrix against the live catalog: Swift 0.4.11
+      (API 0.6) installed from Zed, started the system `sourcekit-lsp`, returned
+      `Calculation` completion in 544 ms and Swift grammar captures, then
+      restarted and uninstalled cleanly. Separate targeted smokes verified HTML
+      0.3.2/API 0.7 and Proto 0.3.4/API 0.7. The catalog snapshot had no API
+      0.8 language-server package; API 0.8 remains fixture-tested at the host
+      boundary. The live-catalog smokes use isolated profiles and disposable
+      workspaces; the Swift profile was removed and its retained workspace is
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-P7XPFN`.
+      They do not verify native gallery or editor rendering.
       versioned ABI alone does not prove every adapter is compatible. On
       2026-10-07, the source-matched `ahead-proxy` test binary (newer than
       `catalog.rs` and `lsp.rs`) passed all 248 active tests serially from the
@@ -6881,6 +10330,51 @@ It also passed four source-matched app regressions: directory launch,
       proxy/server path; native popup placement, acceptance rendering and Undo
       remain subject to the macOS app launch failure above. All server binaries
       were already installed locally; no downloads or provider calls occurred.
+      On 2026-10-27, implemented the Zed 0.8 extension `http-client` host
+      contract for buffered and streamed requests, all seven HTTP methods,
+      redirect policies, returned headers, 4xx/5xx buffered-fetch errors, and
+      bounded buffered response bodies. The disposable loopback callback test
+      passed, then the complete extension-host unit suite passed (45 passed,
+      3 ignored). This closes the previously stubbed HTTP host interface; it
+      does not establish compatibility for every catalog extension or replace
+      native gallery/activation acceptance below.
+      On 2026-10-27, the live native Extensions gallery loaded Zed's catalog
+      and installed HTML 0.3.2 into the isolated `AHEAD_DATA_HOME` used by
+      `just dev`. Opening a disposable `html-smoke.html` activated completion;
+      Ctrl+Space offered HTML tags, accepting `div` changed only the editor
+      buffer, and Cmd+Z restored it. The temporary file was removed. This
+      verifies the rendered gallery install-to-completion-and-Undo path for
+      HTML; restart persistence, native watcher refresh, and other real
+      extension packages remain open. A live Tombi 0.2.4 install initially
+      exposed an archive extraction-path mismatch: Zed's extension API passes
+      the requested download directory into TAR/ZIP extraction, while AHEAD
+      had extracted at the extension work-directory root. The host now joins
+      archive entries beneath that requested path and rechecks each destination
+      against the extension root. A loopback TAR+ZIP regression and the full
+      host suite pass (46 passed, 3 ignored). After rebuilding with the shared
+      `just dev` loop, Tombi installed from the live gallery, reached Ready,
+      and reported the expected `expected =` diagnostic for an unsaved invalid
+      TOML line; undo cleared the probe and uninstall removed Tombi from the
+      isolated profile. Other real extension packages remain open.
+      On 2026-10-29, the fresh integrated binary passed the live Zed HTML
+      extension smoke from a clean temporary profile: it fetched catalog
+      metadata, installed HTML 0.3.2, loaded its real grammar/highlight captures,
+      completed HTML tags, restarted the server, then uninstalled the package.
+      The temporary server/profile data was removed and the disposable fixture
+      remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-mpM097`.
+      This verifies the live RPC/host install path, not native gallery-control
+      interaction or watcher-to-editor refresh.
+      Rechecked the current extension-host source on 2026-10-29 with
+      `rtk cargo test --locked --offline -p ahead-extension-host --lib`:
+      47 passed, 3 ignored. This covers host contracts, not every catalog
+      adapter or native installation flow.
+      On 2026-11-02, the 19:07:54 integrated binary also installed live Zed
+      Proto 0.3.4 (API 0.7) in an isolated profile, started Buf, loaded Proto
+      highlights, recovered after restart and uninstalled cleanly. This adds a
+      second real language package to the HTML install-path evidence. A later
+      valid Buf v2 module returned import-path and local message-type
+      completion. Native gallery interaction and popup insertion remain open.
 - [ ] Finish language-server acquisition and discovery in
       `ahead-proxy/src/plugin/catalog.rs`, `ahead-extension-host/src/host.rs`
       and `ahead-app/src/extensions_panel.rs`. Normal builds now include the
@@ -6932,8 +10426,35 @@ It also passed four source-matched app regressions: directory launch,
       while a 2026-10-08 network-enabled disposable run hid that path from AHEAD,
       fetched the checksum-verified Node LTS runtime, installed Vtsls and
       BasedPyright, and passed the full TypeScript/JavaScript/Python LSP matrix.
-      This verifies the clean-PATH runtime download on macOS. Still verify a
-      cache-only fallback, Windows launch behavior, and native install progress.
+      This verifies the clean-PATH runtime download on macOS. Cache-only startup,
+      Windows launch behavior, and native install progress were still open then.
+      On 2026-10-30, managed Node selection was aligned with Zed's pinned-version
+      cache-first path. A valid current-version cache now avoids the release-index
+      request; an older valid cache remains the fallback when a new download
+      fails. The focused cache/no-network and archive tests passed 4/4 after a
+      fixture path correction. The shared `just dev` loop rebuilt the integrated
+      app and proxy, then entered the proxy main loop in the disposable project.
+      Two integrated `tests/lsp-smoke.mjs` runs then hid system Node/npm from the
+      proxy PATH. The first acquired pinned Node 24.22.1 and passed Vtsls
+      TypeScript/JavaScript completion, navigation, diagnostics, formatting,
+      rename, restart and shutdown. The second seeded that managed Node and
+      language-server cache into a fresh disposable profile, and passed the same
+      matrix without a managed Node download. Both used the watcher-built binary;
+      the retained seed profile was removed after the second run. Native install
+      progress and Windows launch behavior remain open.
+      On 2026-10-29, the fresh integrated binary passed
+      `rtk env AHEAD_LSP_INSTALL_MISSING=1 node tests/lsp-smoke.mjs
+      target/debug/ahead` from a clean isolated profile. AHEAD acquired the
+      missing Vtsls, BasedPyright, Ruff and Rust Analyzer servers, then passed
+      the full Rust/TypeScript/JavaScript/Python matrix: completion and local
+      type resolution, navigation, diagnostics/repair, formatting, signatures,
+      import/code actions, unsaved cross-file rename, live Ruff configuration,
+      fresh-process restart/recovery and graceful shutdown. The workspace
+      remains at
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-hecD6l`;
+      the successful run removed its isolated server profile. This confirms
+      managed protocol/server behavior, not native popup rendering or install
+      progress.
       On 2026-10-07, direct execution of the existing proxy test binary passed
       all nine `plugin::catalog::tests` and seven `plugin::lsp::tests`. That
       binary is newer than `catalog.rs` and `lsp.rs`, but older than
@@ -6970,8 +10491,14 @@ It also passed four source-matched app regressions: directory launch,
       launch, so PATH-selected binaries and installed extension servers do not
       trigger registry requests or cache restarts. The check uses an already
       available npm/Node runtime and does not fetch Node just to check versions.
-      Parser, bounded-output and fake-npm regressions were added but not run in
-      this pass.
+      On 2026-10-29, the source-current proxy test runner
+      `target/debug/deps/ahead_proxy-cdf6288b8da2959d` passed 30 tests in
+      `plugin::catalog::document_diagnostic_tests`; one real Zed HTML adapter
+      test was ignored because it requires an explicitly seeded package and
+      matching server. This covers JSON/plain-semver parsing, bounded version
+      output and subprocess lookup, fake-npm staged publication/concurrency,
+      cache repair safety and install cancellation. No Cargo build was started.
+      Windows update behavior and rendered native progress remain unverified.
       An explicit Repair cache action now targets only the failed
       AHEAD-managed BasedPyright/Vtsls npm package, leaves PATH-installed
       servers alone, rejects symlinked cache roots, and restarts open documents
@@ -7200,6 +10727,23 @@ It also passed four source-matched app regressions: directory launch,
       calls were used. Fixture:
       `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-fpLfI9`.
       Native Extensions-tab and editor-popup rendering remain unverified.
+      On 2026-11-02, the latest integrated binary repeated the live-catalog
+      path from a fresh isolated profile: Zed HTML 0.3.2 installed, its grammar
+      captures loaded, `<di` returned `div`, the extension survived server
+      restart and uninstalled cleanly. Managed Vtsls, BasedPyright and Ruff
+      passed the TypeScript/JavaScript/Python checks in the same run. No model
+      credentials or requests were used. The disposable workspace is
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-QlqGgi`.
+      This still does not verify the native gallery/editor render or resolve
+      the tracked endpoint-terms question.
+      On 2026-10-29, reran the extension-only syntax smoke against the current
+      integrated binary, seeding the installed TOML extension from the active
+      disposable dev profile into a fresh isolated profile. TOML captures
+      returned through the real proxy; restart and graceful shutdown passed.
+      No download or model request occurred. Disposable workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-f73Atj`.
+      This confirms the seeded package-to-proxy path, not native gallery
+      installation or rendered CodePanel colors.
 - [ ] Finish production hardening of the searchable Extensions tab. Per the
       user's 2026-10-14 decision, release builds should query Zed's live catalog
       and package API, with an explicit compatibility/non-endorsement disclaimer;
@@ -7213,6 +10757,12 @@ It also passed four source-matched app regressions: directory launch,
       distribution. Preserve the HTTPS/artifact trust boundary and separately
       review extension licenses and external language-server binaries.
       The gallery now offers **Uninstall** for an installed language extension.
+      The gallery's offline installed-package scan no longer requires
+      `[lib].version` in `extension.toml`: current Zed packages embed the API
+      version in `extension.wasm`. The extension host still validates that
+      section before launch. A focused headless gallery regression now lists
+      an installed HTML-shaped manifest without `[lib]`; native gallery
+      presentation after restart remains unverified.
       Removal runs through the proxy/catalog boundary: active servers are stopped,
       the target and any validated interrupted-update backup are removed under
       the shared install lock, installed grammar-cache entries are evicted, and
@@ -7224,6 +10774,12 @@ It also passed four source-matched app regressions: directory launch,
       precedence/fallback, install requests and language-server reload routing.
       These headless tests do not issue a live catalog request, publish a
       package or verify the native install journey.
+      On 2026-10-30 the watcher-built binary passed the live Zed HTML smoke:
+      catalog version 0.3.2, install, `vscode-html-language-server` startup,
+      grammar/highlight captures, completion, restart, uninstall and graceful
+      shutdown in a disposable profile. Workspace:
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-oC6KBL`.
+      This still does not verify the rendered gallery or editor colors.
       Rechecked against Zed's live Terms of Service on 2026-10-14 (page last
       updated 2026-03-02): sections 2.2 and 2.4 retain the designated-access
       mechanism and non-public-API restrictions, but do not name these extension
@@ -7243,12 +10799,31 @@ It also passed four source-matched app regressions: directory launch,
       Review extension-code licenses and separately assess external language
       servers and other downloaded tools: Zed's [license requirements](https://zed.dev/docs/extensions/publishing/license-requirements)
       explicitly exclude those tools from the extension-code license rule.
-      The shared installer now requires credential-free HTTPS and refuses
-      downgrade redirects in production; its disposable loopback package test
-      remains test-only. The install request now carries an optional archive
-      SHA-256 and selected package version; the host checks both before
-      replacing an installed extension. The digest, version and RPC regressions
-      pass. Zed's preview catalog does not supply the archive digest.
+      The shared installer now restricts initial URLs to the exact versioned
+      Zed download route or the version-matched AHEAD GitHub release asset.
+      Redirects are restricted to those routes, the observed Zed extension
+      object store, and GitHub release-asset hosts. Credentials, arbitrary HTTPS
+      hosts, non-default ports and HTTPS downgrades are rejected; only tests
+      allow credential-free loopback HTTP. The install request now carries an
+      optional archive SHA-256 and selected package version; the host checks
+      both before replacing an installed extension. The digest, version and RPC
+      regressions pass. Zed's preview catalog does not supply the archive digest.
+      On 2026-10-30, extension-host source and redirect policy regressions
+      passed 2/2. The rebuilt integrated binary then installed Zed HTML 0.3.2
+      through the live catalog/API and observed CDN redirect, passed HTML LSP
+      completion and server restart, and uninstalled the package cleanly. The
+      smoke retained only its disposable project; its isolated profile was
+      removed. This verifies the current allowlist against the live route, not
+      endpoint authorization, broad package compatibility, or rendered gallery
+      interaction.
+      Rechecked immediately afterward with the current integrated binary and
+      a fresh isolated profile: AHEAD fetched the live catalog, installed HTML
+      0.3.2, started `vscode-html-language-server`, returned grammar/highlight
+      captures and HTML completion, then recovered after server restart and
+      uninstalled the package. The generated profile was removed; only the
+      disposable workspace remains. This confirms the current live
+      catalog-to-install-to-LSP lifecycle for HTML, not broader package
+      compatibility or native gallery interaction.
       On 2026-10-12, release builds began querying Zed's live catalog as well
       as the AHEAD-owned feed. Debug builds read the checkout copy of
       `extensions/registry.json`; release builds read its published URL. Zed
@@ -7409,12 +10984,86 @@ It also passed four source-matched app regressions: directory launch,
       14.64s; macOS again aborted the app child at HIServices initialization
       (signal 6) before rendering. Watcher session 96223 remains live; this UI
       status change is covered by headless tests only.
+      On 2026-10-27, a fresh live-catalog install of HTML extension 0.3.2
+      launched its bundled language server, passed grammar/highlight and HTML
+      completion checks, survived a server restart, and uninstalled cleanly.
+      This verifies live catalog/package and proxy-host behavior; native gallery
+      rendering and the endpoint-terms review remain open.
+      On 2026-10-28, the rebuilt native Extensions tab loaded the live catalog
+      (315 candidates) and filtering `html` rendered the HTML and RsHtml rows
+      with install controls and the compatibility disclaimer. Native install
+      and server activation remain separate checks.
+      On 2026-10-29, the current native app installed HTML 0.3.2 from that
+      gallery into its isolated dev profile. The workspace HTML server reached
+      Ready; typing `<di` showed `dialog` and `div`, accepting `div` changed
+      the buffer, and undo restored the original text. The temporary probe file
+      was removed. This closes the native install-to-server-to-completion path
+      for HTML; production catalog authorization and broader extension
+      compatibility remain open.
+      Rechecked the live catalog on 2026-10-30 with AHEAD's
+      `max_schema_version=1&provides=language-servers&filter=html` query: HTTP
+      200 returned HTML 0.3.2 and RsHtml 0.1.7, both schema 1 / WASM API 0.7.
+      A one-byte range probe of AHEAD's versioned HTML download URL returned
+      HTTPS 307 to the artifact host; no archive body was downloaded. This
+      confirms current endpoint shape and routing, not production service
+      authorization or compatibility beyond the previously verified HTML path.
+      On 2026-10-30, reran the live Zed HTML extension path against the current
+      `target/debug/ahead`: HTML 0.3.2 installed, grammar/highlight captures
+      loaded, `vscode-html-language-server` initialized, `<di` completion
+      passed, restart recovery passed, and uninstall/shutdown completed. The
+      script removed its isolated profile and retained the disposable fixture
+      at `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-VLfwQi`.
+      This verifies current live API/package/proxy behavior, not native gallery
+      rendering or broad extension compatibility.
+      Repeated after the latest shared `just dev` rebuild with a fresh profile:
+      the live catalog supplied HTML 0.3.2, AHEAD installed it, loaded grammar
+      captures, started `vscode-html-language-server`, completed `<di`, then
+      restarted, uninstalled and shut down cleanly. The isolated profile was
+      removed; the disposable workspace is
+      `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-uAtj5b`.
+      This confirms the current live catalog/package/proxy path, not native
+      gallery rendering or production service authorization.
 - [ ] Port Zed's project search panel with search/replace, keyboard result
       navigation, match highlighting,
       include/exclude globs and paginated results. Clicked matches open at the
       start and select the full range, including cross-line matches; the Search
       tab remains beside code tabs so results can be revisited without rerunning
       the query. Verify range selection and tab navigation in rendered GPUI.
+      On 2026-10-27, the current binary passed the disposable 10,000-file
+      correctness and symlink-boundary smoke. In five alternating warm-cache
+      samples, AHEAD's no-hit median was 540ms versus ripgrep's 632ms; indexing
+      took 420ms, and AHEAD returned its capped 5,000 results in 363ms. Ripgrep
+      counted all 10,000 hot matches in 631ms, which is different work from
+      AHEAD's capped result. This is one synthetic host run, not a general
+      performance claim; native large-result rendering and contention remain
+      open.
+      Rechecked on 2026-10-27 against the rebuilt `just dev` binary with the
+      alternating ripgrep comparison: 10,000-file indexing took 423ms; median
+      no-hit scans were 672ms for AHEAD and 642ms for ripgrep; AHEAD returned
+      the capped 5,000 matches in 371ms while ripgrep counted all 10,000 in
+      657ms. The stale file and directory symlink boundary checks passed. This
+      second synthetic host sample reinforces that no-hit latency is close but
+      variable; capped-result and full-count timings are different work, and
+      native large-result rendering and contention remain open.
+      On 2026-10-28, the rebuilt integrated binary passed the same smoke over
+      10,000 files in 10 nested directories: index build 780ms, multiline
+      search 682ms, capped 5,000-result search 699ms, and median no-hit scan
+      656ms across three samples. The stale-index symlink escape was rejected.
+      This is a single synthetic host run; it does not verify native large-list
+      rendering or concurrent editor/agent contention.
+      Rechecked on 2026-10-30 against the rebuilt integrated binary with the
+      alternating ripgrep baseline: 10,000 nested files indexed in 485ms,
+      multiline search took 496ms, and the capped 5,000-result query took
+      247ms. Median no-hit search was 475ms for AHEAD and 445ms for ripgrep;
+      ripgrep counted all 10,000 hot matches in 539ms. Literal
+      `console.log(` matching and stale-index symlink rejection passed. This is
+      one local synthetic sample; the close no-hit comparison does not establish
+      performance under concurrent editor/agent load or native result rendering.
+      On 2026-11-02, the current integrated binary searched 10,000 files across
+      10 nested directories: indexing 422 ms, multiline search 381 ms, capped
+      5,000-result return 199 ms, and median no-hit 340 ms over three runs.
+      Literal Text search and stale-index symlink rejection passed. This is a
+      single synthetic host run, not a native large-result or contention check.
       On 2026-10-16, added a `Replace Match` action beside `Replace All`; it
       applies the selected result only and prefers dirty-buffer text. Focused
       core tests pass for an unsaved UTF-8 match and regex capture/escape
@@ -7438,6 +11087,42 @@ It also passed four source-matched app regressions: directory launch,
       focused shell and search-panel test runs pass (4 tests); the live app
       replaced one match and the reverse replacement restored the disposable
       fixture. Native search query/edit behavior is now verified for this path.
+      On 2026-10-26, rendered the replacement toolbar in the active `just dev`
+      app and exercised it with a disposable three-match file: Replace Match
+      changed only the selected occurrence and reduced results from three to
+      two; Replace All changed the remaining two and reduced results to zero.
+      The editor buffer showed all three replacements while disk remained
+      unchanged; the temporary buffer was discarded and fixture removed.
+      Also verified in the rendered Search panel that Down while the query
+      field is focused advances the selected result row, and Enter opens that
+      result in its file at the matching line. The same Down key after opening
+      a result moves the editor caret, as expected for editor focus.
+      On 2026-10-27, the current `just dev` app searched `double` across the
+      disposable Rust/TypeScript/JavaScript/Python workspace (26 results), then
+      narrowed to nine with `python/*.py`. Opening the `python/main.py` result
+      selected the exact `double` match at line 4; no project files were written.
+      Rechecked the source-current 16:58 app runner directly on 2026-10-26:
+      all three `workspace_panels::tests::search_replace` tests pass (3/3),
+      covering current-match-only replacement, replace-all in unsaved editor
+      content, and the collapsible replacement controls.
+      On 2026-10-29, the current app runner passed the typed literal-regex
+      search regression (1/1) and the search-replacement suite (4/4), covering
+      selected-match-only replacement, replace-all in unsaved content, and the
+      collapsible controls. The Mac is locked, so rendered Search-panel checks
+      remain open.
+      Rechecked on 2026-10-30 against the rebuilt integrated binary: the
+      workspace-search smoke passed literal `console.log(` matching without
+      matching `consoleXlog`, alongside the 10,000-file scale and symlink
+      checks. The focused GPUI regression types `(` as a separate event in
+      Text mode and passed in the current app test runner. Two AHEAD processes
+      are running from before and after the rebuild; the Mac is locked, so I
+      could not confirm which window is visible or verify the rendered panel.
+      In the current native `just dev` app on 2026-10-30, a disposable 60-file,
+      6,000-match Text query rendered 100 grouped results, scrolled its virtual
+      list without moving the search controls, and expanded to 200 results with
+      Show more while preserving scroll position. The generated files were
+      removed afterward. Concurrent editor/agent load and navigation into a
+      later page still need native checks.
       Search results now have a visible selected row, cyclic Up/Down keyboard
       navigation, and Enter opens the selected full match range. The focused
       navigation regression passed with
@@ -7486,6 +11171,148 @@ It also passed four source-matched app regressions: directory launch,
       and GPUI panel tests; the source-current `ahead-core --lib search::tests`
       run passed all 36 scanner/replacement tests. This still does not verify
       native rendered panel behavior.
+      On 2026-10-28, the source-current GPUI regression
+      `search_panel_treats_regex_metacharacters_as_literal_text` passed (1/1).
+      On 2026-10-29, it was tightened to wait for the debounced `console.log`
+      search before entering `(` as a separate keystroke in default Text mode;
+      the focused regression passed (1/1), verifying the literal
+      `console.log(42)` result and rejecting the `consoleXlog` false match.
+      On 2026-10-30, extended the exclusive-mode GPUI test to type the same
+      query in Regex mode, observe its expected unclosed-group error, then
+      switch back to Text and verify the error clears and one literal match
+      remains. The focused test passed (1/1).
+      The shared `just dev` loop then rebuilt the integrated app and proxy on
+      the same approved disposable workspace/profile. The current binary passed
+      `tests/workspace-search-scale-smoke.mjs` across 10,000 files, including
+      literal `console.log(` matching, multiline search, the 5,000-result cap
+      and stale-index symlink rejection. This host measured 5.17 s indexing,
+      419 ms multiline search, 239 ms for the capped result set and 386 ms
+      median no-hit search over three samples. The Mac remains locked, so the
+      rebuilt window could not be inspected in this continuation.
+      The current dev UI also returned both JavaScript/TypeScript matches for
+      the exact query with Text selected and no parse error; macOS locked before
+      a post-rebuild UI check.
+      On 2026-10-29, the running `just dev` app on the approved disposable
+      Rust/TypeScript/JavaScript/Python fixture searched `console.log(` with
+      Text selected and returned exactly its JavaScript and TypeScript matches,
+      with no regex error. Replace Match changed only the current JavaScript
+      match and left one TypeScript result; Replace All changed that remaining
+      match. Both editor buffers were undone and their on-disk contents were
+      confirmed restored. With `double` searched, Down moved the selected row
+      from README line 17 to line 119, and Enter opened that selected result at
+      line 119. This closes native literal metacharacter, current/all replacement,
+      and basic result-navigation acceptance; include/exclude paging and exact
+      rendered match-range selection remain open.
+      Rechecked the exact literal query through the rebuilt integrated
+      `global_search` RPC: `console.log(` returned one match and excluded the
+      `consoleXlog(3)` near miss. The 10,000-file disposable scale, multiline,
+      result-cap and symlink-boundary checks passed in the same run (613ms
+      indexing, 363ms multiline search, 325ms for the 5,000-result cap). This
+      confirms the proxy/core literal-search route, not native panel rendering.
+      The user then reported a native failure with Text visibly selected:
+      entering `console.log(` displayed a regex parse error. This conflicts
+      with the earlier native pass and the current literal-escaping source and
+      GPUI regression. The attached screenshot is dated 2026-10-28; the current
+      matcher explicitly escapes literal punctuation before compiling, and the
+      rebuilt integrated binary passed `tests/workspace-search-scale-smoke.mjs`
+      on 2026-10-29 with the exact `console.log(` query (one match, excluding
+      `consoleXlog`). Follow-up rendered repro on 2026-10-29 in the restarted
+      app on the approved disposable project: Text was visibly selected, the
+      exact `console.log(` query returned two JavaScript/TypeScript matches with
+      no parse error, and opening the JavaScript result set the editor to line 4.
+      Pressing Left collapsed the selected match to column 1, confirming the
+      full range; the file remained unmodified. The screenshot-era binary's
+      provenance is unknown, but the current native search path is verified.
+      On 2026-10-29, a fresh check found an older detached AHEAD process and
+      the rebuilt dev app attached to the same disposable workspace. After
+      closing the stale process, the rebuilt app again showed two results for
+      `console.log(` with Text visibly selected. The focused GPUI regression
+      passed 1/1 against the same source.
+      Rechecked after the latest screenshot in the active shared `just dev`
+      window: replaced the query with `console.log`, then entered `(` as a
+      separate keystroke. Text stayed selected and the panel showed exactly two
+      literal JavaScript/TypeScript results without a regex error. A temporary
+      comment typed into `main.ts` during gutter inspection was immediately
+      undone; the tab returned clean.
+      After the current `just dev` rebuild, reran
+      `tests/workspace-search-scale-smoke.mjs`: the exact `console.log(` query
+      returned one literal match and rejected `consoleXlog(3)`; stale-index
+      symlink escape was rejected. On 10,000 nested files, indexing took
+      6.41 s, multiline search 340 ms, the 5,000-result cap 216 ms, and median
+      no-hit search 420 ms across three samples. This is one synthetic host
+      run with cold-index and OS-cache variation, not a general performance
+      claim.
+      In the rebuilt native app, clicking one of those results opened
+      `javascript/src/main.mjs` at line 4 and exposed its selected-code context
+      chip in chat. Moving the caret to the blank line 5 removed the chip without
+      adding the focused file to context or editing source. Exact match-range
+      paint and include/exclude paging remain open.
+      After the latest `workspace_panels.rs` change, the source-current
+      `cargo test --locked --offline -p ahead-app --lib
+      workspace_panels::tests -j 1 -- --test-threads=1` run passed all 33
+      tests. The shared watcher was stopped for that focused Cargo run, then
+      restarted on the same disposable project and isolated Turso data home;
+      the integrated app rebuilt in 3.06s and the proxy entered its main loop.
+      The Mac is locked, so this adds current GPUI/source evidence but no new
+      native rendering evidence.
+      On 2026-10-30, the user reported the same Text-mode `console.log(` parse
+      error again. The focused GPUI typing regression passes against the
+      source-current runner, and the current `just dev` app binary is newer
+      than both search sources. Restarted the same shared dev loop on the
+      approved disposable project; the rebuilt app and proxy relaunched. The
+      Mac is locked, so the reported rendered failure could not be checked
+      after restart; keep the native repro open until it is resolved in the
+      running UI.
+      After the restart, the integrated binary passed
+      `tests/workspace-search-scale-smoke.mjs`: 10,000 files, literal
+      `console.log(` matching, multiline search, the 5,000-result cap and
+      stale-index symlink rejection. This verifies the core matcher, not the
+      reported UI mode wiring.
+      On 2026-10-30, the rebuilt source-current app runner passed all 465
+      `ahead-app` tests, including the focused separate-keystroke Text-mode
+      search case. The fresh integrated binary also passed the 10,000-file
+      smoke (263 ms indexing, 337 ms multiline, 264 ms for 5,000 capped
+      matches, 368 ms median no-hit over three samples). The agent and editor
+      search call-site audit confirms all three use `ahead-core::search`.
+      This is headless and RPC evidence; the newly reported native mode/error
+      display remains open because the desktop is locked.
+      Re-ran the two focused GPUI tests after the latest screenshot: typing
+      `console.log` and then `(` in default Text mode passes (1/1), and the
+      Regex-error-to-Text-mode transition clears the error and returns the
+      literal match (1/1). Source inspection confirms Text mode snapshots
+      `is_regex = false` and routes through the fixed-string matcher. Two AHEAD
+      processes currently use the same dev bundle and disposable workspace;
+      both started after that bundle was built, so this does not establish a
+      stale-binary cause. The desktop is locked, leaving the reported rendered
+      mode/error mismatch unresolved until it can be inspected live.
+      Rechecked on 2026-10-30: the 03:43 ET AHEAD process had a different
+      executable inode from the 08:58 ET build and was terminated on the
+      disposable workspace after confirming the visible `math.ts` buffer was
+      clean. The current `just dev` watcher and rebuilt app/proxy remain
+      running. The native accessibility tree accepted `console.log(` with
+      Text selected, but the captured window image remained blank/stale, so
+      this does not confirm the rendered result or error state. Keep native
+      acceptance open until the active window can be visually verified.
+      Follow-up on 2026-10-30: both focused GPUI search regressions passed (2/2)
+      after fixing a test-context compile error. With no dev watcher holding the
+      build lock, started `just dev` on the same disposable project using an
+      isolated data home; the rebuilt app and proxy launched. The Mac remains
+      locked, so the preexisting app/proxy pair was left untouched and the
+      rendered Search panel still needs confirmation after unlock.
+      After the user unlocked the dev window, the visible AHEAD process was
+      confirmed stale: it started at 10:03 while the current app binary was
+      rebuilt at 10:18. Stopped that process and relaunched the shared `just
+      dev` loop. In the rebuilt native app, Text remained selected while the
+      query was entered as `console.log` followed by a separate `(` keystroke;
+      the Search panel showed the two JavaScript/TypeScript matches and no
+      regex error. The stale-process cause and rendered regression are resolved.
+      Reconfirmed in the active native app on 2026-10-30: Text remained selected
+      for the literal `console.log(` query and both JavaScript/TypeScript matches
+      rendered without a regex error. Replace Match changed only the selected
+      JavaScript occurrence; the original disposable editor buffer was restored
+      and is clean. The rendered toolbar exposes separate Replace Match and
+      Replace All actions. Large-result rendering and concurrent search
+      contention remain open.
       On 2026-10-12, the 11:38 `target/debug/ahead` binary passed the
       10,000-file scale smoke with four search workers: no-hit scans took
       1.15s/680ms cold/warm, and returning the 5,000-result cap took 469ms.
@@ -8253,6 +12080,107 @@ It also passed four source-matched app regressions: directory launch,
       flush promptly, a later exact-binary run measured 5.80s indexing,
       652/430ms median no-hit scans, and 1.04s for the capped hit search. The
       same-day samples vary substantially, so no performance claim follows.
+      Rechecked on 2026-10-26 against the running integrated binary after
+      reviewing Zed's `project_search.rs`: the same 10,000-file fixture indexed
+      in 286ms, with five paired no-hit medians of 509ms for AHEAD versus 409ms
+      for ripgrep. AHEAD returned the 5,000-result cap in 756ms; ripgrep counted
+      all 10,000 hot matches in 366ms, which is different work. This single
+      cache-sensitive run confirms no-hit latency remains a profiling target,
+      not a broad performance claim. The stale-index symlink escape was still
+      rejected. Zed schedules snapshot-backed file scans on its shared
+      background executor; AHEAD uses a cached path index and shared bounded
+      Rayon pool. Profile secure per-file opens and ordered result delivery
+      before changing those boundaries. A later paired rerun on the current
+      integrated binary indexed in 519ms and measured AHEAD/ripgrep no-hit
+      medians of 704/632ms across five alternating samples. AHEAD took 1.116s
+      to return its capped 5,000 matches; ripgrep counted all 10,000 hot
+      matches in 569ms, which is different work. The stale-index symlink escape
+      was rejected and the disposable fixture/profile were removed. This
+      repeats a modest synthetic no-hit gap but does not justify changing the
+      secure-open or worker policy without component-level profiling.
+      A flat 10,000-file rerun then indexed in 730ms, measured five alternating
+      no-hit medians of 463ms for AHEAD versus 448ms for ripgrep, and took
+      4.587s to return AHEAD's 5,000-match cap. Ripgrep counted all 10,000 hot
+      matches in 517ms, so the hit timings do different work. A three-second
+      macOS sample during that capped query captured worker stacks in
+      `search_one_path`, the secure relative open/`openat`, and the grep reader;
+      it is not enough to attribute the dense-hit latency to any one stage. No
+      security-boundary or worker-policy change is justified yet. The stale
+      symlink escape remained rejected and the disposable fixture was cleaned.
+      Two immediate reruns of the same integrated binary indexed in 7.233s
+      (a cache-sensitive outlier) and 327ms. Their five alternating no-hit
+      medians were 572/366ms and 544/406ms for AHEAD/ripgrep; capped 5,000-hit
+      results took 919ms and 976ms for AHEAD, while ripgrep counted all 10,000
+      hot matches in 474ms and 397ms. The hit workloads differ. The fresh runs
+      repeat a no-hit gap but do not justify changing secure-open or worker
+      policy without component-level profiling; the stale-index symlink escape
+      remained rejected.
+      A later flat-directory run indexed in 332ms and returned AHEAD's capped
+      5,000 rich matches in 804ms. Five alternating no-hit samples measured
+      486ms for AHEAD versus 460ms for ripgrep; ripgrep counted all 10,000 hot
+      matches in 399ms, a different workload. This closer comparison shows
+      cache/host variability; the symlink escape remained rejected and the
+      disposable fixture was cleaned.
+      On 2026-10-26, a five-second macOS sample during a 10,000-file no-hit
+      search found secure `openat` traversal and handle cleanup in the worker
+      stacks. Added a per-batch cache for securely opened parent directories
+      (at most eight search paths), retaining no-follow directory and file
+      opens; the cache is dropped with each batch. The scale smoke now also
+      replaces an indexed parent directory with an outside symlink and confirms
+      that search does not read it. The same `just dev` loop rebuilt the app in
+      44.61s, and `cargo fmt --all -- --check` passed. Post-change nested runs
+      measured AHEAD/ripgrep no-hit medians of 587/568ms and 498/408ms; a flat
+      run measured 575/583ms. These cache-sensitive runs do not establish a
+      speedup or broad parity. Nested file and directory symlink checks passed;
+      keep production contention profiling open.
+      On 2026-10-27, the current integrated binary passed the 10,000-file
+      nested scale smoke: index build 319ms, median no-hit search 450ms across
+      three samples, and 749ms to return the 5,000-result cap. Replacing an
+      indexed file and parent directory with outside symlinks still produced
+      no escaped results. This run did not include a same-binary ripgrep
+      comparison; production contention profiling remains open.
+      The rebuilt source-current app runner also passed the Search panel
+      GPUI checks (9 search tests, including mutually exclusive Text/Word/Regex
+      modes and case independence), the three selected/all replacement tests,
+      and replace-next advancement/wrap (1/1). These verify headless search
+      interaction; rendered focus and large-result scrolling remain separate.
+      Corrected `tests/workspace-search-scale-smoke.mjs` so multiline and
+      capped-result scans are timed independently. The 2026-10-27 rerun on
+      10,000 nested files indexed in 495ms; after warmup, the multiline query
+      took 793ms, the 5,000-result query 551ms, and median no-hit took 800ms
+      versus 780ms for ripgrep. Ripgrep's full 10,000-match count took 884ms;
+      that is more work than AHEAD's capped result. Both stale-index symlink
+      checks passed. This single cache-sensitive run is diagnostic, not a
+      broad performance claim; mixed editor/agent contention remains open.
+      On 2026-10-29, the rebuilt `just dev` binary passed the current
+      10,000-file scale smoke: indexing took 652ms, multiline search 476ms,
+      returning the 5,000-result cap 429ms, and median no-hit search 451ms
+      across three samples. Stale indexed file and parent-directory symlink
+      escapes were rejected. Source review confirms the Search panel consumes
+      per-file result batches as they arrive and renders only its current page
+      through GPUI `uniform_list`; actual native scrolling with 5,000 matches
+      and editor/agent contention remain to verify. This is one synthetic
+      host run, not a general performance claim.
+      After the subsequent `just dev` rebuild, the 10,000-file smoke passed
+      again: indexing 395ms, multiline search 456ms, capped 5,000-result search
+      220ms, and median no-hit 392ms; the stale-index symlink escape was
+      rejected. The source-matched GPUI test that types `console.log` then `(`
+      in separate Text-mode input events also passed 1/1 without a regex error.
+      These are synthetic/backend and headless UI checks; rendered search
+      behavior remains a separate acceptance.
+      Re-ran `tests/workspace-search-scale-smoke.mjs` against the current
+      watcher-built binary after the literal-parenthesis report: `console.log(`
+      matched once and `consoleXlog` did not; 10,000-file indexing took 691ms,
+      multiline search 482ms, the 5,000-result cap 255ms, and median no-hit
+      search 370ms. Stale-index symlink escape was rejected. This remains
+      disposable backend evidence; the Mac is still locked, so I could not
+      inspect the rendered Search panel.
+      On 2026-11-02, the same 19:07:54 integrated binary passed the current
+      10,000-file scale smoke: indexing 311ms, multiline search 307ms, capped
+      5,000-result search 305ms, median no-hit 372ms across three samples, and
+      stale-index symlink escape rejection. This is one synthetic host run;
+      native large-result rendering and concurrent editor/agent contention
+      remain open.
 - [ ] Add an optional watch/restart action for parsed just recipes using
       watchexec's supervisor/process-group and clear-screen support; direct
       recipe runs should remain the default. The Tasks panel now has a
@@ -8261,6 +12189,11 @@ It also passed four source-matched app regressions: directory launch,
       remains unchanged. A GPUI regression covers Watch dispatch and a command
       test covers shell-safe recipe/justfile names. Watching requires
       `watchexec` on PATH; native task restart behavior remains for user review.
+      On 2026-10-29, running `verify-python` in the native disposable app opened
+      a separate terminal tab titled `verify-python` and completed its one
+      Python test successfully. The same render confirmed long workspace paths
+      ellipsize on one line while Run and Watch controls stay visible. Native
+      Watch/restart behavior remains open.
 - [ ] Port a Git source-control/review view with changed files, diffs,
       stage/unstage, commit, branches and conflicts; preserve AHEAD anchors,
       attribution and session trailers. `Commit Staged` now calls an acknowledged
@@ -8353,6 +12286,32 @@ It also passed four source-matched app regressions: directory launch,
       caret; standard and diff3 marker blocks are handled, and the resolution
       remains an unsaved buffer edit until the user reviews and stages it.
       Parser and GPUI interaction regressions were added but not run.
+
+      On 2026-10-30, direct execution of source-current test binaries passed
+      26 proxy tests matching `git` (including branch, push, patch, status,
+      askpass and instruction-root cases), 11 matching `commit` (including
+      anchor attribution, hook failure and conflict refusal), all 33
+      `workspace_panels::tests`, nine Git client-RPC tests, five editor
+      conflict tests and three Git-marker tests. These runs supersede the
+      earlier "not run" notes for those regressions. They do not verify native
+      source-control interactions or HTTPS/SSH credential prompts.
+
+      On 2026-10-29, `tests/git-source-control-smoke.mjs target/debug/ahead`
+      passed against a fresh disposable project and two local bare remotes.
+      It exercised status, working diff, per-file stage/unstage, Stage All,
+      commit/history/patch, publish and push, branch create/checkout/delete,
+      merge-conflict protection and resolution. It also confirmed AHEAD's
+      `.ahead/.gitignore` bootstrap behavior. This verifies the live proxy and
+      Git subprocess path; native GPUI rendering, conflict-resolution UI, and
+      HTTPS/SSH authentication remain unverified. The focused proxy/RPC/GPUI
+      regressions and platform-specific askpass flow still need their own runs.
+      Repeated on 2026-10-30 against the current watcher-built `ahead` binary
+      after the retained-config edits: the complete disposable workflow passed
+      again in 9.8 seconds. The smoke removed its temporary repository and
+      local remotes; rendered and remote-authentication gates remain open.
+
+## Pull request review milestone (post-MVP)
+
 - [ ] Add a distinct pull-request review work type: open an immutable base/head
       snapshot, show each change in the context of the entire file, and let a
       human use the active AHEAD agent to interrogate the change with the
@@ -8364,6 +12323,9 @@ It also passed four source-matched app regressions: directory launch,
       Support handoff back to the originating work rather than treating GitHub's
       line-diff view as the canonical review experience; do not gate or perform
       the repository merge or require a second reviewer universally.
+
+## Debugger milestone (post-MVP)
+
 - [ ] Port Zed's high-fidelity DAP debugger surface: sessions, breakpoints,
       threads, stack frames, scopes, variables, stepping, source mapping and
       verified state. Carry upstream tests and add AHEAD policy/session tests.
@@ -8463,24 +12425,81 @@ It also passed four source-matched app regressions: directory launch,
       The rebuilt-proxy standalone shutdown smoke passes all three disposable
       mock adapter modes. The separate native mock probe above exercises
       `runInTerminal`, but not a real debuggee.
+## Terminal and agent-panel acceptance
+
 - [ ] Verify the new Zed-style terminal-tab rename flow and finish native
       resize/reflow and close/quit acceptance. Allow selected terminal output
-      to attach to the AHEAD agent panel as context. `@terminal` now prefers
+      to attach to the AHEAD agent panel as context.
+      Terminal grid sizing now uses `f32::next_up()` before flooring exact-fit
+      dimensions, matching Zed's `TerminalBounds::num_lines/num_columns`. Added
+      a regression for an 11px font where five exact columns otherwise divide
+      to just under five. The source-matched app runner passes that focused
+      test; native resize/reflow acceptance remains open.
+      On 2026-10-30, a PTY-backed Unix regression narrowed a live shell from
+      120 to 10 columns, then widened it to 80. The Alacritty grid and PTY
+      accepted both sizes and retained the printed output through reflow
+      (`resizing_the_pty_reflows_output_without_losing_it`, 1/1). This follows
+      Zed's `terminal/src/terminal.rs::set_size` cell-count behavior; dragging
+      the native panel and checking visual reflow remain open.
+      `@terminal` now prefers
       non-empty selected text, falls back to bounded recent output, and labels
-      which source was attached; the focused selection/fallback regression is
-      added but has not been run. Source also adds the
-      right-click `Rename Terminal` action and inline title editor, with Enter/
-      Save to apply and Esc/Cancel to preserve the prior title; a focused
-      title-state regression covers custom, dynamic and cleared names.
+      which source was attached; the focused selection/fallback regression
+      passed in the source-matched 2026-10-28 backend tests below. Source also
+      adds the right-click `Rename Terminal` action and inline title editor,
+      with Enter/Save to apply and Esc/Cancel to preserve the prior title. The
+      focused title-state regression covers custom, dynamic and cleared names and
+      passed in the source-matched 2026-10-28 panel tests below.
+      On 2026-10-27, running `verify-python` from the disposable project's
+      Tasks panel opened a fresh PTY and the justfile recipe passed its Python
+      test. The terminal rename field was prefilled with `verify-python`.
+      The adjacent shell's full OSC title had consumed the tab strip, hiding
+      the recipe title. The terminal tab now uses a stable shell-and-index
+      label for ordinary terminals and the custom recipe title for task
+      terminals. A fresh native run visibly showed `verify-python` beside the
+      unchanged `zsh 1` tab. The recipe test output rendered in the PTY;
+      selecting output, Cmd+C, and Cmd+V back into the prompt pasted the copied
+      text, and Ctrl+C cleared the unsent command. Its focused
+      title/tab-label unit test and real-PTY
+      `app::lifecycle_tests::just_tasks_open_fresh_named_terminals` both pass
+      (1 test each, 424 filtered out); the lifecycle assertion reads the
+      `Panel::tab_name()` presented to the dock. The shared `just dev` app
+      rebuilds passed in 12.1s and 3.13s. The native app reopened to its
+      workspace picker after restart, and the UI bridge timed out before I
+      could reopen the approved fixture; the later rendered run above confirms
+      the corrected task-tab caption.
       `rustfmt` and `git diff --check` pass, but the latest `target/debug/ahead`
       (19:37) and app test binary (19:36) predate this source edit (20:04), so
       they are not build evidence.
       The inline rename state now hides the terminal-close X so its Cancel X is
       the only close-shaped control; rendered confirmation remains part of
       native acceptance.
-      The existing dev-loop handle remains live but has emitted no rebuild
-      output; process inspection is denied. Reuse that loop for compilation and
-      perform the native interaction check after the desktop is unlocked.
+      Rechecked on 2026-10-29 in the current shared `just dev` app on the
+      disposable `ahead-lsp-smoke-ocUYn6` project: pasted and ran a harmless
+      `printf` command in the zsh PTY, copied a selected output range with
+      Cmd+C and pasted it into `echo` with Cmd+V, and interrupted `sleep 30`
+      with Ctrl+C back to a fresh prompt. No project files were changed. Native
+      resize/reflow, close/quit and terminal-output context attachment remain
+      open.
+      The corrected task-tab caption, command dispatch, and macOS terminal
+      copy/paste are now confirmed natively; Linux/Windows behavior and other
+      close/quit acceptance remain open. On 2026-10-28, pasted a harmless
+      `printf` command into the integrated terminal in the current disposable
+      workspace and ran it; the expected `AHEAD_TERMINAL_PASTE_OK` output
+      appeared in the PTY. This independently reconfirms paste-to-shell
+      behavior, not cross-platform clipboard or resize/close acceptance.
+      On 2026-10-29, the current native app again ran `verify-python` from the
+      Tasks panel: it opened a separate terminal tab titled `verify-python`,
+      beside the existing `zsh 1` tab, and the recipe reported one passing test.
+      In that PTY, Cmd+C copied a printed token and Cmd+V pasted it into a
+      `printf` command that echoed the same token. This confirms the current
+      macOS task-title and clipboard round-trip paths; resize/close and other
+      platform acceptance remain open.
+      Rechecked after the 09:54 rebuild on the same fixture: UI paste ran
+      `printf 'AHEAD_PTY_PASTE_OK\\n'` and the PTY printed the sentinel; a
+      selected terminal-text Cmd+C/Cmd+V round-trip appeared at the prompt and
+      Ctrl+C canceled it without execution. Starship warned that its
+      `/opt/homebrew/bin/node` prompt probe timed out; no fixture source files
+      changed.
       Separate terminal panels already appear as tabs in the bottom
       `DockLayout`.
       `ahead-app/src/terminal.rs` now retains the Alacritty IO handle, terminates
@@ -8496,6 +12515,16 @@ It also passed four source-matched app regressions: directory launch,
       close/window close/quit after
       rebuilding. Also verify Linux/Windows, detached jobs, an IO thread
       that fails to return, and native quit within GPUI's short hook deadline.
+      On 2026-10-30, three `verify-python` watch tasks remained alive after
+      their terminal tabs closed in the disposable project. Their PTY file
+      descriptors were revoked and each had a separate process group within
+      its original terminal session. Shutdown now enumerates and terminates
+      every group still in that session on a background thread, including
+      groups left after the shell exits. The focused real-PTY regressions for
+      foreground, background, and orphaned background jobs pass (3/3), and
+      all 15 terminal-backend tests pass. Verify task-tab close and watch-task
+      cleanup in the native app;
+      the desktop was locked during this source-level check.
       Rechecked 2026-10-08 18:58 EDT using the existing app test runner built
       at 15:18, newer than `terminal.rs` (07:40) and `terminal_panel.rs` (09:25):
       all 31 `terminal_` tests passed serially without Cargo. This covers the
@@ -8518,32 +12547,123 @@ It also passed four source-matched app regressions: directory launch,
       shell-safe paths, input/mouse handling and cleanup. No Cargo command was
       started; native OS clipboard/menu rendering and window lifecycle remain
       unverified while macOS is locked.
-- [ ] Review the tracked root `alacritty.recording` before removing it from
-      version control. Earlier terminal runs modified this file, and it may
-      contain PTY output. AHEAD no longer enables Alacritty's reference-test
-      recording, but the existing file has been preserved untouched.
+      On 2026-10-26, the focused real-PTY
+      `app::lifecycle_tests::just_tasks_open_fresh_named_terminals` test passed
+      1/1 after a source-current test-profile build. It verifies that a Just
+      recipe's terminal keeps the recipe title even after the shell reports its
+      own title. The shared `just dev` loop was restarted on the same disposable
+      project; the integrated build completed in 2.55s and the proxy entered
+      its main loop. The desktop remains locked, so rendered title acceptance
+      is still open.
+      On 2026-10-28, source-matched runner
+      `target/debug/deps/ahead_app-ae401acfe1bf5540` (built 15:48, newer than
+      `terminal.rs` and `terminal_panel.rs`) passed 12 backend and 21 panel
+      terminal tests serially. Coverage includes selected-output/fallback
+      agent context, context bounds, PTY copy/paste, shell-safe path paste,
+      Ctrl+C, OSC 52, mouse input, title handling and shell editing. This does
+      not cover native window resize/reflow, OS clipboard/menu rendering or
+      window close/quit.
+      On 2026-10-30, the source-current app test target passed
+      `terminal_tabs_close_from_the_tab_and_right_click_menu` (1/1): the tab X
+      shut down only its PTY, and right-click > Close shut down the selected
+      terminal. The rebuilt native app visibly rendered the X beside `zsh 1`
+      in the disposable project. Native window close/quit and resize/reflow
+      remain open.
+      Follow-up on 2026-10-30: the focused terminal tab lifecycle tests pass
+      with the middle-click close and Close Clean actions. In the rebuilt native
+      app, the tab X closed only the selected PTY; right-click exposed New,
+      Rename, Close, Close Others, Close Left/Right, Close Clean and Close All.
+      Right-click Close removed one tab, and Close Clean removed all tabs. The
+      desktop automation did not deliver a reliable middle-click, so that
+      gesture has headless GPUI coverage only. Window close/quit and
+      resize/reflow remain open.
+      Rechecked directly against `target/debug/deps/ahead_app-2867482f11cd4168`
+      (built at 20:43, newer than `terminal_panel.rs` and
+      `app_lifecycle_tests.rs`): all three `terminal_tab`-filtered tests passed
+      serially, covering tab-X close, middle-click close, right-click Close and
+      bulk-close actions. This is headless interaction evidence; native window
+      close/quit, resize/reflow and OS menu rendering remain open while the
+      desktop is locked.
+      The same source-current runner passed all 50 `terminal`-filtered tests
+      serially in 8.21s, covering PTY resize/reflow, shell input and shortcuts,
+      clipboard paths, task terminals, selected-output context, mouse modes,
+      tab closing and process-group cleanup. No Cargo build was started. Native
+      window close/quit and OS integration remain open.
+      The terminal content menu now also offers Zed's **Clear** and **Close
+      Terminal Tab** actions. Clear removes scrollback while retaining the
+      current command line; its focused Rust test passes. Close uses the
+      existing PTY-aware handler. The shared `just dev` build passes; verify
+      these new menu actions in the native app.
+      Zed's focus-aware close shortcut is now wired for editor and terminal
+      tabs: Cmd+W on macOS, Ctrl+W for editors on Linux/Windows, and Ctrl+F4
+      for their terminals so Ctrl+W still reaches the shell. Two focused GPUI
+      lifecycle tests pass for terminal/editor focus and PTY shutdown; the
+      shortcut-mapping test passes. Verify native key delivery after unlock.
+      In the current native `just dev` app on 2026-10-30, `stty size` in the
+      disposable project's zsh PTY changed from `9 81` to `18 81` after the
+      bottom pane grew, then to `18 105` after the app window widened. The
+      prompt visibly reflowed at both widths and returned to the narrower
+      layout when the window was restored. The automated drag did not reliably
+      shrink the bottom pane again, so bidirectional divider behavior and
+      native window close/quit still need checking. No project files changed.
 - [ ] Polish the AHEAD agent panel with streamed Markdown/code rendering,
       follow-tail, cancellation, durable reopen/retry and terminal context.
       Assistant messages now use gpui-kit Markdown streaming fades and each
       fenced code block has its own copy control, following Zed's conversation
       renderer without adding a second Markdown parser. A focused GPUI source
-      regression was added but not run. Native streamed rendering remains for
+      regression and the composer Enter/Shift+Enter test pass in the
+      source-current 423-test app suite. Native streamed rendering remains for
       the user's walkthrough.
       Terminal context is now an explicit `@terminal` or Add context attachment
       from the active PTY, bounded to 120 lines/16 KiB, removable in the
       composer, and labeled as untrusted context in the managed prompt. Native
       attachment rendering and a user-selected terminal-to-session turn remain
-      for the user's walkthrough.
-- [ ] Complete the single-human-plus-agent full-duplex journey under
-      [Session voice calls](#session-voice-calls). Defer group audio until the
-      single-user flow is reliable; existing shared text sessions remain separate.
+      for the user's walkthrough. The source-current suite also passes the
+      terminal-context selection/fallback and UTF-8 size-boundary tests.
+      On 2026-10-30, the selected-code chip stopped calling `turn_context` on
+      every composer render; it now reads the selection and UTF-16 line positions
+      from the editor rope without copying the full file. The full snapshot is
+      still captured when a turn is sent. The shared `just dev` build and the
+      focused GPUI selection/chip tests passed. Measure native large-file
+      composer latency before closing the responsiveness concern. Generic chat
+      sends now skip the full editor snapshot when there is no selection,
+      `@currentFile`, or voice focus; verify that send path in the app.
+- [ ] Bound explicit chat file context before Turso turn-request persistence and
+      model dispatch. The source now follows `../zed/crates/agent/src/outline.rs`:
+      files over 16 KiB (or a smaller model-aware threshold) become a labeled
+      LSP outline or first-1 KiB excerpt, exact selections are persisted without
+      the whole editor buffer, and the managed turn checks item and total prompt
+      limits before saving to Turso. The composer announces substitutions and
+      the file picker reports unreadable/oversized attachments. All 29
+      `ahead-rpc` library tests passed. On 2026-10-30 the focused app tests
+      for large-file labeling, explicit `@currentFile` context, and cancellation
+      or session switch during a pending LSP outline lookup passed. The managed
+      runtime test confirmed oversized context cannot start or persist a turn.
+      The integrated binary and Code Mode host rebuilt with pinned V8 assets;
+      the source-current disposable Code Mode smoke passed delegated search,
+      cancellation, Turso reopen/retry and scope denials. Run a real large-file
+      send in the disposable app and verify the error/outline UI once the Mac
+      is unlocked. A managed read-only memory review now accepts a complete
+      snapshot up to the existing 32 KiB memory-document limit; other file
+      attachments retain the 16 KiB item limit, and the model prompt budget
+      still applies. The disposable Code Mode smoke now sends a complete
+      >16 KiB memory review and checks the ordinary-turn rejection. On
+      2026-11-02, after the shared `just dev` rebuild, the smoke passed against
+      `target/debug/ahead`; inspection of its loopback provider request
+      confirmed the complete snapshot arrived. Native memory review and a real
+      large-file send in the disposable app remain before closing this item.
+      Remove it
+      only when those checks pass.
+
+## Editor polish and deferred workspace scope
+
 - [ ] Keep all new editor chrome on GPUI/gpui-kit theme tokens and use familiar
       VS Code keybindings where they do not conflict with AHEAD actions.
 - [ ] Defer remote/Kubernetes development, broad customization/profiles,
       arbitrary VS Code extension hosting and symbol outline until the core
       editor parity loop is working.
 
-## Multiplayer collaboration
+## Multiplayer milestone (post-MVP)
 
 - [ ] Finish session code comments in `ahead-app/src/code_panel.rs` and
       `ahead-app/src/session_panel.rs`: gutter range rails, an editor side panel
@@ -8557,7 +12677,14 @@ It also passed four source-matched app regressions: directory launch,
       synchronize and enforce participant roles. The host session panel now
       refreshes remote comments in the background while sharing; a headless
       two-window test proves a guest comment reaches the host navigator and
-      guest poll. Verify the rendered multi-client comment journey. Before the
+      guest poll. Verify the rendered multi-client comment journey. On
+      2026-10-30, the selected-line Add Comment icon was placed in a centered
+      child within its gpui-kit button. The focused GPUI interaction test passes
+      against the current source and the integrated binary rebuilt. On
+      2026-11-02, an earlier unlocked-app capture appeared centered in both
+      axes. A later screenshot exposed a remaining optical offset; the latest
+      gpui-kit icon-slot change and its native screenshot check are tracked below.
+      Before the
       2026-10-14 session-gating change, Add Comment was always visible as a
       labeled gpui-kit primary button and explained missing prerequisites in
       its tooltip; that behavior is historical, not current. Existing
@@ -8699,7 +12826,65 @@ It also passed four source-matched app regressions: directory launch,
       does not verify native rendered UI behavior. External ACP sessions are
       now excluded from editor comment context, and the proxy rejects comment
       list/create/resolve requests for external-agent bindings; focused app and
-      proxy regressions were added but have not been run.
+      proxy regressions were added but have not been run. On 2026-10-27 in the
+      approved disposable project, a fresh managed AHEAD session accepted a
+      selected-line comment, displayed its author and line range, and resolved
+      it. An older restored session correctly rejected a non-participant. This
+      verifies native single-client create/resolve and participant gating;
+      rendered multi-client propagation remains open. A fresh 2026-10-27
+      native check also confirmed the labeled Add Comment action is present
+      for a managed AHEAD session and absent for the Pi ACP thread; no external
+      turn was sent. On 2026-10-30, the current `just dev` build in the
+      disposable `ahead-editor-smoke.0Hepwq/project` visibly rendered the
+      selected-code Add Comment marker in its gutter button. The
+      marker used gpui-kit `Button::icon` for the purple button and glyph;
+      the source-current `code_comment_actions_require_a_session_and_fit_the_gutter`
+      test passed with a button-to-gutter center assertion. This verifies
+      single-client marker placement, not the deferred multiplayer journey.
+      Follow-up to the user's 2026-10-30 screenshot: the current marker uses
+      gpui-kit's centered icon button without a manual position offset. Its
+      focused GPUI test passes for button and gutter bounds. Recheck the
+      rebuilt native marker: the assertion covers the button box, not the
+      visible SVG strokes. On 2026-11-02, a new screenshot still showed the
+      glyph artwork offset, so the button now centers a 14px icon box inside
+      its full-size content and removes the manual translation. The focused
+      GPUI test measures that icon box against the button center and passes
+      (1/1) after the adjustment. `cargo fmt --all -- --check` passes, and the
+      shared `just dev` loop rebuilt the app and returned the proxy to its main
+      loop. A fresh native screenshot is still needed to confirm the SVG
+      artwork itself. On 2026-11-02, another screenshot showed the glyph strokes
+      still optically high and left, so the glyph received a 2px right/down
+      correction; the existing shared `just dev` loop rebuilt the app in 10.73s.
+      The latest screenshot still showed a slight high-left offset, so this was
+      increased to 3px right/down. The shared dev loop rebuilt successfully;
+      native screenshot confirmation is pending because macOS is locked.
+      Follow-up to the user's latest screenshot: replaced the nested,
+      manually-positioned glyph with gpui-kit's `Button::icon(MessageSquarePlus)`
+      so the purple gutter control uses the component's centered icon slot.
+      The existing GPUI test still asserts button-to-gutter alignment; it does
+      not measure the SVG strokes. The shared `just dev` rebuild succeeded;
+      `impeccable detect` and `git diff --check` are clean. A fresh rendered
+      screenshot is still needed because the Mac is locked.
+      The next screenshot still showed the glyph high and left. Kept the button
+      centered, restored a 3 px right/down optical correction inside its icon
+      slot, and extended the focused GPUI assertion to cover that offset.
+      The focused GPUI interaction test passed (1/1); its first build exposed
+      missing ACP helper imports in the existing session-panel tests, which are
+      now fixed. `rustfmt --check` and `git diff --check` pass. The shared
+      serial `ahead-app` suite passed all 500 tests in 70.50s. Restarted the
+      shared `just dev` loop on the same disposable project; its integrated
+      app rebuilt in 1.28s, then rebuilt after import formatting in 10.54s and
+      its proxy re-entered the main loop. Native pixel verification remains
+      open while macOS is locked.
+      Follow-up on 2026-11-03: the current source had lost the optical offset
+      despite the user's latest screenshot still showing a high-left glyph.
+      Restored the centered icon frame with a 3px right/down glyph correction
+      and added a focused GPUI assertion for that exact geometry. Formatting and
+      diff checks pass. After clearing only the generated language-server cache
+      in the disposable profile, the active watcher compiled `ahead-app` but
+      could not link the final `ahead` executable because the volume is full.
+      No fresh screenshot or focused test result is available.
+      The multiplayer comment journey remains open.
 - [ ] Build a host-authoritative, cloudless multiplayer session for AHEAD chat,
       code and terminal surfaces. Share only from an active managed AHEAD
       session; its owner hosts the worktree, agent and provider account, so
@@ -8835,8 +13020,10 @@ It also passed four source-matched app regressions: directory launch,
       hover target and tooltip in one freshly rebuilt native AHEAD process
       against the disposable multi-language project. The current gutter is 23
       logical pixels wide with a 20px breakpoint/action area and shared 3px
-      indicator rail; the latest width/hit-target assertions were updated but
-      not run. Earlier 26px-gutter test evidence below predates this change.
+      indicator rail; the source-current GPUI test asserts this exact sizing
+      and separate Git/breakpoint hit targets. The breakpoint button carries an
+      F9 plus line-number tooltip. Earlier 26px-gutter test evidence below
+      predates this change.
       The full 214-test app library suite passes with loopback-enabled local
       mocks on 2026-10-03. An isolated
       native copy opened the hunk card on Git-marker click
@@ -8872,7 +13059,19 @@ It also passed four source-matched app regressions: directory launch,
       separate change-marker hit target and modified/deleted hunk preview all
       pass (3/3). This confirms debounce and retention under rapid edits in the
       headless harness; sustained native typing/marker stability and the
-      breakpoint hover tooltip remain unverified while macOS is locked.
+      breakpoint hover tooltip remain unverified while macOS is locked. On
+      2026-10-26, direct execution of the source-current app runner (16:58,
+      newer than `code_panel.rs` at 15:37) passed the marker preview, separate
+      breakpoint hit target, session-required comment action, and hunk-geometry
+      stability tests (4/4). This remains headless evidence; the rendered
+      tooltip, cursor and sustained-typing appearance still need native review.
+      On 2026-10-27, the source-current `ahead_app-a284c6e65a113f9b` runner
+      passed all 82 `code_panel::tests` serially. This includes session-gated
+      comments, distinct Git/breakpoint hit targets, diff-hunk previews,
+      metadata debounce/stale-reply handling, inline blame, above-caret LSP
+      completion, signature help and extension syntax ranges. These remain
+      headless checks; native hover/tooltips and sustained-typing appearance
+      still need rendered review.
 - [ ] Managed AHEAD runtime file-change completion now records `ahead` anchors from
       applied diffs. The managed-loop integration test now runs by default with
       an offline loopback Responses mock, including the startup /models request
@@ -8937,6 +13136,14 @@ It also passed four source-matched app regressions: directory launch,
       loopback permission, made no external request, and removed its disposable
       project/profile. This remains headless synthetic-provider evidence; the
       rendered gutter-to-user-commit flow is still open.
+      Revalidated on 2026-10-30 against the watcher-built integrated binary:
+      the disposable attribution smoke passed shell-write denial, a Code Mode
+      edit and a direct `apply_patch` tool edit. Both edits produced matching
+      Turso anchors; staged commits used `ahead` as author, the human as
+      committer, and an AHEAD session trailer, then cleared the committed
+      anchors. The focused GPUI gutter-row test passed on 2026-10-29. This
+      remains synthetic-provider and headless evidence; native gutter rendering
+      is still open.
 - [ ] Verify the existing proxy `GitCommit` route against a real user-driven
       commit with live anchors; its git2 path is now unit-tested to set
       `author = ahead`, preserve the human committer, include the session
@@ -8996,7 +13203,7 @@ It also passed four source-matched app regressions: directory launch,
       The trigger's accessible label includes the selected model, provider and
       reasoning effort so the compact visual control retains its full meaning.
       A focused unit regression covers populated and loading-state labels; it
-      has not been run against the current source.
+      was included in the source-matched rerun recorded below.
       The same popover now remains stable when the selected model has not
       loaded or does not advertise reasoning levels; only the model row appears
       until effort controls are available. A GPUI regression covers both states.
@@ -9009,6 +13216,21 @@ It also passed four source-matched app regressions: directory launch,
       The provider-search GPUI test now checks the single-popover behavior before
       and after reasoning metadata arrives. Focused persistence and capability-
       selection tests remain unrun after this change; native rendering is open.
+      On 2026-10-28, source-matched runner
+      `ahead_app-b6526016c2642312` passed all 77 `session_panel::tests`,
+      including managed and ACP reasoning options, provider/model search,
+      picker loading, and context-meter selection. The source-matched
+      `app::lifecycle_tests::empty_agent_panel_routes_ahead_and_external_start_actions`
+      also passed (1/1), clicking New AHEAD, External ACP and Join while the
+      right dock was zoomed. These are headless GPUI checks; fresh native
+      rendering remains open.
+      On 2026-10-28, the rebuilt native app in the disposable multi-language
+      workspace opened the New AHEAD setup flow, advanced through its review,
+      and started a session. Its composer opened the searchable model picker;
+      filtering `deep` showed the cached `deepseek-coder` option. The provider
+      endpoint was unavailable, so no inference or reasoning-level transition
+      was attempted. Native session creation and model search are confirmed;
+      reasoning controls and narrow-width rendering remain open.
       On 2026-10-20, restored the Codex-style hierarchy: the compact trigger
       opens one effort-first gpui-kit popover, and its selected-model row opens
       the searchable model list. This keeps effort and model choice together
@@ -9125,6 +13347,12 @@ It also passed four source-matched app regressions: directory launch,
       containment, slash-token filtering, skill metadata filtering/insertion,
       and keyboard navigation/escape tests (1/1 each). These headless checks do
       not verify native menu focus or appearance.
+      On 2026-10-28, the source-matched app runner
+      `target/debug/deps/ahead_app-ae401acfe1bf5540` (newer than
+      `session_panel.rs`) passed all 78 `session_panel::tests` serially,
+      including the combined model/effort selector, provider/model search,
+      context-window precedence, context-meter sizing and chat controls. Native
+      rendering and an authenticated provider turn remain open.
 - [ ] Verify the settings-to-managed-provider path in a running GPUI app. Settings
       supports editable per-provider model catalogs and authenticated OpenAI-
       compatible `/models` discovery; stale discovery responses are discarded
@@ -9143,7 +13371,14 @@ It also passed four source-matched app regressions: directory launch,
       picker open/reopen, no duplicate pass from rerendering or filtering, and
       provider-name search/selection. The watcher is being restarted on its
       disposable project. A native-window bind timed out; rendered picker
-      behavior remains unverified.
+      behavior remains unverified. On 2026-10-27, the model picker delegate
+      moved fuzzy matching to GPUI's background executor using the existing
+      Nucleo matcher. Model-name hits rank before provider/model-ID metadata,
+      while the GPUI-kit grouped virtual list is retained. Focused tests for
+      punctuation-tolerant model-name matching and provider-only matching were
+      added but not run; the shared `just dev` watcher rebuilt and relaunched
+      the app. Native inspection timed out in macOS ViewBridge, so rendered
+      filtering and ranking remain unverified.
       Per-connection
       `hidden_models` preferences default to empty (show all); Settings groups
       each provider's configured and discovered model ids in a collapsed,
@@ -9261,6 +13496,15 @@ It also passed four source-matched app regressions: directory launch,
       prompt. Native install/reconnect, picker rendering and authenticated
       turns remain open. The final-source agent suite passes 169 tests (four
       opt-in ignored); the strict registry test passed separately in 32.07s.
+      On 2026-10-30, the watcher-built integrated binary passed
+      `tests/agent-acp-install-smoke.mjs` for all three curated adapters in
+      disposable profiles. It installed Pi ACP 0.0.34, Codex ACP 2.5.0 and
+      Claude ACP 0.99.1, prepared and reconnected sessions, verified installed
+      provenance, then uninstalled each. Pi and Codex correctly advertised
+      authentication requirements without credentials; Claude exposed five
+      config options, accepted an alternate model, and restored that selection
+      after reconnect. This sends no model prompt and does not establish native
+      picker rendering, authenticated turns or cancellation.
       Config-option completion now checks the active session and request
       generation so a delayed result cannot overwrite a newer selection's
       status; `config_option_results_ignore_older_requests_and_other_sessions`
@@ -9455,6 +13699,111 @@ It also passed four source-matched app regressions: directory launch,
       acknowledgements, picker/install error recovery, and stale adapter/session
       replies in the GPUI harness; native installation and reconnect rendering
       remain unverified.
+      On 2026-10-26, `tests/agent-acp-install-smoke.mjs` installed the three
+      curated agents from the ACP registry in isolated temporary profiles using
+      the integrated binary built at 17:35. Pi 0.0.34 and Codex ACP 2.3.0
+      launched and returned their expected authentication-required states
+      without user credentials or prompts. Claude Agent ACP 0.94.0 launched
+      and advertised four config options. Installed provenance was recorded,
+      and successful runs removed their temporary profiles. This verifies
+      registry-backed install and ACP session preparation; it does not verify
+      rendered install/reconnect UI, model selection across restore, or
+      authenticated turns, streaming and cancellation. No Cargo build ran.
+      A fresh profile initially returned pinned fallback versions while its
+      background registry fetch continued; this let the install screen become
+      interactive before current registry entries were available. Zed's
+      `AgentRegistryStore` notifies observers after refresh; AHEAD had no
+      equivalent update to the open picker. The UI awaits a missing/stale
+      registry refresh off-thread and retains the last valid cache or pinned
+      fallback when offline. A 2026-10-26 source review found the catalog RPC
+      itself still ran inline on the serialized proxy dispatcher; it is now
+      routed through the existing background handler and has a focused routing
+      regression test. Rust verification of that test is pending because the
+      final app link ran out of disk space. The shared `just dev` loop rebuilt
+      the integrated binary at 18:32, then the fresh-profile smoke
+      listed and installed current registry versions Pi 0.0.34, Codex ACP
+      2.3.0, and Claude ACP 0.97.0. Pi/Codex initialized to their
+      authentication-required states; Claude ACP exposed five config options.
+      The temporary profiles were removed; no credentials or model prompts
+      were used. Rendered picker/login, authenticated turns, cancellation and
+      resume remain open. On the same binary, the disposable ACP smoke now
+      changes Claude's advertised model through `agent_config_option_set` and
+      waits for the updated config notification; Claude ACP 0.97.0 selected
+      Opus 5.5 and the targeted run exited cleanly. A full three-agent run
+      installed and initialized Pi 0.0.34 and Codex ACP 2.3.0 (both correctly
+      requested authentication) and also changed Claude's model, but its first
+      exit exposed a race while Claude wrote profile-local MCP logs. Cleanup now
+      retries for up to 30 seconds; the Claude-only rerun confirmed clean
+      teardown. A second full run stopped during Claude installation with
+      `ENOSPC` after the earlier package installs; its temporary profile was
+      removed. The smoke now uses a separate disposable profile per agent and
+      removes it before starting the next install. The complete three-agent
+      rerun then exited 0: Pi 0.0.34 and Codex ACP 2.3.0 initialized to their
+      expected authentication-required states; Claude ACP 0.97.0 exposed five
+      config options and accepted an alternate-model change to Opus 5.5. All
+      three profiles were removed, `node --check` passed, and no Cargo build or
+      provider prompt was used. Authenticated Codex/Claude turns, native
+      install/picker UI, streaming and cancellation remain open. This evidence
+      supersedes the earlier full-run `ENOTEMPTY` and `ENOSPC` failures: each
+      adapter now gets a fresh profile that is removed before the next install.
+      On 2026-10-26, reran Pi alone against the integrated binary built at
+      19:16:45: the live catalog returned Pi 0.0.34, installation and ACP
+      initialization succeeded, and the agent requested authentication as
+      expected with no inherited credentials or prompt. The disposable profile
+      was removed; authenticated turns remain unverified.
+      At 20:21 ET, reran the full curated install smoke against the freshly
+      linked integrated binary: Pi 0.0.34 and Codex ACP 2.3.0 again requested
+      authentication; Claude ACP 0.97.0 exposed five config options and accepted
+      a live change to Opus 5.5. All isolated profiles were removed. This still
+      does not cover provider-backed turns or rendered install/reconnect UI.
+      On 2026-10-27, reran the isolated Pi-only smoke against the current
+      integrated binary. The live catalog resolved and installed `pi-acp`
+      0.0.34, the bridge launched the host Pi CLI and returned the expected
+      authentication-required state without credentials or a prompt. The
+      temporary project/profile was removed. This reconfirms registry install
+      and ACP launch, not native install/reconnect UI or an authenticated turn.
+      Latest 2026-10-28 rerun against `target/debug/ahead` rebuilt at 17:58:17:
+      Pi 0.0.34 and Codex ACP 2.3.0 installed and launched to authentication-
+      required state; Claude ACP 0.99.0 exposed five options and accepted a live
+      alternate-model update to Opus 5.5. The smoke exited 0, removed its
+      isolated profiles, and sent no prompts. `node --check` also passed.
+      Native install/reconnect UI and provider-backed turns, streaming, and
+      cancellation remain open. The source-current
+      `ahead_agent-edbf9874b28f8c82` runner (17:43, newer than the adapter
+      sources) also passed the ignored Pi offline model round-trip: it selected
+      an alternate advertised model, restarted the ACP process, loaded the same
+      session, and observed the saved model. The endpoint was unreachable and
+      `PI_OFFLINE=1`; no provider turn was sent.
+      On 2026-10-29, reran the full curated install smoke against the current
+      integrated binary: Pi 0.0.34 and Codex ACP 2.3.0 launched and requested
+      authentication; Claude ACP 0.99.0 exposed five config options and accepted
+      a live model change to Opus 5.5. The run exited 0 with isolated profiles
+      removed and no prompts sent. Native install/reconnect and provider-backed
+      turns remain open.
+      Rechecked on 2026-10-30 against the freshly rebuilt integrated binary:
+      live-registry installs launched Pi 0.0.34 and Codex ACP 2.5.0 to their
+      expected authentication prompts; Claude ACP 0.99.1 exposed five options
+      and accepted a change to Opus 5.5. All isolated profiles were removed;
+      the run sent no model prompts. Native install/reconnect remains open.
+      On 2026-10-30, the integrated live-turn mode installed Pi ACP 0.0.34,
+      selected the configured OpenRouter model through ACP, and completed its
+      authenticated no-tools turn with the expected response. The key was read
+      without terminal echo and redacted from captured output; the isolated
+      profile was removed. Authenticated Codex/Claude turns, rendered streaming,
+      and cancellation/resume remain open.
+      Also on 2026-10-30, the source-current
+      `ahead_agent-d65088789a03b888` runner passed all 43
+      `acp_client::tests` serially. Coverage includes streamed message deltas,
+      cancellation and shutdown, live config updates, auth methods, and unsaved
+      editor-buffer reads. This is headless protocol evidence; it does not close
+      the rendered chat, authenticated Codex/Claude, or resume acceptance gaps.
+      On 2026-11-02, reran `tests/agent-acp-install-smoke.mjs` against the
+      freshly rebuilt integrated binary: Pi 0.0.34 and Codex ACP 2.5.0 launched
+      to their expected authentication-required states and prepared again after
+      proxy restart; Claude ACP 0.100.0 exposed five options and accepted the
+      Opus 5.5 selection. The run exited successfully, removed all isolated
+      profiles, and sent no model prompt. Native install/reconnect rendering,
+      authenticated Codex/Claude turns, and streaming/cancellation remain open.
 - [ ] Verify native managed runtime fidelity on multi-tool turns, compaction,
       unsaved-buffer reads, unmapped runtime events, and model-specific tool
       selection against the pinned runtime. The managed `/compact` composer
@@ -9512,7 +13861,62 @@ It also passed four source-matched app regressions: directory launch,
       rendered an empty-agent-response placeholder; successful explicit
       compaction now stores and shows "Context compacted.". A rebuilt-app run
       rendered that notice, and it survived a process restart. Authenticated
-      provider and cancellation/retry compaction checks remain open.
+      provider compaction remains open.
+      On 2026-10-27, pre-sampling compaction now records the current workspace
+      context changes before checking the budget, and counts pending user input
+      plus selected skill text. When compaction clears the context baseline, the
+      current context is re-injected before sampling. An AHEAD-owned
+      mock-provider regression changes root `AGENTS.md` between turns so the
+      short prompt alone remains under budget but its workspace-context delta
+      crosses it; the test observes compaction before the next sample. The full
+      serial `ahead-agent` library suite passes (183 passed, 4 ignored). The
+      retained engine's standalone test target still fails to compile on
+      pre-existing missing dev dependencies and test errors. The focused app test for hiding
+      the numeric context count at narrow widths passed, and the composer now
+      uses runtime/model context metadata instead of the 32k display fallback.
+      The retained engine's focused test target currently fails during test
+      compilation on pre-existing missing dev dependencies and test errors;
+      the AHEAD app dev build compiles the runtime library. An AHEAD-owned
+      mock-provider regression now passes for current-context usage and
+      automatic pre-turn compaction when the next prompt crosses the threshold.
+      Re-ran `native_client::tests::compacts_before_sampling_when_workspace_context_changes_cross_the_limit`
+      directly from `target/debug/deps/ahead_agent-edbf9874b28f8c82` at 20:13
+      on 2026-10-27; the runner is newer than `native_client.rs` (18:30) and
+      `session/turn.rs` (18:33), and the focused test passed (1/1). This confirms
+      source-current loopback-model behavior; rendered composer and authenticated
+      provider compaction acceptance remain open.
+      On 2026-10-28, `node --check tests/agent-compaction-smoke.mjs` and
+      `node tests/agent-compaction-smoke.mjs target/debug/ahead` passed against
+      the watcher-built binary. With provider usage omitted and the selected
+      10k context window crossed by changed project instructions, the runtime
+      compacted before sampling, persisted the summary, then sent the summary,
+      refreshed `AGENTS.md`, and next user message in the follow-up request.
+      The loopback-only disposable project and profile were removed.
+      Re-ran the syntax check and smoke at 21:52 EST on 2026-11-02 against
+      `target/debug/ahead` (21:45), newer than the relevant app/runtime sources;
+      estimated usage, the effective model limit, automatic compaction, summary
+      persistence and clean shutdown passed again. The test's isolated project
+      and profile were removed. This remains local mock-provider evidence.
+      source-matched app runner `ahead_app-ae401acfe1bf5540` also passed the
+      selected-model context-window and narrow-width count tests (1/1 each).
+      This is offline acceptance; authenticated-provider and rendered composer
+      behavior remain open.
+      The app tests also confirm that a 272k model window resolves to the
+      runtime-reported 258.4k usable window and that unknown windows do not use
+      the old 32k fallback. Narrow composer rendering and authenticated
+      provider behavior still need a live-window pass. A fresh `just dev` run
+      on the disposable TypeScript/Python/Rust smoke project compiled the
+      integrated app and entered the proxy main loop; the desktop was locked in
+      this pass, so rendered resize behavior was not observed.
+      A timestamp check then showed the `ahead-agent` test executable predated
+      the current `ahead-agent-engine/core/src/session/turn.rs`. After pausing
+      the shared watcher, the focused compaction regression rebuilt `codex-core`
+      and `ahead-agent`; `compacts_before_sampling_when_workspace_context_changes_cross_the_limit`
+      passed (1 passed, 186 filtered out), as did
+      `managed_context_window_override_resets_to_startup_value` (1 passed).
+      The watcher restarted on the same disposable project and data home. This
+      is current-source offline evidence, not authenticated-provider or native
+      rendered acceptance.
       Directory-first CLI launch now selects that directory as the
       workspace without opening it as a file; the focused startup regression
       passes. On 2026-10-01 the rebuilt `just dev` app created and restored a
@@ -9554,6 +13958,12 @@ It also passed four source-matched app regressions: directory launch,
       `Reconnecting… waiting for network`; no tool calls or answer were
       observed. Auto-retry was left active. Do not count this as authenticated
       multi-tool acceptance.
+      Rechecked the freshly rebuilt integrated binary on 2026-10-30 with the
+      disposable Code Mode, MCP, memory, FIM and compaction smokes. They passed
+      delegated search/cancellation/Turso retry, MCP discovery/approval/cancel,
+      project/user memory review and reopen, session-bound FIM context, and
+      automatic compaction with summary persistence. These use local fixtures;
+      authenticated provider behavior and rendered chat remain open.
 - [ ] Durable messages are now persisted (`conversation_messages` table) and
       streamed into the panel. The panel renders headings, unordered/ordered
       lists, blockquotes, tables, emphasis, inline code, fenced code blocks and
@@ -9594,8 +14004,16 @@ It also passed four source-matched app regressions: directory launch,
       explicit Latest/Follow control and auto-follow during streamed updates;
       verify the control, manual scrolling, and jump-to-latest behavior in a
       running GPUI window.
+      The existing `ahead_app-a284c6e65a113f9b` runner passed
+      `session_panel::tests::streaming_chat_stays_responsive_with_a_delayed_history_reply`
+      (1/1) on 2026-10-26; this is headless responsiveness evidence, not a
+      rendered scroll-anchor or Latest/Follow check.
 - [ ] Enter-to-send is wired via `subscribe_in` on `InputEvent::PressEnter` but
       unverified in a running app. Confirm Shift+Enter inserts a newline.
+      On 2026-10-26, the existing `ahead_app-a284c6e65a113f9b` runner passed
+      `session_panel::tests::composer_shift_enter_inserts_newline_and_enter_submits`
+      (1/1); the runner is newer than `session_panel.rs`. This confirms the
+      GPUI action path, not rendered key handling in the locked desktop.
 - [ ] The `session_panel` -> proxy turn path now has a live managed streaming
       roundtrip, durable failed-turn persistence, explicit interrupted-turn
       retry and durable reopen verification. Still drive an authenticated turn
@@ -9647,6 +14065,11 @@ It also passed four source-matched app regressions: directory launch,
       without the injected trigger. Verify that a model tool call already in
       flight is cancelled or visibly attributed after a durable write failure;
       do not claim a failed turn is safe to replay automatically.
+      On 2026-11-02, the authenticated synthetic OpenRouter smoke passed with
+      streamed managed search/read/edit, Turso CodeAnchor and attributed Git
+      commit, context compaction, RPC cancellation, durable retry and cleanup.
+      The disposable credential/profile were removed. Rendered stop-button and
+      failure-detail behavior remain unverified while the Mac is locked.
 - [ ] Verify startup workspace selection in a running app. macOS LaunchServices
       starts the bundle with `/` as its working directory, so AHEAD now asks for
       one directory when no file/workspace argument was supplied and the cwd is
@@ -9814,6 +14237,20 @@ It also passed four source-matched app regressions: directory launch,
       fail-closed tool omission; the headless smoke above covers synthetic
       Code Mode execution, not an authenticated native turn. Do not depend on
       a Codex installation layout.
+      Rechecked on 2026-10-26 against the existing `target/debug/ahead` with
+      `rtk node tests/agent-code-mode-smoke.mjs target/debug/ahead`: the managed
+      Code Mode cell, eight concurrent delegated searches, cancellation, retry
+      after Turso reopen, and clean shutdown all passed. No Cargo build or
+      external credentials were used; the script removed its disposable
+      workspace and profile.
+      Rechecked on 2026-10-27 against the rebuilt `just dev` app binary: the
+      loopback-provider smoke also confirmed root/nested `AGENTS.md` and
+      project `.agents/skills/` instructions reached the first model request,
+      and no Codex installation ID was sent. Delegated search, cancellation,
+      Turso reopen/retry and clean shutdown passed; the disposable workspace
+      and profile were removed. The full current app and proxy suites also
+      passed (425 and 352 tests; one proxy test ignored). Authenticated provider
+      turns and rendered native chat remain separate acceptance gates.
 
 - [ ] Keep regression coverage for retained native-loop behavior in AHEAD-owned
       test targets; do not repair or restore the copied `codex-core` / `codex-mcp`
@@ -10041,7 +14478,17 @@ It also passed four source-matched app regressions: directory launch,
       and owner-configured roots remain. The active AHEAD executor uses one
       local environment; the remaining `TurnEnvironmentSelection` list and
       per-environment configuration lifecycle still need an AHEAD-owned
-      reduction. On 2026-10-04, the default-off `DeferredExecutor` feature,
+      reduction. Session settings now reject multiple selections and
+      non-local environment IDs before committing, preventing the local-only
+      manager from silently dropping unsupported environment state while
+      retaining the local workspace, permission and MCP configuration. On
+      2026-10-29, `just dev` compiled this runtime change successfully, but the
+      focused `cargo test --locked --offline -p codex-core` target fails during
+      test compilation with 259 errors, including missing test-only crates,
+      references to removed runtime types, and duplicate Tokio test attributes.
+      Prune or restore only the test support needed for retained behavior
+      before relying on the Codex-core test suite. On
+      2026-10-04, the default-off `DeferredExecutor` feature,
       model-visible `wait_for_environment` tool/configuration, remote-startup
       prompt fragment and rollback marker, and feature-controlled nonblocking
       snapshot switch were removed. Pending local configuration remains
@@ -10902,6 +15349,12 @@ It also passed four source-matched app regressions: directory launch,
       restart all passed. The smoke removed its temporary project/profile on
       success; no model provider, network or Cargo build was used. Native memory
       selection/review remains unverified.
+      On 2026-10-29, `tests/agent-memory-smoke.mjs` passed against the current
+      integrated binary: isolated project/user append and search, reviewed
+      replacement, stale-snapshot rejection, and Turso reopen. No Cargo build
+      or model provider was used. This confirms proxy/RPC persistence behavior;
+      rendered composer selection and managed-session memory review remain
+      separate acceptance gates.
 
 - [ ] Validate and polish the agent-composer slash palette, using the attached
       Codex menu as the interaction reference. Treat this as a grouped
@@ -10967,6 +15420,29 @@ It also passed four source-matched app regressions: directory launch,
       selecting an entry or sending a turn. Native filtering is verified at
       this window size; ACP-command presence, narrow layout and refresh after
       editing skill files remain open.
+      On 2026-10-26, the source-current offline `slash_palette` GPUI suite
+      passed 8/8, including successive filtering/ranking, skill metadata,
+      insertion, mouse selection, keyboard navigation and Escape. I paused the
+      shared watcher for the focused test, then restarted it on the same
+      disposable project; `ahead` rebuilt in 3.14s and the proxy entered its
+      mainloop. The Mac is locked, so this does not verify the rebuilt palette
+      in a native window.
+      Rechecked on 2026-10-28 by running the source-current
+      `ahead_app-ae401acfe1bf5540` test executable directly (newer than
+      `session_panel.rs`): all 10 slash-palette tests passed serially, including
+      ACP command filtering, skill metadata search, result ranking, keyboard
+      and mouse selection, and Escape dismissal. This is headless GPUI evidence;
+      native ACP-command presence, narrow layout and live skill-file refresh
+      remain open.
+      Rechecked on 2026-10-30 with `ahead_app-a22d426232bf3801`: all 10 slash
+      tests passed serially against `session_panel.rs` from 05:58, including
+      filtering/ranking, skill metadata, insertion, keyboard and mouse
+      selection, and Escape dismissal. Native layout and live ACP/skill refresh
+      remain open while macOS is locked.
+      On 2026-11-02, the freshly rebuilt app test runner passed all 10 slash
+      palette GPUI tests, including command/skill filtering and keyboard/mouse
+      selection. Native ACP-command presence, narrow layout, and live project/
+      user-skill refresh remain open while macOS is locked.
 
 - [ ] Finish end-to-end behavior validation for Turso-backed managed session
       persistence. Pre-production scope is the working initial schema; schema
@@ -10984,8 +15460,14 @@ It also passed four source-matched app regressions: directory launch,
       The importer is wired through `ahead-agent/src/native_client.rs` and the
       Turso transaction in `ahead-proxy/src/ahead/store.rs`; plain/compressed
       reader, ambiguity/symlink lookup and atomic/idempotent storage regressions
-      are added. Run those focused tests and verify resume after process restart;
-      they have not been run against this source revision yet.
+      are added. On 2026-10-30, the source-current `ahead-agent` suite passed
+      183 tests with 4 ignored, including all five rollout-reader/import lookup
+      tests. The proxy suite's existing test runner, newer than the touched
+      Turso store and RPC sources, passed atomic/idempotent import and the
+      model-issued child spawn/resume regression (2/2). That regression drove
+      71 child turns, reopened file-backed Turso storage, then resumed the child
+      by ID. This verifies the persistence/runtime path; rendered session
+      history remains a separate native acceptance gate.
       thread-settings event path now persists through the normal thread store
       without probing for a local rollout. Shell-snapshot cleanup expires
       snapshots by their own modification time instead of treating every
@@ -11328,6 +15810,12 @@ It also passed four source-matched app regressions: directory launch,
       instead of materializing the full conversation; its worker-failure
       regression places the retry target behind 100 newer messages. The focused
       locked/offline test passed on 2026-09-28 (1 passed, 78 filtered).
+      Source audit on 2026-10-26 found the active session/memory persistence
+      path uses `libsql` through `ahead-proxy/src/ahead/store.rs` and the
+      managed thread adapters; no separate `rusqlite` or SQLx SQLite store is
+      present. SQLite-named flags and schema tables here are part of libSQL's
+      embedded Turso implementation. This is a source audit; the file-backed
+      Turso reopen and persistence tests remain the behavioral evidence.
 - [ ] Finish managed-skills provenance and policy: the runtime system-skill
       bundle now comes from `ahead-agent-skills/builtins/` rather than Codex sample
       assets, while project/user discovery remains `.agents/skills/` and
@@ -11360,8 +15848,13 @@ It also passed four source-matched app regressions: directory launch,
       skill-resource authorization now requires the opaque ID from that turn's
       `SkillContextLoaded` event; the managed mock-model regression also checks
       that a fabricated, unselected handle is denied while the selected skill's
-      nested reference remains readable. This source regression has not been
-      run here; broader host-enforced capability policy remains open.
+      nested reference remains readable. On 2026-10-30, the locked/offline
+      `native_agent_advertises_and_dispatches_ahead_dynamic_tools` test passed
+      (1 passed, 187 filtered): the denied and permitted tool results reached
+      the follow-up model request, and selected-skill provenance survived
+      managed-thread reopen. This uses a loopback mock model; broader
+      host-enforced capability policy and authenticated-provider acceptance
+      remain open.
       Host discovery now retains same-named entries across scopes; opaque host
       locators include scope plus a SHA-256 path fingerprint, and slash
       activation rejects ambiguous unqualified names. On 2026-09-28, the full
@@ -11387,6 +15880,23 @@ It also passed four source-matched app regressions: directory launch,
       excluded and increments a path-free warning count. The slash palette now
       displays a non-selectable warning entry alongside valid skills; verify
       the rendered row against invalid project/user skill packages in `just dev`.
+      On 2026-10-30, the retained parser was extended to type-check the standard
+      optional `license`, `compatibility` and `allowed-tools` strings, require
+      string keys and values throughout `metadata`, and enforce the compatibility
+      length bound. `serde_yaml` coerces plain scalars when deserializing into
+      `String`, so the parser now dispatches by YAML scalar type and rejects
+      numbers, booleans, nulls and collections. After the shared watcher rebuilt
+      `codex_skills`, all 12 source parser tests passed through a standalone
+      `rustc --test` harness linked to that library, including repository and
+      bundled skills. This did not rebuild the Cargo test target or relink the
+      integrated app. `cargo fmt --all -- --check` and `git diff --check` pass.
+      On 2026-10-30, removed the retained parser's invalid-YAML repair fallback
+      to follow the Agent Skills format and Zed's strict frontmatter parsing.
+      Repository and bundled skills validate as written; the locked offline
+      Cargo library suites for `codex-skills` and `ahead-agent-skills` pass 62
+      tests. The managed dynamic-skill-tool regression also passes after the
+      cut, and the shared `just dev` build relaunched its proxy. Invalid
+      package diagnostics still need a native check.
       The rendered slash-palette filtering/selection regressions pass in the
       focused AHEAD app suite (9 tests). The
       `agent_skills_rpc_returns_project_source_without_a_host_path` regression
@@ -11535,7 +16045,12 @@ It also passed four source-matched app regressions: directory launch,
       native write boundary. Its sibling-prefix regressions,
       `scope_rejects_parent_traversal_and_accepts_descendants` and
       `test_streamed_agent_turn_stale_policy_and_scope_reject` passed on
-      2026-10-02. The real managed multi-tool policy journey remains open.
+      2026-10-02. The disposable `tests/agent-code-mode-smoke.mjs` passes
+      delegated search, cancellation and Turso-backed retry. Its loopback
+      model's Code Mode patches are denied for a Teaching task even with
+      `read_only: false`, and for an Assist turn scoped to `src` when targeting
+      root `main.py`; the source file stays unchanged in both cases.
+      Authenticated multi-tool turns and native policy presentation remain open.
 - [ ] Finish removing unused upstream config-loader code. The retained
       loader no longer has a system or project config-file layer, and Codex
       project-config discovery remains removed. On 2026-10-20, a caller audit
@@ -11550,8 +16065,15 @@ It also passed four source-matched app regressions: directory launch,
       `strict_config_accepts_opaque_desktop_keys` with
       `strict_config_rejects_retired_codex_product_sections` (`rtk cargo test
       --locked --offline -p codex-config --lib -- strict_config` passed 9/9).
-      The broader core/workspace compile remains pending while `cola-v2`'s
-      workspace Cargo check is active (25 GiB free).
+      On 2026-10-29, the single guarded `just dev` loop completed the
+      production build (`ahead`, `ahead-code-mode-host`, including
+      `ahead-proxy`) in 60 seconds and launched a fresh native app; the full
+      workspace/test-target compile remains pending. The previous `cola-v2`
+      contention and 25 GiB free-space note is stale. The same caller audit
+      removed the unused strict-config validation path and `ConfigLoadOptions`,
+      its validator/tests, and the now-unused `serde_ignored` dependency.
+      Production app compilation succeeds after that removal; focused config
+      tests were not rerun because the test-only validator was deleted.
       Host-managed requirements remain a separate policy layer. The AHEAD
       runtime also ignores Codex login requirements. The
       unused Codex cloud-config bundle loader, fragment parser, and
@@ -11583,6 +16105,14 @@ It also passed four source-matched app regressions: directory launch,
       publish the Codex config schema, and the shell-snapshot test no longer
       names its removed generator binary. Runtime config parsing remains because
       managed provider settings still use the retained loader. The unused
+      JSON-schema module and derives remained after the generator removal.
+      A whole-workspace caller search found no consumer of
+      `codex_config::schema` or the config types' `JsonSchema` implementations,
+      so the dead schema module, annotations and `codex-config`'s direct
+      `schemars` dependency are removed. The shared `just dev` production build
+      passed, the focused `codex-config --lib` suite passed 144/144, and
+      `cargo fmt --all -- --check` and `git diff --check` passed. Other crates'
+      live tool schemas still use `schemars`. The unused
       thread-config injection abstraction, remote gRPC client, generated
       protocol and codegen script have been removed; AHEAD has no remote config
       service boundary. The
@@ -11766,6 +16296,19 @@ It also passed four source-matched app regressions: directory launch,
       fixes do not change runtime behavior. The model-picker GPUI test build
       was stopped before reaching its test when free space fell to 2.2 GiB;
       app/workspace compilation and native UI verification remain outstanding.
+      On 2026-10-30, removed the unreferenced config-stack helpers
+      `with_user_config`, `get_active_user_layer`, `get_user_config_file`, and
+      `effective_user_config`; runtime reload still uses
+      `with_user_layer_from`. Loader-path coverage now inspects layer metadata
+      directly, and malformed user-layer validation remains covered through
+      `ConfigLayerStack::new`. The live `just dev` build compiled
+      `codex-config` and its production dependencies, then failed linking the
+      `ahead` binary with `No space left on device` at 739 MiB free. That
+      disk-space failure was later cleared and the shared `just dev` loop
+      rebuilt the integrated app. On 2026-10-30, the focused locked/offline
+      `codex-config --lib` suite passed all 144 tests. `cargo fmt --all
+      -- --check`, `git diff --check`, and the repository-wide removed-API
+      search pass. Native UI and cross-platform config verification remain open.
 - [ ] **ACP guardrail gap (live-verified 2026-09-18):** the Codex ACP adapter
       executed shell/`edit` tool calls with **zero** `session/request_permission`
       and never called client `fs/write_text_file`, even in `read-only` mode, and
@@ -11846,6 +16389,34 @@ It also passed four source-matched app regressions: directory launch,
       option selection/recovery). These are headless GPUI checks; CUA reports
       AHEAD Dev running but window attachment times out, so native rendering,
       install/reconnect and external-process behavior remain unverified.
+      On 2026-10-26, the source-current app runner passed all six `acp_`
+      session-panel interaction tests and the empty-state AHEAD/External start
+      action test (1/1). This verifies the GPUI routing and fake-proxy option
+      paths, not installed-agent reconnect or native rendering.
+      On 2026-10-30, `rtk node tests/agent-acp-install-smoke.mjs
+      target/debug/ahead` installed and launched the registry packages in
+      isolated temporary profiles: Pi ACP `0.0.34` and Codex ACP `2.5.0`
+      reached their expected authentication-required states; Claude ACP
+      `0.99.1` advertised five options and accepted a switch to Opus 5.5. After
+      a proxy restart, all three sessions prepared again; Claude's empty
+      pre-prompt session returned ACP resource-not-found, so AHEAD now creates
+      a replacement only when the durable AHEAD conversation is empty. The
+      selected Claude model remained applied. The smoke then removed each agent
+      from the installed catalog and verified the state cleared. No prompt was
+      sent, and the smoke removes its temporary profiles. All three passed
+      against the rebuilt binary. Native install/remove UI and reconnect
+      rendering remain open.
+      On 2026-11-02, the current integrated binary passed the same live
+      registry lifecycle: Pi ACP `0.0.34` and Codex ACP `2.5.0` reached
+      authentication-required; Claude ACP `0.100.0` exposed five config
+      options and accepted Opus 5.5; all three re-prepared after proxy restart
+      and removed cleanly. No prompt was sent. This verifies the current
+      registry/install/reconnect path, not native picker rendering.
+      Rechecked against `target/debug/ahead` rebuilt at 19:36:54: the same
+      three live registry packages installed, prepared, re-prepared after
+      proxy restart, and uninstalled from isolated profiles; Claude accepted
+      the alternate Opus 5.5 model. No prompt or model request was sent, and
+      all temporary profiles were removed.
 - [ ] Verify external ACP permission review in the running GPUI app. Assist
       now queues an advertised `session/request_permission` choice in the
       existing question card instead of auto-selecting `allow_*`; Learn,
@@ -11865,9 +16436,11 @@ It also passed four source-matched app regressions: directory launch,
       with bounded, path-safe extraction. Registry and installed versions are
       surfaced in the curated Pi/Codex/Claude picker; updates install on next
       launch. The code follows Zed's `AgentRegistryStore` and
-      `LocalRegistryArchiveAgent` selection/install lifecycle. Focused source
-      tests were added but not run; verify actual download, launch, update and
-      rendered status behavior before removing this item. Registry cache reads
+      `LocalRegistryArchiveAgent` selection/install lifecycle. On 2026-10-28,
+      the source-current `ahead-agent` runner passed the focused archive
+      validation, checksummed platform selection, live-generation retention,
+      and registry-cache recovery tests (4/4). Verify actual download, launch,
+      update and rendered status behavior before removing this item. Registry cache reads
       remain capped at 4 MiB, malformed refreshes preserve the last good cache,
       and cache publication uses a unique atomic temporary file. A source review
       against the live ACP registry found Windows targets that use a bare
@@ -11883,10 +16456,10 @@ It also passed four source-matched app regressions: directory launch,
       conservatively. Other platforms retain process-local cleanup and keep
       generations from prior app processes. Cleanup runs when an adapter is
       resolved, not as a startup sweep. Do not sweep existing user caches as
-      part of source cleanup. Unix regressions for inherited live-child leases
-      and reclaiming an unleased generation from another app instance were
-      added, but were not run in this checkout. Safe cross-restart reclamation
-      on non-Unix platforms remains open.
+      part of source cleanup. On 2026-10-28, focused locked/offline runs passed
+      the Unix regressions for inherited live-child leases and reclaiming an
+      unleased generation from another app instance (1/1 each). Safe
+      cross-restart reclamation on non-Unix platforms remains open.
       Verify real npm install/update failures and concurrent launches through
       the installed-agent UI; current failure/concurrency tests use disposable
       fake packages. The offline real-npm two-generation Node smoke test passed
@@ -11924,7 +16497,21 @@ It also passed four source-matched app regressions: directory launch,
       prompts at 128 KiB. Oversized required context returns an error instead of
       dropping constraints. The cold Turso reader checks row lengths before
       decoding titles, decisions, summaries and plan JSON, so irrelevant runtime
-      fields do not consume the plan budget. On 2026-10-15, the final-source
+      fields do not consume the plan budget. The existing timing probe now uses
+      a file-backed `SessionStore` and reopens the host before its first read.
+      With 100 work items and a 7,202-byte context, the uncached read took
+      4.49 ms; 100 cached reads measured 10.9 µs median and 12.6 µs p95. Full
+      `prepare_prediction_with_model_context` with that session, a 12 KiB active
+      excerpt and four 4 KiB related excerpts took 9.05 ms cold after host reopen;
+      warm calls measured 1.99 ms median and 2.21 ms p95. The local fake provider
+      config makes no network request. On 2026-10-29, active source capture was
+      changed to slice at most 24 KiB from each side of the caret directly from
+      the Rope; related open-buffer excerpts are sliced at 4 KiB without first
+      materializing the full buffers, and active-buffer relevance scans one line
+      at a time. The large Unicode target test verifies the absolute caret offset
+      survives bounded capture and acceptance. All 40 proxy tests matching
+      `prediction_` pass. Native acceptance and large-file typing costs remain
+      open. On 2026-10-15, the final-source
       combined app/proxy/agent/RPC prediction filter passed all 50 matching tests
       (the agent crate had no matching tests); source-current formatting and
       `git diff --check` also pass. A targeted provider-selection regression
@@ -11932,9 +16519,12 @@ It also passed four source-matched app regressions: directory launch,
       configured provider instead of lexicographically sorting provider IDs.
       The host FIM context fixture now opens the canonical `.ahead/session.db`
       path instead of creating `.ahead/sessions.db`; source search confirms no
-      remaining plural-path reference. Its test remains unrun in this source
-      state because the runner is absent and another Cargo workspace currently
-      owns the build process.
+      remaining plural-path reference. The source-current
+      `ahead_proxy-1699264ce39d6f81` runner passed all 28
+      `ahead::prediction::tests` on 2026-10-27, including project instruction
+      hierarchy, active-session context, open buffers, cancellation, model
+      budgets and stale-context rejection. Native rendered context remains a
+      separate check.
       An integrated `just dev` build completed in 2m30s and the runtime reported
       the proxy entering its main loop. A later restart found the `target/`
       directory absent after a missing `.rmeta` error; the lock-guarded clean
@@ -11954,7 +16544,8 @@ It also passed four source-matched app regressions: directory launch,
       provider tokenizer. Oversized recent work-item notes now trigger the same
       compact-cache fallback; `oversized_recent_work_history_uses_compact_context_and_keeps_invariants`
       covers the 64 KiB overflow while retaining the invariant and memoizing
-      the compact result. This regression has not been run. Related-buffer
+      the compact result; it passed in the current `prediction::tests` run.
+      Related-buffer
       selection remains bounded to four open buffers at 4 KiB each. After the
       language server returns no inline completion, the proxy scans a bounded
       three-line radius for nearby identifiers and issues up to eight concurrent
@@ -11963,14 +16554,14 @@ It also passed four source-matched app regressions: directory launch,
       are excerpted around the nearest definition line. Successful results are
       cached for three seconds by active-buffer revision and identifier
       position; entries require the referenced open-buffer identity/revision
-      to remain unchanged. Source-only regressions cover nearest-symbol
+      to remain unchanged. The source-only regressions for nearest-symbol
       ordering, deduplication, UTF-16 positions and stale target-buffer
-      invalidation; they have not been run.
+      invalidation passed in the current `prediction_` run.
       Import/module file-stem matches, exact identifier references and sibling
       files remain the fallback ranking, with substring collisions such as
       `log` inside `catalog` excluded. New regressions cover LSP response shapes,
       definition-centered excerpts, import priority and substring collisions;
-      they have not been run. This moves toward Zed's
+      they passed in the current `prediction_` run. This moves toward Zed's
       `../zed/crates/edit_prediction_context/src/edit_prediction_context.rs`,
       which uses Tree-sitter identifier captures and containing outline
       headers. AHEAD now prefers
@@ -11978,26 +16569,33 @@ It also passed four source-matched app regressions: directory launch,
       from existing editor-highlighting requests, rejecting stale buffer
       identity/revision/length and excluding comment/string token types; a
       bounded lexical scan remains the fallback when usable semantic tokens are
-      unavailable. Focused regressions cover filtering and stale-token rejection;
-      they have not been run. Installed Zed grammar captures from the existing
+      unavailable. Focused regressions for filtering and stale-token rejection
+      passed in the current `prediction_` run. Installed Zed grammar captures from the existing
       `GetExtensionSyntax` path now fill in nearby declaration identifiers when
       current semantic tokens are unavailable. Capture caching is fenced by
       buffer ID/revision/length, bounded to known identifier scopes, and falls
       back to lexical scanning when no grammar candidates are available. Focused
-      capture-selection and stale-cache regressions were added but not run.
+      capture-selection and stale-cache regressions passed in the current
+      `prediction_` run.
       Preserve the active session's
       behavioral constraints during compaction; byte guards are not
       tokenizer-based context limits.
       Ancestor instruction watches now refresh when a watched `.git` marker
       changes while a nested workspace is open, using the same root discovery
       policy as native instruction loading. A regression covers creating and
-      removing a nested root and delivery from the newly active ancestor; it
-      has not been run. Instruction/provider changes invalidate predictions
+      removing a nested root and delivery from the newly active ancestor; the
+      current proxy runner passed `instruction_watch_boundary_tracks_git_root_changes`
+      on 2026-10-27 (1/1). Instruction/provider changes invalidate predictions
       immediately, while Git/search/LSP refreshes remain debounced. If
       root-marker settings are exposed, share one policy across native
       instructions, skills and FIM.
       Windows reparse-point runtime
       validation still requires its CI job.
+      Rechecked the watcher-built integrated binary with
+      `tests/agent-fim-smoke.mjs` after the runtime trim: session-bound provider
+      request, changed-session context and root/nested `AGENTS.md` hierarchy
+      passed against an isolated loopback provider. Native placement, typing
+      latency and authenticated-provider acceptance remain open.
       Version-1 snapshot bindings now reach RPC/display/acceptance. Before
       insertion, the host validates the live target, remaining suggestion,
       consumed-buffer versions and fresh session/provider/instruction state,
@@ -12007,17 +16605,55 @@ It also passed four source-matched app regressions: directory launch,
       records the human actor, target range, model/provider, prediction binding
       and accepted-text hash in the Turso session event log without copying
       source text. The store exposes a session-scoped read path; GPUI and Turso
-      regressions cover recording and retrieval but have not run against this
-      source. Verify native caret/replacement placement, undo, error
+      regressions now pass in the current app suite and the focused
+      `test_turso_session_store_crud` test. Verify native caret/replacement
+      placement, undo, error
       presentation and large-file typing latency, then authenticated-provider
       acceptance. Headless GPUI and local-provider checks do not close those
       gates; evidence is in `docs/development/zed-tracking.md` under the FIM
-      sections dated 2026-10-15.
+      sections dated 2026-10-15. On 2026-10-26, source-current runners passed
+      all 28 `ahead::prediction` tests, all 40 proxy tests matching
+      `prediction_`, and all four app `inline_prediction` tests. The first
+      40-test run exposed one intermittent `WouldBlock` while reading a
+      request from a socket accepted by a nonblocking test listener. Both
+      fixtures now switch accepted streams to blocking before applying their
+      read timeout; the focused locked/offline Cargo test passed 1/1, then the
+      updated runner passed all 40 tests. Scoped rustfmt and diff checks pass.
+      These headless tests cover instruction hierarchy, active-session context,
+      stale acceptance and cancellation; native caret/undo and provider-backed
+      acceptance remain open.
+      Rechecked on 2026-10-27 using the current proxy runner (newer than the
+      prediction/host/dispatch sources): all 40 `prediction_` tests passed. The
+      rebuilt app runner also passed all four `inline_prediction` tests. This
+      revalidates bounded session context, semantic/LSP/extension-derived
+      related code, stale-context fencing and cancellation; native caret/undo
+      behavior and an authenticated provider turn remain open.
+      Follow-up on 2026-10-27 rebuilt the current proxy test target and reran all
+      28 `prediction::tests` and all 40 `prediction_` tests serially; both passed.
+      The Turso session-history round trip containing prediction-acceptance
+      write/read also passed (`test_turso_session_store_crud`, 1/1). The current
+      app suite passed 425/425. Windows reparse-point behavior, native caret/
+      undo and authenticated-provider acceptance remain open.
+      On 2026-10-28, the current proxy runner
+      `ahead_proxy-1699264ce39d6f81` (newer than `prediction.rs`, `host.rs`, and
+      `dispatch.rs`) passed all 28 `ahead::prediction::tests` again. This covers
+      the AGENTS.md hierarchy, active-session context, open buffers, model
+      budgeting, cancellation and stale-context rejection. Native caret/undo
+      and authenticated-provider acceptance remain open.
+      On 2026-10-30, `rtk node tests/agent-fim-smoke.mjs target/debug/ahead`
+      passed against the integrated binary newer than the FIM sources. The
+      local provider received the selected model, active session objective,
+      caller context, root/nested `AGENTS.md`, and live prefix/suffix; its
+      completion returned through the proxy. The disposable workspace/profile
+      were removed. This is RPC/local-provider evidence; native insertion,
+      undo, typing latency and authenticated-provider acceptance remain open.
 - [ ] Finish live agent-panel acceptance for dynamic ACP commands, session
       restore during an active turn and running-app keyboard behavior. The
       empty-state New AHEAD and External agent actions now reveal the Threads
       column before showing their setup wizard, even when that column was
-      hidden; the Shell-level GPUI regression covers both paths but has not run.
+      hidden; the source-current Shell-level GPUI regression passed 1/1 on
+      2026-10-26. Native click/render behavior and session restore during an
+      active turn remain open.
       250 ms UI timer now queues coalesced asynchronous durable/runtime reads
       only during turn startup or streaming, without blocking the UI;
       while idle it mirrors cached ACP config-option updates. A headless GPUI
@@ -12184,24 +16820,29 @@ It also passed four source-matched app regressions: directory launch,
       Keep `.ahead/sessions/<id>/` as an explicit session checkpoint, separate
       from lasting documentation; retain libSQL only for expiring runtime history.
 
-## Guided investigation, debugger and voice
+## Guided investigation and teaching milestone (post-MVP)
 
 - [ ] Finish task-local intent lifecycle: sessions now create durable
       `teaching` or `assistance` tasks from the starting request, persist the
       initial teaching mission and expose the task intent to policy/prediction;
       still link a later teaching request to its parent assistance task and
       add the full verified-source/concept/learner-response/review record flow.
+
 - [ ] Implement durable teaching arcs for explicit teaching tasks: mission,
       verified source references, concept state, learner responses, evidence and
       review queue. Render one native conversation card at a time, preserve the
       human caret, keep teaching read-only and export selected records through
       the `.ahead` Markdown artifact convention.
+## Debugging assistance milestone (post-MVP)
+
 - [ ] Integrate the graduated `diagnosing-bugs` loop into investigation and
       corrective-debugging assistance tasks: red reproduction gate, minimization,
       ranked falsifiable hypotheses, selected experiment, regression evidence,
       cleanup and diagnostic-evidence redaction. Stop honestly when no tight
       loop can be built; do not let a linked teaching arc turn an untested
       hypothesis into a fact.
+## Agent presentation milestone (post-MVP)
+
 - [ ] Validate the adapter-neutral Presentation Core contract in real native
       GPUI sessions for each supported managed model/provider route and through
       every supported ACP adapter: verify `present_code` opens the right tab
@@ -12229,8 +16870,11 @@ It also passed four source-matched app regressions: directory launch,
       settlement, including a serialized stdio loop regression. They do not
       verify end-to-end ACP stdio startup/discovery for real Pi, Codex or Claude
       agents, or a rendered frame. Durable inline discussion is tracked under
-      Multiplayer collaboration. Compare the full journey with
+      the multiplayer milestone. Compare the full journey with
       `docs/development/ahead-workflows.md` §6.
+
+## Debugger assistance milestone (post-MVP)
+
 - [ ] Extend `ahead-app/src/{proxy_client,debug_bar}.rs` and the existing
       `ahead-proxy/src/plugin/dap.rs` route for guided breakpoint setup: retain
       source/debug-session identity, ownership, actual binding/verified status
@@ -12239,7 +16883,11 @@ It also passed four source-matched app regressions: directory launch,
       Expose the tested capability to the selected harness and verify the real
       experiment loop in `docs/development/ahead-workflows.md` §5 and §10.
 
-### Session voice calls
+## Voice milestone (post-MVP)
+
+- [ ] Complete the single-human-plus-agent full-duplex journey. Defer group
+      audio until the single-user flow is reliable; existing shared text
+      sessions remain separate.
 
 Implement [the session voice call plan](docs/plans/session-voice-calls.md).
 Source now contains an initial OpenAI GPT-Live transport, self-hosted

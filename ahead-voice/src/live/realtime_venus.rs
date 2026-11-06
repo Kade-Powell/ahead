@@ -482,8 +482,9 @@ pub(super) async fn run(
                             emit_event(&events, &overflowed, LiveCallEvent::PlaybackEnded);
                         }
                         VoiceEvent::PlaybackChunkPlayed { generation, frames } => {
-                            if let Some(ack) = playback.played(generation, frames) {
-                                if let Err(error) = ack_sender.try_send(ack) {
+                            if let Some(ack) = playback.played(generation, frames)
+                                && let Err(error) = ack_sender.try_send(ack)
+                            {
                                     let message = match error {
                                         mpsc::error::TrySendError::Full(_) => {
                                             "Realtime-Venus playback acknowledgement queue is full."
@@ -495,7 +496,6 @@ pub(super) async fn run(
                                     emit_event(&events, &overflowed, LiveCallEvent::Error(message.into()));
                                     capture.stop();
                                     break 'call;
-                                }
                             }
                         }
                         VoiceEvent::AudioFrame { pcm16le, .. } => {

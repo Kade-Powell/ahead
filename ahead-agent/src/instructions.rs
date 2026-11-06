@@ -377,6 +377,7 @@ mod tests {
             caret: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
             selection: None,
             file_content: String::new(),
+            selected_excerpt: None,
             visible_end: None,
             attached_anchor_ids: Vec::new(),
             attached_files: attached_paths
@@ -384,6 +385,7 @@ mod tests {
                 .map(|path| ahead_rpc::ahead::TurnContextFile {
                     path,
                     content: String::new(),
+                    kind: ahead_rpc::ahead::TurnContextFileKind::Full,
                 })
                 .collect(),
             attached_memories: Vec::new(),

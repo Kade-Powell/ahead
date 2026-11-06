@@ -235,6 +235,11 @@ pub enum ProxyRequest {
     GetDocumentFormatting {
         path: PathBuf,
     },
+    GetDocumentOnTypeFormatting {
+        path: PathBuf,
+        position: Position,
+        trigger_character: String,
+    },
     GetOpenFilesContent {},
     ReadDir {
         path: PathBuf,
@@ -327,6 +332,9 @@ pub enum ProxyNotification {
     },
     CancelInlineCompletions {
         request_id: RequestId,
+    },
+    CancelCompletion {
+        request_id: usize,
     },
     Completion {
         request_id: usize,
@@ -517,6 +525,9 @@ pub enum ProxyResponse {
         resp: Option<GotoImplementationResponse>,
     },
     GetDocumentFormatting {
+        edits: Vec<TextEdit>,
+    },
+    GetDocumentOnTypeFormatting {
         edits: Vec<TextEdit>,
     },
     GetDocumentSymbols {
@@ -900,6 +911,10 @@ impl ProxyRpcHandler {
         });
     }
 
+    pub fn cancel_completion(&self, request_id: usize) {
+        self.notification(ProxyNotification::CancelCompletion { request_id });
+    }
+
     pub fn signature_help(
         &self,
         request_id: usize,
@@ -1279,6 +1294,23 @@ impl ProxyRpcHandler {
         f: impl ProxyCallback + 'static,
     ) {
         self.request_async(ProxyRequest::GetDocumentFormatting { path }, f);
+    }
+
+    pub fn get_document_on_type_formatting(
+        &self,
+        path: PathBuf,
+        position: Position,
+        trigger_character: String,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(
+            ProxyRequest::GetDocumentOnTypeFormatting {
+                path,
+                position,
+                trigger_character,
+            },
+            f,
+        );
     }
 
     pub fn get_semantic_tokens(

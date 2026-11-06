@@ -86,7 +86,6 @@ fn top_level_values_use_toml_priority() {
 allowed_approval_policies = ["on-request"]
 allowed_sandbox_modes = ["workspace-write"]
 default_permissions = ":workspace"
-allow_remote_control = true
 additional_developer_instructions = "Lower-priority instructions."
 
 [allowed_permission_profiles]
@@ -101,7 +100,6 @@ additional_developer_instructions = "Lower-priority instructions."
 allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
-allow_remote_control = false
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -120,7 +118,6 @@ additional_developer_instructions = ""
 allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
-allow_remote_control = false
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -263,7 +260,6 @@ fn composition_strategy_applies_to_non_cloud_layers() {
                 format!(
                     r#"
 allowed_approval_policies = ["on-request"]
-allow_remote_control = true
 
 [features]
 shared = false
@@ -283,7 +279,6 @@ deny_read = [{low_path:?}]
                 format!(
                     r#"
 allowed_approval_policies = ["never"]
-allow_remote_control = false
 
 [features]
 shared = true
@@ -308,7 +303,6 @@ deny_read = [{high_path:?}]
         expected_requirements(format!(
             r#"
 allowed_approval_policies = ["never"]
-allow_remote_control = false
 
 [features]
 shared = true
@@ -333,10 +327,6 @@ deny_read = [{high_path:?}, {low_path:?}]
             vec![AskForApproval::Never],
             mdm_source.clone()
         ))
-    );
-    assert_eq!(
-        composed.allow_remote_control,
-        Some(Sourced::new(/*value*/ false, mdm_source))
     );
 }
 
@@ -456,114 +446,6 @@ command = "low-mcp"
 
 [mcp_servers.shared.identity]
 command = "high-mcp"
-"#
-        )
-    );
-}
-
-#[test]
-fn browser_and_computer_use_requirements_use_regular_toml_merge() {
-    let composed = compose(vec![
-        layer(
-            "req_low",
-            "Low",
-            r#"
-allow_browser_and_computer_use = true
-
-[browser_use]
-allow_history_access = true
-allow_global_persistent_approval = true
-
-[browser_use.default_origin_policy]
-access = "allow"
-access_approval_lifetime = "thread"
-
-[browser_use.origins."https://example.com"]
-access = "deny"
-downloads = "allow"
-
-[computer_use]
-allow_locked_computer_use = true
-default_app_access = "allow"
-
-[computer_use.macos.bundle_ids]
-"com.apple.Safari" = "deny"
-
-[computer_use.windows.aumids]
-"Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
-"#,
-        ),
-        layer(
-            "req_high",
-            "High",
-            r#"
-allow_browser_and_computer_use = false
-
-[browser_use]
-allow_history_access = false
-allow_global_persistent_approval = false
-
-[browser_use.default_origin_policy]
-persistent_approval = false
-access_approval_lifetime = "turn"
-
-[browser_use.origins."https://example.com"]
-downloads = "deny"
-uploads = "deny"
-
-[computer_use]
-allow_persistent_approval = false
-
-[computer_use.macos.bundle_ids]
-"com.apple.Safari" = "allow"
-
-[[computer_use.windows.exes]]
-publisher_name = "CN=Google LLC"
-product_name = "Google Chrome"
-binary_name = "chrome.exe"
-access = "deny"
-"#,
-        ),
-    ])
-    .expect("compose requirements")
-    .expect("requirements present");
-
-    assert_eq!(
-        composed,
-        expected_requirements(
-            r#"
-allow_browser_and_computer_use = false
-
-[browser_use]
-allow_history_access = false
-allow_global_persistent_approval = false
-
-[browser_use.default_origin_policy]
-access = "allow"
-persistent_approval = false
-access_approval_lifetime = "turn"
-
-[browser_use.origins."https://example.com"]
-access = "deny"
-downloads = "deny"
-uploads = "deny"
-
-[computer_use]
-allow_locked_computer_use = true
-allow_persistent_approval = false
-default_app_access = "allow"
-
-[computer_use.macos.bundle_ids]
-"com.apple.Safari" = "allow"
-
-[computer_use.windows.aumids]
-"Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
-
-[[computer_use.windows.exes]]
-publisher_name = "CN=Google LLC"
-product_name = "Google Chrome"
-binary_name = "chrome.exe"
-access = "deny"
 "#
         )
     );

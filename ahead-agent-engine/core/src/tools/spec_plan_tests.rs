@@ -1039,11 +1039,9 @@ async fn candidate_model_plan_leaves_selected_model_and_inventory_unchanged() {
             source: TurnToolSource::Harness,
         }
     );
-    let metadata = turn.turn_metadata_state.to_responses_metadata(
-        "installation".to_string(),
-        "window".to_string(),
-        CodexResponsesRequestKind::Turn,
-    );
+    let metadata = turn
+        .turn_metadata_state
+        .to_responses_metadata("window".to_string(), CodexResponsesRequestKind::Turn);
     assert_eq!(metadata.tool_namespaces_info, Some(selected_inventory));
     assert_eq!(turn.model_info(), &selected_model);
     assert_eq!(

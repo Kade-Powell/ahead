@@ -683,7 +683,7 @@ impl NativeClient {
         for feature in AHEAD_DISABLED_FEATURES {
             config.features.disable(*feature).map_err(|error| {
                 anyhow!(
-                    "AHEAD native runtime cannot disable Codex product feature {feature:?}: {error}"
+                    "AHEAD agent runtime cannot disable retained feature {feature:?}: {error}"
                 )
             })?;
         }
@@ -1442,23 +1442,23 @@ impl NativeClient {
                 } else {
                     None
                 };
-            if let Some(ahead_turn_id) = ahead_turn_id {
-                if captured_instruction_sources.is_none() {
-                    match thread
-                        .project_instruction_source_hashes_for_turn(&core_turn_id)
-                        .await
-                    {
-                        Some(sources) => {
-                            self.store.set_project_instruction_sources(
-                                ahead_turn_id,
-                                &local_project_instruction_sources(sources)?,
-                            )?;
-                        }
-                        None if result.is_ok() => {
-                            bail!("managed turn completed without an AGENTS.md provenance snapshot")
-                        }
-                        None => {}
+            if let Some(ahead_turn_id) = ahead_turn_id
+                && captured_instruction_sources.is_none()
+            {
+                match thread
+                    .project_instruction_source_hashes_for_turn(&core_turn_id)
+                    .await
+                {
+                    Some(sources) => {
+                        self.store.set_project_instruction_sources(
+                            ahead_turn_id,
+                            &local_project_instruction_sources(sources)?,
+                        )?;
                     }
+                    None if result.is_ok() => {
+                        bail!("managed turn completed without an AGENTS.md provenance snapshot")
+                    }
+                    None => {}
                 }
             }
             result
@@ -1807,8 +1807,8 @@ impl NativeClient {
                     if !is_child_thread && let Some(info) = event.info {
                         (self.sink)(HarnessEvent::Usage {
                             acp_session_id: thread_id.to_string(),
-                            total_tokens: u64::try_from(
-                                info.total_token_usage.total_tokens.max(0),
+                            used_tokens: u64::try_from(
+                                info.last_token_usage.total_tokens.max(0),
                             )
                             .unwrap_or(u64::MAX),
                             context_window: info
@@ -2532,7 +2532,7 @@ impl NativeClient {
             let permission_profile =
                 permission_profile(mode_id, &settings.cwd, child_scope.as_ref())?;
             let request = TurnInputRequest::user_input(vec![UserInput::Text {
-                text: message.to_string(),
+                text: message.clone(),
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
@@ -3662,10 +3662,10 @@ fn open_buffer_overrides(
             continue;
         };
         contents.insert(path.clone(), snapshot.content);
-        if !snapshot.symbols.is_empty() {
-            symbols_by_path.insert(path, snapshot.symbols);
-        } else {
+        if snapshot.symbols.is_empty() {
             symbols_by_path.remove(&path);
+        } else {
+            symbols_by_path.insert(path, snapshot.symbols);
         }
     }
     (contents, symbols_by_path)
@@ -3805,7 +3805,6 @@ const AHEAD_DISABLED_FEATURES: &[Feature] = &[
     Feature::CodeModeOnly,
     Feature::CodeModePrewarm,
     Feature::Collab,
-    Feature::MemoryTool,
     Feature::MultiAgentV2,
     Feature::RespectSystemProxy,
     Feature::WebSearchCached,
@@ -4080,12 +4079,14 @@ mod tests {
         std::fs::create_dir_all(&session_directory)?;
         let rollout_path =
             session_directory.join(format!("rollout-{thread_id_text}.jsonl"));
-        let mut meta = codex_protocol::protocol::SessionMeta::default();
-        meta.id = thread_id;
-        meta.session_id = thread_id.into();
-        meta.timestamp = "2025-01-03T12:00:00Z".to_string();
-        meta.cwd = workspace.path().to_path_buf();
-        meta.model_provider = Some("mock".to_string());
+        let meta = codex_protocol::protocol::SessionMeta {
+            id: thread_id,
+            session_id: thread_id.into(),
+            timestamp: "2025-01-03T12:00:00Z".to_string(),
+            cwd: workspace.path().to_path_buf(),
+            model_provider: Some("mock".to_string()),
+            ..Default::default()
+        };
         let line = codex_rollout::RolloutLine {
             timestamp: meta.timestamp.clone(),
             ordinal: Some(0),
@@ -6518,6 +6519,198 @@ log_user_prompt = true
     }
 
     #[test]
+    fn compacts_before_sampling_when_workspace_context_changes_cross_the_limit() {
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        std::fs::create_dir_all(workspace.path().join(".ahead"))
+            .expect("create private settings directory");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock model");
+        let address = listener.local_addr().expect("read mock model address");
+        std::fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            format!(
+                "[ai]\nactive_connection = \"Mock\"\n[[ai.connections]]\nname = \"Mock\"\nprovider_id = \"mock\"\nbase_url = \"http://{address}/v1\"\nmodel = \"gpt-5.5\"\n"
+            ),
+        )
+        .expect("configure local model");
+        let agents_path = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_path, "Initial project guidance.\n")
+            .expect("write initial project instructions");
+
+        let model_server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for request_number in 0..4 {
+                let (mut stream, request, header_end, content_length) =
+                    accept_model_post(&listener);
+                let model_request = serde_json::from_slice::<Value>(
+                    &request[header_end..header_end + content_length],
+                )
+                .expect("model request JSON");
+                let is_compaction = model_request
+                    .to_string()
+                    .contains("CONTEXT CHECKPOINT COMPACTION");
+                requests.push(model_request);
+
+                let (text, end_turn, usage) = match request_number {
+                    0 => ("Continuing", false, Some((300, 0, 300))),
+                    1 => ("First answer", true, None),
+                    2 if is_compaction => ("Compact summary", true, None),
+                    2 => ("Second answer", true, None),
+                    _ => ("Second answer", true, None),
+                };
+                let message_id = format!("context-message-{request_number}");
+                let mut response = json!({
+                    "id": format!("context-response-{request_number}"),
+                    "end_turn": end_turn,
+                });
+                if let Some((input_tokens, output_tokens, total_tokens)) = usage {
+                    response["usage"] = json!({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                    });
+                }
+                let events = vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                    json!({
+                        "type": "response.output_text.delta",
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        },
+                    }),
+                    json!({"type": "response.completed", "response": response}),
+                ];
+                let body = events
+                    .into_iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().expect("event type")
+                        )
+                    })
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write model response");
+
+                if request_number == 2 && !is_compaction {
+                    break;
+                }
+            }
+            requests
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let client = NativeClient::spawn(
+            &NativeClientConfig::ahead(workspace.path().to_path_buf()),
+            Arc::new(TestHarnessStore::default()),
+            Arc::new(move |event| captured_events.lock().push(event)),
+        )
+        .expect("start managed agent");
+        let thread_id = client
+            .new_session(
+                workspace.path(),
+                "read-only",
+                Some("gpt-5.5"),
+                Some("mock"),
+            )
+            .expect("create managed session");
+        client
+            .prompt_for_ahead_turn(
+                &thread_id,
+                "Build enough context to test compaction.",
+                "context-usage-first-turn",
+                Some(1_000),
+            )
+            .expect("run first managed turn");
+
+        let thread = client
+            .threads
+            .lock()
+            .get(&thread_id)
+            .cloned()
+            .expect("loaded managed thread");
+        let usage = client
+            .runtime
+            .block_on(thread.token_usage_info())
+            .expect("model usage was reported");
+        assert_eq!(usage.total_token_usage.total_tokens, 300);
+        assert!(
+            usage.last_token_usage.total_tokens > 300,
+            "a local history estimate should replace the stale provider count"
+        );
+        assert!(events.lock().iter().any(|event| matches!(
+            event,
+            HarnessEvent::Usage {
+                used_tokens,
+                context_window: Some(950),
+                ..
+            } if *used_tokens > 300
+        )));
+
+        let remaining_tokens = usize::try_from(
+            9_500_i64.saturating_sub(usage.last_token_usage.total_tokens),
+        )
+        .expect("the reported context usage leaves a positive token count");
+        assert!(
+            remaining_tokens > 8,
+            "the first turn should leave room below the limit"
+        );
+        std::fs::write(
+            &agents_path,
+            format!(
+                "Updated project guidance.\n{}",
+                "context ".repeat(remaining_tokens / 2 + 16)
+            ),
+        )
+        .expect("update project instructions");
+        client
+            .prompt_for_ahead_turn(
+                &thread_id,
+                "Continue.",
+                "context-usage-near-limit-turn",
+                Some(10_000),
+            )
+            .expect("compact after workspace context delta crosses the threshold");
+        let requests = model_server.join().expect("join mock model server");
+        assert_eq!(
+            requests.len(),
+            4,
+            "expected two turn requests, compaction, then the next turn"
+        );
+        assert!(
+            requests[2]
+                .to_string()
+                .contains("CONTEXT CHECKPOINT COMPACTION")
+        );
+        client.shutdown();
+    }
+
+    #[test]
     fn file_search_pages_matches_without_silent_truncation() {
         let workspace = Path::new("/workspace");
         let matches = (0..23)
@@ -6686,11 +6879,11 @@ log_user_prompt = true
         ];
         let flat_output = format_file_search_results(
             workspace.path(),
-            vec![(path.clone(), matches.clone())],
+            vec![(path.clone(), matches)],
             0,
             1,
             &"a".repeat(64),
-            &std::collections::HashMap::from([(path.clone(), flat_symbols)]),
+            &std::collections::HashMap::from([(path, flat_symbols)]),
         )
         .expect("format flat search result");
         assert!(flat_output.contains("(in flat_fn)"), "{flat_output}");
@@ -6701,7 +6894,7 @@ log_user_prompt = true
                 name: format!("level_{depth}"),
                 start_line: 0,
                 end_line: 20,
-                depth: depth as u16,
+                depth: u16::try_from(depth).expect("test symbol depth fits in u16"),
             })
             .collect();
         let deep_output = format_file_search_results(
@@ -7111,7 +7304,7 @@ log_user_prompt = true
             &self,
             thread_id: &str,
         ) -> Result<Option<crate::NativeThreadHeader>> {
-            let timestamps = self.header_timestamps.lock().clone();
+            let timestamps = *self.header_timestamps.lock();
             Ok(self.native_threads.lock().get(thread_id).map(|snapshot| {
                 crate::NativeThreadHeader {
                     thread_id: thread_id.to_string(),
@@ -7121,10 +7314,10 @@ log_user_prompt = true
                     archived_at: snapshot.archived_at,
                     created_at: timestamps
                         .as_ref()
-                        .map(|(created_at, _)| created_at.clone()),
+                        .map(|(created_at, _)| *created_at),
                     updated_at: timestamps
                         .as_ref()
-                        .map(|(_, updated_at)| updated_at.clone()),
+                        .map(|(_, updated_at)| *updated_at),
                 }
             }))
         }
@@ -7163,7 +7356,7 @@ log_user_prompt = true
         fn list_native_thread_headers(
             &self,
         ) -> Result<Vec<crate::NativeThreadHeader>> {
-            let timestamps = self.header_timestamps.lock().clone();
+            let timestamps = *self.header_timestamps.lock();
             let mut headers = self
                 .native_threads
                 .lock()
@@ -7176,10 +7369,10 @@ log_user_prompt = true
                     archived_at: snapshot.archived_at,
                     created_at: timestamps
                         .as_ref()
-                        .map(|(created_at, _)| created_at.clone()),
+                        .map(|(created_at, _)| *created_at),
                     updated_at: timestamps
                         .as_ref()
-                        .map(|(_, updated_at)| updated_at.clone()),
+                        .map(|(_, updated_at)| *updated_at),
                 })
                 .collect::<Vec<_>>();
             headers.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
@@ -7752,9 +7945,11 @@ log_user_prompt = true
 
             let thread_id =
                 ThreadId::from_string(&thread_id).expect("valid thread id");
-            let mut items = (0..100)
-                .map(|ordinal| turn_complete_item(&format!("old-{ordinal}")))
-                .collect::<Vec<_>>();
+            let mut items = Vec::new();
+            items.extend(
+                (0..100)
+                    .map(|ordinal| turn_complete_item(&format!("old-{ordinal}"))),
+            );
             items.push(codex_rollout::RolloutItem::Compacted(
                 codex_rollout::CompactedItem {
                     message: "checkpoint".to_string(),
@@ -8019,26 +8214,24 @@ log_user_prompt = true
             )
             .await
             .expect("build child configuration");
-            client
-                .manager
-                .spawn_subagent_session(
-                    parent_thread_id,
-                    StartThreadOptions {
-                        session_source: Some(SessionSource::SubAgent(
-                            SubAgentSource::ThreadSpawn {
-                                parent_thread_id,
-                                depth: 1,
-                                agent_path: None,
-                                agent_nickname: None,
-                            },
-                        )),
-                        dynamic_tools: ahead_dynamic_tools(false),
-                        ..StartThreadOptions::new(runtime_config)
-                    },
-                )
-                .await
-                .expect("create child")
-                .thread_id
+            Box::pin(client.manager.spawn_subagent_session(
+                parent_thread_id,
+                StartThreadOptions {
+                    session_source: Some(SessionSource::SubAgent(
+                        SubAgentSource::ThreadSpawn {
+                            parent_thread_id,
+                            depth: 1,
+                            agent_path: None,
+                            agent_nickname: None,
+                        },
+                    )),
+                    dynamic_tools: ahead_dynamic_tools(false),
+                    ..StartThreadOptions::new(runtime_config)
+                },
+            ))
+            .await
+            .expect("create child")
+            .thread_id
         });
         let check_child_tools = |client: &NativeClient| {
             let (is_subagent, tools) = client
@@ -8280,7 +8473,7 @@ log_user_prompt = true
                     body.len(),
                     body
                 )
-                .map(|_| ())
+                .map(|()| ())
                 };
 
             let (mut parent_stream, parent_request, _, _) =
@@ -8386,7 +8579,9 @@ log_user_prompt = true
                     &prompt_parent_thread_id,
                     "Start a child and wait for its response",
                 );
-                let _ = prompt_sender.send(result);
+                prompt_sender
+                    .send(result)
+                    .expect("deliver parent prompt result");
             })
             .expect("spawn parent prompt");
 

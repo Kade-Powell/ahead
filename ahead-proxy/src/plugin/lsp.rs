@@ -575,9 +575,19 @@ impl DocumentFilter {
                 .as_deref()
                 .is_none_or(|scheme| scheme.eq_ignore_ascii_case("file"))
             && path.is_none_or(|path| {
-                self.pattern
-                    .as_ref()
-                    .is_none_or(|pattern| pattern.is_match(path))
+                self.pattern.as_ref().is_none_or(|pattern| {
+                    let path_without_root = path
+                        .components()
+                        .filter(|component| {
+                            !matches!(
+                                component,
+                                std::path::Component::Prefix(_)
+                                    | std::path::Component::RootDir
+                            )
+                        })
+                        .collect::<PathBuf>();
+                    pattern.is_match(path) || pattern.is_match(path_without_root)
+                })
             })
     }
 }
@@ -890,6 +900,7 @@ done
                 method.into(),
                 Value::Null,
                 Some("python".into()),
+                None,
                 None,
                 Box::new(move |id, result| {
                     sender.send((id, result)).expect("request result")

@@ -1,4 +1,8 @@
-use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 const MAX_NAME_LEN: usize = 64;
@@ -10,16 +14,56 @@ struct SkillFrontmatter {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    license: Option<FrontmatterString>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    compatibility: Option<FrontmatterString>,
+    #[serde(
+        default,
+        rename = "allowed-tools",
+        deserialize_with = "deserialize_optional_string"
+    )]
+    allowed_tools: Option<FrontmatterString>,
     #[serde(default, rename = "disable-model-invocation")]
     disable_model_invocation: bool,
     #[serde(default)]
-    metadata: SkillFrontmatterMetadata,
+    metadata: BTreeMap<FrontmatterString, FrontmatterString>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct SkillFrontmatterMetadata {
-    #[serde(default, rename = "short-description")]
-    short_description: Option<String>,
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FrontmatterString(String);
+
+impl<'de> Deserialize<'de> for FrontmatterString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FrontmatterStringVisitor;
+
+        impl Visitor<'_> for FrontmatterStringVisitor {
+            type Value = FrontmatterString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(FrontmatterString(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(FrontmatterString(value))
+            }
+        }
+
+        deserializer.deserialize_any(FrontmatterStringVisitor)
+    }
 }
 
 /// Validated metadata parsed from a `SKILL.md` frontmatter block.
@@ -51,19 +95,8 @@ pub fn parse_skill_frontmatter_metadata(
 ) -> Result<ParsedSkillFrontmatter, SkillParseError> {
     let frontmatter = extract_frontmatter(contents).ok_or(SkillParseError::MissingFrontmatter)?;
 
-    let parsed: SkillFrontmatter = match serde_yaml::from_str(&frontmatter) {
-        Ok(parsed) => Ok(parsed),
-        Err(original_error) => match repair_frontmatter_scalar_fields(&frontmatter) {
-            // Some third-party skills use prose like `description: Build for AWS: ECS`
-            // or `argument-hint: <duration: e.g. 7d>`. Keep the repair line-oriented
-            // so unrelated invalid YAML still surfaces.
-            Some(repaired_frontmatter) => {
-                serde_yaml::from_str(&repaired_frontmatter).map_err(|_| original_error)
-            }
-            None => Err(original_error),
-        },
-    }
-    .map_err(SkillParseError::InvalidYaml)?;
+    let parsed: SkillFrontmatter =
+        serde_yaml::from_str(&frontmatter).map_err(SkillParseError::InvalidYaml)?;
 
     let name = parsed
         .name
@@ -76,10 +109,21 @@ pub fn parse_skill_frontmatter_metadata(
         .filter(|value| !value.trim().is_empty())
         .ok_or(SkillParseError::MissingField("description"))?;
     validate_len(description, MAX_DESCRIPTION_LEN, "description")?;
+    if let Some(compatibility) = parsed.compatibility.as_ref() {
+        if compatibility.0.trim().is_empty() {
+            return Err(SkillParseError::InvalidField {
+                field: "compatibility",
+                reason: "must not be empty".to_string(),
+            });
+        }
+        validate_len(&compatibility.0, 500, "compatibility")?;
+    }
+    let _license = parsed.license;
+    let _allowed_tools = parsed.allowed_tools;
     let short_description = parsed
         .metadata
-        .short_description
-        .as_deref()
+        .get(&FrontmatterString("short-description".to_string()))
+        .map(|value| value.0.as_str())
         .map(sanitize_single_line)
         .filter(|value| !value.is_empty());
 
@@ -89,6 +133,15 @@ pub fn parse_skill_frontmatter_metadata(
         short_description,
         disable_model_invocation: parsed.disable_model_invocation,
     })
+}
+
+fn deserialize_optional_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<FrontmatterString>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    FrontmatterString::deserialize(deserializer).map(Some)
 }
 
 fn validate_name(name: &str, directory_name: &str) -> Result<(), SkillParseError> {
@@ -116,91 +169,6 @@ fn validate_name(name: &str, directory_name: &str) -> Result<(), SkillParseError
 
 fn sanitize_single_line(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
-    let mut changed = false;
-    let mut block_scalar_indent: Option<usize> = None;
-    let mut repaired_lines = Vec::new();
-    for line in frontmatter.lines() {
-        let indent = line
-            .chars()
-            .take_while(|character| *character == ' ')
-            .count();
-        if let Some(block_indent) = block_scalar_indent {
-            if line.trim().is_empty() || indent > block_indent {
-                repaired_lines.push(line.to_string());
-                continue;
-            }
-            block_scalar_indent = None;
-        }
-
-        let Some((key, value)) = line.split_once(':') else {
-            repaired_lines.push(line.to_string());
-            continue;
-        };
-        if key.trim().is_empty() || !value.chars().next().is_none_or(char::is_whitespace) {
-            repaired_lines.push(line.to_string());
-            continue;
-        }
-
-        let trimmed_start = value.trim_start();
-        let leading_whitespace = &value[..value.len() - trimmed_start.len()];
-        let mut scalar = trimmed_start;
-        let mut comment = "";
-        for (index, character) in trimmed_start.char_indices() {
-            if character == '#'
-                && (index == 0
-                    || trimmed_start[..index]
-                        .chars()
-                        .next_back()
-                        .is_some_and(char::is_whitespace))
-            {
-                let comment_start = trimmed_start[..index].trim_end().len();
-                scalar = &trimmed_start[..comment_start];
-                comment = &trimmed_start[comment_start..];
-                break;
-            }
-        }
-
-        let scalar = scalar.trim_end();
-        let Some(first_char) = scalar.chars().next() else {
-            repaired_lines.push(line.to_string());
-            continue;
-        };
-        if matches!(first_char, '|' | '>') {
-            block_scalar_indent = Some(indent);
-            repaired_lines.push(line.to_string());
-            continue;
-        }
-        if matches!(first_char, '\'' | '"') {
-            repaired_lines.push(line.to_string());
-            continue;
-        }
-        let mut has_colon_separator = false;
-        let mut chars = scalar.chars().peekable();
-        while let Some(character) = chars.next() {
-            if character == ':'
-                && matches!(chars.peek(), Some(next_character) if next_character.is_whitespace())
-            {
-                has_colon_separator = true;
-                break;
-            }
-        }
-        let invalid_flow_like_scalar = matches!(first_char, '[' | '{' | '@' | '`')
-            && serde_yaml::from_str::<serde_yaml::Value>(scalar).is_err();
-        if !has_colon_separator && !invalid_flow_like_scalar {
-            repaired_lines.push(line.to_string());
-            continue;
-        }
-
-        let quoted_scalar = format!("'{}'", scalar.replace('\'', "''"));
-        repaired_lines.push(format!(
-            "{key}:{leading_whitespace}{quoted_scalar}{comment}"
-        ));
-        changed = true;
-    }
-    changed.then(|| repaired_lines.join("\n"))
 }
 
 fn validate_len(

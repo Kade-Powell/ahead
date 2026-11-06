@@ -238,10 +238,9 @@ fn installed_language_extension(
         .is_ok_and(|metadata| {
             metadata.is_file() && !metadata.file_type().is_symlink()
         });
-    if !has_language_servers
-        || !has_wasm
-        || !matches!(api_version, Some("0.6.0" | "0.7.0" | "0.8.0"))
-    {
+    // Current Zed packages embed their API version in the WASM custom section;
+    // the extension host validates it when loading the package.
+    if !has_language_servers || !has_wasm {
         return None;
     }
     let version = manifest.get("version")?.as_str()?.to_string();
@@ -1289,6 +1288,7 @@ mod tests {
             ready,
             quiescent,
             message: message.map(str::to_string),
+            on_type_formatting_triggers: Vec::new(),
         })
         .collect();
         let notices = builtin_setup_notices(statuses);
@@ -1782,7 +1782,7 @@ mod tests {
         std::fs::create_dir(&html).expect("HTML extension directory");
         std::fs::write(
             html.join("extension.toml"),
-            "id = 'html'\nname = 'HTML'\nversion = '0.2.0'\nschema_version = 1\ndescription = 'HTML support'\n[lib]\nversion = '0.7.0'\n[language_servers.html]\nlanguages = ['HTML']\n",
+            "id = 'html'\nname = 'HTML'\nversion = '0.2.0'\nschema_version = 1\ndescription = 'HTML support'\n[language_servers.html]\nlanguages = ['HTML']\n",
         )
         .expect("HTML extension manifest");
         std::fs::write(html.join("extension.wasm"), b"test")
@@ -1790,6 +1790,7 @@ mod tests {
         let installed = installed_language_extensions_in(root.path());
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].installed_version.as_deref(), Some("0.2.0"));
+        assert_eq!(installed[0].wasm_api_version, None);
         assert!(!installed[0].from_catalog);
         #[cfg(unix)]
         {

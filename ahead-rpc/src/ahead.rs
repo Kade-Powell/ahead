@@ -23,6 +23,9 @@ pub type RepoPath = String;
 /// JSON-RPC error returned by an ACP agent when the user must authenticate.
 pub const ACP_AUTH_REQUIRED_ERROR_CODE: i64 = -32000;
 
+/// JSON-RPC error returned by an ACP agent when a saved session does not exist.
+pub const ACP_RESOURCE_NOT_FOUND_ERROR_CODE: i64 = -32002;
+
 /// The six descriptive work categories inferred from the human request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -741,6 +744,10 @@ pub struct TurnEditorContext {
     pub caret: DisplayPosition,
     pub selection: Option<DisplayRange>,
     pub file_content: String,
+    /// Exact selected text captured for a turn without persisting the whole
+    /// editor buffer. The selection range still identifies its source lines.
+    #[serde(default)]
+    pub selected_excerpt: Option<String>,
     pub visible_end: Option<DisplayPosition>,
     pub attached_anchor_ids: Vec<Id>,
     pub attached_files: Vec<TurnContextFile>,
@@ -754,6 +761,9 @@ impl TurnEditorContext {
     /// captured editor snapshot.
     pub fn selected_text(&self) -> Option<&str> {
         let selection = self.selection.as_ref()?;
+        if let Some(excerpt) = self.selected_excerpt.as_deref() {
+            return (!excerpt.is_empty()).then_some(excerpt);
+        }
         let start = byte_offset_at(&self.file_content, selection.start)?;
         let end = byte_offset_at(&self.file_content, selection.end)?;
         self.file_content
@@ -773,6 +783,7 @@ impl TurnEditorContext {
             .iter()
             .any(|file| file.path == self.active_path);
         self.selection = None;
+        self.selected_excerpt = None;
         self.caret = DisplayPosition { line: 0, col: 0 };
         self.file_content.clear();
         self.visible_end = None;
@@ -816,7 +827,23 @@ fn byte_offset_at(content: &str, position: DisplayPosition) -> Option<usize> {
 pub struct TurnContextFile {
     pub path: String,
     pub content: String,
+    #[serde(default)]
+    pub kind: TurnContextFileKind,
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnContextFileKind {
+    #[default]
+    Full,
+    Outline,
+    Excerpt,
+}
+
+/// Match Zed's point where an explicit file becomes an outline rather than
+/// full text. The managed agent also enforces this as an individual item cap.
+pub const CHAT_FILE_OUTLINE_THRESHOLD_BYTES: usize = 16 * 1024;
+pub const CHAT_CONTEXT_PROMPT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -892,6 +919,7 @@ mod turn_editor_context_tests {
                 end: DisplayPosition { line: 0, col: 3 },
             }),
             file_content: "a😀猫\nnext".into(),
+            selected_excerpt: None,
             visible_end: Some(DisplayPosition { line: 3, col: 0 }),
             attached_anchor_ids: vec!["anchor-1".into()],
             attached_files: Vec::new(),
@@ -925,6 +953,20 @@ mod turn_editor_context_tests {
     }
 
     #[test]
+    fn selected_excerpt_survives_without_the_full_editor_buffer() {
+        let mut context = turn_context();
+        context.selected_excerpt = context.selected_text().map(str::to_owned);
+        context.file_content.clear();
+        let restored: TurnEditorContext = serde_json::from_value(
+            serde_json::to_value(context).expect("serialize"),
+        )
+        .expect("restore");
+        assert_eq!(restored.selected_text(), Some("😀"));
+        assert!(restored.file_content.is_empty());
+        assert_eq!(restored.selection, turn_context().selection);
+    }
+
+    #[test]
     fn stale_selection_cleanup_removes_implicit_focus_but_keeps_explicit_context() {
         let mut context = turn_context();
         context.selection = Some(DisplayRange {
@@ -948,6 +990,7 @@ mod turn_editor_context_tests {
         explicitly_attached.attached_files.push(TurnContextFile {
             path: "src/main.rs".into(),
             content: "explicit file contents".into(),
+            kind: TurnContextFileKind::Full,
         });
         assert!(explicitly_attached.discard_stale_selection());
         assert_eq!(explicitly_attached.active_path, "src/main.rs");
@@ -1527,7 +1570,9 @@ pub struct AgentTerminalAuthLaunch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentUsage {
-    pub total_tokens: u64,
+    /// Tokens used by the current context, not cumulative billed tokens.
+    pub used_tokens: u64,
+    /// Effective context limit available to inference after model headroom.
     pub context_window: Option<u64>,
 }
 

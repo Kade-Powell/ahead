@@ -16,11 +16,8 @@ use wildmatch::WildMatchPattern;
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
 use crate::Constrained;
 use crate::ConstraintError;
-use crate::InAppBrowserRequirementsToml;
 use crate::McpServerRequirement;
 use crate::RequirementsExecPolicy;
-use crate::browser_computer_use_requirements::BrowserUseRequirementsToml;
-use crate::browser_computer_use_requirements::ComputerUseRequirementsToml;
 use crate::config_toml::ConfigToml;
 use crate::mcp_requirements::validate_mcp_server_requirement;
 use crate::permissions_toml::PermissionProfileToml;
@@ -135,9 +132,6 @@ pub struct ConfigRequirements {
     pub windows_sandbox_mode: ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
     pub windows_sandbox_private_desktop: Option<Sourced<bool>>,
     pub web_search_mode: ConstrainedWithSource<WebSearchMode>,
-    pub allow_appshots: Option<Sourced<bool>>,
-    pub allow_remote_control: Option<Sourced<bool>>,
-    pub computer_use: Option<Sourced<ComputerUseRequirementsToml>>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
     pub exec_policy: Option<Sourced<RequirementsExecPolicy>>,
@@ -171,9 +165,6 @@ impl Default for ConfigRequirements {
                 Constrained::allow_any(WebSearchMode::Cached),
                 /*source*/ None,
             ),
-            allow_appshots: None,
-            allow_remote_control: None,
-            computer_use: None,
             feature_requirements: None,
             mcp_servers: None,
             exec_policy: None,
@@ -435,12 +426,6 @@ pub struct ConfigRequirementsToml {
     pub default_permissions: Option<String>,
     pub remote_sandbox_config: Option<Vec<RemoteSandboxConfigToml>>,
     pub allowed_web_search_modes: Option<Vec<WebSearchModeRequirement>>,
-    pub allow_browser_and_computer_use: Option<bool>,
-    pub allow_appshots: Option<bool>,
-    pub allow_remote_control: Option<bool>,
-    pub computer_use: Option<ComputerUseRequirementsToml>,
-    pub browser_use: Option<BrowserUseRequirementsToml>,
-    pub in_app_browser: Option<InAppBrowserRequirementsToml>,
     pub windows: Option<WindowsRequirementsToml>,
     #[serde(rename = "features", alias = "feature_requirements")]
     pub feature_requirements: Option<FeatureRequirementsToml>,
@@ -516,12 +501,6 @@ pub struct ConfigRequirementsWithSources {
     pub allowed_permission_profiles: Option<Sourced<BTreeMap<String, bool>>>,
     pub default_permissions: Option<Sourced<String>>,
     pub allowed_web_search_modes: Option<Sourced<Vec<WebSearchModeRequirement>>>,
-    pub allow_browser_and_computer_use: Option<Sourced<bool>>,
-    pub allow_appshots: Option<Sourced<bool>>,
-    pub allow_remote_control: Option<Sourced<bool>>,
-    pub computer_use: Option<Sourced<ComputerUseRequirementsToml>>,
-    pub browser_use: Option<Sourced<BrowserUseRequirementsToml>>,
-    pub in_app_browser: Option<Sourced<InAppBrowserRequirementsToml>>,
     pub windows: Option<Sourced<WindowsRequirementsToml>>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
@@ -560,12 +539,6 @@ impl ConfigRequirementsWithSources {
             default_permissions: _,
             remote_sandbox_config: _,
             allowed_web_search_modes: _,
-            allow_browser_and_computer_use: _,
-            allow_appshots: _,
-            allow_remote_control: _,
-            computer_use: _,
-            browser_use: _,
-            in_app_browser: _,
             windows: _,
             feature_requirements: _,
             mcp_servers: _,
@@ -590,12 +563,6 @@ impl ConfigRequirementsWithSources {
                 allowed_permission_profiles,
                 default_permissions,
                 allowed_web_search_modes,
-                allow_browser_and_computer_use,
-                allow_appshots,
-                allow_remote_control,
-                computer_use,
-                browser_use,
-                in_app_browser,
                 windows,
                 feature_requirements,
                 mcp_servers,
@@ -618,12 +585,6 @@ impl ConfigRequirementsWithSources {
             allowed_permission_profiles,
             default_permissions,
             allowed_web_search_modes,
-            allow_browser_and_computer_use,
-            allow_appshots,
-            allow_remote_control,
-            computer_use,
-            browser_use,
-            in_app_browser,
             windows,
             feature_requirements,
             mcp_servers,
@@ -643,13 +604,6 @@ impl ConfigRequirementsWithSources {
             default_permissions: default_permissions.map(|sourced| sourced.value),
             remote_sandbox_config: None,
             allowed_web_search_modes: allowed_web_search_modes.map(|sourced| sourced.value),
-            allow_browser_and_computer_use: allow_browser_and_computer_use
-                .map(|sourced| sourced.value),
-            allow_appshots: allow_appshots.map(|sourced| sourced.value),
-            allow_remote_control: allow_remote_control.map(|sourced| sourced.value),
-            computer_use: computer_use.map(|sourced| sourced.value),
-            browser_use: browser_use.map(|sourced| sourced.value),
-            in_app_browser: in_app_browser.map(|sourced| sourced.value),
             windows: windows.map(|sourced| sourced.value),
             feature_requirements: feature_requirements.map(|sourced| sourced.value),
             mcp_servers: mcp_servers.map(|sourced| sourced.value),
@@ -736,21 +690,6 @@ impl ConfigRequirementsToml {
             && self.default_permissions.is_none()
             && self.remote_sandbox_config.is_none()
             && self.allowed_web_search_modes.is_none()
-            && self.allow_browser_and_computer_use.is_none()
-            && self.allow_appshots.is_none()
-            && self.allow_remote_control.is_none()
-            && self
-                .computer_use
-                .as_ref()
-                .is_none_or(ComputerUseRequirementsToml::is_empty)
-            && self
-                .browser_use
-                .as_ref()
-                .is_none_or(BrowserUseRequirementsToml::is_empty)
-            && self
-                .in_app_browser
-                .as_ref()
-                .is_none_or(|requirements| requirements == &InAppBrowserRequirementsToml::default())
             && self
                 .windows
                 .as_ref()
@@ -869,12 +808,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             allowed_permission_profiles: _,
             default_permissions: _,
             allowed_web_search_modes,
-            allow_browser_and_computer_use: _,
-            allow_appshots,
-            allow_remote_control,
-            computer_use,
-            browser_use: _,
-            in_app_browser: _,
             windows,
             feature_requirements,
             mcp_servers,
@@ -1110,9 +1043,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             windows_sandbox_mode,
             windows_sandbox_private_desktop,
             web_search_mode,
-            allow_appshots,
-            allow_remote_control,
-            computer_use,
             feature_requirements,
             mcp_servers,
             exec_policy,
@@ -1149,12 +1079,6 @@ pub fn sandbox_mode_requirement_for_permission_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AllowDenyRequirementToml;
-    use crate::BrowserUseAccessApprovalLifetimeToml;
-    use crate::BrowserUseOriginPolicyToml;
-    use crate::ComputerUseMacosRequirementsToml;
-    use crate::ComputerUseWindowsExeRequirementToml;
-    use crate::ComputerUseWindowsRequirementsToml;
     use crate::McpServerCommandMatcher;
     use crate::McpServerIdentity;
     use crate::McpServerValueMatcher;
@@ -1254,12 +1178,6 @@ mod tests {
             default_permissions,
             remote_sandbox_config: _,
             allowed_web_search_modes,
-            allow_browser_and_computer_use,
-            allow_appshots,
-            allow_remote_control,
-            computer_use,
-            browser_use,
-            in_app_browser,
             windows,
             feature_requirements,
             mcp_servers,
@@ -1284,16 +1202,6 @@ mod tests {
             default_permissions: default_permissions
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_web_search_modes: allowed_web_search_modes
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            allow_browser_and_computer_use: allow_browser_and_computer_use
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            allow_appshots: allow_appshots
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            allow_remote_control: allow_remote_control
-                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            computer_use: computer_use.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            browser_use: browser_use.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            in_app_browser: in_app_browser
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             windows: windows.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             feature_requirements: feature_requirements
@@ -1355,19 +1263,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_allow_appshots() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_appshots = true
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_appshots, Some(true));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn filesystem_requirements_table_cannot_define_a_permission_profile() {
         let err = from_str::<ConfigRequirementsToml>(
             r#"
@@ -1383,243 +1278,6 @@ mod tests {
             ),
             "unexpected error: {err:#}"
         );
-    }
-
-    #[test]
-    fn allow_appshots_false_is_still_configured() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_appshots = false
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_appshots, Some(false));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn allow_remote_control_false_is_still_configured() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_remote_control = false
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_remote_control, Some(false));
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn deserialize_browser_and_computer_use_requirements() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-                allow_browser_and_computer_use = false
-
-                [browser_use]
-                allow_history_access = false
-                disable_auto_review = true
-                allow_global_persistent_approval = false
-
-                [browser_use.default_origin_policy]
-                access = "deny"
-                downloads = "allow"
-                uploads = "deny"
-                full_cdp_access = "allow"
-                auto_review = "deny"
-                persistent_approval = false
-                access_approval_lifetime = "turn"
-
-                [browser_use.origins."https://example.com"]
-                access = "allow"
-                downloads = "deny"
-                uploads = "allow"
-                full_cdp_access = "deny"
-                auto_review = "deny"
-                persistent_approval = true
-                access_approval_lifetime = "thread"
-
-                [computer_use]
-                allow_locked_computer_use = false
-                allow_persistent_approval = false
-                default_app_access = "deny"
-
-                [computer_use.macos.bundle_ids]
-                "com.apple.Safari" = "allow"
-
-                [computer_use.windows.aumids]
-                "Microsoft.Paint_8wekyb3d8bbwe!App" = "allow"
-
-                [[computer_use.windows.exes]]
-                publisher_name = "CN=Google LLC, O=Google LLC, L=Mountain View, S=California, C=US"
-                product_name = "Google Chrome"
-                binary_name = "chrome.exe"
-                access = "deny"
-            "#,
-        )?;
-
-        assert_eq!(requirements.allow_browser_and_computer_use, Some(false));
-        assert_eq!(
-            requirements.browser_use,
-            Some(BrowserUseRequirementsToml {
-                allow_history_access: Some(false),
-                disable_auto_review: Some(true),
-                allow_global_persistent_approval: Some(false),
-                default_origin_policy: Some(BrowserUseOriginPolicyToml {
-                    access: Some(AllowDenyRequirementToml::Deny),
-                    downloads: Some(AllowDenyRequirementToml::Allow),
-                    uploads: Some(AllowDenyRequirementToml::Deny),
-                    full_cdp_access: Some(AllowDenyRequirementToml::Allow),
-                    auto_review: Some(AllowDenyRequirementToml::Deny),
-                    persistent_approval: Some(false),
-                    access_approval_lifetime: Some(BrowserUseAccessApprovalLifetimeToml::Turn),
-                }),
-                origins: Some(BTreeMap::from([(
-                    "https://example.com".to_string(),
-                    BrowserUseOriginPolicyToml {
-                        access: Some(AllowDenyRequirementToml::Allow),
-                        downloads: Some(AllowDenyRequirementToml::Deny),
-                        uploads: Some(AllowDenyRequirementToml::Allow),
-                        full_cdp_access: Some(AllowDenyRequirementToml::Deny),
-                        auto_review: Some(AllowDenyRequirementToml::Deny),
-                        persistent_approval: Some(true),
-                        access_approval_lifetime: Some(
-                            BrowserUseAccessApprovalLifetimeToml::Thread,
-                        ),
-                    },
-                )])),
-            })
-        );
-        assert_eq!(
-            requirements.computer_use,
-            Some(ComputerUseRequirementsToml {
-                allow_locked_computer_use: Some(false),
-                allow_persistent_approval: Some(false),
-                default_app_access: Some(AllowDenyRequirementToml::Deny),
-                macos: Some(ComputerUseMacosRequirementsToml {
-                    bundle_ids: Some(BTreeMap::from([(
-                        "com.apple.Safari".to_string(),
-                        AllowDenyRequirementToml::Allow,
-                    )])),
-                }),
-                windows: Some(ComputerUseWindowsRequirementsToml {
-                    aumids: Some(BTreeMap::from([(
-                        "Microsoft.Paint_8wekyb3d8bbwe!App".to_string(),
-                        AllowDenyRequirementToml::Allow,
-                    )])),
-                    exes: Some(vec![ComputerUseWindowsExeRequirementToml {
-                        publisher_name:
-                            "CN=Google LLC, O=Google LLC, L=Mountain View, S=California, C=US"
-                                .to_string(),
-                        product_name: "Google Chrome".to_string(),
-                        binary_name: Some("chrome.exe".to_string()),
-                        access: AllowDenyRequirementToml::Deny,
-                    }]),
-                }),
-            })
-        );
-        assert!(!requirements.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn browser_and_computer_use_leaf_requirements_are_not_empty() -> Result<()> {
-        for (name, requirements_toml) in [
-            (
-                "browser history",
-                "[browser_use]\nallow_history_access = false",
-            ),
-            (
-                "browser auto-review",
-                "[browser_use]\ndisable_auto_review = true",
-            ),
-            (
-                "global persistent approval",
-                "[browser_use]\nallow_global_persistent_approval = false",
-            ),
-            (
-                "default origin access",
-                "[browser_use.default_origin_policy]\naccess = \"deny\"",
-            ),
-            (
-                "default origin downloads",
-                "[browser_use.default_origin_policy]\ndownloads = \"deny\"",
-            ),
-            (
-                "default origin uploads",
-                "[browser_use.default_origin_policy]\nuploads = \"deny\"",
-            ),
-            (
-                "default origin full CDP access",
-                "[browser_use.default_origin_policy]\nfull_cdp_access = \"deny\"",
-            ),
-            (
-                "default origin auto-review",
-                "[browser_use.default_origin_policy]\nauto_review = \"deny\"",
-            ),
-            (
-                "default origin persistent approval",
-                "[browser_use.default_origin_policy]\npersistent_approval = false",
-            ),
-            (
-                "default origin access approval lifetime",
-                "[browser_use.default_origin_policy]\naccess_approval_lifetime = \"turn\"",
-            ),
-            (
-                "origin access",
-                "[browser_use.origins.\"https://example.com\"]\naccess = \"deny\"",
-            ),
-            (
-                "origin downloads",
-                "[browser_use.origins.\"https://example.com\"]\ndownloads = \"deny\"",
-            ),
-            (
-                "origin uploads",
-                "[browser_use.origins.\"https://example.com\"]\nuploads = \"deny\"",
-            ),
-            (
-                "origin full CDP access",
-                "[browser_use.origins.\"https://example.com\"]\nfull_cdp_access = \"deny\"",
-            ),
-            (
-                "origin auto-review",
-                "[browser_use.origins.\"https://example.com\"]\nauto_review = \"deny\"",
-            ),
-            (
-                "origin persistent approval",
-                "[browser_use.origins.\"https://example.com\"]\npersistent_approval = false",
-            ),
-            (
-                "origin access approval lifetime",
-                "[browser_use.origins.\"https://example.com\"]\naccess_approval_lifetime = \"turn\"",
-            ),
-            (
-                "computer persistent approval",
-                "[computer_use]\nallow_persistent_approval = false",
-            ),
-            (
-                "default app access",
-                "[computer_use]\ndefault_app_access = \"deny\"",
-            ),
-            (
-                "macOS bundle identifier",
-                "[computer_use.macos.bundle_ids]\n\"com.example.App\" = \"deny\"",
-            ),
-            (
-                "Windows AUMID",
-                "[computer_use.windows.aumids]\n\"Example.App_123!Main\" = \"deny\"",
-            ),
-            (
-                "Windows executable",
-                "[[computer_use.windows.exes]]\npublisher_name = \"CN=Example Corp\"\nproduct_name = \"Example App\"\naccess = \"deny\"",
-            ),
-        ] {
-            let requirements: ConfigRequirementsToml = from_str(requirements_toml)?;
-            assert!(!requirements.is_empty(), "{name} requirement was dropped");
-        }
-
-        Ok(())
     }
 
     #[test]
@@ -1664,20 +1322,6 @@ mod tests {
         let feature_requirements = FeatureRequirementsToml {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
-        let browser_use = BrowserUseRequirementsToml {
-            allow_history_access: Some(false),
-            disable_auto_review: Some(true),
-            allow_global_persistent_approval: None,
-            default_origin_policy: None,
-            origins: None,
-        };
-        let computer_use = ComputerUseRequirementsToml {
-            allow_locked_computer_use: Some(false),
-            allow_persistent_approval: Some(false),
-            default_app_access: None,
-            macos: None,
-            windows: None,
-        };
         let models = ModelsRequirementsToml {
             new_thread: Some(NewThreadModelDefaultsToml {
                 model: Some("managed-model".to_string()),
@@ -1710,12 +1354,6 @@ mod tests {
             default_permissions: Some("managed".to_string()),
             remote_sandbox_config: None,
             allowed_web_search_modes: Some(allowed_web_search_modes.clone()),
-            allow_browser_and_computer_use: Some(false),
-            allow_appshots: Some(false),
-            allow_remote_control: Some(false),
-            computer_use: Some(computer_use.clone()),
-            browser_use: Some(browser_use.clone()),
-            in_app_browser: None,
             windows: Some(windows.clone()),
             feature_requirements: Some(feature_requirements.clone()),
             mcp_servers: None,
@@ -1748,18 +1386,6 @@ mod tests {
                     allowed_web_search_modes,
                     enforce_source.clone(),
                 )),
-                allow_browser_and_computer_use: Some(Sourced::new(
-                    /*value*/ false,
-                    enforce_source.clone(),
-                )),
-                allow_appshots: Some(Sourced::new(/*value*/ false, enforce_source.clone(),)),
-                allow_remote_control: Some(Sourced::new(
-                    /*value*/ false,
-                    enforce_source.clone(),
-                )),
-                computer_use: Some(Sourced::new(computer_use, enforce_source.clone())),
-                browser_use: Some(Sourced::new(browser_use, enforce_source.clone())),
-                in_app_browser: None,
                 windows: Some(Sourced::new(windows, enforce_source.clone())),
                 feature_requirements: Some(Sourced::new(
                     feature_requirements,
@@ -1801,11 +1427,6 @@ mod tests {
                 allowed_permission_profiles: None,
                 default_permissions: None,
                 allowed_web_search_modes: None,
-                allow_appshots: None,
-                allow_remote_control: None,
-                computer_use: None,
-                browser_use: None,
-                in_app_browser: None,
                 windows: None,
                 feature_requirements: None,
                 mcp_servers: None,
@@ -1849,11 +1470,6 @@ mod tests {
                 allowed_permission_profiles: None,
                 default_permissions: None,
                 allowed_web_search_modes: None,
-                allow_appshots: None,
-                allow_remote_control: None,
-                computer_use: None,
-                browser_use: None,
-                in_app_browser: None,
                 windows: None,
                 feature_requirements: None,
                 mcp_servers: None,

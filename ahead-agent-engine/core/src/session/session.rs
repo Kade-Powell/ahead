@@ -14,6 +14,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
+use codex_config::CONFIG_TOML_FILE;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::SessionId;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
@@ -36,7 +37,6 @@ use tokio::sync::Semaphore;
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
-    pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
@@ -537,11 +537,9 @@ impl Session {
         request_kind: CodexResponsesRequestKind,
     ) -> CodexResponsesMetadata {
         let (window_id, window_number, context_window_id) = self.current_window().await;
-        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
-            self.installation_id.clone(),
-            window_id,
-            request_kind,
-        );
+        let responses_metadata = turn_context
+            .turn_metadata_state
+            .to_responses_metadata(window_id, request_kind);
         CodexResponsesMetadata {
             window_number: Some(window_number),
             context_window_id: Some(context_window_id),
@@ -565,7 +563,6 @@ impl Session {
         environment_selections: &[TurnEnvironmentSelection],
         config: Arc<Config>,
         user_instructions: Option<ahead_runtime_api::Instructions>,
-        installation_id: String,
         auth_manager: Arc<AuthManager>,
         models_manager: SharedModelsManager,
         model_info: ModelInfo,
@@ -885,15 +882,6 @@ impl Session {
 
             let mut post_session_configured_events = Vec::<Event>::new();
 
-            for usage in config.features.legacy_feature_usages() {
-                post_session_configured_events.push(Event {
-                    id: INITIAL_SUBMIT_ID.to_owned(),
-                    msg: EventMsg::DeprecationNotice(DeprecationNoticeEvent {
-                        summary: usage.summary.clone(),
-                        details: usage.details.clone(),
-                    }),
-                });
-            }
             for message in &config.startup_warnings {
                 post_session_configured_events.push(Event {
                     id: "".to_owned(),
@@ -1112,7 +1100,6 @@ impl Session {
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
                 thread_id,
-                installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),

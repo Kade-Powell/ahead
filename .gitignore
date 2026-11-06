@@ -4,6 +4,7 @@
 shell.nix
 lib/
 target/
+alacritty.recording
 core/languages/
 vendor/
 .ahead/*

@@ -89,6 +89,10 @@ pub enum CoreNotification {
     LanguageExtensionIssues {
         issues: Vec<LanguageExtensionIssue>,
     },
+    LanguageServerSchemas {
+        server_id: String,
+        schemas: LanguageServerSchemas,
+    },
     LanguageServerStatusesCleared,
     WorkDoneProgress {
         progress: ProgressParams,
@@ -264,10 +268,10 @@ impl CoreRpcHandler {
         response: Result<CoreResponse, RpcError>,
     ) {
         let tx = { self.pending.lock().remove(&id) };
-        if let Some(tx) = tx {
-            if tx.send(response).is_err() {
-                tracing::error!("Core RPC response receiver was dropped");
-            }
+        if let Some(tx) = tx
+            && tx.send(response).is_err()
+        {
+            tracing::error!("Core RPC response receiver was dropped");
         }
     }
 
@@ -405,6 +409,17 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::LanguageExtensionIssues { issues });
     }
 
+    pub fn language_server_schemas(
+        &self,
+        server_id: String,
+        schemas: LanguageServerSchemas,
+    ) {
+        self.notification(CoreNotification::LanguageServerSchemas {
+            server_id,
+            schemas,
+        });
+    }
+
     pub fn clear_language_server_statuses(&self) {
         self.notification(CoreNotification::LanguageServerStatusesCleared);
     }
@@ -515,6 +530,8 @@ pub enum LogLevel {
 pub struct ServerStatusParams {
     #[serde(default)]
     pub server_name: Option<String>,
+    #[serde(default)]
+    pub on_type_formatting_triggers: Vec<String>,
     health: String,
     quiescent: bool,
     pub message: Option<String>,
@@ -526,10 +543,17 @@ pub struct LanguageExtensionIssue {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LanguageServerSchemas {
+    pub initialization_options: Option<serde_json::Value>,
+    pub settings: Option<serde_json::Value>,
+}
+
 impl ServerStatusParams {
     pub fn starting(server_name: String) -> Self {
         Self {
             server_name: Some(server_name),
+            on_type_formatting_triggers: Vec::new(),
             health: "starting".into(),
             quiescent: false,
             message: None,
@@ -538,6 +562,7 @@ impl ServerStatusParams {
     pub fn ready(server_name: String) -> Self {
         Self {
             server_name: Some(server_name),
+            on_type_formatting_triggers: Vec::new(),
             health: "ok".to_string(),
             quiescent: true,
             message: None,
@@ -547,10 +572,19 @@ impl ServerStatusParams {
     pub fn failed(server_name: String, message: String) -> Self {
         Self {
             server_name: Some(server_name),
+            on_type_formatting_triggers: Vec::new(),
             health: "error".to_string(),
             quiescent: true,
             message: Some(message),
         }
+    }
+
+    pub fn with_on_type_formatting_triggers(
+        mut self,
+        triggers: Vec<String>,
+    ) -> Self {
+        self.on_type_formatting_triggers = triggers;
+        self
     }
 
     pub fn is_ok(&self) -> bool {

@@ -2,11 +2,11 @@
 
 ## Search this workspace
 
-Press **Cmd+Shift+F** / **Ctrl+Shift+F**, or choose Search in the status bar. Enter text and use **Case**, **Word**, or **Regex** when needed. Include and exclude patterns narrow the file paths. Select a result to open its file at the match. Search includes supported unsaved editor buffers, so save only when you intend to keep the change.
+Press **Cmd+Shift+F** / **Ctrl+Shift+F**, or choose Search in the status bar. Include and exclude patterns narrow the file paths. Select a result to open its file at the match. Search includes supported unsaved editor buffers, so save only when you intend to keep the change.
+
+Choose exactly one match mode: **Text**, **Word**, or **Regex**. Text matches the query literally, including punctuation such as `(` and `.`; for example, `console.log(` is searched exactly as typed. Word also treats the query literally and requires whole-word boundaries. Only Regex interprets regular-expression syntax. **Match case** is a separate modifier and can be combined with any mode.
 
 Regex supports look-ahead and look-behind patterns. It reads each file for cross-line context, while literal search remains streaming.
-
-Choose exactly one match mode: **Text**, **Word**, or **Regex**. **Case** is a separate modifier and can be combined with any mode.
 
 Choose **Replace** to expand the replacement field. **Replace Match** changes only the selected result; **Replace All** changes every matching occurrence in the filtered workspace. The current match mode, case setting, and include/exclude patterns apply to replacement too. Text and Word replacements are literal; Regex replacements can reference capture groups (for example, `$1` or `$name`) and use `\n`, `\t`, and `\\` escapes. AHEAD checks every target against its current editor buffer before applying any changes. Replacements become undoable unsaved editor edits; affected files open as tabs, and nothing is saved automatically. Review the changed tabs and save only when you want to keep the edits.
 

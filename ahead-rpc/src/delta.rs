@@ -225,12 +225,8 @@ impl AheadDelta {
             }
         }
 
-        let Some(replacement_start) = replacement_start else {
-            return None;
-        };
-        let Some(changed_base_start) = changed_base_start else {
-            return None;
-        };
+        let replacement_start = replacement_start?;
+        let changed_base_start = changed_base_start?;
         let (summary_start, summary_end) = self.summary();
         let final_updated_offset =
             updated_offset.checked_add(base.len().checked_sub(base_offset)?)?;
@@ -255,23 +251,19 @@ impl AheadDelta {
 
     /// Returns the inserted text when the delta is a single insertion.
     pub fn as_simple_insert(&self) -> Option<&str> {
-        if self.ops.len() == 3 {
-            if let [
-                DeltaOp::Retain(_),
-                DeltaOp::Insert(text),
-                DeltaOp::Retain(_),
-            ] = &self.ops[..]
-            {
-                return Some(text);
-            }
+        if let [
+            DeltaOp::Retain(_),
+            DeltaOp::Insert(text),
+            DeltaOp::Retain(_),
+        ] = &self.ops[..]
+        {
+            return Some(text);
         }
-        if self.ops.len() == 2 {
-            if let [DeltaOp::Retain(_), DeltaOp::Insert(text)] = &self.ops[..] {
-                return Some(text);
-            }
-            if let [DeltaOp::Insert(text), DeltaOp::Retain(_)] = &self.ops[..] {
-                return Some(text);
-            }
+        if let [DeltaOp::Retain(_), DeltaOp::Insert(text)] = &self.ops[..] {
+            return Some(text);
+        }
+        if let [DeltaOp::Insert(text), DeltaOp::Retain(_)] = &self.ops[..] {
+            return Some(text);
         }
         if let [DeltaOp::Insert(text)] = &self.ops[..] {
             return Some(text);

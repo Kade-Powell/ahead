@@ -13,13 +13,11 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
 use crate::client::X_CODEX_TURN_METADATA_HEADER;
 use crate::client::X_CODEX_WINDOW_ID_HEADER;
 use crate::client::X_OPENAI_SUBAGENT_HEADER;
 
-pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
 pub(crate) const AGENT_NAME_KEY: &str = "agent_name";
@@ -51,8 +49,9 @@ pub(crate) const WORKSPACES_KEY: &str = "workspaces";
 // App-server clients can specify additional metadata in the `responsesapi_client_metadata` param
 // when submitting a turn, but they must not override fields owned by core.
 const RESERVED_METADATA_KEYS: &[&str] = &[
-    INSTALLATION_ID_KEY,
-    X_CODEX_INSTALLATION_ID_HEADER,
+    // Prevent legacy caller metadata from reintroducing the retired Codex installation ID.
+    "installation_id",
+    "x-codex-installation-id",
     SESSION_ID_KEY,
     THREAD_ID_KEY,
     AGENT_NAME_KEY,
@@ -222,7 +221,6 @@ pub(crate) enum TurnToolSource {
 /// truth.
 #[derive(Clone, Debug)]
 pub struct CodexResponsesMetadata {
-    pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
     pub(crate) agent_name: Option<String>,
@@ -251,14 +249,8 @@ pub struct CodexResponsesMetadata {
 }
 
 impl CodexResponsesMetadata {
-    pub(crate) fn new(
-        installation_id: String,
-        session_id: String,
-        thread_id: String,
-        window_id: String,
-    ) -> Self {
+    pub(crate) fn new(session_id: String, thread_id: String, window_id: String) -> Self {
         Self {
-            installation_id,
             session_id,
             thread_id,
             agent_name: None,
@@ -301,10 +293,6 @@ impl CodexResponsesMetadata {
 
     pub(crate) fn client_metadata(&self) -> HashMap<String, String> {
         let mut client_metadata = HashMap::from([
-            (
-                X_CODEX_INSTALLATION_ID_HEADER.to_string(),
-                self.installation_id.clone(),
-            ),
             (SESSION_ID_KEY.to_string(), self.session_id.clone()),
             (THREAD_ID_KEY.to_string(), self.thread_id.clone()),
             (X_CODEX_WINDOW_ID_HEADER.to_string(), self.window_id.clone()),
@@ -376,7 +364,6 @@ impl CodexResponsesMetadata {
         });
         let has_request_identity = request_kind.is_some();
         CodexTurnMetadataPayload {
-            installation_id: has_request_identity.then_some(self.installation_id.as_str()),
             session_id: Some(self.session_id.as_str()),
             thread_id: Some(self.thread_id.as_str()),
             agent_name: self.agent_name.as_deref(),
@@ -493,8 +480,6 @@ fn non_empty_workspaces(
 
 #[derive(Serialize)]
 struct CodexTurnMetadataPayload<'a> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    installation_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

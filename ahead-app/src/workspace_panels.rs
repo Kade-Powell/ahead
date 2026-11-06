@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
     sync::{
@@ -466,7 +466,10 @@ impl Render for JustTasksPanel {
                                 )),
                         )
                         .child(
-                            Button::new(("watch_just_task", index))
+                            Button::new(format!("watch_just_task_{index}"))
+                                .debug_selector(move || {
+                                    format!("watch_just_task_{index}")
+                                })
                                 .icon(IconName::RefreshCw)
                                 .ghost()
                                 .accessibility_label(format!("Watch {recipe}"))
@@ -481,9 +484,12 @@ impl Render for JustTasksPanel {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
                                 .min_w_0()
                                 .child(
                                     div()
+                                        .min_w_0()
+                                        .truncate()
                                         .text_size(px(11.))
                                         .text_color(muted)
                                         .child(cwd),
@@ -1401,7 +1407,7 @@ impl GitPanel {
                         panel.refresh(cx);
                     }
                     Err(error) => {
-                        panel.status = format!("Push failed: {error}").into();
+                        panel.status = git_push_failure_status(&error).into();
                     }
                 }
                 cx.notify();
@@ -1643,6 +1649,23 @@ fn relative_git_time(timestamp: i64, now: i64) -> String {
 
 fn git_repository_not_found(error: &str) -> bool {
     error.contains("could not find repository")
+}
+
+fn git_push_failure_status(error: &str) -> String {
+    if is_non_fast_forward_error(error) {
+        format!(
+            "Push rejected: fetch and integrate remote changes before pushing again. {error}"
+        )
+    } else {
+        format!("Push failed: {error}")
+    }
+}
+
+fn is_non_fast_forward_error(error: &str) -> bool {
+    (error.contains("[rejected]")
+        && (error.contains("(non-fast-forward)") || error.contains("(fetch first)")))
+        || (error.contains("Updates were rejected")
+            && (error.contains("behind") || error.contains("remote")))
 }
 
 impl BasePanel for GitPanel {
@@ -2147,7 +2170,7 @@ impl Render for GitPanel {
                                         chrono::Utc::now().timestamp(),
                                     );
                                     let commit_for_open = commit.clone();
-                                    Button::new(("git_history_commit", index))
+                                    Button::new(format!("git-history-commit-{index}"))
                                         .ghost()
                                         .w_full()
                                         .min_w_0()
@@ -2226,6 +2249,9 @@ impl Render for GitPanel {
                                             .pb_2()
                                             .child(
                                                 Button::new("git_commit_diff_back")
+                                                    .debug_selector(|| {
+                                                        "git_commit_diff_back".into()
+                                                    })
                                                     .icon(IconName::ArrowLeft)
                                                     .ghost()
                                                     .tooltip(if is_worktree_diff {
@@ -2287,6 +2313,9 @@ impl Render for GitPanel {
                                                     };
                                                     header.child(
                                                         Button::new("git_commit_diff_copy")
+                                                            .debug_selector(|| {
+                                                                "git_commit_diff_copy".into()
+                                                            })
                                                             .icon(IconName::Copy)
                                                             .ghost()
                                                             .tooltip(tooltip)
@@ -4242,7 +4271,34 @@ pub struct LanguageServersPanel {
     undecided: bool,
     trust_pending: bool,
     trust_error: Option<String>,
+    expanded_schemas: HashSet<String>,
+    open_settings_handler: Option<Rc<dyn Fn(PathBuf, &mut Window, &mut App)>>,
     _updates: Task<()>,
+}
+
+fn language_server_schema_properties(
+    schema: &serde_json::Value,
+) -> Vec<(String, String)> {
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.iter())
+        .map(|(name, property)| {
+            let description = property
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    property
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "configuration option".into());
+            (name.clone(), description)
+        })
+        .collect()
 }
 
 fn workspace_trust_prompt(root: &Path) -> (String, String) {
@@ -4292,8 +4348,17 @@ impl LanguageServersPanel {
             undecided,
             trust_pending: false,
             trust_error,
+            expanded_schemas: HashSet::new(),
+            open_settings_handler: None,
             _updates: task,
         }
+    }
+
+    pub fn set_open_settings_handler<F>(&mut self, handler: F)
+    where
+        F: 'static + Fn(PathBuf, &mut Window, &mut App),
+    {
+        self.open_settings_handler = Some(Rc::new(handler));
     }
 
     fn refresh_trust(&mut self, cx: &mut Context<Self>) {
@@ -4434,6 +4499,8 @@ impl Render for LanguageServersPanel {
         let text = cx.theme().sidebar_foreground;
         let muted = cx.theme().muted_foreground;
         let servers = self.proxy.lsp_servers();
+        let server_schemas = self.proxy.language_server_schemas();
+        let expanded_schemas = self.expanded_schemas.clone();
         let extension_issues = self.proxy.language_extension_issues();
         v_flex()
             .size_full()
@@ -4443,9 +4510,29 @@ impl Render for LanguageServersPanel {
             .child(
                 h_flex()
                     .items_center()
+                    .justify_end()
                     .gap_2()
-                    .child(IconName::Zap)
-                    .child(div().flex_1().text_color(text).child("Language Servers"))
+                    .child(
+                        Button::new("edit_language_server_settings")
+                            .icon(IconName::Settings)
+                            .label("Config")
+                            .ghost()
+                            .disabled(self.open_settings_handler.is_none())
+                            .tooltip(
+                                "Edit shareable language-server routing in .ahead/config.toml",
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(handler) =
+                                    this.open_settings_handler.clone()
+                                {
+                                    handler(
+                                        this.root.join(".ahead/config.toml"),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("restart_language_servers")
                             .icon(IconName::RefreshCw)
@@ -4528,48 +4615,211 @@ impl Render for LanguageServersPanel {
                 } else {
                     (IconName::CircleDashed, "Starting", cx.theme().warning)
                 };
-                let name = server
+                let server_id = server
                     .name
                     .strip_prefix("lsp-")
-                    .map(|language| format!("{language} language server"))
-                    .unwrap_or_else(|| server.name.clone());
-                h_flex()
+                    .unwrap_or(&server.name)
+                    .to_owned();
+                let name = format!("{server_id} language server");
+                let schema = server_schemas
+                    .get(&server_id)
+                    .filter(|schemas| {
+                        schemas.initialization_options.is_some()
+                            || schemas.settings.is_some()
+                    })
+                    .cloned();
+                let schema_expanded = expanded_schemas.contains(&server_id);
+                let server_id_for_click = server_id.clone();
+                v_flex()
                     .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap_2()
-                    .p_2()
-                    .bg(cx.theme().group_box)
-                    .child(div().text_color(color).child(icon))
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .flex_1()
+                        h_flex()
+                            .w_full()
                             .min_w_0()
-                            .gap_1()
+                            .items_center()
+                            .gap_2()
+                            .p_2()
+                            .bg(cx.theme().group_box)
+                            .child(div().text_color(color).child(icon))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_color(text)
+                                            .child(name),
+                                    )
+                                    .when_some(server.message.clone(), |el, message| {
+                                        el.child(
+                                            div()
+                                                .min_w_0()
+                                                .text_size(px(11.))
+                                                .text_color(muted)
+                                                .child(message),
+                                        )
+                                    }),
+                            )
                             .child(
                                 div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(text)
-                                    .child(name),
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(color)
+                                    .child(state),
                             )
-                            .when_some(server.message.clone(), |el, message| {
-                                el.child(
-                                    div()
-                                        .min_w_0()
-                                        .text_size(px(11.))
-                                        .text_color(muted)
-                                        .child(message),
+                            .when_some(schema.clone(), |row, _| {
+                                row.child(
+                                    Button::new(format!("lsp_schema_{server_id}"))
+                                        .icon(if schema_expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .label("Options")
+                                        .ghost()
+                                        .tooltip(
+                                            "Show configuration options supported by this extension",
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this
+                                                .expanded_schemas
+                                                .remove(&server_id_for_click)
+                                            {
+                                                this.expanded_schemas
+                                                    .insert(server_id_for_click.clone());
+                                            }
+                                            cx.notify();
+                                        })),
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(color)
-                            .child(state),
-                    )
+                    .when_some(schema, |item, schemas| {
+                        item.when(schema_expanded, |item| {
+                            let initialization_options = schemas
+                                .initialization_options
+                                .as_ref()
+                                .map(language_server_schema_properties)
+                                .unwrap_or_default();
+                            let settings = schemas
+                                .settings
+                                .as_ref()
+                                .map(language_server_schema_properties)
+                                .unwrap_or_default();
+                            item.child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .p_2()
+                                    .pl_8()
+                                    .bg(cx.theme().group_box)
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(muted)
+                                            .child(format!(
+                                                "Edit [lsp.{server_id}] in .ahead/config.toml with Config above"
+                                            )),
+                                    )
+                                    .when_some(
+                                        schemas.initialization_options.as_ref(),
+                                        |details, _| {
+                                            details.child(
+                                                v_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_color(text)
+                                                            .child("Initialization options"),
+                                                    )
+                                                    .children(
+                                                        initialization_options
+                                                            .iter()
+                                                            .take(8)
+                                                            .map(|(name, description)| {
+                                                                h_flex()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .text_color(text)
+                                                                            .child(name.clone()),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .truncate()
+                                                                            .text_color(muted)
+                                                                            .child(description.clone()),
+                                                                    )
+                                                            }),
+                                                    )
+                                                    .when(
+                                                        initialization_options.len() > 8,
+                                                        |details| {
+                                                            details.child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(muted)
+                                                                    .child(format!(
+                                                                        "{} more options",
+                                                                        initialization_options.len() - 8
+                                                                    )),
+                                                            )
+                                                        },
+                                                    )
+                                            )
+                                        },
+                                    )
+                                    .when_some(schemas.settings.as_ref(), |details, _| {
+                                        details.child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_color(text)
+                                                        .child("Server settings"),
+                                                )
+                                                .children(
+                                                    settings.iter().take(8).map(
+                                                        |(name, description)| {
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .text_color(text)
+                                                                        .child(name.clone()),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .min_w_0()
+                                                                        .truncate()
+                                                                        .text_color(muted)
+                                                                        .child(description.clone()),
+                                                                )
+                                                        },
+                                                    ),
+                                                )
+                                                .when(settings.len() > 8, |details| {
+                                                    details.child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(muted)
+                                                            .child(format!(
+                                                                "{} more options",
+                                                                settings.len() - 8
+                                                            )),
+                                                    )
+                                                }),
+                                        )
+                                    }),
+                            )
+                        })
+                    })
             }))
             .when(!extension_issues.is_empty(), |el| {
                 el.child(
@@ -4623,8 +4873,10 @@ impl Render for LanguageServersPanel {
 mod tests {
     use super::{
         GitFile, GitPanel, GitWorkspaceStatus, JustTask, JustTasksPanel,
-        SEARCH_RESULT_PAGE_SIZE, SearchDisplayRow, SearchMode, SearchPanel,
-        SearchResult, git_repository_not_found, next_search_result_index,
+        LanguageServersPanel, SEARCH_RESULT_PAGE_SIZE, SearchDisplayRow, SearchMode,
+        SearchPanel, SearchResult, git_push_failure_status,
+        git_repository_not_found, is_non_fast_forward_error,
+        language_server_schema_properties, next_search_result_index,
         next_search_result_page_size, parse_just_list,
         search_display_row_for_result, search_display_rows,
         search_location_after_replacement, search_preview_segments,
@@ -4634,8 +4886,60 @@ mod tests {
     use ahead_rpc::source_control::GitStatusFile;
     use gpui_kit::prelude::*;
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{Entity, Render, TestAppContext, Window, div, px};
+    use gpui_kit::{Entity, Focusable, Render, TestAppContext, Window, div, px};
     use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
+
+    #[test]
+    fn language_server_schema_preview_lists_fields_and_descriptions() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Enable the feature"
+                },
+                "mode": { "type": "string" }
+            }
+        });
+
+        assert_eq!(
+            language_server_schema_properties(&schema),
+            vec![
+                ("enabled".into(), "Enable the feature".into()),
+                ("mode".into(), "string".into()),
+            ]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn language_server_config_action_opens_tracked_workspace_config(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().to_path_buf();
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(root.clone());
+        let opened_path = Rc::new(RefCell::new(None));
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(move |_, cx| {
+            LanguageServersPanel::new(&root, proxy.clone(), cx)
+        });
+        let opened_path_for_handler = opened_path.clone();
+        panel.update(cx, |panel, _| {
+            panel.set_open_settings_handler(move |path, _, _| {
+                *opened_path_for_handler.borrow_mut() = Some(path);
+            });
+        });
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            window.click("edit_language_server_settings", cx);
+        });
+
+        assert_eq!(
+            opened_path.borrow().as_ref(),
+            Some(&workspace.path().join(".ahead/config.toml"))
+        );
+    }
 
     #[test]
     fn workspace_trust_prompt_identifies_project_and_full_path() {
@@ -4653,6 +4957,36 @@ mod tests {
         assert!(message.contains(
             "Installed extensions may run processes with your user permissions."
         ));
+    }
+
+    #[test]
+    fn git_push_failure_status_explains_stale_remote_and_preserves_details() {
+        let error = "error: failed to push some refs to 'origin'\n! [rejected] main -> main (non-fast-forward)";
+
+        let status = git_push_failure_status(error);
+
+        assert!(status.starts_with(
+            "Push rejected: fetch and integrate remote changes before pushing again."
+        ));
+        assert!(status.contains(error));
+    }
+
+    #[test]
+    fn git_push_failure_status_keeps_other_git_errors_unchanged() {
+        assert_eq!(
+            git_push_failure_status("fatal: Authentication failed"),
+            "Push failed: fatal: Authentication failed"
+        );
+    }
+
+    #[test]
+    fn non_fast_forward_detection_handles_git_rejection_variants() {
+        assert!(is_non_fast_forward_error("! [rejected] main (fetch first)"));
+        assert!(is_non_fast_forward_error(
+            "Updates were rejected because the remote contains work you do not have locally"
+        ));
+        assert!(!is_non_fast_forward_error("fatal: Authentication failed"));
+        assert!(!is_non_fast_forward_error("error: RPC failed; curl 56"));
     }
 
     struct NarrowGitPanel(Entity<GitPanel>);
@@ -4872,8 +5206,9 @@ mod tests {
     #[gpui_kit::test]
     fn search_modes_are_exclusive_and_case_is_independent(cx: &mut TestAppContext) {
         let workspace = tempfile::tempdir().expect("workspace");
-        let file_path = workspace.path().join("main.rs");
-        std::fs::write(&file_path, "needle needlework\n").expect("source file");
+        let file_path = workspace.path().join("main.js");
+        std::fs::write(&file_path, "console.log(42)\nconsoleXlog(42)\n")
+            .expect("source file");
         let root = workspace.path().to_string_lossy().into_owned();
         let file_path = file_path.to_string_lossy().into_owned();
         cx.update(gpui_kit::component::init);
@@ -4926,6 +5261,107 @@ mod tests {
             SearchMode::Text
         );
         assert!(cx.update(|_, cx| panel.read(cx).case_sensitive));
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.query.update(cx, |input, cx| {
+                input.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_keystrokes("console.log");
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.search_mode, SearchMode::Text);
+            assert!(panel.search_error.is_none());
+            assert_eq!(panel.results.len(), 1);
+        });
+
+        cx.update(|window, cx| window.click("search_mode_regex", cx));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.search_mode, SearchMode::Regex);
+            assert_eq!(panel.results.len(), 2);
+            assert!(panel.search_error.is_none());
+        });
+
+        cx.simulate_keystrokes("(");
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.search_mode, SearchMode::Regex);
+            assert!(panel.search_error.is_some());
+        });
+
+        cx.update(|window, cx| window.click("search_mode_text", cx));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, app| {
+            assert_eq!(panel.search_mode, SearchMode::Text);
+            assert_eq!(panel.query.read(app).value().as_ref(), "console.log(");
+            assert!(panel.search_error.is_none());
+            assert_eq!(panel.results.len(), 1);
+            assert_eq!(panel.results[0].text, "console.log(42)");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn search_panel_treats_regex_metacharacters_as_literal_text(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file_path = workspace.path().join("main.js");
+        std::fs::write(&file_path, "console.log(42)\nconsoleXlog(42)\n")
+            .expect("source file");
+        let root = workspace.path().to_string_lossy().into_owned();
+        let file_path = file_path.to_string_lossy().into_owned();
+        cx.update(gpui_kit::component::init);
+        let (panel, cx) = cx.add_window_view(move |window, cx| {
+            let code = cx.new(|cx| CodePanel::new(&file_path, window, cx));
+            SearchPanel::new(&root, 0, code, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.query.update(cx, |input, cx| {
+                input.focus_handle(cx).focus(window, cx);
+            });
+        });
+        cx.simulate_keystrokes("console.log");
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.search_mode, SearchMode::Text);
+            assert!(panel.search_error.is_none());
+            assert_eq!(panel.results.len(), 1);
+            assert!(
+                panel
+                    .results
+                    .iter()
+                    .all(|result| { result.text.contains("console.log(") })
+            );
+        });
+
+        // Enter the opening parenthesis in a distinct input event, as users do
+        // when completing a literal call expression.
+        cx.simulate_keystrokes("(");
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, app| {
+            assert_eq!(panel.search_mode, SearchMode::Text);
+            assert_eq!(panel.query.read(app).value().as_ref(), "console.log(");
+            assert!(!panel.searching);
+            assert!(panel.search_error.is_none());
+            assert_eq!(panel.results.len(), 1);
+            assert_eq!(panel.results[0].text, "console.log(42)");
+        });
     }
 
     #[gpui_kit::test]

@@ -175,7 +175,6 @@ async fn delayed_exec_command_uses_its_captured_authority_after_next_turn_starts
     let handler = crate::tools::handlers::ExecCommandHandler::default();
     let invocation = handler.handle(ToolInvocation {
         session: Arc::clone(&session),
-        turn: Arc::clone(&action_turn),
         step_context,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
@@ -346,7 +345,6 @@ async fn unified_exec_rejects_missing_additional_permissions() {
     let resp = handler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
-            turn: Arc::clone(&turn_context),
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::clone(&tracker),
@@ -412,7 +410,6 @@ async fn exec_command_allows_sticky_turn_permissions_without_inline_request_perm
     let resp = handler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
-            turn: Arc::clone(&turn_context),
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),

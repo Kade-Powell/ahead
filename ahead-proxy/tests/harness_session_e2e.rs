@@ -36,6 +36,7 @@ fn turn_dto(session_id: &str, message: &str) -> AgentTurnRequestDto {
             caret: DisplayPosition { line: 0, col: 0 },
             selection: None,
             file_content: String::new(),
+            selected_excerpt: None,
             visible_end: None,
             attached_anchor_ids: Vec::new(),
             attached_files: Vec::new(),
@@ -515,6 +516,9 @@ fn managed_connection_change_resumes_history_on_new_endpoint() {
                         Err(error) => panic!("accept model request: {error}"),
                     }
                 };
+                stream
+                    .set_nonblocking(false)
+                    .expect("set blocking model stream");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .expect("set read timeout");

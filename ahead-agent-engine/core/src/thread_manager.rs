@@ -268,7 +268,6 @@ pub(crate) struct ThreadManagerState {
     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     session_source: SessionSource,
-    installation_id: String,
     // Captures submitted ops for testing purpose when test mode is enabled.
     #[cfg(test)]
     ops_log: Option<SharedCapturedOps>,
@@ -305,9 +304,6 @@ impl ThreadManager {
             config.ahead_linux_sandbox_exe.clone(),
         )?;
         let environment_manager = EnvironmentManager::local_only(local_runtime_paths);
-        let installation_id =
-            crate::installation_id::resolve_installation_id(&config.codex_home).await?;
-
         Ok(Self::new(
             config,
             Arc::clone(&auth_manager),
@@ -317,7 +313,6 @@ impl ThreadManager {
             user_instructions_provider,
             thread_store,
             Some(agent_graph_store),
-            installation_id,
             /*external_time_provider*/ None,
         ))
     }
@@ -332,7 +327,6 @@ impl ThreadManager {
         user_instructions_provider: Arc<dyn UserInstructionsProvider>,
         thread_store: Arc<dyn ThreadStore>,
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
-        installation_id: String,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
         let codex_home = config.codex_home.clone();
@@ -367,7 +361,6 @@ impl ThreadManager {
                 external_time_provider,
                 auth_manager,
                 session_source,
-                installation_id,
                 #[cfg(test)]
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -469,7 +462,6 @@ impl ThreadManager {
     ) -> Self {
         set_thread_manager_test_mode_for_tests(/*enabled*/ true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
-        let installation_id = uuid::Uuid::new_v4().to_string();
         let absolute_codex_home = match AbsolutePathBuf::from_absolute_path_checked(&codex_home) {
             Ok(codex_home) => codex_home,
             Err(err) => panic!("test codex_home should be absolute: {err}"),
@@ -500,7 +492,6 @@ impl ThreadManager {
                 external_time_provider: None,
                 auth_manager,
                 session_source: SessionSource::Exec,
-                installation_id,
                 #[cfg(test)]
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -1578,7 +1569,6 @@ impl ThreadManagerState {
             config,
             allow_provider_model_fallback,
             user_instructions,
-            installation_id: self.installation_id.clone(),
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
             environment_manager: Arc::clone(&self.environment_manager),

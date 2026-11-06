@@ -14,8 +14,7 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
 
-const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
-const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+const MANAGED_NODE_VERSION: &str = "v24.22.1";
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -114,27 +113,20 @@ impl NodeRuntime {
         let _file_lock = acquire_runtime_lock(&root, &self.cancelled).await?;
         let cache_directory = self.cache_directory_path()?;
         let cached = latest_cached_runtime(Some(&cache_directory));
-        let version = match self.fetch_latest_lts_version().await {
-            Ok(version) => version,
-            Err(error) => match cached.as_ref() {
-                Some(paths) => return Ok(paths.clone()),
-                None => {
-                    return Err(error)
-                        .context("locating a supported Node.js LTS release");
-                }
-            },
-        };
         if let Some(paths) = cached.as_ref()
-            && version_key(&paths.version) >= version_key(&version)
+            && version_key(&paths.version) >= version_key(MANAGED_NODE_VERSION)
         {
             *self.cached.lock().await = Some(paths.clone());
             return Ok(paths.clone());
         }
 
-        let paths = match self.download_runtime(&root, &version).await {
+        let paths = match self.download_runtime(&root, MANAGED_NODE_VERSION).await {
             Ok(paths) => paths,
             Err(error) => match cached {
-                Some(paths) => return Ok(paths),
+                Some(paths) => {
+                    *self.cached.lock().await = Some(paths.clone());
+                    return Ok(paths);
+                }
                 None => return Err(error),
             },
         };
@@ -150,13 +142,6 @@ impl NodeRuntime {
 
     fn runtime_directory(&self) -> Result<PathBuf> {
         Ok(self.cache_directory_path()?.join("node-runtime"))
-    }
-
-    async fn fetch_latest_lts_version(&self) -> Result<String> {
-        let bytes = self.fetch_bounded(NODE_INDEX_URL, MAX_INDEX_BYTES).await?;
-        latest_lts_version(&bytes).ok_or_else(|| {
-            anyhow!("Node.js release index contains no supported LTS release")
-        })
     }
 
     async fn download_runtime(
@@ -325,21 +310,6 @@ fn node_archive_filename(version: &str, target: &NodeTarget) -> String {
         ArchiveKind::Zip => "zip",
     };
     format!("node-{version}-{}.{extension}", target.name)
-}
-
-fn latest_lts_version(index: &[u8]) -> Option<String> {
-    let releases: serde_json::Value = serde_json::from_slice(index).ok()?;
-    releases
-        .as_array()?
-        .iter()
-        .filter_map(|release| {
-            let version = release.get("version")?.as_str()?;
-            let lts = release.get("lts")?.as_str()?;
-            (!lts.is_empty()).then(|| (version_key(version), version.to_string()))
-        })
-        .filter(|(key, _)| *key != (0, 0, 0))
-        .max_by_key(|(key, _)| *key)
-        .map(|(_, version)| version)
 }
 
 fn version_key(version: &str) -> (u64, u64, u64) {
@@ -711,16 +681,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_newest_supported_lts_and_ignores_current_releases() {
-        let index = br#"[
-            {"version":"v26.11.1","lts":false},
-            {"version":"v24.21.0","lts":"Krypton"},
-            {"version":"v22.23.3","lts":"Jod"}
-        ]"#;
-        assert_eq!(latest_lts_version(index).as_deref(), Some("v24.21.0"));
-    }
-
-    #[test]
     fn checksum_lookup_requires_the_exact_archive_filename() {
         let checksum = "a".repeat(64);
         let manifest = format!(
@@ -747,13 +707,16 @@ mod tests {
         assert_eq!(version_key("v024.21.0"), (0, 0, 0));
     }
 
-    #[test]
-    fn cached_runtime_paths_match_the_node_distribution_layout() -> Result<()> {
+    #[tokio::test]
+    async fn cached_runtime_paths_match_the_node_distribution_layout() -> Result<()>
+    {
         let cache = tempfile::tempdir()?;
-        let version = "v24.21.0";
+        let version = MANAGED_NODE_VERSION;
         let target = node_target()?;
-        let runtime_root =
-            cache.path().join(format!("node-{version}-{}", target.name));
+        let runtime_root = cache
+            .path()
+            .join("node-runtime")
+            .join(format!("node-{version}-{}", target.name));
         let paths = if target.name.starts_with("win-") {
             (
                 runtime_root.join("node.exe"),
@@ -782,6 +745,16 @@ mod tests {
             .expect("complete distribution root is accepted");
         assert_eq!(runtime.node, paths.0);
         assert_eq!(runtime.npm_cli, paths.1);
+        let manager = NodeRuntime::new(
+            Some(cache.path().to_path_buf()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let managed = manager.managed_runtime().await?;
+        assert_eq!(managed.node, paths.0);
+        assert!(
+            manager.client.get().is_none(),
+            "cached runtime must not check the network"
+        );
         Ok(())
     }
 

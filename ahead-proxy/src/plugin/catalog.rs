@@ -29,6 +29,7 @@ use ahead_rpc::{
 };
 use anyhow::Context;
 use fs4::fs_std::FileExt;
+use jsonrpc_lite::Id;
 use lsp_types::{
     Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentDiagnosticParams, DocumentDiagnosticReport,
@@ -115,7 +116,9 @@ impl BuiltinLanguageServer {
             args: vec![script.to_str()?.into(), "--stdio".into()],
             env: Vec::new(),
             initialization_options: None,
+            initialization_options_schema: None,
             workspace_configuration: None,
+            workspace_configuration_schema: None,
         })
     }
 }
@@ -744,7 +747,9 @@ fn rust_analyzer_command(path: &Path) -> LanguageServerCommand {
         args: Vec::new(),
         env: Vec::new(),
         initialization_options: None,
+        initialization_options_schema: None,
         workspace_configuration: None,
+        workspace_configuration_schema: None,
     }
 }
 
@@ -863,7 +868,9 @@ fn ruff_command(path: &Path) -> LanguageServerCommand {
         args: vec!["server".into()],
         env: Vec::new(),
         initialization_options: None,
+        initialization_options_schema: None,
         workspace_configuration: None,
+        workspace_configuration_schema: None,
     }
 }
 
@@ -1167,6 +1174,97 @@ fn builtin_language_servers(language_id: &str) -> Vec<BuiltinLanguageServer> {
     servers
 }
 
+fn zed_default_language_servers(
+    language: &str,
+    available: &[String],
+    defaults: Vec<String>,
+    opt_in: &[String],
+) -> Vec<String> {
+    // Mirror Zed's server order and exclusions from ../zed/assets/settings/default.json at 37faef8.
+    // The final "..." in those settings means every other installed, non-opt-in server.
+    let language = language.to_ascii_lowercase();
+    let language = match language.as_str() {
+        "jsx" | "javascriptreact" => "javascript",
+        "tsx" | "typescriptreact" => "typescript",
+        language => language,
+    };
+    let (preferred, excluded): (&[&[&str]], &[&str]) = match language {
+        "astro" => (&[&["astro-language-server"]], &[]),
+        "csharp" => (&[&["roslyn"]], &["csharp-ls", "omnisharp"]),
+        "eex" | "heex" => (
+            &[&["elixir-ls"]],
+            &["expert", "dexter", "next-ls", "lexical"],
+        ),
+        "elixir" => (
+            &[&["elixir-ls"]],
+            &[
+                "expert",
+                "dexter",
+                "next-ls",
+                "lexical",
+                "emmet-language-server",
+            ],
+        ),
+        "erlang" => (&[&["erlang-ls"]], &["elp"]),
+        "html+erb" => (&[&["herb"]], &["ruby-lsp"]),
+        "javascript" | "typescript" => {
+            (&[&["vtsls"]], &["typescript-language-server"])
+        }
+        "js+erb" | "yaml+erb" => (&[], &["ruby-lsp"]),
+        "kotlin" => (&[&["kotlin-lsp"]], &["kotlin-language-server"]),
+        "latex" => (&[&["texlab"]], &[]),
+        "php" => (&[&["phpactor"]], &["intelephense", "phptools", "phpantom"]),
+        "proto" => (&[&["buf"]], &["protols", "protobuf-language-server"]),
+        "python" => (
+            &[&["basedpyright", "basedpyright-langserver"], &["ruff"]],
+            &["ty", "pyrefly", "pyright", "pylsp"],
+        ),
+        "ruby" => (
+            &[&["solargraph"]],
+            &[
+                "ruby-lsp",
+                "rubocop",
+                "sorbet",
+                "steep",
+                "kanayago",
+                "fuzzy-ruby-server",
+            ],
+        ),
+        "starlark" => (&[&["starpls"]], &["buck2-lsp", "tilt"]),
+        "systemverilog" => (&[&["slang"]], &["verible", "veridian", "svls"]),
+        "vue.js" => (&[&["vue-language-server"], &["vtsls"]], &[]),
+        "zig" => (&[&["zls"]], &[]),
+        _ => return defaults,
+    };
+
+    let mut selected = Vec::with_capacity(available.len());
+    for group in preferred {
+        for server in *group {
+            if available
+                .iter()
+                .any(|available| available.as_str() == *server)
+                && !opt_in.iter().any(|opt_in| opt_in.as_str() == *server)
+            {
+                selected.push((*server).to_owned());
+                break;
+            }
+        }
+    }
+    for server in available {
+        let is_preferred = preferred.iter().any(|group| {
+            group.iter().any(|candidate| *candidate == server.as_str())
+        });
+        if !opt_in.contains(server)
+            && !excluded.contains(&server.as_str())
+            && !is_preferred
+            && !selected.contains(server)
+        {
+            selected.push(server.clone());
+        }
+    }
+    selected
+}
+
 fn builtin_npm_language_server(server_id: &str) -> Option<BuiltinLanguageServer> {
     let language_id = match server_id {
         "basedpyright-langserver" => "python",
@@ -1325,7 +1423,10 @@ impl PluginCatalog {
         .map_err(|error| format!("{error:#}"))
     }
 
-    fn language_server_names(&self, language: &str) -> (Vec<String>, Vec<String>) {
+    fn language_server_names(
+        &self,
+        language: &str,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut available = self
             .language_extensions
             .iter()
@@ -1334,7 +1435,28 @@ impl PluginCatalog {
             .collect::<Vec<_>>();
         available.sort();
         available.dedup();
-        let mut defaults = available.clone();
+        let mut defaults = available
+            .iter()
+            .filter(|server_id| {
+                self.language_extensions.iter().any(|extension| {
+                    extension.server_id.as_str() == server_id.as_str()
+                        && extension.supports_language(language)
+                        && !extension.is_opt_in_for(language)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let opt_in = available
+            .iter()
+            .filter(|server_id| {
+                self.language_extensions.iter().any(|extension| {
+                    extension.server_id.as_str() == server_id.as_str()
+                        && extension.supports_language(language)
+                        && extension.is_opt_in_for(language)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         for builtin in builtin_language_servers(language) {
             if !available.iter().any(|name| name == builtin.command) {
                 available.push(builtin.command.into());
@@ -1345,18 +1467,20 @@ impl PluginCatalog {
                 defaults.push(builtin.command.into());
             }
         }
-        (available, defaults)
+        defaults =
+            zed_default_language_servers(language, &available, defaults, &opt_in);
+        (available, defaults, opt_in)
     }
 
     fn selected_servers(&self, language: &str) -> Result<Vec<String>, RpcError> {
-        let (available, defaults) = self.language_server_names(language);
+        let (available, defaults, opt_in) = self.language_server_names(language);
         self.routing
             .as_ref()
             .map_err(|message| RpcError {
                 code: -32602,
                 message: message.clone(),
             })?
-            .servers(language, &available, &defaults)
+            .servers(language, &available, &defaults, &opt_in)
             .map_err(|error| RpcError {
                 code: -32602,
                 message: error.to_string(),
@@ -1420,6 +1544,7 @@ impl PluginCatalog {
         &mut self,
         plugin_id: Option<PluginId>,
         request_sent: Option<Arc<AtomicUsize>>,
+        cancellation_id: Option<Id>,
         method: Cow<'static, str>,
         params: Value,
         language_id: Option<String>,
@@ -1429,16 +1554,27 @@ impl PluginCatalog {
     ) {
         if let Some(plugin_id) = plugin_id {
             if let Some(plugin) = self.plugins.get(&plugin_id) {
-                plugin.server_request_async(
-                    method,
-                    params,
-                    language_id,
-                    path,
-                    check,
-                    move |result| {
-                        f(plugin_id, result);
-                    },
-                );
+                let callback = move |result| f(plugin_id, result);
+                if let Some(cancellation_id) = cancellation_id {
+                    plugin.server_request_async_with_id(
+                        cancellation_id,
+                        method,
+                        params,
+                        language_id,
+                        path,
+                        check,
+                        callback,
+                    );
+                } else {
+                    plugin.server_request_async(
+                        method,
+                        params,
+                        language_id,
+                        path,
+                        check,
+                        callback,
+                    );
+                }
             } else {
                 f(
                     plugin_id,
@@ -1473,6 +1609,7 @@ impl PluginCatalog {
                 params,
                 language_id,
                 path,
+                cancellation_id,
                 f,
             );
             return;
@@ -1505,6 +1642,12 @@ impl PluginCatalog {
                     f(plugin_id, result);
                 },
             );
+        }
+    }
+
+    pub fn cancel_completion(&self, request_id: Id) {
+        for plugin in self.plugins.values() {
+            plugin.cancel_request(request_id.clone());
         }
     }
 
@@ -1774,7 +1917,9 @@ impl PluginCatalog {
                     args: builtin.args.iter().map(|arg| (*arg).into()).collect(),
                     env: Vec::new(),
                     initialization_options: None,
+                    initialization_options_schema: None,
                     workspace_configuration: None,
+                    workspace_configuration_schema: None,
                 }),
                 builtin.command.to_string(),
                 builtin
@@ -1809,6 +1954,17 @@ impl PluginCatalog {
             }));
         }
         let extension_command = extension.as_ref().map(|_| server.clone());
+        if let Some(command) = extension_command.as_ref() {
+            self.plugin_rpc.core_rpc.language_server_schemas(
+                server_id.clone(),
+                ahead_rpc::core::LanguageServerSchemas {
+                    initialization_options: command
+                        .initialization_options_schema
+                        .clone(),
+                    settings: command.workspace_configuration_schema.clone(),
+                },
+            );
+        }
         languages.retain(|language| {
             self.selected_servers(language)
                 .is_ok_and(|names| names.contains(&server_id))
@@ -3386,6 +3542,182 @@ mod document_diagnostic_tests {
     use super::*;
     use crate::plugin::PluginCatalogRpc;
 
+    fn test_extension_component() -> Vec<u8> {
+        let section_name = b"zed:api-version";
+        let mut section = Vec::with_capacity(section_name.len() + 7);
+        append_unsigned_leb128(section_name.len() as u32, &mut section);
+        section.extend_from_slice(section_name);
+        section.extend_from_slice(&[0, 0, 0, 7, 0, 0]);
+
+        let mut component = b"\0asm\x0d\0\x01\0".to_vec();
+        component.push(0);
+        append_unsigned_leb128(section.len() as u32, &mut component);
+        component.extend_from_slice(&section);
+        component
+    }
+
+    fn append_unsigned_leb128(mut value: u32, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value > 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn zed_language_server_defaults_prefer_one_supported_adapter() {
+        let available = [
+            "basedpyright-langserver",
+            "pyright",
+            "pyrefly",
+            "pylsp",
+            "ruff",
+            "ty",
+            "custom-python-server",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            zed_default_language_servers("Python", &available, Vec::new(), &[]),
+            ["basedpyright-langserver", "ruff", "custom-python-server"]
+                .map(str::to_owned)
+        );
+
+        let available = [
+            "typescript-language-server",
+            "vtsls",
+            "custom-typescript-server",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            zed_default_language_servers("TSX", &available, Vec::new(), &[]),
+            ["vtsls", "custom-typescript-server"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn zed_language_server_defaults_keep_opt_in_servers_dormant() {
+        let available =
+            ["basedpyright", "basedpyright-langserver", "pyright", "ruff"]
+                .map(str::to_owned);
+        let opt_in = ["basedpyright", "ruff"].map(str::to_owned);
+        assert_eq!(
+            zed_default_language_servers("python", &available, Vec::new(), &opt_in),
+            ["basedpyright-langserver"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn opt_in_extension_servers_require_explicit_language_routing()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        let extension = root.path().join("extensions/html");
+        std::fs::create_dir_all(workspace.join(".ahead"))?;
+        std::fs::create_dir_all(&extension)?;
+        std::fs::write(
+            extension.join("extension.toml"),
+            "id = 'html'\n[lib]\nversion = '0.7.0'\n[language_servers.html-server]\nlanguages = ['HTML']\nopt_in_languages = ['HTML']\n",
+        )?;
+        std::fs::write(
+            extension.join("extension.wasm"),
+            test_extension_component(),
+        )?;
+
+        let mut catalog = PluginCatalog::new(
+            Some(workspace.clone()),
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new()),
+        );
+        catalog.language_extensions =
+            discover_language_server_extensions(&root.path().join("extensions"))?
+                .extensions;
+        catalog.routing = Ok(LanguageServerRouting::load(Some(&workspace), None)?);
+
+        assert_eq!(catalog.language_server_names("html").0, ["html-server"]);
+        assert!(
+            catalog
+                .selected_servers("html")
+                .expect("default routing")
+                .is_empty()
+        );
+
+        let config = workspace.join(".ahead/config.toml");
+        std::fs::write(
+            &config,
+            "[languages.HTML]\nlanguage_servers = ['html-server']\n",
+        )?;
+        catalog.routing = Ok(LanguageServerRouting::load(Some(&workspace), None)?);
+        assert_eq!(
+            catalog
+                .selected_servers("html")
+                .expect("explicit server routing"),
+            ["html-server"]
+        );
+
+        std::fs::write(&config, "[languages.HTML]\nlanguage_servers = ['...']\n")?;
+        catalog.routing = Ok(LanguageServerRouting::load(Some(&workspace), None)?);
+        assert_eq!(
+            catalog
+                .selected_servers("html")
+                .expect("wildcard server routing"),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn proto_defaults_match_zed_and_allow_explicit_server_choice()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        let extension = root.path().join("extensions/proto");
+        std::fs::create_dir_all(workspace.join(".ahead"))?;
+        std::fs::create_dir_all(&extension)?;
+        std::fs::write(
+            extension.join("extension.toml"),
+            "id = 'proto'\n[lib]\nversion = '0.7.0'\n[language_servers.buf]\nlanguages = ['Proto']\n[language_servers.protols]\nlanguages = ['Proto']\n[language_servers.protobuf-language-server]\nlanguages = ['Proto']\n",
+        )?;
+        std::fs::write(
+            extension.join("extension.wasm"),
+            test_extension_component(),
+        )?;
+
+        let mut catalog = PluginCatalog::new(
+            Some(workspace.clone()),
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new()),
+        );
+        catalog.language_extensions =
+            discover_language_server_extensions(&root.path().join("extensions"))?
+                .extensions;
+        catalog.routing = Ok(LanguageServerRouting::load(Some(&workspace), None)?);
+
+        assert_eq!(
+            catalog
+                .selected_servers("Proto")
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            ["buf"]
+        );
+
+        let config = workspace.join(".ahead/config.toml");
+        std::fs::write(
+            &config,
+            "[languages.Proto]\nlanguage_servers = ['protols']\n",
+        )?;
+        catalog.routing = Ok(LanguageServerRouting::load(Some(&workspace), None)?);
+        assert_eq!(
+            catalog
+                .selected_servers("Proto")
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            ["protols"]
+        );
+        Ok(())
+    }
+
     #[test]
     fn configured_server_order_and_feature_routes_preserve_explicit_owners()
     -> anyhow::Result<()> {
@@ -3442,6 +3774,7 @@ mod document_diagnostic_tests {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         catalog.handle_server_request(
             Some(PluginId(2)),
+            None,
             None,
             "textDocument/hover".into(),
             Value::Null,
@@ -4101,17 +4434,37 @@ rmdir "$3/../busy"
             "AHEAD_DATA_HOME must be an existing temporary directory for this opt-in test"
         );
         anyhow::ensure!(
-            user_home.canonicalize()?.starts_with(temporary_root),
+            user_home.canonicalize()?.starts_with(&temporary_root),
             "AHEAD_USER_HOME must be an existing temporary directory for this opt-in test"
         );
         let source = PathBuf::from(std::env::var("AHEAD_ZED_EXTENSION_SOURCE")?);
         let project = tempfile::tempdir()?;
-        let extension_root = project.path().join("extensions");
+        let extension_root = ahead_core::directory::Directory::plugins_directory()
+            .context("isolated AHEAD plugin directory")?;
+        anyhow::ensure!(
+            extension_root.canonicalize()?.starts_with(&temporary_root),
+            "AHEAD plugin directory must stay inside the temporary test root"
+        );
         let installed = extension_root.join("html");
-        std::fs::create_dir_all(&installed)?;
-        for name in ["extension.toml", "extension.wasm"] {
-            std::fs::copy(source.join(name), installed.join(name))?;
+        if installed.exists() {
+            std::fs::remove_dir_all(&installed)?;
         }
+        std::fs::create_dir_all(&installed)?;
+        let manifest = std::fs::read_to_string(source.join("extension.toml"))?;
+        let server_section = "[language_servers.vscode-html-language-server]\n";
+        let opt_in_manifest = manifest.replace(
+            server_section,
+            &format!("{server_section}opt_in_languages = [\"HTML\"]\n"),
+        );
+        anyhow::ensure!(
+            opt_in_manifest != manifest,
+            "installed HTML extension manifest has no expected server section"
+        );
+        std::fs::write(installed.join("extension.toml"), opt_in_manifest)?;
+        std::fs::copy(
+            source.join("extension.wasm"),
+            installed.join("extension.wasm"),
+        )?;
         let language_directory = installed.join("languages/html");
         std::fs::create_dir_all(&language_directory)?;
         std::fs::copy(
@@ -4146,6 +4499,18 @@ rmdir "$3/../busy"
         let mut catalog = PluginCatalog::new(Some(workspace.clone()), rpc.clone());
         let server_id = extension.server_id.clone();
         catalog.language_extensions = vec![extension];
+        assert_eq!(
+            catalog.language_server_names("HTML").2,
+            [server_id.clone()],
+            "installed extension manifest must mark its HTML server opt-in"
+        );
+        assert!(
+            catalog
+                .selected_servers("html")
+                .expect("default routing")
+                .is_empty(),
+            "opt-in HTML server must stay dormant under default routing"
+        );
         catalog.handle_did_open_text_document(TextDocumentItem::new(
             url::Url::from_file_path(&file)
                 .map_err(|_| anyhow::anyhow!("invalid HTML file path"))?,
@@ -4156,13 +4521,21 @@ rmdir "$3/../busy"
         assert!(
             catalog
                 .pending_extension_resolutions
-                .contains_key(&server_id),
-            "installed HTML extension should resolve off the catalog thread"
+                .get(&server_id)
+                .is_none(),
+            "opening HTML must not start an opt-in server by default"
         );
         let loop_rpc = rpc.clone();
         let loop_thread = std::thread::spawn(move || {
             loop_rpc.mainloop(&mut catalog);
         });
+        std::fs::write(
+            ahead_config.join("config.toml"),
+            "[languages.HTML]\nlanguage_servers = ['vscode-html-language-server']\n[lsp.vscode-html-language-server.settings.html.validate]\nstyles = true\n",
+        )?;
+        rpc.catalog_notification(
+            PluginCatalogNotification::RefreshWorkspaceConfigurations,
+        )?;
         let outcome = (|| -> anyhow::Result<()> {
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -4170,7 +4543,9 @@ rmdir "$3/../busy"
                 let timeout =
                     deadline.saturating_duration_since(std::time::Instant::now());
                 let CoreRpc::Notification(notification) =
-                    core.rx().recv_timeout(timeout)?
+                    core.rx().recv_timeout(timeout).context(
+                        "waiting for explicitly opted-in HTML server startup",
+                    )?
                 else {
                     continue;
                 };
@@ -4224,7 +4599,7 @@ rmdir "$3/../busy"
 
                         std::fs::write(
                             ahead_config.join("config.toml"),
-                            "[lsp.vscode-html-language-server.settings.html.validate]\nstyles = false\n",
+                            "[languages.HTML]\nlanguage_servers = ['vscode-html-language-server']\n[lsp.vscode-html-language-server.settings.html.validate]\nstyles = false\n",
                         )?;
                         rpc.catalog_notification(
                             PluginCatalogNotification::RefreshWorkspaceConfigurations,
@@ -4270,24 +4645,33 @@ rmdir "$3/../busy"
 
                         std::fs::write(
                             ahead_config.join("config.toml"),
-                            "[lsp.vscode-html-language-server.initialization_options]\naheadSmokeMarker = 'restart'\n[lsp.vscode-html-language-server.settings.html.validate]\nstyles = false\n",
+                            "[languages.HTML]\nlanguage_servers = ['vscode-html-language-server']\n[lsp.vscode-html-language-server.initialization_options]\naheadSmokeMarker = 'restart'\n[lsp.vscode-html-language-server.settings.html.validate]\nstyles = false\n",
                         )?;
                         rpc.catalog_notification(
                             PluginCatalogNotification::RefreshWorkspaceConfigurations,
                         )?;
                         let restart_deadline = std::time::Instant::now()
                             + std::time::Duration::from_secs(20);
+                        let mut last_restart_event = None;
                         loop {
-                            let notification = match core.rx().recv_timeout(
-                                restart_deadline.saturating_duration_since(
-                                    std::time::Instant::now(),
-                                ),
-                            ).context(
-                                "waiting for HTML language-server restart after initialization-options change",
-                            )? {
-                                CoreRpc::Notification(notification) => notification,
-                                _ => continue,
+                            let event = core
+                                .rx()
+                                .recv_timeout(
+                                    restart_deadline.saturating_duration_since(
+                                        std::time::Instant::now(),
+                                    ),
+                                )
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "waiting for HTML language-server restart after initialization-options change; last event: {last_restart_event:?}: {error}"
+                                    )
+                                })?;
+                            let CoreRpc::Notification(notification) = event else {
+                                last_restart_event =
+                                    Some("non-notification RPC event".into());
+                                continue;
                             };
+                            last_restart_event = Some(format!("{notification:?}"));
                             if let CoreNotification::ServerStatus { params } =
                                 &*notification
                                 && params.server_name.as_deref()
@@ -4300,8 +4684,15 @@ rmdir "$3/../busy"
                                     bail!("restarted HTML server failed: {message}");
                                 }
                             }
+                            if let CoreNotification::ShowMessage { title, message } =
+                                &*notification
+                            {
+                                bail!(
+                                    "HTML server restart reported {title}: {}",
+                                    message.message
+                                );
+                            }
                         }
-
                         let request_id = 1;
                         let completion_deadline = std::time::Instant::now()
                             + std::time::Duration::from_secs(20);
@@ -4570,7 +4961,10 @@ rmdir "$3/../busy"
             extension_dir.join("extension.toml"),
             "id = 'html'\n[lib]\nversion = '0.7.0'\n[language_servers.html]\nlanguages = ['HTML']\n",
         )?;
-        std::fs::write(extension_dir.join("extension.wasm"), b"invalid wasm")?;
+        std::fs::write(
+            extension_dir.join("extension.wasm"),
+            test_extension_component(),
+        )?;
         let extension = discover_language_server_extensions(
             &temporary.path().join("extensions"),
         )?
@@ -4631,7 +5025,10 @@ rmdir "$3/../busy"
             extension_dir.join("extension.toml"),
             "id = 'html'\n[lib]\nversion = '0.7.0'\n[language_servers.html-analyzer]\nlanguages = ['HTML']\n[language_servers.html-formatter]\nlanguages = ['HTML']\n",
         )?;
-        std::fs::write(extension_dir.join("extension.wasm"), b"invalid wasm")?;
+        std::fs::write(
+            extension_dir.join("extension.wasm"),
+            test_extension_component(),
+        )?;
         let extensions =
             discover_language_server_extensions(&extension_root)?.extensions;
         assert_eq!(extensions.len(), 2);
@@ -5037,7 +5434,9 @@ mod tests {
             args: vec!["--stdio".into()],
             env: vec![("MODE".into(), "one".into())],
             initialization_options: Some(serde_json::json!({"init": 1})),
+            initialization_options_schema: None,
             workspace_configuration: Some(serde_json::json!({"setting": 1})),
+            workspace_configuration_schema: None,
         };
         let mut changed = original.clone();
         changed.workspace_configuration = Some(serde_json::json!({"setting": 2}));

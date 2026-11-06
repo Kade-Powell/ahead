@@ -376,7 +376,11 @@ export interface EditorContext {
   };
   attached_anchor_ids: Id[];
   attached_artifact_ids: Id[];
-  attached_files?: { path: string; content: string }[];
+  attached_files?: {
+    path: string;
+    content: string;
+    kind?: "full" | "outline" | "excerpt";
+  }[];
 }
 
 export type PresentationAction =

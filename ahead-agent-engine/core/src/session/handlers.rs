@@ -238,10 +238,6 @@ pub fn refresh_mcp_servers(sess: &Session) {
     sess.request_mcp_runtime_refresh();
 }
 
-pub async fn reload_user_config(sess: &Arc<Session>) {
-    sess.reload_user_config_layer().await;
-}
-
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
@@ -347,7 +343,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             turn_context.as_ref(),
             EventMsg::Warning(WarningEvent {
                 message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
+                    "Rolled the thread back, but failed to save the rollback marker. AHEAD will continue retrying. Error: {err}"
                 ),
             }),
         )
@@ -418,7 +414,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     shutdown_session_runtime(sess).await;
-    info!("Shutting down Codex instance");
+    info!("Shutting down AHEAD managed agent runtime");
     let history = sess.clone_history().await;
     let turn_count = history
         .raw_items()
@@ -623,10 +619,6 @@ pub(super) async fn submission_loop(sess: Arc<Session>, rx_sub: Receiver<Submiss
                 }
                 Op::RefreshMcpServers => {
                     refresh_mcp_servers(&sess);
-                    false
-                }
-                Op::ReloadUserConfig => {
-                    reload_user_config(&sess).await;
                     false
                 }
                 Op::Compact => {

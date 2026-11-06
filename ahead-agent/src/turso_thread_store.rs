@@ -877,10 +877,10 @@ mod indexed_listing_tests {
         };
 
         for relation_filter in [
-            ThreadRelationFilter::DirectChildrenOf(parent.clone()),
+            ThreadRelationFilter::DirectChildrenOf(parent),
             ThreadRelationFilter::DescendantsOf(parent),
         ] {
-            params.relation_filter = Some(relation_filter.clone());
+            params.relation_filter = Some(relation_filter);
             let request = indexed_header_page_request(&params)
                 .expect("spawn filters should use indexed keyset paging");
             let expected = match relation_filter {

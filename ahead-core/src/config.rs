@@ -1,12 +1,47 @@
 use std::{
+    fs,
     io::{self, ErrorKind, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
-#[cfg(not(unix))]
-use std::fs;
+#[cfg(any(unix, windows))]
+use std::ffi::OsStr;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Creates the shareable workspace config on first use without replacing an
+/// existing file or following project-owned `.ahead` symlinks.
+pub fn ensure_workspace_config(root: &Path) -> io::Result<PathBuf> {
+    let root = root.canonicalize()?;
+    let ahead = root.join(".ahead");
+    match fs::create_dir(&ahead) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let workspace = crate::secure_fs::open_canonical_directory(&root)?;
+        let ahead_directory = crate::secure_fs::open_relative_directory(
+            &workspace,
+            OsStr::new(".ahead"),
+        )?;
+        crate::secure_fs::open_or_create_relative_lock_file(
+            &ahead_directory,
+            OsStr::new("config.toml"),
+        )?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "secure workspace config creation is unsupported on this platform",
+        ));
+    }
+
+    Ok(ahead.join("config.toml"))
+}
 
 /// Reads one AHEAD provider-settings layer without following a project-owned
 /// `.ahead` directory or config-file symlink.
@@ -19,6 +54,11 @@ pub fn read_ahead_config(root: &Path, filename: &str) -> io::Result<Option<Strin
             ErrorKind::InvalidInput,
             "unsupported AHEAD config filename",
         ));
+    }
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
     let root = root.canonicalize()?;
     let path = root.join(".ahead").join(filename);
@@ -281,8 +321,65 @@ fn credential_key(key: &str, string_value: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LanguageEditorSettings, language_editor_settings, read_ahead_config,
+        LanguageEditorSettings, ensure_workspace_config, language_editor_settings,
+        read_ahead_config,
     };
+
+    #[test]
+    fn workspace_config_is_created_once_and_existing_content_is_preserved() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = ensure_workspace_config(workspace.path())
+            .expect("create shareable config");
+        assert_eq!(
+            config,
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join(".ahead/config.toml")
+        );
+        assert_eq!(
+            read_ahead_config(workspace.path(), "config.toml")
+                .expect("read new config")
+                .as_deref(),
+            Some("")
+        );
+
+        std::fs::write(&config, "[languages.Rust]\ntab_size = 2\n")
+            .expect("edit config");
+        ensure_workspace_config(workspace.path()).expect("open existing config");
+        assert_eq!(
+            std::fs::read_to_string(config).expect("preserved config"),
+            "[languages.Rust]\ntab_size = 2\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_creation_rejects_symlinked_directory_and_file() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        symlink(outside.path(), workspace.path().join(".ahead"))
+            .expect("symlinked config directory");
+        assert!(ensure_workspace_config(workspace.path()).is_err());
+        assert!(!outside.path().join("config.toml").exists());
+
+        std::fs::remove_file(workspace.path().join(".ahead"))
+            .expect("remove directory link");
+        std::fs::create_dir(workspace.path().join(".ahead"))
+            .expect("real config directory");
+        let target = outside.path().join("config.toml");
+        std::fs::write(&target, "[languages.Rust]\n").expect("outside config");
+        symlink(&target, workspace.path().join(".ahead/config.toml"))
+            .expect("symlinked config file");
+        assert!(ensure_workspace_config(workspace.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target).expect("outside file preserved"),
+            "[languages.Rust]\n"
+        );
+    }
 
     #[test]
     fn language_editor_settings_merge_case_insensitive_layers() {
@@ -395,6 +492,27 @@ mod tests {
             symlink(root.path(), &ahead).expect("link settings directory");
             assert!(read_ahead_config(root.path(), "config.toml").is_err());
         }
+    }
+
+    #[test]
+    fn missing_optional_config_root_is_absent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let missing_user_home = workspace.path().join("user-home");
+
+        assert_eq!(
+            language_editor_settings(
+                workspace.path(),
+                Some(&missing_user_home),
+                Some("Rust"),
+            )
+            .expect("missing user config is optional"),
+            LanguageEditorSettings::default()
+        );
+        assert_eq!(
+            read_ahead_config(&missing_user_home, "settings.toml")
+                .expect("missing root is optional"),
+            None
+        );
     }
 
     #[test]

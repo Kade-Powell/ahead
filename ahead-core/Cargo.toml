@@ -40,7 +40,6 @@ windows-sys = { version = "0.52", features = [
 
 [features]
 default      = []
-portable     = []
 distribution = []
 
 [build-dependencies]

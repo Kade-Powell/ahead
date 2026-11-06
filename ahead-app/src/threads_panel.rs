@@ -1519,6 +1519,9 @@ impl ThreadsPanel {
                             )
                             .child(
                                 Button::new("retry-external-agent-catalog")
+                                    .debug_selector(|| {
+                                        "retry-external-agent-catalog".into()
+                                    })
                                     .icon(IconName::RefreshCw)
                                     .label(if adapter_catalog_loading {
                                         "Retrying…"
@@ -1680,7 +1683,10 @@ impl Render for ThreadsPanel {
                     .child(
                         Button::new("new_thread_icon_btn")
                             .icon(IconName::Plus)
-                            .tooltip("New thread")
+                            .tooltip("New AHEAD thread")
+                            .on_click(cx.listener(|this: &mut Self, _, window, cx| {
+                                this.new_thread(window, cx);
+                            }))
                             .dropdown_menu(|menu, _, _| {
                                 menu.menu("New AHEAD thread", Box::new(NewAheadThread))
                                     .menu("New external agent thread", Box::new(NewExternalAcpThread))
@@ -2393,8 +2399,8 @@ mod tests {
             assert!(panel.pending_external_adapter.is_none());
             assert!(!panel.external_adapter_catalog_loading);
             assert_eq!(
-                panel.error.as_deref(),
-                Some("Could not load supported agents: AHEAD host is unavailable")
+                panel.external_adapter_catalog_error.as_deref(),
+                Some("AHEAD host is unavailable")
             );
             assert!(panel.show_new_session);
         });

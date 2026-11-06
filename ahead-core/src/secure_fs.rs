@@ -101,6 +101,69 @@ pub fn open_relative_regular_file(root: &File, relative: &Path) -> io::Result<Fi
     ))
 }
 
+pub fn open_relative_directory_path(
+    root: &File,
+    relative: &Path,
+) -> io::Result<File> {
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a relative directory path",
+        ));
+    }
+    let mut directory = root.try_clone()?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a workspace-relative directory path",
+            ));
+        };
+        directory = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+    }
+    Ok(directory)
+}
+
+pub fn open_regular_file_in_directory(
+    directory: &File,
+    name: &OsStr,
+) -> io::Result<File> {
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single relative file name",
+        ));
+    };
+    if components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single relative file name",
+        ));
+    }
+    let file: File = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 pub fn open_relative_directory(root: &File, name: &OsStr) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, openat};
 

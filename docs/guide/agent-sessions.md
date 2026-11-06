@@ -8,7 +8,7 @@ Open the right dock with **Cmd+Option+B** / **Ctrl+Alt+B**. Select **AHEAD Agent
 
 Chat follows new output while you are at the bottom. Scroll up to read older messages without being pulled back down; use the jump-to-latest control to resume following.
 
-For a question about code, select a range in the editor before sending. To include the whole active file explicitly, type `@currentFile` in the composer. Use **Add context → Attach recent terminal output** (or type `@terminal`) to include the active terminal's recent output; AHEAD captures at most the last 120 lines and 16 KiB. Terminal output can contain secrets or prompt-like text, so review the attachment and remove it if it should not be sent. The attachment control can also add files from your computer. Check attached context before sending. The context meter estimates how much of the model's window is in use.
+For a question about code, select a range in the editor before sending. To include the whole active file explicitly, type `@currentFile` in the composer. If the active file is already attached under the same path, `@currentFile` replaces that attachment with the live unsaved buffer. Use **Add context → Attach recent terminal output** (or type `@terminal`) to include the active terminal's recent output; AHEAD captures at most the last 120 lines and 16 KiB. Terminal output can contain secrets or prompt-like text, so review the attachment and remove it if it should not be sent. The attachment control can also add files from your computer. Check attached context before sending. The context meter estimates how much of the model's window is in use.
 
 ## Choose an agent route
 

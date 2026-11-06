@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
-    thread,
     time::{Duration, SystemTime},
 };
 
@@ -356,18 +355,13 @@ fn installed_adapter_version(
 
 fn load_registry(storage: &Path) -> Result<Vec<RegistryAgent>> {
     let registry_path = storage.join("registry/registry.json");
-    let cached_file = open_registry_cache(&registry_path);
-    let cache_is_fresh = cached_file
-        .as_ref()
-        .ok()
-        .and_then(|file| file.metadata().ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < REGISTRY_CACHE_MAX_AGE);
-
-    if !cache_is_fresh {
-        refresh_registry_in_background(registry_path);
+    if !registry_cache_is_fresh(&registry_path)
+        && let Err(error) = refresh_registry_cache(&registry_path)
+    {
+        tracing::debug!(%error, "ACP registry refresh failed; using cached catalog");
     }
+
+    let cached_file = open_registry_cache(&registry_path);
     let body = match cached_file {
         Ok(file) => read_registry_bytes(file)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -415,6 +409,15 @@ fn load_registry(storage: &Path) -> Result<Vec<RegistryAgent>> {
             }
         })
         .collect())
+}
+
+fn registry_cache_is_fresh(path: &Path) -> bool {
+    open_registry_cache(path)
+        .ok()
+        .and_then(|file| file.metadata().ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < REGISTRY_CACHE_MAX_AGE)
 }
 
 fn open_registry_cache(path: &Path) -> io::Result<File> {
@@ -476,57 +479,33 @@ fn publish_registry_cache(path: &Path, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Zed refreshes its registry asynchronously from `AgentRegistryStore`. AHEAD's
-/// RPC list call is synchronous, so return the cached index immediately and do
-/// the same refresh off-thread rather than blocking the editor on HTTP.
-fn refresh_registry_in_background(registry_path: PathBuf) {
-    let Some(parent) = registry_path.parent().map(Path::to_path_buf) else {
-        return;
-    };
-    if fs::create_dir_all(&parent).is_err() {
-        return;
+/// The UI awaits this catalog request on its background executor, so a stale
+/// cache can be refreshed before the picker becomes interactive. Keep the last
+/// valid cache on fetch or validation failure.
+fn refresh_registry_cache(registry_path: &Path) -> Result<()> {
+    let parent = registry_path
+        .parent()
+        .context("missing registry cache directory")?;
+    fs::create_dir_all(parent)?;
+    let _lock = InstallLock::acquire(registry_path.with_extension("lock"))?;
+    if registry_cache_is_fresh(registry_path) {
+        return Ok(());
     }
-    let Ok(Some(lock)) =
-        InstallLock::try_acquire(registry_path.with_extension("lock"))
-    else {
-        return;
-    };
-    let refresh = thread::Builder::new()
-        .name("ahead-acp-registry-refresh".to_string())
-        .spawn(move || {
-            let result = (|| -> Result<()> {
-                let response = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .context("creating ACP registry HTTP client")?
-                    .get(REGISTRY_URL)
-                    .send()
-                    .context("fetching ACP registry")?
-                    .error_for_status()
-                    .context("ACP registry returned an error status")?;
-                let body =
-                    read_registry_bytes(response).context("reading ACP registry")?;
-                publish_registry_cache(&registry_path, &body).with_context(
-                    || {
-                        format!(
-                            "publishing ACP registry cache {}",
-                            registry_path.display()
-                        )
-                    },
-                )?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                tracing::debug!(%error, "ACP registry refresh failed");
-            }
-            drop(lock);
-        });
-    match refresh {
-        Ok(handle) => drop(handle),
-        Err(error) => {
-            tracing::debug!(%error, "failed to start ACP registry refresh");
-        }
-    }
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("creating ACP registry HTTP client")?
+        .get(REGISTRY_URL)
+        .send()
+        .context("fetching ACP registry")?
+        .error_for_status()
+        .context("ACP registry returned an error status")?;
+    let body = read_registry_bytes(response).context("reading ACP registry")?;
+    publish_registry_cache(registry_path, &body).with_context(|| {
+        format!("publishing ACP registry cache {}", registry_path.display())
+    })?;
+    Ok(())
 }
 
 /// Lists AHEAD's small, supported ACP catalog and each agent's install state.
@@ -812,6 +791,7 @@ impl InstallLock {
         Ok(Self { _file: file })
     }
 
+    #[cfg(test)]
     fn try_acquire(path: PathBuf) -> Result<Option<Self>> {
         let file = fs::OpenOptions::new()
             .write(true)
@@ -836,7 +816,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         format!("reading package provenance file {}", path.display())
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -1308,7 +1288,7 @@ fn download_and_extract_binary(
         .context("creating temporary ACP binary archive")?;
     let mut digest = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let bytes_read = response.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -1331,10 +1311,13 @@ fn download_and_extract_binary(
     match kind {
         BinaryArchiveKind::Zip => extract_zip(downloaded.reopen()?, staging)?,
         BinaryArchiveKind::TarGzip => {
-            extract_tar(flate2::read::GzDecoder::new(downloaded.reopen()?), staging)?
+            extract_tar(
+                flate2::read::GzDecoder::new(downloaded.reopen()?),
+                staging,
+            )?;
         }
         BinaryArchiveKind::TarBzip2 => {
-            extract_tar(bzip2::read::BzDecoder::new(downloaded.reopen()?), staging)?
+            extract_tar(bzip2::read::BzDecoder::new(downloaded.reopen()?), staging)?;
         }
         BinaryArchiveKind::Raw => {
             let command_path = command_path.as_ref().context(
@@ -1404,7 +1387,8 @@ fn extract_tar(reader: impl Read, destination: &Path) -> Result<()> {
             count <= MAX_BINARY_ARCHIVE_ENTRIES,
             "ACP binary archive has too many entries"
         );
-        let path = validated_archive_path(&entry.path()?.into_owned())?;
+        let entry_path = entry.path()?;
+        let path = validated_archive_path(entry_path.as_ref())?;
         let output = destination.join(path);
         let kind = entry.header().entry_type();
         if kind.is_dir() {
@@ -1438,7 +1422,7 @@ fn copy_archive_file(
         .with_context(|| {
             format!("creating ACP archive entry {}", destination.display())
         })?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -1659,6 +1643,8 @@ fn npm_command() -> Command {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::acp_client::{HarnessClient, HarnessEvent};
     use parking_lot::Mutex;
@@ -1678,7 +1664,7 @@ mod tests {
                 .is_err()
         );
         assert!(publish_registry_cache(&cache, b"not json").is_err());
-        assert!(publish_registry_cache(&cache, br#"{}"#).is_err());
+        assert!(publish_registry_cache(&cache, br"{}").is_err());
         assert_eq!(fs::read(&cache).expect("retain valid registry"), original);
 
         #[cfg(unix)]
@@ -2364,7 +2350,7 @@ mod tests {
                 )?,
                 "script" => fs::remove_file(&old_script)?,
                 "lockfile" => fs::remove_file(generation.join("package-lock.json"))?,
-                _ => unreachable!("cache fixture"),
+                _ => bail!("unexpected missing-cache fixture: {missing}"),
             }
             let manifest = fs::read(cache.join("installed.json"))?;
             let error = ensure_npx_package(&cache, "pi-acp@2.0.0", |_| {
@@ -2404,7 +2390,7 @@ mod tests {
             let package = installed.script.parent().context("adapter package")?;
             match invalid {
                 "manifest" => {
-                    fs::write(cache.join("installed.json"), "invalid JSON")?
+                    fs::write(cache.join("installed.json"), "invalid JSON")?;
                 }
                 "package" => {
                     fs::remove_file(package.join("package.json"))?;
@@ -2420,7 +2406,7 @@ mod tests {
                         r#"{"bin":"../outside.js"}"#,
                     )?;
                 }
-                _ => unreachable!("cache fixture"),
+                _ => bail!("unexpected invalid-cache fixture: {invalid}"),
             }
             let manifest = fs::read(cache.join("installed.json"))?;
             let attempted_repair = std::cell::Cell::new(false);
@@ -2901,23 +2887,10 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let registry_storage = temporary.path().join("live-registry");
         let registry_path = registry_storage.join("registry/registry.json");
-        refresh_registry_in_background(registry_path.clone());
-        let deadline = std::time::Instant::now() + Duration::from_secs(35);
-        let registry_body = loop {
-            match open_registry_cache(&registry_path) {
-                Ok(file) => break read_registry_bytes(file)?,
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        && std::time::Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .context("waiting for the live ACP registry refresh");
-                }
-            }
-        };
+        refresh_registry_cache(&registry_path)
+            .context("refreshing the live ACP registry")?;
+        let registry_body =
+            read_registry_bytes(open_registry_cache(&registry_path)?)?;
         let registry: RegistryIndex = serde_json::from_slice(&registry_body)
             .context("parsing ACP registry")?;
         for supported in SUPPORTED_AGENTS {
@@ -2930,9 +2903,10 @@ mod tests {
                 .with_context(|| {
                     format!("{} has no live registry npm distribution", supported.id)
                 })?;
-            eprintln!(
-                "{}: installing live registry package {package}",
-                supported.display_name
+            tracing::info!(
+                agent = %supported.display_name,
+                %package,
+                "installing live registry package"
             );
             let root = temporary.path().join(supported.id);
             let cwd = root.join("project");
@@ -3063,7 +3037,10 @@ mod tests {
                     "{} ACP initialize returned no object",
                     supported.display_name
                 );
-                eprintln!("{}: ACP initialize completed", supported.display_name);
+                tracing::info!(
+                    agent = %supported.display_name,
+                    "ACP initialize completed"
+                );
                 if supported.id == "codex-acp" {
                     let method = client
                         .auth_methods()
@@ -3167,11 +3144,11 @@ mod tests {
                     "{} did not persist its selected model",
                     supported.display_name
                 );
-                eprintln!(
-                    "{}: session/new exposed {} config options and {} model choices; model selection changed and saved",
-                    supported.display_name,
-                    options.len(),
-                    model.choices.len(),
+                tracing::info!(
+                    agent = %supported.display_name,
+                    config_options = options.len(),
+                    model_choices = model.choices.len(),
+                    "session/new model selection changed and saved"
                 );
                 Ok(())
             })();

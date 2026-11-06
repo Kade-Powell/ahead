@@ -804,7 +804,6 @@ async fn assert_mcp_tool_call_request_meta_uses_the_issuing_step(
         turn_context
             .turn_metadata_state
             .to_responses_metadata(
-                "installation".to_string(),
                 "window".to_string(),
                 crate::responses_metadata::CodexResponsesRequestKind::Turn,
             )

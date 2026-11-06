@@ -69,7 +69,8 @@ that cache root. Subsequent builds reuse the verified cache, including after
 restarting, reducing rebuild churn while agents or formatters touch several
 files. It watches all first-party workspace crates, including the separate
 agent graph store, skills, model-auth, runtime API and retained engine
-packages. Shell-script changes are watched as well. On macOS, the watcher polls
+packages, plus the repo-owned `third_party/gpui-pre` patch. Shell-script
+changes are watched as well. On macOS, the watcher polls
 once per second because native file events missed atomically replaced Rust
 sources in the local development checkout; this adds up to one second of event
 detection delay before the existing debounce. Its macOS dev bundle uses the
@@ -78,6 +79,23 @@ executable on APFS; the system falls back to a regular copy on filesystems
 without cloning. On macOS, `just app` bundles it
 as `target/release-lto/macos/Ahead.app`. A direct `cargo run -p ahead --bin
 ahead` still launches the editor but does not build or place the sidecar.
+
+`just dev` defaults the editor workspace to the repository (`.`). For UI
+acceptance, keep the command's working directory at this repository root so it
+continues watching AHEAD's source, and pass a disposable project as its
+workspace argument:
+
+```sh
+test_workspace="$(mktemp -d "${TMPDIR:-/tmp}/ahead-editor-smoke.XXXXXX")"
+cp -R tests/fixtures/editor-smoke/. "$test_workspace/"
+just dev "$test_workspace"
+```
+
+This starts the normal shared build loop while opening the copied fixture in
+the editor. AHEAD may ask whether to trust project-configured language servers
+or extensions; allow them only for a disposable project you recognize. Avoid
+opening the AHEAD source checkout for broad editor acceptance, since project
+bootstrap writes private session state under that workspace's `.ahead/`.
 
 `cargo clean` removes the Rust build cache but leaves the verified Code Mode V8
 assets in the user cache, avoiding a second download. It still forces a cold
@@ -137,6 +155,35 @@ the test does not read or write the user's Pi profile. It verifies one
 authenticated ACP turn, not Pi cancellation/resume or authenticated
 Codex/Claude turns. See the [adapter's prerequisites](https://github.com/svkozak/pi-acp#prerequisites).
 
+To install and launch all three curated ACP bridges without sending a prompt,
+run the disposable registry smoke:
+
+```sh
+node tests/agent-acp-install-smoke.mjs target/debug/ahead
+```
+
+It fetches the supported entries from the ACP registry, installs each bridge
+into a temporary AHEAD data home, launches it with an isolated user home, and
+checks for model configuration options or an explicit authentication request.
+Pi's `pi` CLI must already be on `PATH`; AHEAD installs the ACP bridge, not the
+Pi CLI itself. This smoke makes no model request and removes its temporary
+packages and profiles afterward. It verifies bridge installation and startup,
+not authenticated turns or native Settings rendering.
+
+To send one authenticated turn through the installed Pi ACP bridge, make
+`OPENROUTER_API_KEY` available in the environment without putting its value in
+shell history, then run:
+
+```sh
+AHEAD_ACP_LIVE_PI_TURN=1 node tests/agent-acp-install-smoke.mjs \
+  target/debug/ahead pi-acp
+```
+
+The smoke creates an isolated Pi home and model catalog, selects the configured
+OpenRouter model, sends a no-tools prompt, and removes its temporary profile.
+It verifies one completed external turn, not rendered streaming, cancellation,
+resume, or authenticated Codex/Claude Code sessions.
+
 ### Agent development loop
 
 From the repository root, start `just dev /absolute/path/to/disposable-project`
@@ -152,6 +199,8 @@ Ctrl-C before a focused Cargo command. `just dev-lock-smoke` verifies the
 duplicate-loop guard without building the app.
 Plain `just dev` opens the AHEAD repository itself. Use a fresh disposable copy
 when testing first-run storage or after changing the pre-production schema.
+Session history is stored by the `libsql` client using its embedded local
+Turso database; AHEAD has no alternate `rusqlite` or SQLx session backend.
 There is one initial Turso schema and no schema-version checks, migrations or
 automatic resets yet. Startup reruns the initial transactional
 `CREATE ... IF NOT EXISTS` statements, but does not reconcile or validate
@@ -187,6 +236,12 @@ directory. Explicit `AHEAD_HOME` or `AHEAD_USER_HOME` values take precedence.
 These defaults are applied whenever the watcher launches the app; they do not
 change an already-running process.
 
+Without `AHEAD_DATA_HOME`, app-private data uses the operating system's normal
+application-data location. The workspace keeps project settings and session
+history in `.ahead/`; AHEAD does not create an `ahead-data/` directory beside
+the project or executable. That directory was used by the removed portable
+build mode.
+
 On macOS and Linux, AHEAD captures only `PATH` from the configured interactive
 login shell once at startup, following Zed's login-shell environment pattern.
 This makes tools available from a GUI launch visible to the integrated
@@ -201,7 +256,8 @@ change. It also watches repository-level files embedded at compile time,
 including `.ahead/.gitignore`, the default settings/themes, and app icons. The
 watcher targets `.ahead/.gitignore` rather than the whole `.ahead` directory,
 so changing runtime session state does not trigger a rebuild. Language-extension
-host sources and WIT interfaces are watched too. On macOS, the private launch
+host sources, WIT interfaces and the patched GPUI source are watched too. On
+macOS, the private launch
 recipe builds the root `ahead` binary into a stable development bundle at
 `target/debug/macos/Ahead.app`, then runs that bundle's executable in the
 watcher's process tree. On macOS that copied bundle identifies as `io.ahead.dev`
@@ -216,12 +272,12 @@ build the root `ahead` package and run `target/debug/ahead`. Use the
 package-qualified command `cargo run -p ahead --bin ahead` for an app-only launch.
 It does not provide the watcher or the bundled Code Mode host; use `just dev` for
 the full development loop.
-Test-only `tests/` trees and `*_tests.rs` files, plus source `README.md` and
-`AGENTS.md` files, are ignored so editing tests or guidance does not rebuild the
-editor. `TODO.md`, `docs/development/`, and these build instructions are also
-ignored, avoiding Cargo relinks for planning and workflow edits. User guides
-under `docs/guide/`, embedded Markdown prompts and bundled skill files remain
-watched because they are compiled into the app.
+Test-only `tests/` trees, `tests.rs` modules and `*_tests.rs` files, plus source
+`README.md` and `AGENTS.md` files, are ignored so editing tests or guidance does
+not rebuild the editor. `TODO.md`, `docs/development/`, and these build
+instructions are also ignored, avoiding Cargo relinks for planning and workflow
+edits. User guides under `docs/guide/`, embedded Markdown prompts and bundled
+skill files remain watched because they are compiled into the app.
 
 The root and editor build scripts watch only their own linker setup. Ordinary
 documentation edits should not rerun those scripts and relink the app on the
@@ -259,6 +315,11 @@ To exercise the duplicate-loop guard without compiling or launching a watcher,
 stop any active AHEAD dev loop and run `just dev-lock-smoke`; it holds the same
 repository lock and substitutes an inert `watchexec` command for the nested
 `just dev` invocation.
+Ctrl-C stops the watcher and reaps its app/proxy child processes. The watched
+command runs through a nested reaper so Watchexec restart and shutdown signals
+reach the `_run-dev` shell and its app; `just dev-shutdown-smoke` checks the
+nested signal-forwarding path. The reapers also stop a child that remains alive
+if `wait` returns early on an interrupt.
 Before a one-off Cargo check or test, coordinate with the loop owner and stop
 the watcher with Ctrl-C; restart it with `just dev` afterward. Prefer a focused
 check such as `just ahead-check` when that is sufficient.
@@ -324,6 +385,13 @@ approval events, tool execution, resource/template listing, resource reads and
 model continuation. It contacts no external service or provider. Local loopback
 access is required; this proxy test does not verify rendered approval UI, legacy
 approval UI or in-flight cancellation.
+
+`node tests/git-source-control-smoke.mjs target/debug/ahead` exercises the
+Source Control proxy in a disposable Git repository with two local bare remotes.
+It covers status and diffs, per-file and bulk staging, commit history, push,
+branch changes, and merge-conflict protection and resolution. It needs no
+provider credentials or network access. A pass verifies the Git/proxy path,
+not the rendered Source Control panel or remote authentication.
 
 With the watcher stopped, run
 `cargo test --locked --offline -p ahead-app --lib terminal::tests -- --test-threads=1`
@@ -425,8 +493,11 @@ For installed language servers, run
 Set `AHEAD_LSP_LANGUAGES=rust` or a comma-separated subset to run only the
 servers available locally (`typescript` also exercises JavaScript). It copies
 the multi-language fixture into
-a temporary directory, isolates AHEAD's data home and permits language servers
-only for that fixture, then checks completion, definition, semantic-token
+a temporary directory, isolates AHEAD's data/runtime/user and tool-cache homes
+in a sibling temporary profile outside the project, and permits language servers
+only for that fixture. A successful run removes the profile but retains the
+project copy; failures retain and report both for diagnosis. It then checks
+completion, definition, semantic-token
 ranges, diagnostics, auto-import resolution, close/reopen and language-server restart through the
 real proxy. It also prepares symbol renames, follows references and applies
 cross-file declaration-rename edits to unsaved TypeScript, JavaScript and
@@ -463,16 +534,56 @@ managed cache. Missing Ruff binaries are acquired from the official
 cache publication as Rust Analyzer. GitHub's release checksum is verified when
 provided. The running app can acquire its built-in npm-backed
 servers into an AHEAD-owned cache. It prefers system Node.js/npm and otherwise
-downloads and checksum-verifies the latest Node.js LTS runtime from the official
-Node.js distribution site on demand; the
+reuses a valid cached managed Node.js runtime without a network check. On a
+cache miss it downloads AHEAD's pinned Node.js release and verifies the
+official SHA-256 manifest; the
 `lsp-smoke.mjs` protocol check uses installed binaries by default. To allow it
 to exercise managed installation for selected servers missing from PATH, run
 `AHEAD_LSP_INSTALL_MISSING=1 node tests/lsp-smoke.mjs target/debug/ahead`;
 this mode needs access to the public npm registry and installs into the
-disposable fixture's `AHEAD_DATA_HOME` with lifecycle scripts disabled. It
+isolated profile's `AHEAD_DATA_HOME` with lifecycle scripts disabled, outside
+the project copy. It
 does not contact a model provider. The smoke retains and prints its disposable
 workspace path for inspection, and now reports a selected server's startup
 error immediately instead of waiting for the diagnostics timeout.
+For a clean-PATH cache replay, invoke the script through an absolute Node
+binary while `PATH` excludes Node and npm. Set `AHEAD_LSP_KEEP_PROFILE=1` on
+the first run; the script prints its retained profile. On a second run, set
+`AHEAD_LSP_NODE_RUNTIME_SEED` to that profile's `data/cache/node-runtime` and
+`AHEAD_LSP_CACHE_SEED` to `data/cache/language-servers`. Both runs create fresh
+disposable profiles and workspaces; remove the retained first profile afterward.
+
+To install HTML from Zed's live public catalog and exercise its language server
+and grammar captures by themselves, run this from the AHEAD repository root:
+
+```sh
+AHEAD_LSP_INSTALL_MISSING=1 \
+AHEAD_LSP_INSTALL_ZED_HTML=1 \
+AHEAD_LSP_LANGUAGES=html \
+node tests/lsp-smoke.mjs target/debug/ahead
+```
+
+This downloads a compatible HTML extension and its required assets into the
+smoke's isolated AHEAD data home, then verifies HTML completion and the
+extension-provided `tag` syntax capture. It needs access to the public Zed
+catalog and package host. The script removes the profile on success and prints
+the disposable workspace path so it can be inspected and removed afterward.
+This checks proxy/server and grammar capture behavior, not editor theme
+resolution or native syntax colors.
+
+The Proto extension has a separate live smoke for its API 0.7 guest, grammar,
+Buf startup, restart and uninstall:
+
+```sh
+AHEAD_LSP_INSTALL_MISSING=1 \
+AHEAD_LSP_INSTALL_ZED_PROTO=1 \
+AHEAD_LSP_LANGUAGES=proto \
+node tests/lsp-smoke.mjs target/debug/ahead
+```
+
+Buf is acquired by the extension into the isolated profile. This smoke does
+not assert a completion item; Buf returned `null` for the tested message-type
+position, so Proto completion remains to be checked in a supported context.
 
 To exercise an installed Zed HTML extension without installing it into
 AHEAD, point `ZED_EXTENSIONS` at Zed's extensions directory and use the HTML
@@ -598,6 +709,38 @@ Cargo's `--offline` does not block the test's registry/npm downloads. Agent
 homes, projects and package caches are temporary; child HTTP proxy settings
 point at an unreachable localhost port. This check does not verify a real
 provider login, model turn, native picker or install/reconnect UI.
+
+To exercise the app's curated ACP install path against the current public
+registry without sending model prompts or using provider credentials, run:
+
+```sh
+node tests/agent-acp-install-smoke.mjs target/debug/ahead
+```
+
+The smoke installs Pi, Codex and Claude Code adapters into isolated temporary
+profiles, launches each ACP process, and verifies that the installed package
+provenance and either model/config options or an authentication-required state
+reach AHEAD. It needs network access to the ACP registry and npm; Pi additionally
+requires the Pi CLI on `PATH`. A missing or stale registry is fetched while the
+picker remains in its loading state; if refresh fails, AHEAD uses its last valid
+cache or the curated pinned fallback. This check does not verify rendered
+picker/login behavior, an authenticated turn, cancellation or resume.
+
+To exercise session-bound FIM through the integrated proxy without an external
+model key, run the disposable loopback-provider smoke:
+
+```sh
+node tests/agent-fim-smoke.mjs target/debug/ahead
+```
+
+It creates temporary AHEAD sessions and a project with root and nested
+`AGENTS.md` files, captures actual OpenAI-compatible completion prompts at a
+local mock endpoint, and verifies the applicable instructions, session
+objective and decisions, editor prefix/suffix, an unsaved related editor buffer,
+session-switch isolation, the bound inline-completion response and completion
+round-trip. It makes no external provider request and removes its temporary
+project and profile. This does not verify native ghost-text rendering or
+overlap with a live provider reply.
 
 `just bacon-test` runs the focused agent, proxy, and viewmodel test set.
 `just test-all` explicitly runs maintained AHEAD package tests and the retained

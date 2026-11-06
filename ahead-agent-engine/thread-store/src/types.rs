@@ -291,84 +291,12 @@ pub struct ListThreadsParams {
     pub relation_filter: Option<ThreadRelationFilter>,
 }
 
-/// Parameters for searching thread content.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchThreadsParams {
-    /// Maximum number of threads to return.
-    pub page_size: usize,
-    /// Opaque cursor returned by a previous search call.
-    pub cursor: Option<String>,
-    /// Sort order requested by the caller.
-    pub sort_key: ThreadSortKey,
-    /// Sort direction requested by the caller.
-    pub sort_direction: SortDirection,
-    /// Allowed session sources. Empty means implementation default.
-    pub allowed_sources: Vec<SessionSource>,
-    /// Whether archived threads should be searched instead of active threads.
-    pub archived: bool,
-    /// Visible thread content to search for.
-    pub search_term: String,
-}
-
 /// A page of stored thread records.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ThreadPage {
     /// Threads returned for this page.
     pub items: Vec<StoredThread>,
     /// Opaque cursor to continue listing.
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredThreadSearchResult {
-    pub thread: StoredThread,
-    pub snippet: String,
-}
-
-/// A page of thread-search results.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ThreadSearchPage {
-    /// Search results returned for this page.
-    pub items: Vec<StoredThreadSearchResult>,
-    /// Opaque cursor to continue searching.
-    pub next_cursor: Option<String>,
-}
-
-/// Parameters for searching visible message occurrences within one paginated thread.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchThreadOccurrencesParams {
-    /// Thread id to search.
-    pub thread_id: ThreadId,
-    /// Case-insensitive literal substring to find.
-    pub search_term: String,
-    /// Opaque cursor returned by a previous search call.
-    pub cursor: Option<String>,
-    /// Maximum number of occurrences to return.
-    pub page_size: usize,
-}
-
-/// UTF-16 code-unit range within `snippet`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchTextRange {
-    pub start: u32,
-    pub end: u32,
-}
-
-/// One visible message occurrence within a stored thread.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredThreadOccurrence {
-    pub turn_id: String,
-    pub item_id: String,
-    pub snippet: String,
-    pub snippet_match_range: SearchTextRange,
-    /// Inclusive cursor accepted by `thread/turns/list` for this turn.
-    pub turn_cursor: String,
-}
-
-/// A page of visible message occurrences within one stored thread.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ThreadOccurrenceSearchPage {
-    pub items: Vec<StoredThreadOccurrence>,
     pub next_cursor: Option<String>,
 }
 
@@ -708,29 +636,11 @@ pub struct ArchiveThreadParams {
     pub thread_id: ThreadId,
 }
 
-/// Parameters for archiving a set of threads as one store operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArchiveThreadsParams {
-    /// Thread ids to archive, in the order their persisted data should be moved.
-    pub thread_ids: Vec<ThreadId>,
-    /// Thread ids whose paginated writer ownership must be checked before archiving, including
-    /// descendants whose rollout has not materialized yet.
-    #[serde(default)]
-    pub writer_lock_thread_ids: Vec<ThreadId>,
-}
-
 /// Parameters for deleting a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteThreadParams {
     /// Thread id to delete.
     pub thread_id: ThreadId,
-}
-
-/// Parameters for deleting a set of threads as one store operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteThreadsParams {
-    /// Thread ids to delete, in the order their persisted data should be removed.
-    pub thread_ids: Vec<ThreadId>,
 }
 
 #[cfg(test)]

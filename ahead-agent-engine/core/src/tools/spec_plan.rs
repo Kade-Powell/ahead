@@ -21,7 +21,6 @@ use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::SendUserMessageAsyncHandler;
 use crate::tools::handlers::SleepHandler;
-use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WriteStdinHandler;
@@ -866,15 +865,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         && let Some(tool_type) = context.model_info.apply_patch_tool_type.as_ref()
     {
         registry.add(ApplyPatchHandler::new(tool_type.clone()));
-    }
-
-    if context
-        .model_info
-        .experimental_supported_tools
-        .iter()
-        .any(|tool| tool == "test_sync_tool")
-    {
-        registry.add(TestSyncHandler);
     }
 
     if context.environments.primary().is_some() && features.enabled(Feature::ViewImage) {

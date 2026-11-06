@@ -33,53 +33,15 @@ pub use feature_configs::ToolRegistryConfigToml;
 pub enum Stage {
     /// Features that are still under development, not ready for external use
     UnderDevelopment,
-    /// Experimental features made available to users through the `/experimental` menu
-    Experimental {
-        name: &'static str,
-        menu_description: &'static str,
-        announcement: &'static str,
-    },
     /// Stable features. The feature flag is kept for ad-hoc enabling/disabling
     Stable,
     /// Deprecated feature that should not be used anymore.
     Deprecated,
-    /// The feature flag is useless but kept for backward compatibility reason.
-    Removed,
-}
-
-impl Stage {
-    pub fn experimental_menu_name(self) -> Option<&'static str> {
-        match self {
-            Stage::Experimental { name, .. } => Some(name),
-            Stage::UnderDevelopment | Stage::Stable | Stage::Deprecated | Stage::Removed => None,
-        }
-    }
-
-    pub fn experimental_menu_description(self) -> Option<&'static str> {
-        match self {
-            Stage::Experimental {
-                menu_description, ..
-            } => Some(menu_description),
-            Stage::UnderDevelopment | Stage::Stable | Stage::Deprecated | Stage::Removed => None,
-        }
-    }
-
-    pub fn experimental_announcement(self) -> Option<&'static str> {
-        match self {
-            Stage::Experimental {
-                announcement: "", ..
-            } => None,
-            Stage::Experimental { announcement, .. } => Some(announcement),
-            Stage::UnderDevelopment | Stage::Stable | Stage::Deprecated | Stage::Removed => None,
-        }
-    }
 }
 
 /// Unique features toggled via configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
-    /// Enable the interactive transcript composer and turn-selection UI.
-    TranscriptV2,
     // Stable.
     /// Enable the default shell tool.
     ShellTool,
@@ -104,8 +66,6 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
-    /// Add terminal-specific visualization guidance to TUI developer instructions.
-    TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
     ApplyPatchStreamingEvents,
     /// Preserve existing line endings when apply_patch updates files.
@@ -134,8 +94,6 @@ pub enum Feature {
     CwdRelativeTurnDiffs,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
-    /// Enable startup memory extraction and file-backed memory consolidation.
-    MemoryTool,
     /// Keep active sampling turns alive until a failed network connection recovers.
     UnboundedConnectionRetries,
     /// Respect host system proxy settings for Codex-owned network clients.
@@ -150,56 +108,14 @@ pub enum Feature {
     DeferredToolWorldState,
     /// Expose MCP model-visible namespaces without the legacy `mcp__` prefix.
     NonPrefixedMcpToolNames,
-    /// Allow the in-app browser pane in desktop apps.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    InAppBrowser,
-    /// Allow the in-app chat pane in desktop apps.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    InAppChat,
-    /// Allow in-app dictation in desktop apps.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    InAppDictation,
-    /// Allow desktop apps to run local automations.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    InAppLocalAutomation,
-    /// Allow desktop apps to perform in-app updates.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    InAppUpdates,
-    /// Allow Browser Use agent integration in desktop apps.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    BrowserUse,
-    /// Allow Browser Use integration to access the full Chrome DevTools Protocol surface.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    BrowserUseFullCdpAccess,
-    /// Allow Browser Use integration with external browsers.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    BrowserUseExternal,
-    /// Allow Codex Computer Use.
-    ///
-    /// Requirements-only gate: this should be set from requirements, not user config.
-    ComputerUse,
     /// Tell the model when a prompt image was resized and include its dimensions.
     ImageResizeNotice,
     /// Apply one shared pixel and token budget to every image, regardless of legacy detail hints.
     UnifiedImageBudget,
     /// Request sequential cutoff reasoning summary delivery.
     ConcurrentReasoningSummaries,
-    /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
-    SkillSearch,
-    /// Enable the unified mention popup used by default in the TUI.
-    MentionsV2,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
-    /// Enable persisted thread goals and automatic goal continuation.
-    Goals,
     /// Add current context-window metadata to model-visible context.
     TokenBudget,
     /// Track and report a shared token budget across a session's agent threads.
@@ -210,30 +126,16 @@ pub enum Feature {
     ToolCallMcpElicitation,
     /// Enable personality selection in the TUI.
     Personality,
-    /// Enable native artifact tools.
-    Artifact,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
     /// Enable explicitly requested model changes for later step captures.
     StepModelSwitching,
-    /// Enable experimental realtime voice conversation mode in the TUI.
-    RealtimeConversation,
-    /// Prevent idle system sleep while a turn is actively running.
-    PreventIdleSleep,
     /// Enable remote compaction v2 over the normal Responses API.
     RemoteCompactionV2,
     /// Include retained images in the remote compaction context budget.
     CompactionImageBudget,
     /// Retain client-authored developer messages across compacted context windows.
     RetainClientDeveloperMessages,
-    /// Enable workspace dependency support.
-    WorkspaceDependencies,
-
-    // Removed
-    /// Enable Windows sandbox (restricted token) on Windows.
-    WindowsSandbox,
-    /// Use the elevated Windows sandbox pipeline (setup + runner).
-    WindowsSandboxElevated,
 }
 
 impl Feature {
@@ -257,19 +159,10 @@ impl Feature {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LegacyFeatureUsage {
-    pub alias: String,
-    pub feature: Feature,
-    pub summary: String,
-    pub details: Option<String>,
-}
-
 /// Holds the effective set of enabled features.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Features {
     enabled: BTreeSet<Feature>,
-    legacy_usages: BTreeSet<LegacyFeatureUsage>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,7 +183,6 @@ impl FeatureOverrides {
             } else {
                 features.disable(Feature::WebSearchRequest);
             }
-            features.record_legacy_usage("web_search_request", Feature::WebSearchRequest);
         }
     }
 }
@@ -304,10 +196,7 @@ impl Features {
                 set.insert(spec.id);
             }
         }
-        Self {
-            enabled: set,
-            legacy_usages: BTreeSet::new(),
-        }
+        Self { enabled: set }
     }
 
     pub fn enabled(&self, f: Feature) -> bool {
@@ -336,32 +225,8 @@ impl Features {
         }
     }
 
-    pub fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature) {
-        let (summary, details) = legacy_usage_notice(alias, feature);
-        self.legacy_usages.insert(LegacyFeatureUsage {
-            alias: alias.to_string(),
-            feature,
-            summary,
-            details,
-        });
-    }
-
-    pub fn record_legacy_usage(&mut self, alias: &str, feature: Feature) {
-        if alias == feature.key() {
-            return;
-        }
-        self.record_legacy_usage_force(alias, feature);
-    }
-
-    pub fn legacy_feature_usages(&self) -> impl Iterator<Item = &LegacyFeatureUsage> + '_ {
-        self.legacy_usages.iter()
-    }
-
     pub fn emit_metrics(&self, otel: &SessionTelemetry) {
         for feature in FEATURES {
-            if matches!(feature.stage, Stage::Removed) {
-                continue;
-            }
             if self.enabled(feature.id) != feature.default_enabled {
                 otel.counter(
                     "codex.feature.state",
@@ -378,27 +243,6 @@ impl Features {
     /// Apply a table of key -> bool toggles (e.g. from TOML).
     pub fn apply_map(&mut self, m: &BTreeMap<String, bool>) {
         for (k, v) in m {
-            match k.as_str() {
-                "web_search_request" => {
-                    self.record_legacy_usage_force(
-                        "features.web_search_request",
-                        Feature::WebSearchRequest,
-                    );
-                }
-                "web_search_cached" => {
-                    self.record_legacy_usage_force(
-                        "features.web_search_cached",
-                        Feature::WebSearchCached,
-                    );
-                }
-                "use_legacy_landlock" => {
-                    self.record_legacy_usage_force(
-                        "features.use_legacy_landlock",
-                        Feature::UseLegacyLandlock,
-                    );
-                }
-                _ => {}
-            }
             match feature_for_key(k) {
                 Some(feat) => {
                     if *v {
@@ -442,60 +286,6 @@ impl Features {
             self.enable(Feature::CodeMode);
         }
     }
-}
-
-fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>) {
-    let canonical = feature.key();
-    match feature {
-        Feature::WebSearchRequest | Feature::WebSearchCached => {
-            let label = match alias {
-                "web_search" => "[features].web_search",
-                "features.web_search_request" | "web_search_request" => {
-                    "[features].web_search_request"
-                }
-                "features.web_search_cached" | "web_search_cached" => {
-                    "[features].web_search_cached"
-                }
-                _ => alias,
-            };
-            let summary =
-                format!("`{label}` is deprecated because web search is enabled by default.");
-            (summary, Some(web_search_details().to_string()))
-        }
-        Feature::UseLegacyLandlock => {
-            let label = match alias {
-                "features.use_legacy_landlock" | "use_legacy_landlock" => {
-                    "[features].use_legacy_landlock"
-                }
-                _ => alias,
-            };
-            let summary = format!("`{label}` is deprecated and will be removed soon.");
-            let details =
-                "Remove this setting to stop opting into the legacy Linux sandbox behavior."
-                    .to_string();
-            (summary, Some(details))
-        }
-        _ => {
-            let label = if alias.contains('.') || alias.starts_with('[') {
-                alias.to_string()
-            } else {
-                format!("[features].{alias}")
-            };
-            let summary = format!("`{label}` is deprecated. Use `[features].{canonical}` instead.");
-            let details = if alias == canonical {
-                None
-            } else {
-                Some(format!(
-                    "Enable it with `--enable {canonical}` or `[features].{canonical}` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details."
-                ))
-            };
-            (summary, details)
-        }
-    }
-}
-
-fn web_search_details() -> &'static str {
-    "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
 }
 
 /// Keys accepted in `[features]` tables.
@@ -626,12 +416,6 @@ pub struct FeatureSpec {
 }
 
 pub const FEATURES: &[FeatureSpec] = &[
-    FeatureSpec {
-        id: Feature::TranscriptV2,
-        key: "transcript_v2",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
     // Stable features.
     FeatureSpec {
         id: Feature::ShellTool,
@@ -742,12 +526,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::MemoryTool,
-        key: "memories",
-        stage: Stage::Stable,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ApplyPatchStreamingEvents,
         key: "apply_patch_streaming_events",
         stage: Stage::UnderDevelopment,
@@ -781,18 +559,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::UseLegacyLandlock,
         key: "use_legacy_landlock",
         stage: Stage::Deprecated,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::WindowsSandbox,
-        key: "experimental_windows_sandbox",
-        stage: Stage::Removed,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::WindowsSandboxElevated,
-        key: "elevated_windows_sandbox",
-        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -838,60 +604,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::InAppBrowser,
-        key: "in_app_browser",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::InAppChat,
-        key: "in_app_chat",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::InAppDictation,
-        key: "in_app_dictation",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::InAppLocalAutomation,
-        key: "in_app_local_automation",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::InAppUpdates,
-        key: "in_app_updates",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::BrowserUse,
-        key: "browser_use",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::BrowserUseFullCdpAccess,
-        key: "browser_use_full_cdp_access",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::BrowserUseExternal,
-        key: "browser_use_external",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::ComputerUse,
-        key: "computer_use",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::ImageResizeNotice,
         key: "image_resize_notice",
         stage: Stage::UnderDevelopment,
@@ -910,34 +622,10 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::SkillSearch,
-        key: "skill_search",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::MentionsV2,
-        key: "mentions_v2",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::DefaultModeRequestUserInput,
         key: "default_mode_request_user_input",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::TerminalVisualizationInstructions,
-        key: "terminal_visualization_instructions",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::Goals,
-        key: "goals",
-        stage: Stage::Stable,
-        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::TokenBudget,
@@ -970,12 +658,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::Artifact,
-        key: "artifact",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::FastMode,
         key: "fast_mode",
         stage: Stage::Stable,
@@ -985,30 +667,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::StepModelSwitching,
         key: "step_model_switching",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::RealtimeConversation,
-        key: "realtime_conversation",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::PreventIdleSleep,
-        key: "prevent_idle_sleep",
-        stage: if cfg!(any(
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "windows"
-        )) {
-            Stage::Experimental {
-                name: "Prevent sleep while running",
-                menu_description: "Keep your computer awake while Codex is running a thread.",
-                announcement: "NEW: Prevent sleep while running is now available in /experimental.",
-            }
-        } else {
-            Stage::UnderDevelopment
-        },
         default_enabled: false,
     },
     FeatureSpec {
@@ -1028,12 +686,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "retain_client_developer_messages",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::WorkspaceDependencies,
-        key: "workspace_dependencies",
-        stage: Stage::Stable,
-        default_enabled: true,
     },
 ];
 

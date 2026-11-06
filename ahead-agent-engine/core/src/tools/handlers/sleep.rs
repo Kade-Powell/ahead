@@ -79,11 +79,12 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
         Box::pin(async move {
             let ToolInvocation {
                 session,
-                turn,
+                step_context,
                 call_id,
                 payload,
                 ..
             } = invocation;
+            let turn = step_context.turn.clone();
             let ToolPayload::Function { arguments } = payload else {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "{TOOL_NAME} handler received unsupported payload"

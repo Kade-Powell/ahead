@@ -19,6 +19,7 @@ use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockPlacement, DockSkin, Panel, PanelControl,
     PanelEvent, PanelStyle, panel_handle,
 };
+use gpui_kit::component::input::RopeExt;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, WindowExt, h_flex, v_flex,
@@ -46,6 +47,7 @@ gpui_kit::actions!(
         OpenHelp,
         SaveFile,
         GoToFile,
+        GoToLine,
         GoToDefinition,
         FindReferences,
         GoToImplementation,
@@ -577,9 +579,11 @@ pub(crate) enum ShellShortcut {
     LanguageServers,
     Problems,
     QuickOpen,
+    GoToLine,
     OpenFileDialog,
     OpenFolderDialog,
     SaveActiveFile,
+    CloseActiveItem,
     CloseEditor,
     CloseOtherEditors,
     CloseEditorsToLeft,
@@ -633,6 +637,7 @@ fn shell_shortcut(
             ("m", true) => Problems,
             ("p", false) => QuickOpen,
             ("p", true) => CommandPalette,
+            ("w", false) => CloseActiveItem,
             ("x", true) => Extensions,
             ("d", true) => Debug,
             _ => return control_shortcut(key, platform, control, alt, shift),
@@ -658,6 +663,9 @@ fn control_shortcut(
     if plain_control && !alt {
         match (key, shift) {
             ("`" | "~", false) => return Some(ToggleBottom),
+            ("f4", false) if !cfg!(target_os = "macos") => {
+                return Some(CloseActiveItem);
+            }
             ("g", true) => return Some(SourceControl),
             _ => {}
         }
@@ -1597,26 +1605,21 @@ impl Shell {
             },
         )
         .detach();
-        let applying_shell = cx.entity().downgrade();
         let applying_code = code.clone();
         cx.subscribe_in(
             &code,
             window,
-            move |_,
+            move |shell,
                   _,
                   request: &crate::code_panel::WorkspaceEditRequest,
                   window,
                   cx| {
-                if let Err(error) = applying_shell.update(cx, |shell, cx| {
-                    shell.apply_workspace_edit(
-                        applying_code.clone(),
-                        request.clone(),
-                        window,
-                        cx,
-                    );
-                }) {
-                    eprintln!("Routing workspace edit: {error}");
-                }
+                shell.apply_workspace_edit(
+                    applying_code.clone(),
+                    request.clone(),
+                    window,
+                    cx,
+                );
             },
         )
         .detach();
@@ -2805,6 +2808,32 @@ impl Shell {
         }
     }
 
+    fn open_language_server_config(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.explorer.read(cx).root.clone();
+        match ahead_core::config::ensure_workspace_config(std::path::Path::new(
+            &workspace,
+        )) {
+            Ok(path) => self.open_file_request(
+                crate::ross::OpenRequest {
+                    path: path.to_string_lossy().into_owned(),
+                    permanent: true,
+                    location: None,
+                },
+                window,
+                cx,
+            ),
+            Err(error) => {
+                self.status_message =
+                    format!("Could not open language-server config: {error}");
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn open_shared_buffer(
         &mut self,
         session_id: String,
@@ -3876,14 +3905,21 @@ impl Shell {
     ) {
         let terminal_id = self.next_terminal_id;
         self.next_terminal_id += 1;
-        let terminal = cx.new(|cx| {
-            crate::terminal_panel::TerminalPanel::new_with_cwd(terminal_id, cwd, cx)
+        let terminal = cx.new(|cx| match title {
+            Some(title) => {
+                crate::terminal_panel::TerminalPanel::new_with_cwd_and_title(
+                    terminal_id,
+                    cwd,
+                    title,
+                    cx,
+                )
+            }
+            None => crate::terminal_panel::TerminalPanel::new_with_cwd(
+                terminal_id,
+                cwd,
+                cx,
+            ),
         });
-        if let Some(title) = title {
-            terminal.update(cx, |terminal, cx| {
-                terminal.set_terminal_title(&title, cx);
-            });
-        }
         self.configure_terminal(terminal.clone(), cx);
         self.terminals.push(terminal);
         self.active_terminal = self.terminals.len() - 1;
@@ -4074,26 +4110,114 @@ impl Shell {
         cx.notify();
     }
 
+    fn focused_terminal_id(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.terminals.iter().find_map(|terminal| {
+            let terminal = terminal.read(cx);
+            terminal
+                .focus
+                .contains_focused(window, cx)
+                .then(|| terminal.terminal_id())
+        })
+    }
+
     fn close_terminal(
         &mut self,
         terminal_id: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
-            .terminals
+        self.close_terminal_set(&[terminal_id], terminal_id, window, cx);
+    }
+
+    fn close_terminal_tab_action(
+        &mut self,
+        terminal_id: usize,
+        action: crate::terminal_panel::TerminalTabAction,
+        panel_order: Vec<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::terminal_panel::TerminalTabAction;
+
+        let mut ordered_ids = panel_order
             .iter()
-            .position(|terminal| terminal.read(cx).terminal_id() == terminal_id)
+            .filter_map(|panel_id| {
+                self.terminals
+                    .iter()
+                    .find(|terminal| terminal.entity_id().as_u64() == *panel_id)
+                    .map(|terminal| terminal.read(cx).terminal_id())
+            })
+            .collect::<Vec<_>>();
+        for terminal in &self.terminals {
+            let id = terminal.read(cx).terminal_id();
+            if !ordered_ids.contains(&id) {
+                ordered_ids.push(id);
+            }
+        }
+        let Some(target_index) =
+            ordered_ids.iter().position(|id| *id == terminal_id)
         else {
             return;
         };
-        for ids in self.debug_terminals.values_mut() {
-            ids.retain(|id| *id != terminal_id);
+        let close_ids = match action {
+            TerminalTabAction::Close => vec![terminal_id],
+            TerminalTabAction::CloseOthers => ordered_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != terminal_id)
+                .collect(),
+            TerminalTabAction::CloseLeft => ordered_ids[..target_index].to_vec(),
+            TerminalTabAction::CloseRight => {
+                ordered_ids[target_index + 1..].to_vec()
+            }
+            // Terminal tabs have no unsaved buffer state, so every tab is clean.
+            TerminalTabAction::CloseClean => ordered_ids.clone(),
+            TerminalTabAction::CloseAll => ordered_ids.clone(),
+        };
+        if close_ids.is_empty() {
+            return;
         }
-        shutdown_terminal(&self.terminals.remove(index), cx);
-        if self.active_terminal > index {
-            self.active_terminal -= 1;
+
+        // Keep the dock's tab order when rebuilding its layout after a close.
+        let mut remaining = std::mem::take(&mut self.terminals);
+        let mut reordered = Vec::with_capacity(remaining.len());
+        for id in &ordered_ids {
+            if let Some(index) = remaining
+                .iter()
+                .position(|terminal| terminal.read(cx).terminal_id() == *id)
+            {
+                reordered.push(remaining.remove(index));
+            }
         }
+        reordered.extend(remaining);
+        self.terminals = reordered;
+        self.close_terminal_set(&close_ids, terminal_id, window, cx);
+    }
+
+    fn close_terminal_set(
+        &mut self,
+        terminal_ids: &[usize],
+        preferred_active_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active_id = self
+            .terminals
+            .get(self.active_terminal)
+            .map(|terminal| terminal.read(cx).terminal_id());
+        let previous_active_index = self.active_terminal;
+        for terminal_id in terminal_ids {
+            let Some(index) = self.terminals.iter().position(|terminal| {
+                terminal.read(cx).terminal_id() == *terminal_id
+            }) else {
+                continue;
+            };
+            for ids in self.debug_terminals.values_mut() {
+                ids.retain(|id| id != terminal_id);
+            }
+            shutdown_terminal(&self.terminals.remove(index), cx);
+        }
+
         if self.terminals.is_empty() {
             if self.debug_visible {
                 self.set_bottom_layout(true, window, cx);
@@ -4101,7 +4225,47 @@ impl Shell {
                 self.close_bottom_panel(window, cx);
             }
         } else {
+            let next_active_id = active_id
+                .filter(|id| {
+                    self.terminals
+                        .iter()
+                        .any(|terminal| terminal.read(cx).terminal_id() == *id)
+                })
+                .or_else(|| {
+                    self.terminals
+                        .iter()
+                        .any(|terminal| {
+                            terminal.read(cx).terminal_id() == preferred_active_id
+                        })
+                        .then_some(preferred_active_id)
+                });
+            self.active_terminal = next_active_id
+                .and_then(|id| {
+                    self.terminals
+                        .iter()
+                        .position(|terminal| terminal.read(cx).terminal_id() == id)
+                })
+                .unwrap_or_else(|| {
+                    previous_active_index.min(self.terminals.len() - 1)
+                });
             self.set_bottom_layout(self.bottom_debug_active, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_terminal_panel(
+        &mut self,
+        panel_entity_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .terminals
+            .iter()
+            .position(|terminal| terminal.entity_id().as_u64() == panel_entity_id)
+            && self.active_terminal != index
+        {
+            self.active_terminal = index;
+            cx.notify();
         }
     }
 
@@ -4121,11 +4285,26 @@ impl Shell {
     ) {
         let shell = cx.weak_entity();
         let terminal_id = terminal.read(cx).terminal_id();
+        let panel_entity_id = terminal.entity_id().as_u64();
         terminal.update(cx, |terminal, _| {
-            let shell_for_close = shell.clone();
-            terminal.set_close_handler(move |window, cx| {
-                _ = shell_for_close.update(cx, |shell, cx| {
-                    shell.close_terminal(terminal_id, window, cx);
+            let shell_for_actions = shell.clone();
+            terminal.set_tab_action_handler(
+                move |action, panel_order, window, cx| {
+                    _ = shell_for_actions.update(cx, |shell, cx| {
+                        shell.close_terminal_tab_action(
+                            terminal_id,
+                            action,
+                            panel_order,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            );
+            let shell_for_active = shell.clone();
+            terminal.set_active_handler(move |_, cx| {
+                _ = shell_for_active.update(cx, |shell, cx| {
+                    shell.select_terminal_panel(panel_entity_id, cx);
                 });
             });
             let shell_for_new = shell.clone();
@@ -4216,18 +4395,19 @@ impl Shell {
         }
     }
 
-    fn set_threads_visible(
+    pub(crate) fn set_threads_visible(
         &mut self,
         visible: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.threads_visible == visible {
-            return;
-        }
+        let changed = self.threads_visible != visible;
         self.threads_visible = visible;
         self.agent_workspace
             .update(cx, |panel, cx| panel.set_threads_visible(visible, cx));
+        if !changed {
+            return;
+        }
         if self.chat_zoomed {
             if visible {
                 let agent_workspace = self.agent_workspace.clone();
@@ -4288,11 +4468,27 @@ impl Shell {
             }
             Problems => self.open_center_panel(CenterPanel::Problems, window, cx),
             QuickOpen => self.open_quick_open(window, cx),
+            GoToLine => self.open_go_to_line(window, cx),
             OpenFileDialog => request_open_path(file_prompt_options(), cx),
             OpenFolderDialog => request_open_path(workspace_prompt_options(), cx),
             SaveActiveFile => {
                 if !self.code_tabs.is_empty() {
                     self.code.update(cx, |code, cx| code.save(window, cx));
+                }
+            }
+            CloseActiveItem => {
+                if let Some(terminal_id) = self.focused_terminal_id(window, cx) {
+                    self.close_terminal(terminal_id, window, cx);
+                } else if !self.code_tabs.is_empty()
+                    && self.code.read(cx).focus.contains_focused(window, cx)
+                {
+                    self.close_code_tab(
+                        gpui_kit::component::dock::PanelId::from(
+                            self.code.entity_id(),
+                        ),
+                        window,
+                        cx,
+                    );
                 }
             }
             CloseEditor => {
@@ -4510,6 +4706,46 @@ impl Shell {
                     shell.open_file_request(request, window, cx);
                 }) {
                     eprintln!("AHEAD could not open the selected file: {error}");
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn open_go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.code_tabs.is_empty() || !self.code.read(cx).is_text_available() {
+            return;
+        }
+        let (path, line, column, line_count) =
+            self.code.read_with(cx, |code, cx| {
+                let editor = code.editor.read(cx);
+                let position = editor.cursor_position();
+                (
+                    code.file_path.clone(),
+                    position.line as usize + 1,
+                    position.character as usize + 1,
+                    editor.text().lines_len().max(1),
+                )
+            });
+        let shell = cx.weak_entity();
+        crate::go_to_line::open(
+            line,
+            column,
+            line_count,
+            Box::new(move |location, window, cx| {
+                if let Err(error) = shell.update(cx, |shell, cx| {
+                    shell.navigate_to_editor_location(
+                        crate::ross::OpenRequest {
+                            path: path.clone(),
+                            permanent: false,
+                            location: Some(location),
+                        },
+                        window,
+                        cx,
+                    );
+                }) {
+                    eprintln!("AHEAD could not navigate to line: {error}");
                 }
             }),
             window,
@@ -4883,8 +5119,10 @@ impl Render for Shell {
                                         if code.is_text_available() {
                                             let editor = code.editor.read(cx);
                                             let position = editor.cursor_position();
+                                            let language_name =
+                                                code.status_language_name(cx);
                                             format!("Ln {}, Col {} · {} · UTF-8",
-                                                position.line + 1, position.character + 1, editor.language_name())
+                                                position.line + 1, position.character + 1, language_name)
                                         } else {
                                             "Text unavailable".to_string()
                                         }
@@ -5148,6 +5386,9 @@ pub fn launch() {
             cx.on_action(|_: &GoToFile, cx| {
                 request_shell_command(ShellShortcut::QuickOpen, cx);
             });
+            cx.on_action(|_: &GoToLine, cx| {
+                request_shell_command(ShellShortcut::GoToLine, cx);
+            });
             cx.on_action(|_: &GoBack, cx| {
                 request_shell_command(ShellShortcut::NavigateBack, cx);
             });
@@ -5277,6 +5518,7 @@ pub fn launch() {
                     GoToFile,
                     None,
                 ),
+                KeyBinding::new("ctrl-g", GoToLine, Some("AHEADCodeEditor > Input")),
                 KeyBinding::new("ctrl--", GoBack, None),
                 KeyBinding::new("ctrl-_", GoForward, None),
                 KeyBinding::new("f12", GoToDefinition, None),
@@ -5377,6 +5619,7 @@ pub fn launch() {
                 ]),
                 Menu::new("Go").items([
                     MenuItem::action("Go to File", GoToFile),
+                    MenuItem::action("Go to Line", GoToLine),
                     MenuItem::action("Go Back", GoBack),
                     MenuItem::action("Go Forward", GoForward),
                     MenuItem::action("Go to Definition", GoToDefinition),
@@ -5654,6 +5897,23 @@ pub fn launch() {
                                 );
                             }
                         });
+                    });
+                    let shell_for_language_servers = shell.downgrade();
+                    language_servers.update(cx, |language_servers, _| {
+                        language_servers.set_open_settings_handler(
+                            move |_path, window, cx| {
+                                if let Err(error) =
+                                    shell_for_language_servers.update(
+                                        cx,
+                                        |shell, cx| shell.open_language_server_config(window, cx),
+                                    )
+                                {
+                                    eprintln!(
+                                        "AHEAD could not open language-server settings: {error}"
+                                    );
+                                }
+                            },
+                        );
                     });
                     session.update(cx, |panel, _| panel.set_shell(shell.clone()));
                     let shell_for_settings_reload = shell.downgrade();
@@ -5936,6 +6196,18 @@ pub fn launch() {
                             ) else {
                                 return;
                             };
+                            if command == ShellShortcut::CloseActiveItem
+                                && !cfg!(target_os = "macos")
+                                && event.keystroke.key == "w"
+                                && matches!(
+                                    shell_for_shortcuts.read_with(cx, |shell, cx| {
+                                        shell.focused_terminal_id(window, cx).is_some()
+                                    }),
+                                    Ok(true)
+                                )
+                            {
+                                return;
+                            }
                             if let Err(error) =
                                 shell_for_shortcuts.update(cx, |shell, cx| {
                                     shell.run_shell_command(command, window, cx);
@@ -5965,6 +6237,7 @@ pub fn launch() {
                     root
                 })
                 .expect("Failed to open AHEAD window");
+                cx.update(|cx| cx.activate(true));
             })
             .detach();
         });
@@ -6057,6 +6330,10 @@ mod shortcut_tests {
         assert_eq!(primary("e", false, true), Some(ShellShortcut::Explorer));
         assert_eq!(primary("f", false, true), Some(ShellShortcut::Search));
         assert_eq!(primary("d", false, true), Some(ShellShortcut::Debug));
+        assert_eq!(
+            primary("w", false, false),
+            Some(ShellShortcut::CloseActiveItem)
+        );
         assert_eq!(primary("x", false, true), Some(ShellShortcut::Extensions));
         assert_eq!(primary("b", true, false), Some(ShellShortcut::ToggleRight));
         assert_eq!(
@@ -6086,6 +6363,12 @@ mod shortcut_tests {
             shell_shortcut("`", !cfg!(target_os = "macos"), true, false, false),
             Some(ShellShortcut::ToggleBottom)
         );
+        if !cfg!(target_os = "macos") {
+            assert_eq!(
+                shell_shortcut("f4", true, true, false, false),
+                Some(ShellShortcut::CloseActiveItem)
+            );
+        }
     }
 }
 

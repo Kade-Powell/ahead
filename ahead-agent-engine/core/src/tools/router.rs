@@ -20,6 +20,7 @@ use codex_protocol::models::SearchToolCallParams;
 #[cfg(test)]
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ToolMode;
+#[cfg(test)]
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -81,6 +82,7 @@ pub struct ToolRouter {
     model_visible_specs: Arc<[ToolSpec]>,
     tool_mode: ToolMode,
     code_mode_availability: CodeModeAvailability,
+    #[cfg(test)]
     code_mode_tool_names: BTreeMap<String, ToolName>,
     tool_namespaces_info: Option<TurnToolNamespacesInfo>,
 }
@@ -112,11 +114,14 @@ impl ToolRouter {
         code_mode_tool_names: BTreeMap<String, ToolName>,
         tool_namespaces_info: Option<TurnToolNamespacesInfo>,
     ) -> Self {
+        #[cfg(not(test))]
+        drop(code_mode_tool_names);
         Self {
             registry,
             model_visible_specs: model_visible_specs.into(),
             tool_mode,
             code_mode_availability,
+            #[cfg(test)]
             code_mode_tool_names,
             tool_namespaces_info,
         }
@@ -137,8 +142,7 @@ impl ToolRouter {
     }
 
     /// The normalized nested identities chosen after exclusions and collisions.
-    // Consumed by the follow-up cell-origin migration.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn code_mode_tool_names(&self) -> &BTreeMap<String, ToolName> {
         &self.code_mode_tool_names
     }
@@ -149,13 +153,13 @@ impl ToolRouter {
     }
 
     /// Whether the model can both start and interact with a terminal process.
-    // Consumed by the follow-up live tool-plan selection.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn has_terminal_controls(&self) -> bool {
         self.exposes_tool(&ToolName::plain("exec_command"))
             && self.exposes_tool(&ToolName::plain("write_stdin"))
     }
 
+    #[cfg(test)]
     // Answers if the tool plan lets the model invoke the tool directly, through code mode, or deferred tool search.
     fn exposes_tool(&self, name: &ToolName) -> bool {
         let name = name.clone().with_default_namespace();
@@ -279,29 +283,6 @@ impl ToolRouter {
         }
     }
 
-    #[allow(dead_code)]
-    #[instrument(level = "trace", skip_all, err)]
-    pub async fn dispatch_tool_call_with_code_mode_result(
-        &self,
-        session: Arc<Session>,
-        step_context: Arc<StepContext>,
-        cancellation_token: CancellationToken,
-        tracker: SharedTurnDiffTracker,
-        call: ToolCall,
-        source: ToolCallSource,
-    ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            /*terminal_outcome_reached*/ None,
-        )
-        .await
-    }
-
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
@@ -344,11 +325,8 @@ impl ToolRouter {
             ..
         } = call;
 
-        // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
-        let turn = Arc::clone(&step_context.turn);
         let invocation = ToolInvocation {
             session,
-            turn,
             step_context,
             cancellation_token,
             tracker,

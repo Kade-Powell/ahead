@@ -2,13 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::merge::merge_toml_values;
 use codex_protocol::permissions::FileSystemAccessMode;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 use toml::Value as TomlValue;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionsToml {
     #[serde(flatten)]
     pub entries: BTreeMap<String, PermissionProfileToml>,
@@ -97,8 +96,7 @@ impl PermissionsToml {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionProfileToml {
     pub description: Option<String>,
     pub extends: Option<String>,
@@ -163,7 +161,7 @@ fn merge_permission_profiles(
         .map_err(|source| PermissionProfileResolutionError::DeserializeProfileToml { source })
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceRootsToml {
     #[serde(flatten)]
     pub entries: BTreeMap<String, bool>,
@@ -177,11 +175,10 @@ impl WorkspaceRootsToml {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilesystemPermissionsToml {
     /// Optional maximum depth for expanding unreadable glob patterns on
     /// platforms that snapshot glob matches before sandbox startup.
-    #[schemars(range(min = 1))]
     pub glob_scan_max_depth: Option<usize>,
     #[serde(flatten)]
     pub entries: BTreeMap<String, FilesystemPermissionToml>,
@@ -193,15 +190,14 @@ impl FilesystemPermissionsToml {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum FilesystemPermissionToml {
     Access(FileSystemAccessMode),
     Scoped(BTreeMap<String, FileSystemAccessMode>),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkToml {
     pub enabled: Option<bool>,

@@ -82,18 +82,23 @@ sends the selected package's pinned download URL and ID through the existing
 proxy installer, which validates the
 manifest, language-server declaration and Wasm component before replacing an
 installed package. Downloads and archive extraction are bounded by byte and
-entry limits. Production downloads require credential-free HTTPS, including
-every redirect; unit tests alone allow loopback HTTP for disposable package
-smokes. A root-wide file lock serializes installs and discovery across
-proxy processes; an interrupted update's valid backup is restored on discovery
-or the next install attempt. Malformed backups are reported without hiding
-healthy extensions. Discovery ignores hidden staging directories and rejects
-a directory whose name disagrees with its manifest ID.
+entry limits. Production package sources are restricted to the exact
+versioned `api.zed.dev/extensions/<id>/<version>/download` route or a
+version-matched `github.com/Kade-Powell/ahead/releases/download/...` asset.
+Redirects remain on those routes or use the observed Zed extension object
+store and GitHub release-asset hosts; arbitrary HTTPS hosts, URL credentials,
+non-default ports and HTTPS downgrades are rejected. Signed object-store query
+parameters are preserved. Unit tests alone allow credential-free loopback HTTP
+for disposable package smokes. A root-wide file lock serializes installs and
+discovery across proxy processes; an interrupted update's valid backup is
+restored on discovery or the next install attempt. Malformed backups are
+reported without hiding healthy extensions. Discovery ignores hidden staging
+directories and rejects a directory whose name disagrees with its manifest ID.
 Hot-path file language lookup does not wait for the install lock; the
 post-install restart reclassifies open buffers from the completed package.
 After an install, the proxy client requests a language-server restart even if
-the Extensions tab has closed; the proxy reclassifies open buffers and rescans installed
-extensions before reopening documents. Opening a matching file then discovers
+the Extensions tab has closed; the proxy reclassifies open buffers and rescans
+installed extensions before reopening documents. Opening a matching file then discovers
 the package and starts its language server;
 `[language-servers.*]` manual command settings are not supported. Existing
 packages remain visible and installed when the catalog is offline; online
@@ -149,6 +154,12 @@ metadata with source revision, package hash and AHEAD-owned download URL. A
 live Zed result takes precedence over an AHEAD feed entry with the same ID.
 AHEAD entries supplement missing Zed results and remain available when its
 catalog cannot be fetched. This feed is currently empty.
+
+The downloader validates source URLs separately from redirect destinations.
+This follows the observed Zed API redirect to
+`zed-extensions.nyc3.digitaloceanspaces.com` while keeping the installer from
+becoming a generic HTTPS fetch proxy. Revalidate the redirect allowlist if Zed
+or GitHub changes package delivery hosts.
 
 The client reads `extensions/registry.json` locally in debug builds and from
 AHEAD's public `main` branch in release builds, and queries Zed's live catalog

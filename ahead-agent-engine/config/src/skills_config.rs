@@ -6,7 +6,6 @@ use std::num::NonZeroUsize;
 use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::warn;
@@ -15,8 +14,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SkillConfig {
     /// Path-based selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,8 +25,7 @@ pub struct SkillConfig {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundled: Option<BundledSkillsConfig>,
@@ -46,8 +43,7 @@ pub struct SkillsConfig {
     pub config: Vec<SkillConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BundledSkillsConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,

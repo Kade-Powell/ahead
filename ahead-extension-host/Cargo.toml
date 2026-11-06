@@ -28,5 +28,6 @@ tree-sitter = { version = "=0.26.13", features = ["wasm"] }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasmparser = { workspace = true }
 which = { workspace = true }
 zip = { workspace = true }

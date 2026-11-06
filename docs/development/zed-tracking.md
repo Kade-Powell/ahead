@@ -44,16 +44,394 @@
 
 ## Current reference baseline
 
-- Checked 2026-10-04: the clean `../zed` checkout is at
-  `418f89714891f9d8105a3e92e60b9a7a5084d232` (2026-09-21). Feature links
-  below use this immutable revision. The extension WIT copy records its
+- Checked 2026-10-27: the clean `../zed` checkout is at
+  `37faef81f74fc1bb08be9939c4cffc8ede6ced2f` (`main`). Each review entry
+  records the specific commit it inspected; feature links remain pinned to
+  their source revisions. The extension WIT copy records its
   provenance and Apache-2.0 terms in `ahead-extension-host/NOTICE`; individual
   source imports retain their applicable notices. Zed's mixed-license source
   boundary and the outstanding clean-room obligation are recorded in
   [Decision 0006](decisions/0006-dependency-replacement-and-zed-reuse-correction.md)
   and `TODO.md`.
 
+- Rechecked 2026-10-28: `../zed` remains clean at the same `main` SHA. Its
+  current baseline includes GPUI's pooled-line-wrapper cycle fix (`e4a3732`),
+  deferred native window-close cleanup (`370591f`), and low-power frame pacing
+  (`fdcb198`). AHEAD resolves `gpui-kit 0.6.6` to `gpui-pre 0.3.6`; that
+  published snapshot still has the old `Vec<LineWrapper>` pool and synchronous
+  `on_close` cleanup. AHEAD now carries the two GPUI fixes as a repository-owned
+  patch under `third_party/gpui-pre`; see its patch ledger for provenance.
+  The frame-pacing change is a lower-priority framework update. Zed's retained
+  focus changes are relevant only if AHEAD adds focus-follows-mouse behavior.
+
 ## Review log
+
+- 2026-11-02: reviewed Zed commit `37faef8` (`Protect against solargraph
+  LSP violations`) in `crates/editor/src/code_context_menus.rs`. Zed checks
+  candidate identity before reusing fuzzy-match offsets after completion
+  resolution. AHEAD does not retain those offsets across resolve: it preserves
+  the original completion label and computes highlights from the current label
+  on render, so that exact mismatch is already avoided. The review exposed a
+  separate async hazard in AHEAD's visible-detail prefetch: a reply was fenced
+  by caret/request context but could still target a different completion at
+  the same row after the list changed. AHEAD now also checks provider and item
+  identity before applying resolved details. The focused GPUI regression
+  replaces the list without changing caret/request context and passes; this
+  complements, rather than copies, Zed's candidate-specific highlight guard.
+
+- 2026-11-02: reran the curated ACP install smoke against the fresh shared
+  `just dev` binary, following Zed's agent-install flow while limiting AHEAD to
+  Pi, Codex and Claude Code. The live ACP registry supplied Pi 0.0.34, Codex
+  ACP 2.5.0 and Claude Code ACP 0.100.0. Each installed and launched from an
+  isolated profile, survived proxy restart, then uninstalled; Pi and Codex
+  requested authentication, while Claude exposed five options and restored an
+  Opus 5.5 model change after reconnect. No prompt or credential was used.
+  This verifies current registry/install/config behavior, not authenticated
+  turns or native picker rendering.
+
+- 2026-11-02: retested Zed's Proto 0.3.4 extension with its default Buf server
+  in a disposable, valid Buf v2 module. AHEAD returned import-path completion
+  for `smoke/common.proto` (20.3 ms) and local message-type completion for
+  `Smoke` (7.0 ms), in addition to grammar captures, restart and uninstall.
+  This follows Zed's `extensions/proto/extension.toml` Buf default and Buf's
+  documented import/symbol completion support. It verifies the live proxy and
+  server path; native popup placement and completion insertion remain separate
+  acceptance checks. See [Buf editor integration](https://buf.build/docs/cli/editors-lsp/).
+
+- 2026-11-02: compared the live Zed extension catalog's API distribution and
+  exercised a real API 0.6 package through AHEAD. The live catalog returned
+  Swift 0.4.11 with `wasm_api_version = 0.6.0`; the disposable
+  `tests/lsp-smoke.mjs` run installed that package, started the system
+  `sourcekit-lsp`, completed a local `Calculation` type in 544 ms, loaded Swift
+  grammar captures, restarted the server, uninstalled the package, and shut
+  down cleanly. HTML 0.3.2 and Proto 0.3.4 cover API 0.7. The catalog snapshot
+  contained 419 language-server entries: 283 on API 0.7, 32 on API 0.6, none
+  on API 0.8, and 104 on older or missing versions. Thus API 0.8 still has
+  fixture-based host coverage only, and older entries remain filtered out.
+  These are proxy/host checks, not native gallery or editor-rendering evidence.
+
+- 2026-10-30: compared terminal task cleanup with Zed's
+  `../zed/crates/terminal/src/terminal.rs::kill_active_task` and
+  `pty_info.rs` at `37faef81f74fc1bb08be9939c4cffc8ede6ced2f`. Zed
+  signals the active process group and its child; AHEAD additionally scans
+  the terminal session at tab shutdown because disposable `watchexec` tasks
+  survived in separate background groups after their PTY closed. The scan
+  runs after the reader stops, off the GPUI thread. PTY tests cover both a
+  live shell and an exited shell with a background job; rendered tab-close
+  acceptance remains open.
+
+- 2026-10-30: the watcher-built integrated binary passed the live Zed HTML
+  extension smoke in a disposable profile. The catalog returned HTML 0.3.2;
+  AHEAD installed it, started `vscode-html-language-server`, loaded grammar
+  highlights, completed HTML, restarted the server and uninstalled the
+  extension. This verifies package-to-proxy behavior, not the rendered gallery
+  or editor colors.
+
+- 2026-10-30: checked completion resolve against
+  `../zed/crates/project/src/lsp_store.rs` at
+  `37faef81f74fc1bb08be9939c4cffc8ede6ced2f`: Zed applies
+  `additional_text_edits` from the resolved item. AHEAD already advertised
+  that resolve property and could apply those edits, but its merge replaced
+  them with the original item's value, dropping lazy auto-imports. The merge
+  now keeps resolved edits and falls back to original edits if resolve omits
+  them. The [LSP completion contract](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/lsp/3.18/language/completion.md)
+  defines the properties a client may resolve lazily. AHEAD also advertises
+  `command` as resolvable because its completion path runs the resolved command
+  after insertion. Native popup and real
+  language-server command side effects remain acceptance work. The dev app
+  build and focused editor auto-import/Undo and proxy capability tests pass.
+  The offline TypeScript/JavaScript `tests/lsp-smoke.mjs` run against that binary
+  passed with cached Vtsls: resolved auto-import edits, import quick-fix
+  command routing, completion/navigation, diagnostics, formatting, cross-file
+  rename, restart and graceful shutdown. This is proxy/server evidence, not
+  editor insertion or Undo evidence.
+
+- 2026-10-29: compared completion scheduling with Zed's
+  `trigger_completion_on_input` and `open_or_update_completions_menu` in
+  `../zed/crates/editor/src/completions.rs`. Zed calls the provider when an
+  input event passes its trigger check. AHEAD already filters complete
+  same-prefix batches locally and cancels stale requests through the proxy,
+  but had added a 50 ms delay before every uncached LSP request. Removed that
+  delay; a focused GPUI regression confirms a typed character dispatches the
+  request without advancing a timer. This removes AHEAD's extra wait, not the
+  language server's response latency; rendered popup responsiveness remains
+  part of native acceptance.
+
+- 2026-10-28: followed Zed's `LanguageRegistration.name` and
+  `LanguageRegistry::language_for_file_path` in
+  `../zed/crates/language/src/language_registry.rs`. AHEAD already matched
+  installed extension language definitions for syntax captures but dropped the
+  display name before the editor status bar. The extension host and RPC now
+  carry the matched name, and the status bar uses it only when the built-in
+  editor language is `text`, with stale path/length responses ignored. The
+  editor/proxy extension-syntax tests passed 3/3 and the host language-config
+  test passed 1/1. This verifies the metadata path in GPUI tests; rendered
+  labels for installed extensions remain open.
+
+- 2026-10-29: rechecked Zed's `BufferSnapshot::chunks` and
+  `BufferChunks::new` in `../zed/crates/language/src/buffer.rs`. Zed resolves
+  cached Tree-sitter highlight runs through each grammar's highlight map before
+  editor painting. AHEAD currently bridges installed grammar captures over RPC
+  into GPUI `TextDecoration`s. The opt-in
+  `AHEAD_EXTENSION_SYNTAX_TRACE=1` CodePanel trace now records current-buffer
+  acceptance and applied decoration counts without source text, to identify
+  where that bridge diverges. Set the variable before starting the shared
+  `just dev` loop; changing it does not affect an already-running app. This
+  adds diagnosis, not proof of rendered extension colors; native acceptance
+  remains open.
+
+- 2026-10-29: Zed's `LanguageRegistry` keeps extension language and grammar
+  registrations and updates them when the installed extension set changes
+  (`../zed/crates/language/src/language_registry.rs`). AHEAD's extension host
+  still parses WASM grammars in its separate boundary, but it now caches parsed
+  language definitions per installed-extension root and invalidates them after
+  install, uninstall, and extension discovery/restart. The bounded cache reuse
+  and discovery invalidation regression passed 1/1. This removes repeated
+  manifest/config scans from syntax requests; it does not claim Zed's shared
+  incremental parser or prove native coloring beyond the already verified
+  TOML path.
+
+- 2026-10-29: reran the complete extension-host library suite against current
+  source with `rtk cargo test --locked --offline -p ahead-extension-host --lib`;
+  47 tests passed and 3 were ignored. This validates the host implementation
+  covered by those tests, not compatibility with every live-catalog extension
+  or native gallery installation.
+
+- 2026-10-28: compared Zed `1399a804bd53e580fa3c60e5344a7c93fe15e28c`
+  (`crates/extension/src/extension_manifest.rs` and
+  `crates/project/src/lsp_store.rs`) with AHEAD's extension catalog and LSP
+  routing. Zed's `opt_in_languages` manifest field keeps a server available
+  while preventing automatic startup for selected languages. AHEAD now parses
+  that field, including language IDs declared through `language_ids`, excludes
+  opt-in servers from default selection and wildcard expansion, while an
+  explicit server ID still enables them. This avoids heavyweight or competing
+  servers starting merely because an extension is installed. The extension-host
+  regression and both focused proxy-routing tests passed; the proxy tests cover
+  wildcard exclusion and explicit selection. The ignored
+  `installed_zed_html_extension_refreshes_settings_and_uses_a_real_server`
+  probe also passed on 2026-10-28 with a copied installed Zed HTML extension
+  marked opt-in and its cached server binary. Default startup stayed dormant;
+  explicit routing started the server and exercised diagnostics, completion,
+  formatting, rename, live settings updates, and restart after initialization
+  options changed. Native routing UI remains open.
+
+- 2026-10-28: reran the full cache-seeded `tests/lsp-smoke.mjs` matrix against
+  the rebuilt integrated binary using an isolated profile copied from the
+  existing AHEAD language-server cache. Vtsls, BasedPyright, Ruff, and Rust
+  Analyzer passed initialization, completion/navigation, diagnostics/repair,
+  semantic tokens, formatting, cross-file rename in unsaved buffers, TypeScript
+  import/code actions, live Ruff configuration changes, restart/replay, routing,
+  and graceful shutdown across Rust, TypeScript, JavaScript, and Python. The
+  valid `interface ExtendedCalculation extends Cal` completion returned the
+  local `Calculation` interface. Disposable workspace:
+  `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ahead-lsp-smoke-PRdSuI`.
+  This validates managed server/proxy behavior, not native completion rendering
+  or insertion.
+
+- 2026-10-28: reran the current integrated binary's managed-agent smokes with
+  disposable local-mock profiles. Automatic context compaction used the
+  effective model limit and persisted its summary. Code Mode covered concurrent
+  delegated search, cancellation, Turso reopen/retry, and shutdown. The
+  CodeAnchor-to-Git smoke verified generated-output handling, shell-write
+  denial, managed `apply_patch`, Turso anchor persistence, staged commit,
+  AHEAD author/human committer, session trailer, and anchor cleanup. No real
+  model provider was contacted; native gutter rendering remains a separate
+  acceptance check. The same binary passed managed MCP discovery/resources,
+  approvals, cancellation and continuation; project/user memory append/search,
+  reviewed replacement and Turso reopen; and editor recovery after SIGKILL,
+  discard and stale-snapshot replay. All used disposable profiles. The fixture
+  Node suite passed 3/3 and Python `unittest` passed 1/1. No OpenRouter key was
+  available in the process or user connection settings, so authenticated
+  provider acceptance remains open. The curated ACP install smoke passed for
+  Pi 0.0.34 and Codex 2.3.0 (both correctly requested authentication) and
+  Claude 0.99.0 (five options and a live model change to Opus 5.5). It sent no
+  prompts and removed all temporary profiles. A 2026-10-29 rerun against the
+  current integrated binary installed Pi ACP 0.0.34, Codex ACP 2.5.0 and Claude
+  ACP 0.99.1; Pi and Codex again requested authentication, while Claude exposed
+  five config options and accepted a live model change to Opus 5.5.
+
+- 2026-10-28: reviewed recent Zed agent/LSP changes `f41ac64`, `9e65fc7`,
+  `fda552e`, `e80af52`, `1563b40`, `9f63850`, and `eee7501`. Zed now defers
+  markdown parsing and tool-call diff materialization for off-screen agent
+  entries; AHEAD's transcript delegates to gpui-kit `TextView`, so profile
+  long conversations and verify its virtualization/cache behavior before
+  adopting a second lazy-rendering layer. Zed's covering-index thread-list
+  query follows the same metadata/detail split AHEAD already uses with paged,
+  indexed Turso thread headers. Its LSP writer fix preserves ordering between
+  `didChange` notifications and requests; AHEAD routes both through one
+  `PluginCatalogRpc` queue, so the exact split-queue defect is not present in
+  this boundary. AHEAD already honors dynamic document selectors and stores
+  model-specific reasoning choices. Zed's removed checkpoints are Git-backed
+  code restore points; AHEAD's `/checkpoint` exports a durable session
+  snapshot, so they are different product behaviors. No direct port was
+  warranted from these commits.
+
+- 2026-10-28: compared Zed GPUI commits `e4a3732`, `370591f`, and `fdcb198`
+  with AHEAD's resolved framework crates. The first two address concrete
+  issues still present in the `gpui-pre 0.3.6` source selected by
+  `gpui-kit 0.6.6`; they cannot be fixed in AHEAD's app panels. AHEAD carries
+  both source changes and the matching regression tests in
+  `third_party/gpui-pre`. The TextSystem lifetime and reentrant-close tests
+  passed, and the normal `just dev` build compiled and launched the app against
+  the disposable Rust workspace. Native screen inspection was unavailable
+  because macOS was locked. Zed's
+  low-power frame pacing is also absent from the resolved framework but is a
+  broader, lower-priority platform change. The latest focus-follows-mouse
+  fixes do not apply because AHEAD has no such setting. The Solargraph change
+  was already reviewed below and does not need a direct port.
+
+- 2026-10-28: reviewed Zed's dock-button fix (`5e548b8`), Git push recovery
+  (`3c2f782`), ACP subagent work (`a5c4ca8`, `d93bf74`, `a8acb01`), and
+  Tree-sitter/grammar update (`e30095f`). Zed's dock fix routes a panel button
+  through the visible zoomed panel's focus handle because the dock itself is
+  not rendered. AHEAD's status-bar controls call shell handlers directly and
+  its chat zoom has a separate layout path; the Zed code is not a direct
+  drop-in. The source-matched AHEAD lifecycle regression passed New AHEAD,
+  External ACP, and Join clicks with the right dock zoomed, so this does not
+  explain those start actions. AHEAD already classifies non-fast-forward push
+  errors and explains that remote changes must be integrated. Zed's
+  `3c2f782` diff only changes the error toast title; its PR summary mentions a
+  recovery button, but the source change adds no fetch/pull/push action, so
+  there is no additional behavior to port from that commit. Zed's ACP
+  subagent cards/configuration are useful references for external-agent UX,
+  while managed AHEAD policy remains on the native path. AHEAD loads Zed
+  grammar WASM through Wasmtime; the Tree-sitter changes warrant compatibility
+  coverage as extension packages evolve, but do not establish a current
+  failure. No direct port was made from these commits.
+
+- 2026-10-28: reran the live Zed catalog path against the integrated AHEAD
+  binary in a disposable workspace. HTML 0.3.2 installed, its Wasmtime-loaded
+  grammar returned highlight captures, the real HTML server completed `<di`,
+  and restart/uninstall passed. This extends the earlier HTML package smoke
+  with current catalog state; it still does not replace native gallery
+  rendering or completion insertion/Undo acceptance.
+
+- 2026-10-30: repeated the live Zed HTML extension lifecycle against the
+  current integrated binary with a fresh isolated profile. The catalog
+  returned HTML 0.3.2; installation started `vscode-html-language-server`,
+  grammar/highlight capture and completion checks passed, restart recovery
+  passed, and uninstall removed the extension. The profile was deleted and
+  the disposable project retained. This validates the live package/proxy
+  lifecycle, not native gallery presentation or editor completion insertion.
+
+- 2026-10-27: compared Zed's `crates/agent_ui/src/model_search.rs` at
+  `065d7ae` with AHEAD's chat model picker. Zed builds separate fuzzy
+  candidates for model names and metadata, runs matching on GPUI's background
+  executor, and appends metadata matches after name matches. AHEAD now applies
+  the same ranking to model name, provider and model ID through its existing
+  Nucleo matcher, keeping gpui-kit's grouped virtual list. The focused
+  punctuation-tolerant name and provider-only search regressions are recorded
+  as passing in the 2026-10-27 `ahead-app` suite in `TODO.md`; native picker
+  focus and narrow-width rendering remain open.
+
+- 2026-10-27: compared Zed's dynamic `didChange`/`didSave` selector handling
+  (`1563b40`) with AHEAD's LSP host. AHEAD already filters both notification
+  types by document selector, but `didSave` previously combined every matching
+  registration and stored them in an unordered map. AHEAD now keeps save
+  registrations in order and applies the latest match, falling back to the
+  previous match or static capability after unregistration. The proxy
+  registration tests passed 9/9; a real language-server confirmation remains
+  open.
+
+- 2026-10-27: compared Zed's provider error retention in `faf8f0b` with AHEAD's
+  `/models` discovery. AHEAD now retains each connection's discovery failure
+  and shows it on that provider's model-visibility row, including while the
+  provider is collapsed. HTTP status, invalid catalogs and timeouts stay
+  actionable; other request errors are sanitized so a URL cannot leak into the
+  UI. The focused `ahead-app` model tests passed 26/26. Native rendering and a
+  live rejected-credentials recovery check remain open.
+
+- 2026-10-27: Zed's `render_token_usage` in
+  `crates/agent_ui/src/conversation_view/thread_view.rs` gets the maximum from
+  the currently selected model. AHEAD now prefers the selected provider
+  catalog's context window over a stale runtime report and suppresses the old
+  usage count when its reported window does not match the selected model. The
+  retained runtime now estimates history token usage when a completed
+  OpenAI-compatible response omits usage, so the next pre-turn compaction check
+  has a current estimate instead of an old count or zero. The updated managed
+  runtime regression omits usage on the final streamed response and passed
+  (1/1). The same `just dev` loop was restarted and rebuilt the app; native
+  inspection remains unavailable while macOS is locked.
+
+- 2026-10-27: inspected Zed's Solargraph completion matching fix (`37faef8`).
+  Zed avoids applying fuzzy-match offsets from the original candidate to a
+  resolved item whose label changed; AHEAD does not reuse those offsets after
+  resolution, so this exact fix is not needed. Separately, AHEAD preserves
+  missing insertion fields from the initially offered completion when resolve
+  mutates its label. Its focused regression passed; that is adjacent fallback
+  hardening, not a direct port of this Zed change.
+
+- 2026-10-26: re-ran the integrated proxy's real language-server matrix on a
+  disposable copy of `tests/fixtures/editor-smoke/`. Following Zed's extension
+  host install flow in `../zed/crates/extension_host/src/extension_host.rs`,
+  `AHEAD_LSP_INSTALL_MISSING=1 AHEAD_LSP_INSTALL_ZED_HTML=1` fetched the live
+  Zed catalog and installed HTML 0.3.2 into an isolated AHEAD data home. Its
+  real HTML server initialized and returned completion; uninstall removed the
+  extension. A focused `AHEAD_LSP_LANGUAGES=html` rerun requested
+  `get_extension_syntax` for an open unsaved HTML buffer and received the
+  expected `tag` capture for `div` from the installed grammar and highlights
+  query. This covers extension package loading, Tree-sitter capture generation,
+  and the proxy response, following Zed's grammar/query assets; it does not
+  verify theme resolution or native color rendering. The same full run acquired
+  Vtsls, BasedPyright, Ruff and Rust Analyzer
+  and passed the Rust, TypeScript, JavaScript and Python protocol smoke matrix,
+  including diagnostics/repair, formatting, navigation, unsaved cross-file
+  rename, restart/replay and graceful shutdown. The proxy also confirmed there
+  was no `ahead-data/` directory in the project. The disposable profile and
+  workspace were removed. The source-current GPUI app suite passed 423/423;
+  the source-current proxy suite passed 351/351 with one ignored when run from
+  its package directory. These are headless and real-server checks, not native
+  popup, Problems view, or extension-grammar render acceptance. The desktop
+  was locked during this recheck, so no `just dev` window was opened.
+
+- 2026-10-26: re-read Zed's `crates/project/src/project_search.rs` search
+  pipeline and compared it with AHEAD's cached `WorkspaceFileIndex`, shared
+  bounded Rayon scanner and `grep_searcher` matcher. Both search a stable
+  worktree path view off the UI thread, account for open buffers and cap
+  results; Zed schedules through its shared background executor, while AHEAD
+  preserves per-query cancellation and ordered results in a process-wide pool.
+  The current integrated binary passed the 10,000-file smoke: index build
+  286ms, median no-hit 509ms for AHEAD versus 409ms for ripgrep, and 756ms to
+  return AHEAD's 5,000-match cap. Ripgrep counted all 10,000 hot matches in
+  366ms, which is different work. This single cache-sensitive run leaves
+  no-hit latency as a profiling target; it is not a general parity claim.
+  A later same-day run on the integrated binary indexed in 519ms and measured
+  five alternating no-hit medians of 704ms for AHEAD versus 632ms for ripgrep.
+  AHEAD took 1,116ms to return its capped 5,000 matches; ripgrep counted all
+  10,000 hot matches in 569ms, a different workload. The paired run repeats a
+  smaller no-hit gap in this synthetic fixture; it does not justify changing
+  the secure-open or worker policy without component-level profiling. The
+  stale-index symlink escape was rejected and the fixture/profile were removed.
+  A flat 10,000-file rerun indexed in 730ms and measured five alternating
+  no-hit medians of 463ms for AHEAD versus 448ms for ripgrep. Returning AHEAD's
+  capped 5,000 rich matches took 4,587ms; ripgrep counted all 10,000 hot
+  matches in 517ms, which is different work. A three-second macOS sample during
+  the capped query captured worker stacks in `search_one_path`, secure relative
+  open/`openat`, and the grep reader, but is too short to attribute latency to a
+  component. The stale-index symlink escape was rejected. No secure-open or
+  worker-policy change is warranted from this evidence alone.
+  Two immediate reruns of the same integrated binary indexed in 7.233s (a
+  cache-sensitive outlier) and 327ms. Five alternating no-hit medians were
+  572/366ms and 544/406ms for AHEAD/ripgrep; AHEAD returned its capped 5,000
+  matches in 919ms and 976ms, while ripgrep counted all 10,000 hot matches in
+  474ms and 397ms. Those hit workloads differ. The runs repeat a no-hit gap but
+  do not justify changing secure-open or worker policy without component-level
+  profiling; the stale-index symlink escape remained rejected.
+  A later flat-directory run indexed in 332ms and returned AHEAD's capped
+  5,000 rich matches in 804ms. Five alternating no-hit samples measured 486ms
+  for AHEAD versus 460ms for ripgrep; ripgrep counted all 10,000 hot matches in
+  399ms, which is different work. This closer comparison shows cache/host
+  variability; the symlink escape remained rejected and the disposable fixture
+  was cleaned.
+
+- 2026-10-28: reran the 10,000-file nested-workspace comparison against the
+  integrated AHEAD binary. Indexing took 849ms, multiline search 535ms, and
+  returning AHEAD's capped 5,000 rich matches took 327ms. Five alternating
+  no-hit samples measured 557ms median for AHEAD versus 518ms for ripgrep.
+  Ripgrep counted all 10,000 hot matches in 539ms, which is more work than
+  AHEAD's capped response. The stale-index symlink escape was rejected. This
+  synthetic run narrows the measured no-hit difference on this fixture but is
+  not a native UI benchmark or general performance/parity claim.
 
 - 2026-10-13: checked AHEAD's `FileWatcher` against Zed's OS watcher boundary
   in `crates/fs/src/fs_watcher.rs`. Both route native `notify` events through a
@@ -2580,6 +2958,21 @@ macOS is locked. Workspace: `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ah
   loopback download, AHEAD install/discovery, Wasm command and initialization
   callbacks, and repeated changed workspace-settings reads. No registry or
   provider was contacted; native gallery activation remains unverified.
+- 2026-10-30: current `../zed/extensions/html/extension.toml` no longer has
+  `[lib].version`; Zed reads the API version from the `zed:api-version` custom
+  section embedded in `extension.wasm` (`parse_wasm_extension_version` in
+  `crates/extension_host/src/wasm_host.rs`). AHEAD now reads the same section
+  during extension discovery, package installation and interrupted-update
+  recovery, mapping 0.6/0.7 to the pinned v0.6 WIT and 0.8 to the pinned v0.8
+  WIT. The integrated `just dev` build succeeds. The source-current Rust proxy
+  smoke passed against the real HTML guest and server, covering readiness,
+  completion, embedded-CSS diagnostics and clearing after live settings refresh
+  without restart, formatting and paired-tag rename. A separate integrated
+  `tests/lsp-smoke.mjs` run installed live Zed HTML 0.3.2 and passed completion,
+  grammar/highlight captures, restart recovery, uninstall and clean shutdown.
+  Both used disposable profiles; the Rust test used the cached server binary.
+  Native gallery activation, editor notification/rendering and completion
+  insertion/Undo remain open in `TODO.md`.
 - 2026-10-01: Zed's `crates/extension_host/src/headless_host.rs` loads each
   extension independently and retains failures for reporting. AHEAD's
   discovery had aborted the entire installed-adapter list on one malformed
@@ -2657,6 +3050,16 @@ macOS is locked. Workspace: `/var/folders/3n/wsjx_vr53cb7v2g6qk51dc2h0000gp/T/ah
   `crates/search/src/project_search.rs` without importing Zed's view code.
   Aligned the regex matcher's line-anchor and CRLF behavior with Zed's
   `crates/project/src/search.rs` so `^`/`$` act on lines, not whole files.
+- 2026-10-30: Zed presents regex, whole-word and case as independent search
+  options. AHEAD intentionally makes Text, Word and Regex mutually exclusive
+  and keeps Match case independent, following the product decision recorded
+  during implementation. Text and Word use literal matching; only Regex
+  interprets punctuation as pattern syntax. The editor, proxy and managed
+  agent `file_search` all use `ahead-core::search`, while the agent keeps its
+  revision-bound cursor and result format. The current 10,000-file smoke
+  passed literal punctuation, multiline matching, capped results and
+  symlink-boundary checks. Native mode presentation remains unverified while
+  macOS is locked.
 - 2026-10-03: ran the disposable `ahead-core/examples/search_profile.rs`
   pre-parallel baseline twice (10,000 files, 10 matches): path indexing took
   88-120 ms;
@@ -3734,13 +4137,16 @@ AHEAD prefers system Node.js/npm and directs installation to
 `cache/language-servers/npm-cache`, rather than inheriting a potentially
 unwritable user-global cache. When system Node or npm is unavailable, the
 extension host and built-in LSP installer share an AHEAD-owned on-demand
-runtime: it selects the newest LTS from the official Node index, verifies the
-archive against that release's SHA-256 manifest, then atomically publishes a
-bounded extraction into `cache/node-runtime/`. Valid cached runtimes are used
-offline; a failed online update falls back to a valid cached copy. Unit tests
-cover LTS parsing, checksum selection, archive extraction and publication; they
-do not yet prove a real clean-PATH network install or Windows launch behavior.
-No Zed source was copied for this boundary. The installer also polls its child
+runtime: like Zed's `ManagedNodeRuntime`, it pins a release in source and uses
+that cached version without checking the release index on every launch. A
+missing pinned release is downloaded, checked against its official SHA-256
+manifest and atomically published under `cache/node-runtime/`. An older valid
+cache remains an offline fallback if the new download fails. Unit tests cover
+cache reuse without a network request, checksum selection, archive extraction
+and publication. On 2026-10-30, a disposable clean-PATH smoke installed the
+pinned Node 24.22.1 runtime and started Vtsls; a second isolated smoke seeded
+that runtime cache and passed the TypeScript/JavaScript LSP matrix and restart.
+Windows launch behavior and native install progress remain unverified. The installer also polls its child
 with a 120-second total deadline and signals cancellation on proxy shutdown,
 waiting briefly for the installer to stop. The existing fake-npm shutdown
 regression verified that an active child exits before publication;
@@ -3857,10 +4263,9 @@ after adding a clean-room parser for the supported subset of the
 [LSP 3.18 snippet syntax](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/):
 numbered tabstops, nested defaults, choices and escapes, plus caret placement
 and Tab/Shift+Tab navigation.
-Completion insertion remains one bounded editor replacement. This is not yet
-Zed parity: gpui-kit exposes one selection, so repeated placeholder ranges do
-not update together; choice alternatives and variable transforms are not
-implemented. Those cases fail closed where unsupported. No code was copied
+At that point, completion insertion was one bounded editor replacement.
+Repeated placeholder ranges did not update together, and choice alternatives
+and variable transforms were not yet implemented. No code was copied
 from Zed's GPL-3.0-or-later `crates/snippet`. Retest the installed HTML server
 and native completion/Undo behavior in the disposable editor project. The
 focused GPUI regression verifies insertion, one-step Undo, placeholder editing,
@@ -3889,6 +4294,17 @@ validation off through the catalog's workspace-configuration refresh path and
 observes the warning clear without restarting the server. This does not verify
 the native filesystem-watcher-to-editor journey. Rendered native editor
 insertion/Undo remains unverified.
+
+On 2026-10-30, AHEAD's local Apache-2.0 `gpui-base` 0.6.6 fork exposes the
+editor's existing multi-selection transaction path. Snippet insertion and
+tab navigation now select all repeated ranges; edits and choice changes update
+the mirrors in one Undo unit. The focused GPUI multi-selection/Undo test and
+23 snippet tests pass. The completion accept path also retains the producing
+server ID and optional command through resolution, applies the text first,
+then uses the existing guarded LSP command RPC. A focused GPUI test proves
+that ordering and the preserved command; 26 completion-filtered tests pass.
+The real HTML choice popup, command side effects and Undo still need native
+acceptance in a disposable project.
 
 ## Fresh native smoke after `cargo clean` (2026-10-05)
 
@@ -4863,3 +5279,270 @@ discovery. System-installed servers remain the user's package-manager concern.
 The Extensions tab surfaces installation progress, and failed managed servers
 offer a scoped cache repair action. The version parser, bounded subprocess
 output, and fake-npm lookup tests are source coverage only until run.
+
+## Project search performance check (2026-10-27)
+
+Compared AHEAD's shared worktree/search path against Zed's
+`../zed/crates/project/src/project_search.rs` worker coordinator and ran
+`tests/workspace-search-scale-smoke.mjs` on 10,000 files
+across ten nested directories. The current integrated binary built the index
+in 495 ms. After the harness warmed both searchers, the multiline query took
+793 ms, AHEAD's 5,000-result cap took 551 ms, and median no-hit took 800 ms
+versus ripgrep's 780 ms. Ripgrep counted all 10,000 hot matches in 884 ms,
+which does more work than AHEAD's capped result. The smoke also confirmed
+that replacing an indexed file or parent directory with an outside symlink
+does not expose external content. This is one cache-sensitive synthetic run;
+real mixed editor/agent contention and large-result UI scrolling remain open.
+The harness now reports multiline and capped-result durations independently.
+
+## Dynamic LSP document synchronization (2026-10-27)
+
+Reviewed `../zed` main at `37faef81f74fc1bb08be9939c4cffc8ede6ced2f`.
+Zed changes #65252 and #65253 compile and match dynamic document selectors,
+then choose the effective `didChange` sync kind per buffer, with the latest
+matching registration ahead of static capabilities. AHEAD now applies that
+selection in `ahead-proxy/src/plugin/psp.rs`; absent selectors stay scoped to
+the host's configured selector, consistent with AHEAD's existing `didSave`
+policy. File-pattern matching also tries the root-relative path, allowing
+absolute workspace paths to match common selectors such as `**/*.toml`.
+Focused proxy tests passed for dynamic `didChange` selector matching,
+same-ID replacement, ordered override, scoped unregistration and the existing
+`didSave` behavior. References: Zed's
+`crates/project/src/lsp_store/dynamic_registration.rs`,
+`crates/project/src/lsp_store.rs`, [#65252](https://github.com/zed-industries/zed/commit/cb59345)
+and [#65253](https://github.com/zed-industries/zed/commit/1563b40). Real-server
+dynamic-registration behavior and native editor rendering remain unverified.
+
+## Other recent upstream candidates (2026-10-27)
+
+Review pinned to Zed main `37faef81f74fc1bb08be9939c4cffc8ede6ced2f`.
+
+On the same Zed main revision, #66119 fixes dock panel action focus while a
+panel is zoomed (`crates/workspace/src/dock.rs` and `workspace.rs`). This is
+partially covered by AHEAD's
+`app::lifecycle_tests::empty_agent_panel_routes_ahead_and_external_start_actions`:
+I ran the source-current GPUI test directly on 2026-10-27 (1/1 passed), covering
+the New AHEAD session, External agent and Join shared session actions. It does
+not exercise switching dock/status buttons while chat is zoomed. AHEAD uses its
+own chat-zoom layout, so keep the upstream focus-handle change as a candidate
+only if a separate zoomed-panel regression reproduces. Zed #65470 defers
+transcript Markdown parsing until an entry is rendered, and #65444 defers
+materializing tool-call diffs until expansion. AHEAD creates Markdown inside
+the indexed `MessageScroller` row renderer, so the visible-row deferral is
+already in place; profile long chats before changing it. Its tool-call
+projection does not carry Zed-style patch diffs, so revisit #65444 if those are
+added.
+
+Zed #47296 in `crates/git_ui_core/src/notifications.rs` improves stale-branch
+push failures with fetch/integrate guidance. AHEAD now recognizes Git's
+non-fast-forward and fetch-first rejection forms, adds that next step to the
+Source Control status, and retains the original Git diagnostic. Zed #66157 in
+`crates/editor/src/code_context_menus.rs` fixes fuzzy-match offsets when a
+completion server changes an item's label during resolve; AHEAD does not reuse
+those offsets after resolve, so the exact bug is not present. AHEAD separately
+preserves the original insertion fallback when resolve omits it. Zed #66185
+updates Tree-sitter to 0.28 and changes its query-capture API; AHEAD remains on
+the version required by gpui-kit, so that update needs a coordinated
+dependency-boundary change.
+Zed #66028 adds ACP `session_message` transcript entries, #66040 presents ACP
+subagents as inline cards, and #66078 exposes ACP v1 subagents behind its beta
+gate. AHEAD's `emit_update` currently has no `session_message` arm, and its
+durable session projection has no child-session routing. This is a real gap
+only for external agents that emit those extensions; implementing it requires
+child-session identity, replay and navigation, not mapping the event to root
+assistant text. Keep it as a follow-up to the curated ACP adapter acceptance,
+and verify which supported clients emit the updates before adopting the UI.
+The three new push-classification regressions and all 435 `ahead-app` tests
+passed with test threads serialized. An unrestricted parallel run had one
+intermittent PTY task-output failure; that test passed alone and in the serial
+suite. AHEAD's separate original-insertion fallback is covered by
+`completion_resolve_label_mutation_keeps_original_fallback_insertion` in
+`ahead-app/src/code_panel.rs`.
+
+Zed #65856 unifies outbound LSP requests and notifications so their send order
+is preserved. AHEAD sends document changes, requests, and notifications through
+the same `PluginCatalogRpc` queue, then serializes writes to each language
+server through one writer thread. This appears to provide the same ordering
+property; no equivalent split notification/request queues were found in the
+proxy path. Zed #65280 isolates npm commands from project `devEngines` settings.
+AHEAD's extension-host `npm:install` already runs with the extension work
+directory as both cwd and explicit `--prefix`, so that setup path does not
+inherit project npm policy. Zed #66015 avoids rereading its entire thread
+database after each save; AHEAD's Turso path already uses paginated native
+thread item reads and bounded conversation-message pages. These changes do not
+currently indicate a port; retain them as comparison points if LSP ordering,
+extension install, or history-save profiling finds a concrete regression.
+
+## Language-server extension configuration schemas (2026-10-28)
+
+Following Zed's `crates/language_extension/src/extension_lsp_adapter.rs`,
+AHEAD's v0.8 extension host calls the initialization-options and
+workspace-configuration schema callbacks and ignores absent or malformed JSON
+schemas, matching Zed's callback handling. The resolved schemas now cross the
+proxy RPC boundary and are cached by the app. The Language Servers panel has a
+per-server expandable preview of top-level options and descriptions, with the
+corresponding `.ahead/settings.toml` section shown to the user. The preview
+shows up to eight fields per schema and reports how many more are available.
+The Language Servers toolbar's Settings action opens the workspace's private
+`.ahead/settings.toml` in the existing editor. Saving the file uses the
+already-wired workspace configuration watcher and extension refresh path.
+
+The extension host also calls Zed's `language_server_additional_workspace_configuration`
+and `language_server_additional_initialization_options` callbacks from installed
+adapters when resolving another server. Their values merge with the target
+server configuration using Zed's recursive object, unique-array, and scalar
+overwrite semantics. The source-current host regression
+`additional_adapter_configuration_uses_zed_union_semantics` passed 1/1 on
+2026-10-28. The full source-current extension-host runner then passed 47 tests
+with three installed-extension probes ignored, covering configuration
+merging/layering, schema parsing, archive validation, and install recovery.
+The integrated `just dev` build subsequently compiled this path.
+
+The reference uses `crates/json_schema_store/src/json_schema_store.rs` to
+resolve dynamic schemas on demand for the settings JSON document. AHEAD's
+settings are TOML and the panel preview is currently read-only. Editable,
+schema-driven controls, validation, and native rendered acceptance remain open
+in `TODO.md`; this is not full Zed settings-schema parity. The app schema
+cache/preview tests passed (2/2). A focused GPUI interaction regression now
+covers opening the workspace settings file; the shared dev loop rebuilt the
+app, but that new test still needs a test build. Formatting and `git diff
+--check` pass for the current update.
+
+## Installed extension grammar rendering (2026-10-29)
+
+Zed loads installed extension grammars through its language registry and applies
+their highlight captures in the editor's syntax layer. AHEAD keeps its separate
+extension-host parser boundary and returns capture ranges over RPC. In the
+approved disposable `ahead-lsp-smoke-ocUYn6` project, a rebuilt native app opened
+`Cargo.toml`; the opt-in trace reported the current TOML response matched the
+buffer and applied 18 decorations. The status bar showed `TOML` and TOML strings
+were visibly highlighted. This verifies the native path for TOML, while broader
+installed-grammar coverage remains open in `TODO.md`.
+
+## Proto language-server defaults (2026-10-29)
+
+Zed's `assets/settings/default.json` selects `buf` for Proto, explicitly
+excludes `protols` and `protobuf-language-server`, and leaves other servers
+available through its `...` entry. AHEAD now applies that preference when
+building the default server list in `ahead-proxy/src/plugin/catalog.rs`; a
+workspace can still choose an alternative with `[languages.Proto].language_servers`.
+The focused proxy test verifies both the default and explicit override. Native
+acceptance installed the live Proto 0.3.4 package into the disposable AHEAD
+profile and observed only `buf language server` reach Ready, with no errors for
+the unselected alternatives. This ports the Proto preference only; it does not
+claim all Zed language defaults are mirrored.
+
+## Managed LSP acquisition from a clean profile (2026-10-29)
+
+Zed resolves its language-server adapters from project configuration and can
+install supported servers when they are missing. AHEAD's disposable
+`tests/lsp-smoke.mjs` run now verifies that path from an empty profile using
+the system Node/npm and managed Rust Analyzer acquisition: it started Vtsls,
+BasedPyright, Ruff and Rust Analyzer, then exercised Rust, TypeScript,
+JavaScript and Python completion, navigation, diagnostics and fixes,
+formatting, signatures, code actions, unsaved cross-file rename, live Ruff
+configuration reload, fresh-process restart/recovery and shutdown. The full
+smoke passed on 2026-10-29 without provider credentials or a Cargo build; its
+temporary server profile was removed and the fixture remains available for
+inspection. This verifies the current macOS managed-server protocol path;
+Windows startup and native install-progress rendering remain open in `TODO.md`.
+
+## Live Zed extension package smoke (2026-10-29)
+
+The rebuilt integrated binary passed `tests/lsp-smoke.mjs` with the live Zed
+catalog and HTML 0.3.2 enabled. From a fresh temporary profile, AHEAD fetched
+the catalog entry, installed the package, loaded its real grammar and highlight
+captures, initialized `vscode-html-language-server`, completed HTML tags,
+restarted the server, and uninstalled the extension. The smoke passed without
+provider credentials or a Cargo build; it cleaned its temporary profile and
+retained the disposable project for inspection. This verifies catalog-to-host
+installation and server behavior, while native gallery-control interaction
+and watcher-to-editor refresh remain separate acceptance gates.
+
+## Editor-to-proxy edit sync (2026-10-30)
+
+Zed's buffer exposes `edits_since` in `crates/language/src/buffer.rs`, and
+`crates/project/src/lsp_store.rs` uses those edits for language-server changes.
+AHEAD's GPUI editor change event does not carry an edit range, so `CodePanel`
+now retains a rope snapshot and `ProxyClient` derives the existing `EditorEdit`
+delta directly from the previous and current ropes. Normal typing no longer
+builds a whole-document string for that sync. Conflict-marker parsing reads
+rope lines, and completion trigger/query checks read the current line. The
+source-current CodePanel tests passed 108/108 and the two proxy edit-delta
+regressions passed; the integrated `just dev` build compiled the path.
+The common-prefix and suffix scans now compare Rope chunks before falling back
+to Unicode character boundaries at a mismatch. Focused regressions cover a
+long multichunk Unicode/CRLF prefix, a long shared suffix, leading insertion,
+and equal text after an edit/revert. Zed's recorded edit ranges remain the
+better design when the editor exposes them to `CodePanel`.
+Saved-content comparison and debounced Git metadata refresh still scan or copy
+large buffers. Native keystroke-to-completion latency has not been measured.
+
+## Narrow agent composer (2026-10-30)
+
+Zed's `crates/agent_ui/src/conversation_view/thread_view.rs` footer uses
+wrapping flex rows with `min_w_0` around its model selector and send controls.
+At 280px, AHEAD's fixed 160px model selector overflowed its shrinking column
+and overlapped the context ring by 18px. The selector and its chat-only warning
+now shrink with that column. A headless GPUI regression checks the combined
+effort/model label and non-overlapping selector, ring, and Send button at 280px.
+Native rendered acceptance remains open.
+
+## Repeatable live Proto extension smoke (2026-10-30)
+
+Zed's `extensions/proto/extension.toml` declares the Proto grammar and Buf,
+while `extensions/proto/src/language_servers/buf.rs` resolves the CLI from the
+worktree or downloads its GitHub release. AHEAD's integrated
+`tests/lsp-smoke.mjs` now installs the live Proto 0.3.4 package (Wasm API 0.7)
+from the Zed catalog into an isolated profile, opens a disk-backed `.proto`
+file, checks the `@type` capture for its message name, observes Buf startup and
+recovery after restart, then uninstalls the package. The full smoke passed with
+the watcher-built app. A completion request for `Smo` in a new message returned
+`null` from Buf; completion for Proto remains unverified.
+
+## Completion menu filtering during typing (2026-10-30)
+
+Zed's `crates/editor/src/completions.rs` filters an existing complete menu
+while a background task ranks the updated query. AHEAD's `CodePanel` previously
+hid its menu on every edit even when it could reuse a complete LSP batch. It
+now immediately filters the five visible candidates, keeps any matches open
+with the new caret context, and replaces them with the full cached ranking
+when that task finishes. Zed stores completion edit ranges as moving buffer
+anchors (`crates/editor/src/completions.rs`); AHEAD adapts its cached raw LSP
+ranges to the extended prefix at acceptance, including UTF-16 columns and
+suffix-only insertions. Focused edit-event and acceptance regressions passed.
+Zed also reuses a completion list only when it is complete
+(`!menu.is_incomplete`); AHEAD applies the same protocol rule in
+`completion_cache_matches`. The 2026-11-02 managed Rust/TypeScript/JavaScript/
+Python LSP smoke measured 19 completion requests at p50 74.7 ms and p95
+467.9 ms. Vtsls returned the requested local `Calculation` completion in
+468 ms cold, then 184 ms and 89 ms on unchanged repeats. Those repeats include
+server initialization and are not native keystroke-to-popup measurements.
+Native popup rendering and latency during actual typing remain open.
+
+## On-type LSP formatting (2026-11-02)
+
+Zed's `crates/editor/src/input.rs` invokes on-type formatting after applying
+newline autoindent; `crates/editor/src/completions.rs` sends the current
+buffer position and trigger character to the project LSP service. AHEAD now
+forwards each server's advertised on-type triggers through server status,
+routes only supported triggers through the existing LSP host, and waits for
+the editor change before capturing the post-edit cursor for the request.
+
+The GPUI regression covers newline autoindent and applying the returned edit.
+The Rust Analyzer case in `tests/lsp-smoke.mjs` checks the server's real
+member-access trigger, requests formatting after a typed method-chain dot, and
+applies the returned indentation edit to the unsaved buffer. The isolated
+Rust-only smoke passed against the integrated binary and a managed Rust
+Analyzer install; focused proxy tests also pass. Native editor input, newline
+formatting and undo behavior remain part of the open acceptance gate in
+`TODO.md`.
+
+## Live Zed language-extension ABI check (2026-11-02)
+
+The live language-server catalog currently exposes no API 0.8 packages. The
+available HTML 0.3.2 extension uses API 0.7.0; its isolated install passed
+grammar/highlight loading, HTML completion, server restart, uninstall and
+graceful proxy shutdown. The smoke now reports both extension and Wasm API
+versions so future catalog runs show which host ABI they exercised. API 0.8
+still needs a real package before its production path can be closed.

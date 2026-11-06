@@ -62,8 +62,9 @@ use url::Url;
 
 use crate::{
     ahead::prediction::{
-        OpenBufferContext, PredictionCancellation, PredictionContextSnapshot,
-        PredictionEngine, prediction_excerpt_for_snapshot,
+        MAX_EXCERPT_TOKENS, OpenBufferContext, PredictionCancellation,
+        PredictionContextSnapshot, PredictionEngine,
+        prediction_excerpt_for_snapshot,
     },
     buffer::{Buffer, get_mod_time, language_id_from_path_with_content, load_file},
     plugin::{
@@ -83,6 +84,7 @@ const INSTRUCTION_ROOT_EVENT_TOKEN: WatchToken = WatchToken(7);
 const AHEAD_GITIGNORE: &str = include_str!("../../.ahead/.gitignore");
 const MAX_FIM_OPEN_BUFFERS: usize = 4;
 const MAX_FIM_OPEN_BUFFER_BYTES: usize = 4096;
+const MAX_FIM_CONTEXT_SIDE_BYTES: usize = MAX_EXCERPT_TOKENS * 3;
 const MAX_FIM_DEFINITION_REQUESTS: usize = 8;
 const MAX_FIM_DEFINITION_CACHE_ENTRIES: usize = 128;
 const MAX_CACHED_FIM_SEMANTIC_TOKENS: usize = 16_384;
@@ -99,6 +101,23 @@ fn rpc_error_from_agent(error: anyhow::Error) -> RpcError {
         code,
         message: error.to_string(),
     }
+}
+
+fn agent_request_runs_in_background(request: &AgentHostRequest) -> bool {
+    matches!(
+        request,
+        AgentHostRequest::ListExternalAcpAdapters
+            | AgentHostRequest::SearchMemory { .. }
+            | AgentHostRequest::WriteMemory { .. }
+            | AgentHostRequest::AgentTurnStart { .. }
+            | AgentHostRequest::AgentTurnRetry { .. }
+            | AgentHostRequest::AgentTurnCancel { .. }
+            | AgentHostRequest::AgentSessionPrepare { .. }
+            | AgentHostRequest::AgentAuthenticate { .. }
+            | AgentHostRequest::AgentTerminalAuthLaunch { .. }
+            | AgentHostRequest::AgentTerminalAuthComplete { .. }
+            | AgentHostRequest::AgentConfigOptionSet { .. }
+    )
 }
 
 fn is_provider_settings_path(workspace: &Path, path: &Path) -> bool {
@@ -383,7 +402,11 @@ impl ReadyPrediction {
                 Ok((path, (buffer.id, buffer.rev)))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let insertion_offset = request.prefix.len();
+        let insertion_offset = prediction_cursor_byte_offset(
+            &target.rope,
+            Position::new(request.cursor.line, request.cursor.col),
+        )
+        .context("prediction cursor is outside the target buffer")?;
         let (prefix, suffix) =
             prediction_excerpt_for_snapshot(&snapshot, &open_buffers)?;
         request.prefix = prefix.clone();
@@ -675,6 +698,9 @@ impl ProxyHandler for Dispatcher {
             } => {
                 self.catalog_rpc
                     .completion(request_id, &path, input, position);
+            }
+            CancelCompletion { request_id } => {
+                self.catalog_rpc.cancel_completion(request_id);
             }
             SignatureHelp {
                 request_id,
@@ -1884,19 +1910,7 @@ impl ProxyHandler for Dispatcher {
                     self.respond_rpc(id, result);
                     return;
                 }
-                let background = matches!(
-                    &request,
-                    AgentHostRequest::SearchMemory { .. }
-                        | AgentHostRequest::WriteMemory { .. }
-                        | AgentHostRequest::AgentTurnStart { .. }
-                        | AgentHostRequest::AgentTurnRetry { .. }
-                        | AgentHostRequest::AgentTurnCancel { .. }
-                        | AgentHostRequest::AgentSessionPrepare { .. }
-                        | AgentHostRequest::AgentAuthenticate { .. }
-                        | AgentHostRequest::AgentTerminalAuthLaunch { .. }
-                        | AgentHostRequest::AgentTerminalAuthComplete { .. }
-                        | AgentHostRequest::AgentConfigOptionSet { .. }
-                );
+                let background = agent_request_runs_in_background(&request);
                 let host = self.ahead_host.clone();
                 let storage_error = self.ahead_storage_error.clone();
                 let proxy_rpc = self.proxy_rpc.clone();
@@ -2307,7 +2321,7 @@ impl ProxyHandler for Dispatcher {
                             &buffer_snapshot,
                             workspace,
                             &path,
-                            &buffer.rope.to_string(),
+                            &buffer.rope,
                             &[],
                         )
                         .into_iter()
@@ -2488,7 +2502,6 @@ impl ProxyHandler for Dispatcher {
                                         && let Some(buffer) =
                                             buffer_snapshot.get(&path_buf)
                                     {
-                                        let active_text = buffer.rope.to_string();
                                         let (prefix, suffix) =
                                             prediction_prefix_suffix(
                                                 &buffer.rope,
@@ -2499,7 +2512,7 @@ impl ProxyHandler for Dispatcher {
                                                 &buffer_snapshot,
                                                 workspace,
                                                 &path_buf,
-                                                &active_text,
+                                                &buffer.rope,
                                                 &definition_locations,
                                             );
                                         if let Some(job) =
@@ -2746,8 +2759,9 @@ impl ProxyHandler for Dispatcher {
                         .map(|syntax| syntax.flatten());
                     match result {
                         Ok(syntax) => {
-                            let (captures, comments) = match syntax {
+                            let (language_name, captures, comments) = match syntax {
                                 Some(syntax) => (
+                                    Some(syntax.language_name),
                                     syntax
                                         .captures
                                         .into_iter()
@@ -2762,7 +2776,7 @@ impl ProxyHandler for Dispatcher {
                                         block_comment: syntax.comments.block_comment,
                                     }),
                                 ),
-                                None => (Vec::new(), None),
+                                None => (None, Vec::new(), None),
                             };
                             syntax_cache.lock().store_syntax_captures(
                                 &buffer_id,
@@ -2778,6 +2792,7 @@ impl ProxyHandler for Dispatcher {
                                         rev: revision,
                                         path: local_path,
                                         len: source_length,
+                                        language_name,
                                         captures,
                                         comments,
                                     },
@@ -2849,6 +2864,24 @@ impl ProxyHandler for Dispatcher {
                         });
                         proxy_rpc.handle_response(id, result);
                     });
+            }
+            GetDocumentOnTypeFormatting {
+                path,
+                position,
+                trigger_character,
+            } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.get_document_on_type_formatting(
+                    &path,
+                    position,
+                    trigger_character,
+                    move |_, result| {
+                        let result = result.map(|edits| {
+                            ProxyResponse::GetDocumentOnTypeFormatting { edits }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
             }
             PrepareRename { path, position } => {
                 let proxy_rpc = self.proxy_rpc.clone();
@@ -3350,19 +3383,52 @@ impl ProxyHandler for Dispatcher {
     }
 }
 
-fn prediction_prefix_suffix(rope: &Rope, position: Position) -> (String, String) {
+fn prediction_cursor_byte_offset(rope: &Rope, position: Position) -> Option<usize> {
     let line_index = position.line as usize;
     if line_index >= rope.len_lines(ropey::LineType::LF_CR) {
-        return (String::new(), String::new());
+        return None;
     }
     let line_start = rope.line_to_byte_idx(line_index, ropey::LineType::LF_CR);
-    let line = rope.line(line_index, ropey::LineType::LF_CR).to_string();
-    let line_content = line.trim_end_matches(['\r', '\n']);
-    let column = offset_utf16_to_utf8_str(line_content, position.character as usize);
-    let cursor_offset = line_start + column;
+    let line = rope.line(line_index, ropey::LineType::LF_CR);
+
+    let target_utf16_column = position.character as usize;
+    let mut utf16_column = 0;
+    let mut byte_column = 0;
+    for character in line.chars() {
+        if matches!(character, '\r' | '\n') || utf16_column >= target_utf16_column {
+            break;
+        }
+        byte_column += character.len_utf8();
+        utf16_column += character.len_utf16();
+    }
+    Some(line_start + byte_column)
+}
+
+fn rope_byte_offset_floor(rope: &Rope, byte_offset: usize) -> usize {
+    let mut byte_offset = byte_offset.min(rope.len());
+    while byte_offset > 0 && !rope.is_char_boundary(byte_offset) {
+        byte_offset -= 1;
+    }
+    byte_offset
+}
+
+fn prediction_prefix_suffix(rope: &Rope, position: Position) -> (String, String) {
+    let Some(cursor_offset) = prediction_cursor_byte_offset(rope, position) else {
+        return (String::new(), String::new());
+    };
+    let prefix_start = rope_byte_offset_floor(
+        rope,
+        cursor_offset.saturating_sub(MAX_FIM_CONTEXT_SIDE_BYTES),
+    );
+    let suffix_end = rope_byte_offset_floor(
+        rope,
+        cursor_offset
+            .saturating_add(MAX_FIM_CONTEXT_SIDE_BYTES)
+            .min(rope.len()),
+    );
     (
-        rope.slice(..cursor_offset).to_string(),
-        rope.slice(cursor_offset..).to_string(),
+        rope.slice(prefix_start..cursor_offset).to_string(),
+        rope.slice(cursor_offset..suffix_end).to_string(),
     )
 }
 
@@ -3970,9 +4036,10 @@ fn prediction_buffer_excerpt(
     buffer: &Buffer,
     definition_line: Option<u32>,
 ) -> String {
-    let contents = buffer.rope.to_string();
-    if contents.len() <= MAX_FIM_OPEN_BUFFER_BYTES {
-        return contents;
+    let rope = &buffer.rope;
+    let contents_len = rope.len();
+    if contents_len <= MAX_FIM_OPEN_BUFFER_BYTES {
+        return rope.to_string();
     }
 
     let target_byte = definition_line.and_then(|line| {
@@ -3987,15 +4054,11 @@ fn prediction_buffer_excerpt(
     let mut start = target_byte
         .map(|offset| offset.saturating_sub(MAX_FIM_OPEN_BUFFER_BYTES / 2))
         .unwrap_or(0);
-    while !contents.is_char_boundary(start) {
-        start += 1;
-    }
+    start = rope_byte_offset_floor(rope, start);
     let mut end = start
         .saturating_add(MAX_FIM_OPEN_BUFFER_BYTES)
-        .min(contents.len());
-    while !contents.is_char_boundary(end) {
-        end -= 1;
-    }
+        .min(contents_len);
+    end = rope_byte_offset_floor(rope, end);
 
     let mut excerpt = String::new();
     if start > 0 {
@@ -4007,8 +4070,8 @@ fn prediction_buffer_excerpt(
             line.saturating_add(1)
         ));
     }
-    excerpt.push_str(&contents[start..end]);
-    if end < contents.len() {
+    excerpt.push_str(&rope.slice(start..end).to_string());
+    if end < contents_len {
         excerpt.push_str("\n[open-buffer excerpt truncated]");
     }
     excerpt
@@ -4018,7 +4081,7 @@ fn relevant_open_buffer_contexts(
     buffers: &HashMap<PathBuf, Buffer>,
     workspace: &Path,
     active_path: &Path,
-    active_text: &str,
+    active_rope: &Rope,
     definition_locations: &[(PathBuf, u32)],
 ) -> Vec<OpenBufferContext> {
     let Ok(workspace_root) = workspace.canonicalize() else {
@@ -4052,14 +4115,7 @@ fn relevant_open_buffer_contexts(
             rows.entry(path).or_insert(line);
             rows
         });
-    let active_text = active_text.to_lowercase();
-    let import_text = active_text
-        .lines()
-        .filter(|line| is_prediction_import_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut candidates = buffers
+    let candidates = buffers
         .values()
         .filter_map(|buffer| {
             let relative = buffer
@@ -4077,11 +4133,44 @@ fn relevant_open_buffer_contexts(
             }
             let stem = relative.file_stem()?.to_string_lossy().to_lowercase();
             let definition_line = definition_rows.get(&path).copied();
-            let mentioned = stem.chars().count() >= 3
-                && contains_prediction_identifier(&active_text, &stem);
-            let imported = stem.chars().count() >= 3
-                && contains_prediction_identifier(&import_text, &stem);
             let sibling = relative.parent() == active_relative.parent();
+            Some((relative, buffer, definition_line, stem, sibling))
+        })
+        .collect::<Vec<_>>();
+    let candidate_stems = candidates
+        .iter()
+        .filter(|(_, _, definition_line, stem, _)| {
+            definition_line.is_none() && stem.chars().count() >= 3
+        })
+        .map(|(_, _, _, stem, _)| stem.clone())
+        .collect::<HashSet<_>>();
+    let mut mentioned_stems = HashSet::new();
+    let mut imported_stems = HashSet::new();
+    if !candidate_stems.is_empty() {
+        for line in active_rope.lines(ropey::LineType::LF_CR) {
+            let line = line.to_string();
+            let is_import = is_prediction_import_line(&line);
+            let line = line.to_lowercase();
+            for stem in &candidate_stems {
+                if !mentioned_stems.contains(stem)
+                    && contains_prediction_identifier(&line, stem)
+                {
+                    mentioned_stems.insert(stem.clone());
+                }
+                if is_import
+                    && !imported_stems.contains(stem)
+                    && contains_prediction_identifier(&line, stem)
+                {
+                    imported_stems.insert(stem.clone());
+                }
+            }
+        }
+    }
+    let mut candidates = candidates
+        .into_iter()
+        .filter_map(|(relative, buffer, definition_line, stem, sibling)| {
+            let imported = imported_stems.contains(&stem);
+            let mentioned = mentioned_stems.contains(&stem);
             let relevance = if definition_line.is_some() {
                 4
             } else if imported {
@@ -6330,6 +6419,12 @@ fn git_diff_new(workspace_path: &Path) -> Option<DiffInfo> {
     let repo = Repository::discover(workspace_path).ok()?;
     let name = match repo.head() {
         Ok(head) => head.shorthand()?.to_string(),
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => repo
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|head| head.symbolic_target().map(str::to_owned))
+            .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_owned))
+            .unwrap_or_else(|| "(No branch)".to_owned()),
         _ => "(No branch)".to_owned(),
     };
 
@@ -6542,15 +6637,15 @@ mod tests {
         FileWatchNotifier, GotoDefinitionResponse, INSTRUCTION_EVENT_TOKEN,
         MAX_FIM_OPEN_BUFFERS, PredictionDefinitionCacheKey,
         PredictionSemanticTokenCache, USER_SETTINGS_HOME_EVENT_TOKEN,
-        WORKSPACE_EVENT_TOKEN, cache_prediction_definitions,
-        cached_prediction_definitions, ensure_ahead_gitignore, git_checkout,
-        git_commit, git_commit_patch, git_create_branch, git_delete_branch,
-        git_history, git_push, git_stage_all, git_stage_paths,
-        git_status_bytes_are_conflicted, git_workspace_status,
-        git_worktree_file_patch, git_worktree_patch, is_prediction_target_visible,
-        is_provider_settings_path, is_user_ahead_directory,
-        is_user_lsp_settings_path, prediction_definition_locations,
-        prediction_identifier_positions,
+        WORKSPACE_EVENT_TOKEN, agent_request_runs_in_background,
+        cache_prediction_definitions, cached_prediction_definitions,
+        ensure_ahead_gitignore, git_checkout, git_commit, git_commit_patch,
+        git_create_branch, git_delete_branch, git_diff_new, git_history, git_push,
+        git_stage_all, git_stage_paths, git_status_bytes_are_conflicted,
+        git_workspace_status, git_worktree_file_patch, git_worktree_patch,
+        is_prediction_target_visible, is_provider_settings_path,
+        is_user_ahead_directory, is_user_lsp_settings_path,
+        prediction_definition_locations, prediction_identifier_positions,
         prediction_identifier_positions_with_semantic_styles,
         prediction_prefix_suffix, relevant_open_buffer_contexts, search_in_path,
         workspace_file_rename,
@@ -6608,6 +6703,16 @@ mod tests {
         .add_path(new_path.clone());
 
         assert_eq!(workspace_file_rename(&event), Some((old_path, new_path)));
+    }
+
+    #[test]
+    fn external_acp_catalog_refresh_does_not_block_proxy_dispatch() {
+        assert!(agent_request_runs_in_background(
+            &AheadRequest::ListExternalAcpAdapters
+        ));
+        assert!(!agent_request_runs_in_background(
+            &AheadRequest::ListSessions
+        ));
     }
 
     fn ready_prediction_fixture() -> (
@@ -6908,8 +7013,13 @@ mod tests {
             .expect("large unsaved target");
         let target = &dispatcher.buffers[&path];
         let position = target.offset_to_position(text.len());
+        let (prefix, suffix) = prediction_prefix_suffix(
+            &target.rope,
+            lsp_types::Position::new(position.line, position.character),
+        );
         let mut request = previous.request;
-        request.prefix = text.clone();
+        request.prefix = prefix;
+        request.suffix = suffix;
         request.cursor = DisplayPosition {
             line: position.line,
             col: position.character,
@@ -6980,6 +7090,9 @@ mod tests {
                     Err(error) => panic!("provider connection: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking provider reads");
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .expect("bounded reads");
@@ -7215,6 +7328,9 @@ mod tests {
                     Err(error) => panic!("FIM did not connect promptly: {error}"),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking provider reads");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("bounded socket reads");
@@ -7791,6 +7907,9 @@ mod tests {
         let status = git_workspace_status(unborn.path()).expect("unborn status");
         assert_eq!(status.branch, "main");
         assert!(status.branches.is_empty());
+
+        let diff = git_diff_new(unborn.path()).expect("unborn Git diff");
+        assert_eq!(diff.head, "main");
     }
 
     #[test]
@@ -9227,11 +9346,13 @@ mod tests {
             Buffer::new(BufferId::next(), unrelated_path),
         );
 
+        let active_rope =
+            Rope::from("mod sibling;\nmod large;\nuse crate::request::Request;");
         let context = relevant_open_buffer_contexts(
             &buffers,
             workspace,
             &active_path,
-            "mod sibling;\nmod large;\nuse crate::request::Request;",
+            &active_rope,
             &[],
         );
 
@@ -9288,12 +9409,15 @@ mod tests {
             .into_iter()
             .map(|path| (path.clone(), Buffer::new(BufferId::next(), path)))
             .collect::<HashMap<_, _>>();
+        let active_rope = Rope::from(
+            "import { Request } from '../models/request';\n\
+             const names = 'alpha beta gamma delta catalog';",
+        );
         let context = relevant_open_buffer_contexts(
             &buffers,
             workspace,
             &active_path,
-            "import { Request } from '../models/request';\n\
-             const names = 'alpha beta gamma delta catalog';",
+            &active_rope,
             &[],
         );
 
@@ -9334,7 +9458,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut active = Buffer::new(BufferId::next(), active_path.clone());
-        active.rope = Rope::from("use_shared_type();");
+        let active_rope = Rope::from("use_shared_type();");
+        active.rope = active_rope.clone();
         let mut definition = Buffer::new(BufferId::next(), definition_path.clone());
         definition.rope = Rope::from(definition_text);
         let buffers = HashMap::from([
@@ -9346,7 +9471,7 @@ mod tests {
             &buffers,
             workspace,
             &active_path,
-            "use_shared_type();",
+            &active_rope,
             &[(definition_path, 70)],
         );
 

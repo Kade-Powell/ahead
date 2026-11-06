@@ -42,6 +42,7 @@ pub struct ExtensionSyntax {
     pub rev: u64,
     pub path: PathBuf,
     pub len: usize,
+    pub language_name: Option<String>,
     pub captures: Vec<SyntaxCapture>,
     pub comments: Option<LanguageComments>,
 }

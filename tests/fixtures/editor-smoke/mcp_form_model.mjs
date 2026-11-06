@@ -11,11 +11,12 @@ const modelIds = catalogMode
 
 let turn = 0;
 const server = createServer(async (request, response) => {
-  if (request.method === "GET" && request.url === "/v1") {
+  const requestUrl = new URL(request.url, "http://127.0.0.1");
+  if (request.method === "GET" && requestUrl.pathname === "/v1") {
     response.writeHead(200, { "content-type": "application/json" }).end("{}");
     return;
   }
-  if (request.method === "GET" && request.url === "/v1/models") {
+  if (request.method === "GET" && requestUrl.pathname === "/v1/models") {
     if (catalogMode) {
       appendFileSync(traceFile, JSON.stringify({ type: "model_catalog_request", method: request.method, url: request.url }) + "\n");
     }

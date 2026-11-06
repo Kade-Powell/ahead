@@ -29,7 +29,7 @@ use gpui_kit::component::input::{
     SelectAll as InputSelectAll,
 };
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -57,6 +57,16 @@ enum TerminalClipboardAction {
     Copy,
     Paste,
     PasteText,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalTabAction {
+    Close,
+    CloseOthers,
+    CloseLeft,
+    CloseRight,
+    CloseClean,
+    CloseAll,
 }
 
 #[derive(Clone, Copy)]
@@ -95,7 +105,9 @@ pub struct TerminalPanel {
     mouse_reporting_button: Option<MouseButton>,
     panel_id: PanelId,
     tab_group: Option<WeakEntity<TabGroup>>,
-    close_handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    tab_action_handler:
+        Option<Rc<dyn Fn(TerminalTabAction, Vec<u64>, &mut Window, &mut App)>>,
+    active_handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     new_terminal_handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     exit_handler: Option<Rc<dyn Fn(Option<i32>, &mut Context<Self>)>>,
 }
@@ -104,19 +116,30 @@ struct TerminalTab {
     id: usize,
     terminal: Option<TerminalBackend>,
     shell_name: String,
+    program_name: String,
     custom_title: Option<String>,
     status: SharedString,
 }
 
+fn terminal_cell_count(available: f32, cell_size: f32) -> usize {
+    // Preserve an exact-fit cell when float division rounds one ULP low, as Zed does.
+    (available / cell_size).next_up().floor().max(1.0) as usize
+}
+
 impl TerminalTab {
-    fn new(id: usize, cwd: String, shell: &str) -> Self {
+    fn new_with_title(
+        id: usize,
+        cwd: String,
+        shell: &str,
+        title: Option<String>,
+    ) -> Self {
         Self::new_with_command(
             id,
             cwd,
             shell.to_string(),
             Vec::new(),
             std::collections::HashMap::new(),
-            None,
+            title,
         )
     }
 
@@ -133,6 +156,7 @@ impl TerminalTab {
             .and_then(|name| name.to_str())
             .unwrap_or("shell")
             .to_string();
+        let program_name = shell_name.clone();
         let (terminal, status) =
             match TerminalBackend::new_with_command(&cwd, &program, args, env) {
                 Ok(terminal) => (Some(terminal), SharedString::from("ready")),
@@ -142,6 +166,7 @@ impl TerminalTab {
             id,
             terminal,
             shell_name,
+            program_name,
             custom_title: title,
             status,
         }
@@ -155,6 +180,14 @@ impl TerminalTab {
 
     fn default_title(&self) -> String {
         format!("{} {}", self.shell_name, self.id)
+    }
+
+    fn tab_name(&self) -> String {
+        self.custom_title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} {}", self.program_name, self.id))
     }
 
     fn set_custom_title(&mut self, title: &str) {
@@ -182,13 +215,34 @@ impl TerminalPanel {
         Self::new_with_shell(id, cwd.into(), &shell, cx)
     }
 
+    pub(crate) fn new_with_cwd_and_title(
+        id: usize,
+        cwd: impl Into<String>,
+        title: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let shell =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        Self::new_with_shell_and_title(id, cwd.into(), &shell, Some(title), cx)
+    }
+
     pub(crate) fn new_with_shell(
         id: usize,
         cwd: String,
         shell: &str,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::from_tab(TerminalTab::new(id, cwd, shell), None, cx)
+        Self::new_with_shell_and_title(id, cwd, shell, None, cx)
+    }
+
+    fn new_with_shell_and_title(
+        id: usize,
+        cwd: String,
+        shell: &str,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_tab(TerminalTab::new_with_title(id, cwd, shell, title), None, cx)
     }
 
     pub(crate) fn new_for_agent_auth(
@@ -226,7 +280,8 @@ impl TerminalPanel {
             mouse_reporting_button: None,
             panel_id: PanelId::from(cx.entity_id()),
             tab_group: None,
-            close_handler: None,
+            tab_action_handler: None,
+            active_handler: None,
             new_terminal_handler: None,
             exit_handler,
         };
@@ -284,24 +339,23 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    pub(crate) fn set_terminal_title(
-        &mut self,
-        title: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.terminal.set_custom_title(title);
-        cx.notify();
-    }
-
+    #[cfg(test)]
     pub(crate) fn terminal_title(&self) -> String {
         self.terminal.title()
     }
 
-    pub fn set_close_handler<F>(&mut self, handler: F)
+    pub(crate) fn set_tab_action_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(TerminalTabAction, Vec<u64>, &mut Window, &mut App) + 'static,
+    {
+        self.tab_action_handler = Some(Rc::new(handler));
+    }
+
+    pub(crate) fn set_active_handler<F>(&mut self, handler: F)
     where
         F: Fn(&mut Window, &mut App) + 'static,
     {
-        self.close_handler = Some(Rc::new(handler));
+        self.active_handler = Some(Rc::new(handler));
     }
 
     pub fn set_new_terminal_handler<F>(&mut self, handler: F)
@@ -374,8 +428,8 @@ impl TerminalPanel {
         self.cell_size = Some((cell_width, line_height));
         let width = (f32::from(bounds.size.width) - 24.0).max(cell_width);
         let height = (f32::from(bounds.size.height) - 24.0).max(line_height);
-        let columns = (width / cell_width).floor().max(1.0) as usize;
-        let rows = (height / line_height).floor().max(1.0) as usize;
+        let columns = terminal_cell_count(width, cell_width);
+        let rows = terminal_cell_count(height, line_height);
 
         if self.terminal_size == Some((columns, rows)) {
             return;
@@ -1433,9 +1487,43 @@ fn terminal_modifier_code(shift: bool, alt: bool) -> u8 {
     1 + u8::from(shift) + (u8::from(alt) * 2)
 }
 
+fn terminal_panel_order(group: Option<&WeakEntity<TabGroup>>, cx: &App) -> Vec<u64> {
+    group
+        .and_then(|group| {
+            group
+                .read_with(cx, |group, cx| {
+                    group
+                        .panels()
+                        .iter()
+                        .map(|panel| panel.panel_id(cx).as_u64())
+                        .collect::<Vec<_>>()
+                })
+                .ok()
+        })
+        .unwrap_or_default()
+}
+
 impl BasePanel for TerminalPanel {
     fn panel_name(&self) -> &'static str {
         "ahead_terminal"
+    }
+
+    fn closable(&self, _: &App) -> bool {
+        // Dock's generic close action removes the panel without shutting down
+        // its PTY or removing it from Shell::terminals. Use the terminal-aware
+        // tab actions below instead.
+        false
+    }
+
+    fn set_active(
+        &mut self,
+        active: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if active && let Some(handler) = self.active_handler.as_ref() {
+            handler(window, cx);
+        }
     }
 
     fn on_added_to(
@@ -1450,18 +1538,44 @@ impl BasePanel for TerminalPanel {
 
 impl Panel for TerminalPanel {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.terminal_title();
+        let title = self.terminal.tab_name();
         let rename_input = self.rename_input.clone();
         let is_renaming = rename_input.is_some();
         let group = self.tab_group.clone();
         let panel_id = self.panel_id;
-        let close_handler = self.close_handler.clone();
+        let terminal_id = self.terminal.id;
+        let tab_action_handler = self.tab_action_handler.clone();
+        let new_terminal_handler = self.new_terminal_handler.clone();
+        let panel = cx.weak_entity();
+        let close_handler = tab_action_handler.clone();
+        let close_group = group.clone();
+        let middle_close_handler = tab_action_handler.clone();
+        let middle_close_group = group.clone();
+        let close_button = Button::new(format!("close_terminal_tab_{terminal_id}"))
+            .icon(IconName::X)
+            .xsmall()
+            .ghost()
+            .tab_stop(false)
+            .tooltip("Close Terminal")
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                if let Some(handler) = close_handler.as_ref() {
+                    let order = terminal_panel_order(close_group.as_ref(), cx);
+                    handler(TerminalTabAction::Close, order, window, cx);
+                }
+            });
         h_flex()
+            .id(format!("terminal_tab_title_{terminal_id}"))
+            .w_full()
+            .max_w(px(280.))
+            .min_w_0()
             .items_center()
             .gap_1()
             .when_some(rename_input, |row, input| {
                 row.child(
                     h_flex()
+                        .flex_1()
+                        .min_w_0()
                         .items_center()
                         .gap_1()
                         .on_key_down(cx.listener(Self::handle_terminal_rename_key))
@@ -1470,8 +1584,7 @@ impl Panel for TerminalPanel {
                         )
                         .child(
                             Button::new(format!(
-                                "save_terminal_title_{}",
-                                panel_id.as_u64()
+                                "save_terminal_title_{terminal_id}"
                             ))
                             .icon(IconName::Check)
                             .ghost()
@@ -1484,8 +1597,7 @@ impl Panel for TerminalPanel {
                         )
                         .child(
                             Button::new(format!(
-                                "cancel_terminal_title_{}",
-                                panel_id.as_u64()
+                                "cancel_terminal_title_{terminal_id}"
                             ))
                             .icon(IconName::X)
                             .ghost()
@@ -1498,32 +1610,95 @@ impl Panel for TerminalPanel {
                         ),
                 )
             })
-            .when(!is_renaming, |row| row.child(title))
             .when(!is_renaming, |row| {
                 row.child(
-                    Button::new("close_terminal_panel")
-                        .icon(IconName::X)
-                        .ghost()
-                        .tooltip("Close Terminal")
-                        .on_click(move |_, window, cx| {
-                            if let Some(handler) = close_handler.as_ref() {
-                                handler(window, cx);
-                            } else if let Some(group) = group.as_ref() {
-                                let is_last = group
-                                    .read_with(cx, |group, _| {
-                                        group.panels().len() == 1
-                                    })
-                                    .unwrap_or(false);
-                                if is_last {
-                                    return;
-                                } else {
-                                    _ = group.update(cx, |group, cx| {
-                                        group.close_panel(panel_id, cx);
-                                    });
-                                }
-                            }
-                        }),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(title),
                 )
+                .child(close_button.flex_shrink_0())
+            })
+            .on_aux_click(move |event, window, cx| {
+                if !event.is_middle_click() || is_renaming {
+                    return;
+                }
+                cx.stop_propagation();
+                if let Some(handler) = middle_close_handler.as_ref() {
+                    let order =
+                        terminal_panel_order(middle_close_group.as_ref(), cx);
+                    handler(TerminalTabAction::Close, order, window, cx);
+                }
+            })
+            .context_menu(move |menu, _, cx| {
+                let tab_order = terminal_panel_order(group.as_ref(), cx);
+                let new_handler = new_terminal_handler.clone();
+                let rename_panel = panel.clone();
+                let new_item = PopupMenuItem::new("New Terminal").on_click(
+                    move |_, window, cx| {
+                        if let Some(handler) = new_handler.as_ref() {
+                            handler(window, cx);
+                        }
+                    },
+                );
+                let rename_item = PopupMenuItem::new("Rename Terminal").on_click(
+                    move |_, window, cx| {
+                        _ = rename_panel.update(cx, |panel, cx| {
+                            panel.begin_terminal_rename(window, cx);
+                        });
+                    },
+                );
+                let menu_action =
+                    |label: &'static str,
+                     action: TerminalTabAction,
+                     disabled: bool| {
+                        let handler = tab_action_handler.clone();
+                        let order = tab_order.clone();
+                        PopupMenuItem::new(label).disabled(disabled).on_click(
+                            move |_, window, cx| {
+                                if let Some(handler) = handler.as_ref() {
+                                    handler(action, order.clone(), window, cx);
+                                }
+                            },
+                        )
+                    };
+                let tab_index =
+                    tab_order.iter().position(|id| *id == panel_id.as_u64());
+                let has_tabs_left = tab_index.is_some_and(|index| index > 0);
+                let has_tabs_right =
+                    tab_index.is_some_and(|index| index + 1 < tab_order.len());
+                menu.item(new_item)
+                    .item(rename_item)
+                    .separator()
+                    .item(menu_action("Close", TerminalTabAction::Close, false))
+                    .item(menu_action(
+                        "Close Others",
+                        TerminalTabAction::CloseOthers,
+                        tab_order.len() <= 1,
+                    ))
+                    .item(menu_action(
+                        "Close Left",
+                        TerminalTabAction::CloseLeft,
+                        !has_tabs_left,
+                    ))
+                    .item(menu_action(
+                        "Close Right",
+                        TerminalTabAction::CloseRight,
+                        !has_tabs_right,
+                    ))
+                    .item(menu_action(
+                        "Close Clean",
+                        TerminalTabAction::CloseClean,
+                        tab_order.is_empty(),
+                    ))
+                    .item(menu_action(
+                        "Close All",
+                        TerminalTabAction::CloseAll,
+                        tab_order.is_empty(),
+                    ))
             })
     }
     fn toolbar_buttons(
@@ -1607,6 +1782,8 @@ impl Render for TerminalPanel {
             !self.terminal_mode().intersects(TermMode::MOUSE_MODE);
         let terminal_panel = cx.entity();
         let terminal_panel_for_canvas = terminal_panel.clone();
+        let close_tab_handler = self.tab_action_handler.clone();
+        let close_tab_group = self.tab_group.clone();
         let focus = self.focus.clone();
 
         v_flex()
@@ -1848,6 +2025,9 @@ impl Render for TerminalPanel {
                         let select_all_panel = terminal_panel.clone();
                         let paste_panel = terminal_panel.clone();
                         let paste_text_panel = terminal_panel.clone();
+                        let clear_panel = terminal_panel.clone();
+                        let close_tab_handler = close_tab_handler.clone();
+                        let close_tab_group = close_tab_group.clone();
                         menu.item(PopupMenuItem::new("Rename Terminal").on_click(
                             move |_, window, cx| {
                                 rename_panel.update(cx, |this, cx| {
@@ -1887,16 +2067,45 @@ impl Render for TerminalPanel {
                                 });
                             },
                         ))
-                        .item(
-                            PopupMenuItem::new("Paste Text").on_click(
-                                move |_, window, cx| {
-                                    paste_text_panel.update(cx, |this, cx| {
-                                        window.focus(&this.focus, cx);
-                                        this.paste_text_from_clipboard(cx);
+                        .item(PopupMenuItem::new("Paste Text").on_click(
+                            move |_, window, cx| {
+                                paste_text_panel.update(cx, |this, cx| {
+                                    window.focus(&this.focus, cx);
+                                    this.paste_text_from_clipboard(cx);
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .item(PopupMenuItem::new("Clear").on_click(
+                            move |_, window, cx| {
+                                clear_panel.update(cx, |this, cx| {
+                                    window.focus(&this.focus, cx);
+                                    if let Some(terminal) = this.active_terminal() {
+                                        terminal.clear();
                                         cx.notify();
-                                    });
-                                },
-                            ),
+                                    }
+                                });
+                            },
+                        ))
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Close Terminal Tab")
+                                .disabled(close_tab_handler.is_none())
+                                .on_click(move |_, window, cx| {
+                                    if let Some(handler) = close_tab_handler.as_ref()
+                                    {
+                                        let order = terminal_panel_order(
+                                            close_tab_group.as_ref(),
+                                            cx,
+                                        );
+                                        handler(
+                                            TerminalTabAction::Close,
+                                            order,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
                         )
                     })
                     .children(snapshot.rows.into_iter().map(move |line| {
@@ -2155,18 +2364,23 @@ mod tests {
             id: 4,
             terminal: None,
             shell_name: "zsh".to_string(),
+            program_name: "zsh".to_string(),
             custom_title: None,
             status: "ready".into(),
         };
         assert_eq!(tab.title(), "zsh 4");
+        assert_eq!(tab.tab_name(), "zsh 4");
 
         tab.set_custom_title("  Build  ");
         assert_eq!(tab.title(), "Build");
+        assert_eq!(tab.tab_name(), "Build");
 
         tab.shell_name = "project".to_string();
         assert_eq!(tab.title(), "Build");
+        assert_eq!(tab.tab_name(), "Build");
         tab.set_custom_title("project 4");
         assert_eq!(tab.title(), "project 4");
+        assert_eq!(tab.tab_name(), "zsh 4");
 
         tab.set_custom_title("  ");
         assert_eq!(tab.title(), "project 4");
@@ -2567,6 +2781,13 @@ mod tests {
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn terminal_grid_keeps_an_exact_fit_after_float_rounding() {
+        let cell_width = 11.0_f32 * 0.6;
+        assert!(33.0 / cell_width < 5.0);
+        assert_eq!(terminal_cell_count(33.0, cell_width), 5);
     }
 }
 

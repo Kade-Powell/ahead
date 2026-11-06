@@ -163,7 +163,7 @@ set = ["invalid"]
 }
 
 #[test]
-fn with_user_config_rejects_malformed_shell_policy_filter_fields() {
+fn config_layer_stack_rejects_malformed_user_shell_policy_filter_fields() {
     let temp_dir = TempDir::new().expect("tempdir");
     let config_file = test_user_config_path(&temp_dir, "config.toml");
     let cases = [
@@ -190,54 +190,21 @@ exclude = ["SECRET_*"]
     ];
 
     for contents in cases {
-        let error = ConfigLayerStack::default()
-            .with_user_config(&config_file, toml::from_str(contents).expect("user config"))
-            .expect_err("malformed shell policy filter fields should be rejected");
+        let user_layer = ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: config_file.clone(),
+            },
+            toml::from_str(contents).expect("user config"),
+        );
+        let error = ConfigLayerStack::new(
+            vec![user_layer],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect_err("malformed shell policy filter fields should be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
-}
-
-#[test]
-fn active_user_layer_exposes_its_path_and_effective_config() {
-    let temp_dir = TempDir::new().expect("tempdir");
-    let user_file = test_user_config_path(&temp_dir, "config.toml");
-    let user_layer = ConfigLayerEntry::new(
-        ConfigLayerSource::User {
-            file: user_file.clone(),
-        },
-        toml::from_str(
-            r#"
-model = "ahead"
-approval_policy = "on-request"
-"#,
-        )
-        .expect("user config"),
-    );
-    let stack = ConfigLayerStack::new(
-        vec![user_layer],
-        ConfigRequirements::default(),
-        ConfigRequirementsToml::default(),
-    )
-    .expect("user layer should be valid");
-
-    assert_eq!(stack.get_user_config_file(), Some(&user_file));
-    assert_eq!(
-        stack
-            .effective_user_config()
-            .expect("merged user config")
-            .get("model")
-            .and_then(toml::Value::as_str),
-        Some("ahead")
-    );
-    assert_eq!(
-        stack
-            .effective_user_config()
-            .expect("merged user config")
-            .get("approval_policy")
-            .and_then(toml::Value::as_str),
-        Some("on-request")
-    );
 }
 
 #[test]
@@ -294,40 +261,5 @@ fn layer_iterators_preserve_precedence_and_disabled_layers() {
             .map(|layer| &layer.name)
             .collect::<Vec<_>>(),
         vec![&session_source, &user_source, &disabled_packaged_source]
-    );
-}
-
-#[test]
-fn with_user_config_updates_the_matching_user_layer() {
-    let temp_dir = TempDir::new().expect("tempdir");
-    let user_file = test_user_config_path(&temp_dir, "config.toml");
-    let user_layer = ConfigLayerEntry::new(
-        ConfigLayerSource::User {
-            file: user_file.clone(),
-        },
-        toml::from_str(r#"model = "base""#).expect("user config"),
-    );
-    let stack = ConfigLayerStack::new(
-        vec![user_layer],
-        ConfigRequirements::default(),
-        ConfigRequirementsToml::default(),
-    )
-    .expect("user layer should be valid");
-
-    let updated = stack
-        .with_user_config(
-            &user_file,
-            toml::from_str(r#"model = "updated-base""#).expect("updated base config"),
-        )
-        .expect("updated user layer should be valid");
-
-    assert_eq!(updated.get_user_config_file(), Some(&user_file));
-    assert_eq!(
-        updated
-            .effective_user_config()
-            .expect("merged user config")
-            .get("model")
-            .and_then(toml::Value::as_str),
-        Some("updated-base")
     );
 }

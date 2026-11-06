@@ -14,19 +14,11 @@ use toml::Table;
 use toml::Value as TomlValue;
 
 #[test]
-fn transcript_v2_resolves_explicit_config_overrides() {
-    let mut features = Features::with_defaults();
-    for enabled in [false, true, false] {
-        features.apply_map(&BTreeMap::from([("transcript_v2".to_string(), enabled)]));
-        assert_eq!(features.enabled(Feature::TranscriptV2), enabled);
-    }
-}
-
-#[test]
-fn removed_guardian_feature_keys_are_not_known() {
+fn retired_feature_keys_are_not_known() {
     let defaults = Features::with_defaults();
     let mut features = defaults.clone();
     let keys = [
+        "transcript_v2",
         "guardian_reuse_parent_compaction",
         "guardian_enhanced_node_repl_transcripts",
         "guardian_node_repl_transcript_images",
@@ -105,8 +97,8 @@ fn default_enabled_features_are_stable() {
     for spec in crate::FEATURES {
         if spec.default_enabled {
             assert!(
-                matches!(spec.stage, Stage::Stable | Stage::Removed),
-                "feature `{}` is enabled by default but is not stable/removed ({:?})",
+                matches!(spec.stage, Stage::Stable),
+                "feature `{}` is enabled by default but is not stable ({:?})",
                 spec.key,
                 spec.stage
             );
@@ -164,6 +156,8 @@ disable_in_process_fallback = true
 fn retired_feature_aliases_are_not_known() {
     for key in [
         "enable_experimental_windows_sandbox",
+        "experimental_windows_sandbox",
+        "elevated_windows_sandbox",
         "experimental_use_unified_exec_tool",
         "request_permissions",
         "web_search",
@@ -181,25 +175,30 @@ fn retired_feature_aliases_are_not_known() {
 }
 
 #[test]
-fn use_legacy_landlock_config_records_deprecation_notice() {
-    let mut entries = BTreeMap::new();
-    entries.insert("use_legacy_landlock".to_string(), true);
-
-    let mut features = Features::with_defaults();
-    features.apply_map(&entries);
-
-    let usages = features.legacy_feature_usages().collect::<Vec<_>>();
-    assert_eq!(usages.len(), 1);
-    assert_eq!(usages[0].alias, "features.use_legacy_landlock");
-    assert_eq!(usages[0].feature, Feature::UseLegacyLandlock);
-    assert_eq!(
-        usages[0].summary,
-        "`[features].use_legacy_landlock` is deprecated and will be removed soon."
-    );
-    assert_eq!(
-        usages[0].details.as_deref(),
-        Some("Remove this setting to stop opting into the legacy Linux sandbox behavior.")
-    );
+fn retired_codex_product_features_are_not_known() {
+    for key in [
+        "artifact",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "goals",
+        "in_app_browser",
+        "in_app_chat",
+        "in_app_dictation",
+        "in_app_local_automation",
+        "in_app_updates",
+        "mentions_v2",
+        "memories",
+        "prevent_idle_sleep",
+        "realtime_conversation",
+        "skill_search",
+        "terminal_visualization_instructions",
+        "workspace_dependencies",
+    ] {
+        assert_eq!(feature_for_key(key), None, "{key}");
+        assert!(!crate::is_known_feature_key(key), "{key}");
+    }
 }
 
 #[test]

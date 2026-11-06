@@ -293,6 +293,29 @@ fn user_message(text: &str) -> ResponseItem {
 }
 
 #[test]
+fn environment_updates_reject_multiple_and_nonlocal_selections() {
+    let cwd = PathUri::from_host_native_path(std::env::current_dir().expect("current directory"))
+        .expect("cwd URI");
+    let local = codex_protocol::protocol::TurnEnvironmentSelection {
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: cwd.clone(),
+        workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::FromThread,
+    };
+
+    assert!(super::environment::validate_environment_selections(&[]).is_ok());
+    assert!(super::environment::validate_environment_selections(&[local.clone(), local,]).is_err());
+
+    let remote = codex_protocol::protocol::TurnEnvironmentSelection {
+        environment_id: "remote".to_string(),
+        cwd,
+        workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::FromThread,
+    };
+    assert!(super::environment::validate_environment_selections(&[remote]).is_err());
+}
+
+#[test]
 fn assign_missing_response_item_ids_assigns_agent_message_ids() {
     let items = Cow::Owned(vec![
         ResponseItem::AgentMessage {
@@ -962,101 +985,6 @@ async fn get_base_instructions_no_user_content() {
         let base_instructions = session.get_base_instructions().await;
         assert_eq!(base_instructions.text, model_instructions);
     }
-}
-
-#[tokio::test]
-async fn reload_user_config_layer_keeps_previous_config_for_malformed_shell_policy() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
-    std::fs::write(&config_toml_path, "model = \"gpt-5\"\n").expect("write valid user config");
-    session.reload_user_config_layer().await;
-    let previous_config = session
-        .get_config()
-        .await
-        .config_layer_stack
-        .effective_user_config()
-        .expect("previous user config");
-
-    std::fs::write(
-        &config_toml_path,
-        r#"
-model = "gpt-5"
-
-[shell_environment_policy]
-exclude = ["SECRET_*", 17]
-"#,
-    )
-    .expect("write malformed user config");
-
-    session.reload_user_config_layer().await;
-
-    let current_config = session
-        .get_config()
-        .await
-        .config_layer_stack
-        .effective_user_config()
-        .expect("current user config");
-    assert_eq!(current_config, previous_config);
-}
-
-#[tokio::test]
-async fn reload_user_config_layer_updates_selected_user_config() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let codex_home = session.codex_home().await;
-    std::fs::create_dir_all(&codex_home).expect("create codex home");
-    let user_config_path = codex_home.join("agent.toml");
-    std::fs::write(
-        &user_config_path,
-        "model = \"before\"\napproval_policy = \"on-request\"\n",
-    )
-    .expect("write user config");
-    let config = ConfigBuilder::isolated_for_tests()
-        .codex_home(codex_home.to_path_buf())
-        .loader_overrides(LoaderOverrides {
-            user_config_path: Some(user_config_path.abs()),
-            ..LoaderOverrides::isolated_for_tests()
-        })
-        .build()
-        .await
-        .expect("load selected user config");
-    {
-        let mut state = session.state.lock().await;
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
-    }
-    std::fs::write(
-        &user_config_path,
-        "model = \"after\"\napproval_policy = \"never\"\n",
-    )
-    .expect("update user config");
-
-    session.reload_user_config_layer().await;
-
-    let config = session.get_config().await;
-    assert_eq!(
-        config
-            .config_layer_stack
-            .get_user_config_file()
-            .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-        Some(user_config_path.as_path())
-    );
-    let effective_user_config = config
-        .config_layer_stack
-        .effective_user_config()
-        .expect("merged user config");
-    assert_eq!(
-        effective_user_config
-            .get("model")
-            .and_then(toml::Value::as_str),
-        Some("after")
-    );
-    assert_eq!(
-        effective_user_config
-            .get("approval_policy")
-            .and_then(toml::Value::as_str),
-        Some("never")
-    );
 }
 
 #[tokio::test]
@@ -4745,7 +4673,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let session = Session {
         thread_id,
-        installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
@@ -4894,7 +4821,6 @@ async fn make_session_with_config_and_rx(
         &default_environments,
         Arc::clone(&config),
         /*user_instructions*/ None,
-        "11111111-1111-4111-8111-111111111111".to_string(),
         auth_manager,
         models_manager,
         model_info,
@@ -5005,7 +4931,6 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         &default_environments,
         Arc::clone(&config),
         /*user_instructions*/ None,
-        "11111111-1111-4111-8111-111111111111".to_string(),
         auth_manager,
         models_manager,
         model_info,
@@ -5424,7 +5349,6 @@ async fn request_permissions_tool_resolves_relative_paths_against_selected_envir
                 .handle(ToolInvocation {
                     session,
                     step_context,
-                    turn: turn_context,
                     cancellation_token: CancellationToken::new(),
                     tracker,
                     call_id,
@@ -5501,7 +5425,6 @@ async fn request_permissions_tool_rejects_unknown_environment_id() {
         .handle(ToolInvocation {
             session: Arc::new(session),
             step_context,
-            turn: turn_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-1".to_string(),
@@ -6676,7 +6599,6 @@ where
 
     let session = Arc::new(Session {
         thread_id,
-        installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
@@ -9306,13 +9228,14 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let err = router
-        .dispatch_tool_call_with_code_mode_result(
+        .dispatch_tool_call_with_terminal_outcome(
             Arc::clone(&session),
             step_context,
             CancellationToken::new(),
             tracker,
             call,
             ToolCallSource::Direct,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .err()
@@ -9470,7 +9393,6 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
     let resp = handler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
-            turn: Arc::clone(&turn_context),
             step_context,
             cancellation_token: CancellationToken::new(),
             tracker: Arc::clone(&tracker),

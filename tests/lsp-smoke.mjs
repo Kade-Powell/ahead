@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { constants } from "node:fs";
-import { access, cp, mkdir, mkdtemp, readFile, realpath, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -9,15 +9,26 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 // By default this is an offline smoke using already-installed language servers.
 // Set AHEAD_LSP_INSTALL_MISSING=1 to explicitly exercise AHEAD's managed
-// acquisition path; its cache stays under this disposable fixture's
-// AHEAD_DATA_HOME. AHEAD_LSP_CACHE_SEED can copy an existing language-server
-// cache into that disposable home. AHEAD_LSP_LANGUAGES selects a subset.
+// acquisition path; its cache stays in an isolated profile outside the
+// disposable workspace. AHEAD_LSP_CACHE_SEED can copy an existing language-
+// server cache into that disposable home. AHEAD_LSP_NODE_RUNTIME_SEED can copy
+// a managed Node runtime cache. AHEAD_LSP_KEEP_PROFILE=1 retains the profile
+// for a follow-up cache-only run. AHEAD_LSP_LANGUAGES selects a subset.
+// AHEAD_LSP_TOML_EXTENSION_SEED copies an installed TOML extension into the
+// isolated profile and exercises syntax through the proxy; an empty language
+// selection makes that an extension-only smoke.
+// AHEAD_LSP_INSTALL_ZED_HTML/PROTO/SWIFT=1 installs the corresponding live
+// catalog extension into the isolated profile when its language is selected.
 const binary = path.resolve(process.argv[2] ?? "target/debug/ahead");
 const fixture = fileURLToPath(new URL("./fixtures/editor-smoke/", import.meta.url));
+const tomlExtensionSeed = process.env.AHEAD_LSP_TOML_EXTENSION_SEED
+  ? path.resolve(process.env.AHEAD_LSP_TOML_EXTENSION_SEED)
+  : undefined;
 const selectedLanguages = new Set((process.env.AHEAD_LSP_LANGUAGES ?? "typescript,python,rust")
   .split(",").map((language) => language.trim()).filter(Boolean));
-const supportedLanguages = new Set(["typescript", "python", "rust"]);
-assert(selectedLanguages.size > 0, "AHEAD_LSP_LANGUAGES must select at least one language");
+const supportedLanguages = new Set(["html", "proto", "swift", "typescript", "python", "rust"]);
+assert(selectedLanguages.size > 0 || tomlExtensionSeed,
+  "AHEAD_LSP_LANGUAGES must select a server unless a TOML extension syntax seed is provided");
 for (const language of selectedLanguages) {
   assert(supportedLanguages.has(language), `Unsupported LSP smoke language: ${language}`);
 }
@@ -60,16 +71,51 @@ const serverCommands = [
   ...(selectedLanguages.has("typescript") ? ["vtsls"] : []),
   ...(selectedLanguages.has("python") ? ["basedpyright-langserver", "ruff"] : []),
   ...(selectedLanguages.has("rust") ? ["rust-analyzer"] : []),
+  ...(selectedLanguages.has("swift") ? ["sourcekit-lsp"] : []),
   ...(process.env.AHEAD_LSP_INSTALL_ZED_HTML === "1" ? ["vscode-html-language-server"] : []),
 ];
 const installMissingServers = process.env.AHEAD_LSP_INSTALL_MISSING === "1";
+const cacheSeed = process.env.AHEAD_LSP_CACHE_SEED
+  ? path.resolve(process.env.AHEAD_LSP_CACHE_SEED)
+  : undefined;
+const nodeRuntimeSeed = process.env.AHEAD_LSP_NODE_RUNTIME_SEED
+  ? path.resolve(process.env.AHEAD_LSP_NODE_RUNTIME_SEED)
+  : undefined;
+const keepProfile = process.env.AHEAD_LSP_KEEP_PROFILE === "1";
 const installZedHtmlExtension = process.env.AHEAD_LSP_INSTALL_ZED_HTML === "1";
+const installZedProtoExtension = process.env.AHEAD_LSP_INSTALL_ZED_PROTO === "1";
+const installZedSwiftExtension = process.env.AHEAD_LSP_INSTALL_ZED_SWIFT === "1";
 assert(
-  !installZedHtmlExtension || installMissingServers,
-  "AHEAD_LSP_INSTALL_ZED_HTML requires AHEAD_LSP_INSTALL_MISSING=1",
+  !(installZedHtmlExtension || installZedProtoExtension || installZedSwiftExtension)
+    || installMissingServers,
+  "Zed extension installation requires AHEAD_LSP_INSTALL_MISSING=1",
+);
+assert(
+  !selectedLanguages.has("html") || installZedHtmlExtension,
+  "AHEAD_LSP_LANGUAGES=html requires AHEAD_LSP_INSTALL_ZED_HTML=1",
+);
+assert(
+  !selectedLanguages.has("proto") || installZedProtoExtension,
+  "AHEAD_LSP_LANGUAGES=proto requires AHEAD_LSP_INSTALL_ZED_PROTO=1",
+);
+assert(
+  !selectedLanguages.has("swift") || installZedSwiftExtension,
+  "AHEAD_LSP_LANGUAGES=swift requires AHEAD_LSP_INSTALL_ZED_SWIFT=1",
 );
 const serverTimeoutMs = installMissingServers ? 150_000 : 30_000;
-async function fetchZedHtmlExtension() {
+const cachedServerPackages = {
+  "basedpyright-langserver": {
+    directory: "basedpyright",
+    package: "basedpyright",
+    entrypoint: "langserver.index.js",
+  },
+  vtsls: {
+    directory: "vtsls",
+    package: "@vtsls/language-server",
+    entrypoint: "bin/vtsls.js",
+  },
+};
+async function fetchZedExtension(extensionId) {
   const catalogUrl = new URL("https://api.zed.dev/extensions");
   catalogUrl.searchParams.set("max_schema_version", "1");
   catalogUrl.searchParams.set("provides", "language-servers");
@@ -78,21 +124,25 @@ async function fetchZedHtmlExtension() {
   const bytes = new Uint8Array(await response.arrayBuffer());
   assert(bytes.length <= 4 * 1024 * 1024, "Zed extension catalog exceeded AHEAD's response limit");
   const catalog = JSON.parse(new TextDecoder().decode(bytes));
-  const entry = catalog.data?.find((candidate) => candidate.id === "html"
+  const entry = catalog.data?.find((candidate) => candidate.id === extensionId
     && candidate.schema_version <= 1
     && candidate.provides?.includes("language-servers")
     && ["0.6.0", "0.7.0", "0.8.0"].includes(candidate.wasm_api_version));
-  assert(entry, "Zed catalog has no HTML extension supported by AHEAD's current Wasm host");
+  assert(entry, `Zed catalog has no ${extensionId} extension supported by AHEAD's current Wasm host`);
   assert.match(entry.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);
   const expectedSha256 = entry.archive_sha256 ?? null;
   if (expectedSha256 !== null) assert.match(expectedSha256, /^[a-fA-F0-9]{64}$/);
   return {
-    url: new URL(`/extensions/html/${entry.version}/download`, catalogUrl).href,
+    url: new URL(`/extensions/${extensionId}/${entry.version}/download`, catalogUrl).href,
     version: entry.version,
+    wasmApiVersion: entry.wasm_api_version,
     expectedSha256,
   };
 }
-const zedHtmlExtension = installZedHtmlExtension ? await fetchZedHtmlExtension() : undefined;
+const zedHtmlExtension = installZedHtmlExtension ? await fetchZedExtension("html") : undefined;
+const zedProtoExtension = installZedProtoExtension ? await fetchZedExtension("proto") : undefined;
+const zedSwiftExtension = installZedSwiftExtension ? await fetchZedExtension("swift") : undefined;
+const expectedServerNames = [...serverCommands, ...(zedProtoExtension ? ["buf"] : [])];
 const executableExtensions = process.platform === "win32"
   ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
   : [""];
@@ -109,6 +159,29 @@ async function commandIsAvailable(command) {
   }
   return false;
 }
+async function cachedServerIsAvailable(command) {
+  const cached = cachedServerPackages[command];
+  if (!cacheSeed || !cached) return false;
+  const packagePath = path.join(
+    cacheSeed,
+    cached.directory,
+    "node_modules",
+    cached.package,
+  );
+  try {
+    const [manifestText, entrypoint] = await Promise.all([
+      readFile(path.join(packagePath, "package.json"), "utf8"),
+      stat(path.join(packagePath, cached.entrypoint)),
+    ]);
+    const manifest = JSON.parse(manifestText);
+    return manifest.name === cached.package
+      && typeof manifest.version === "string"
+      && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(manifest.version)
+      && entrypoint.isFile();
+  } catch {
+    return false;
+  }
+}
 const missingServers = [];
 if (!installMissingServers) {
   for (const command of serverCommands) {
@@ -118,7 +191,9 @@ if (!installMissingServers) {
       else await access(rustAnalyzerOverride, constants.X_OK);
       continue;
     }
-    if (!await commandIsAvailable(command)) missingServers.push(command);
+    if (!await commandIsAvailable(command) && !await cachedServerIsAvailable(command)) {
+      missingServers.push(command);
+    }
   }
   if (serverCommands.includes("rust-analyzer")) {
     const probe = spawnSync(rustAnalyzerOverride ?? "rust-analyzer", ["--version"], {
@@ -139,16 +214,17 @@ if (!installMissingServers) {
   );
 }
 const workspace = await mkdtemp(path.join(tmpdir(), "ahead-lsp-smoke-"));
+const profile = await mkdtemp(path.join(tmpdir(), "ahead-lsp-profile-"));
 await cp(fixture, workspace, {
   recursive: true,
   filter: (source) => !["target", "node_modules", "__pycache__", ".ahead"].includes(path.basename(source)),
 });
-const dataHome = path.join(workspace, "ahead-data");
-const runtimeHome = path.join(workspace, "ahead-runtime");
-const userHome = path.join(workspace, "ahead-user");
-const cargoHome = path.join(workspace, "cargo-home");
-const cacheHome = path.join(workspace, "cache-home");
-const configHome = path.join(workspace, "config-home");
+const dataHome = path.join(profile, "data");
+const runtimeHome = path.join(profile, "runtime");
+const userHome = path.join(profile, "user");
+const cargoHome = path.join(profile, "cargo-home");
+const cacheHome = path.join(profile, "cache-home");
+const configHome = path.join(profile, "config-home");
 await Promise.all([
   mkdir(dataHome),
   mkdir(runtimeHome),
@@ -157,13 +233,31 @@ await Promise.all([
   mkdir(cacheHome),
   mkdir(configHome),
 ]);
-if (process.env.AHEAD_LSP_CACHE_SEED) {
-  const cacheSeed = path.resolve(process.env.AHEAD_LSP_CACHE_SEED);
+if (tomlExtensionSeed) {
+  assert((await stat(tomlExtensionSeed)).isDirectory(),
+    "AHEAD_LSP_TOML_EXTENSION_SEED must name an installed TOML extension directory");
+  const manifest = await readFile(path.join(tomlExtensionSeed, "extension.toml"), "utf8");
+  assert.match(manifest, /^id\s*=\s*[\"']toml[\"']/m,
+    "AHEAD_LSP_TOML_EXTENSION_SEED must contain the TOML extension");
+  const extensionDirectory = path.join(dataHome, "plugins", "toml");
+  await mkdir(path.dirname(extensionDirectory), { recursive: true });
+  await cp(tomlExtensionSeed, extensionDirectory, { recursive: true });
+}
+assert(!dataHome.startsWith(`${workspace}${path.sep}`),
+  "AHEAD test data must stay outside the disposable workspace");
+if (cacheSeed) {
   const cacheMetadata = await stat(cacheSeed);
   assert(cacheMetadata.isDirectory(), "AHEAD_LSP_CACHE_SEED must name a language-server cache directory");
   const languageServerCache = path.join(dataHome, "cache", "language-servers");
   await mkdir(path.dirname(languageServerCache), { recursive: true });
   await cp(cacheSeed, languageServerCache, { recursive: true });
+}
+if (nodeRuntimeSeed) {
+  const cacheMetadata = await stat(nodeRuntimeSeed);
+  assert(cacheMetadata.isDirectory(), "AHEAD_LSP_NODE_RUNTIME_SEED must name a Node runtime cache directory");
+  const nodeRuntimeCache = path.join(dataHome, "cache", "node-runtime");
+  await mkdir(path.dirname(nodeRuntimeCache), { recursive: true });
+  await cp(nodeRuntimeSeed, nodeRuntimeCache, { recursive: true });
 }
 await writeFile(path.join(dataHome, "trusted-workspaces.toml"),
   `trusted = [${JSON.stringify(await realpath(workspace))}]\nblocked = []\n`);
@@ -180,7 +274,7 @@ const serverEnvironment = {
 };
 if (rustAnalyzerOverride && selectedLanguages.has("rust")) {
   assert.notEqual(process.platform, "win32", "The explicit Rust Analyzer alias is currently Unix-only");
-  const serverBin = path.join(workspace, "server-bin");
+  const serverBin = path.join(profile, "server-bin");
   await mkdir(serverBin);
   await symlink(rustAnalyzerOverride, path.join(serverBin, "rust-analyzer"));
   serverEnvironment.PATH = `${serverBin}${path.delimiter}${serverEnvironment.PATH ?? ""}`;
@@ -189,8 +283,10 @@ const proxy = spawn(binary, ["--proxy"], { cwd: workspace, detached: true, stdio
 const messages = [];
 const waiters = new Set();
 let requestId = 0;
+const completionLatencies = [];
 let stderr = "";
 let failure;
+let passed = false;
 proxy.stderr.on("data", (chunk) => {
   const text = String(chunk);
   stderr = (stderr + text).slice(-4000);
@@ -241,6 +337,7 @@ async function waitForLanguageServer(serverName, label, after = messages.length)
   assert.equal(status.params.params.health, "ok",
     `${label}: ${status.params.params.message ?? "server failed"}`);
   console.log(`PASS ${serverName}: initialized`);
+  return status;
 }
 function notify(method, params) { proxy.stdin.write(JSON.stringify({ method, params }) + "\n"); }
 async function request(method, params, expectError = false) {
@@ -303,14 +400,18 @@ async function snapshot(relative, content, acceptDiagnostics) {
 }
 async function completion(relative, position, expected) {
   const id = ++requestId;
+  const startedAt = performance.now();
   const response = waitFor((message) => message.method === "completion_response" && message.params.request_id === id, `${relative}: completion`);
   notify("completion", { request_id: id, path: path.join(workspace, relative), input: "", position });
   const params = (await response).params;
+  const elapsedMs = performance.now() - startedAt;
   const reply = params.resp;
-  const items = Array.isArray(reply) ? reply : reply.items;
+  const items = reply == null ? [] : Array.isArray(reply) ? reply : reply.items;
+  const isIncomplete = !Array.isArray(reply) && reply.isIncomplete === true;
   const item = items.find((item) => expected instanceof RegExp ? expected.test(item.label) : item.label === expected);
-  assert(item, `${relative}: missing ${expected}`);
-  return { plugin_id: params.plugin_id, completion_item: item };
+  assert(item, `${relative}: missing ${expected}; received ${items.slice(0, 12).map((item) => item.label).join(", ")}`);
+  completionLatencies.push({ file: relative, ms: elapsedMs, label: item.label, is_incomplete: isIncomplete });
+  return { plugin_id: params.plugin_id, completion_item: item, elapsed_ms: elapsedMs, is_incomplete: isIncomplete };
 }
 async function closeBuffer(relative) {
   const file = path.join(workspace, relative);
@@ -348,6 +449,15 @@ async function references(relative, position) {
 async function formatDocument(relative) {
   const response = await request("get_document_formatting", { path: path.join(workspace, relative) });
   assert.equal(response.method, "get_document_formatting");
+  return response.params.edits;
+}
+async function formatOnType(relative, position, triggerCharacter) {
+  const response = await request("get_document_on_type_formatting", {
+    path: path.join(workspace, relative),
+    position,
+    trigger_character: triggerCharacter,
+  });
+  assert.equal(response.method, "get_document_on_type_formatting");
   return response.params.edits;
 }
 function applyTextEdits(text, edits) {
@@ -625,6 +735,21 @@ try {
     newText: "invalid",
   }]), /overlapping or reversed/);
   notify("initialize", { workspace, window_id: 1, tab_id: 1 });
+  if (tomlExtensionSeed) {
+    const cargoManifest = "Cargo.toml";
+    const content = '[package]\nname = "syntax-probe"\nversion = "0.1.0"\n';
+    await snapshot(cargoManifest, content);
+    const response = await request("get_extension_syntax", {
+      path: path.join(workspace, cargoManifest),
+    });
+    assert.equal(response.method, "get_extension_syntax");
+    const syntax = response.params.syntax;
+    assert.equal(syntax.language_name, "TOML");
+    assert(syntax.captures.some((capture) => capture.scope === "string"
+      && content.slice(capture.start, capture.end).includes("syntax-probe")),
+    "the installed TOML grammar should return string captures through the proxy");
+    console.log("PASS installed TOML extension syntax through the proxy");
+  }
   if (zedHtmlExtension) {
     await request("install_language_extension", {
       url: zedHtmlExtension.url,
@@ -637,7 +762,118 @@ try {
     await snapshot(html, "<di");
     await waitForLanguageServer("vscode-html-language-server", "live Zed HTML extension");
     await completion(html, { line: 0, character: 3 }, /^div\b/);
-    console.log(`PASS live Zed gallery install and HTML completion (${zedHtmlExtension.version})`);
+    const htmlSource = '<div title="x">hello</div>\n';
+    await snapshot(html, htmlSource);
+    const syntaxResponse = await request("get_extension_syntax", {
+      path: path.join(workspace, html),
+    });
+    assert.equal(syntaxResponse.method, "get_extension_syntax");
+    const syntax = syntaxResponse.params.syntax;
+    assert.equal(syntax.path, path.join(workspace, html));
+    assert.equal(syntax.len, Buffer.byteLength(htmlSource, "utf8"));
+    assert(syntax.captures.some((capture) => capture.scope === "tag"
+      && htmlSource.slice(capture.start, capture.end) === "div"),
+    "the installed Zed HTML grammar and highlights query must produce tag captures");
+    console.log("PASS live Zed HTML extension grammar and highlight captures");
+    console.log(
+      `PASS live Zed gallery install and HTML completion `
+      + `(${zedHtmlExtension.version}, Wasm API ${zedHtmlExtension.wasmApiVersion})`,
+    );
+  }
+  if (zedProtoExtension) {
+    await request("install_language_extension", {
+      url: zedProtoExtension.url,
+      extension_id: "proto",
+      version: zedProtoExtension.version,
+      expected_sha256: zedProtoExtension.expectedSha256,
+    });
+    notify("restart_language_servers", {});
+    const proto = "proto/zed-extension-smoke.proto";
+    const protoCommon = "proto/smoke/common.proto";
+    const protoSource = [
+      'syntax = "proto3";',
+      "package smoke;",
+      'import "smoke/common.proto";',
+      "message Smoke { string name = 1; }",
+      "message Consumer { Smoke target = 1; }",
+      "",
+    ].join("\n");
+    await writeFile(path.join(workspace, "buf.yaml"), [
+      "version: v2",
+      "modules:",
+      "  - path: proto",
+      "",
+    ].join("\n"));
+    await mkdir(path.dirname(path.join(workspace, protoCommon)), { recursive: true });
+    await writeFile(path.join(workspace, protoCommon), [
+      'syntax = "proto3";',
+      "package smoke;",
+      "message Common { string value = 1; }",
+      "",
+    ].join("\n"));
+    await writeFile(path.join(workspace, proto), protoSource);
+    const protoStart = messages.length;
+    await snapshot(proto, protoSource);
+    await waitForLanguageServer("buf", "live Zed Proto extension", protoStart);
+    await completion(
+      proto,
+      { line: 2, character: 'import "smoke/'.length },
+      /common\.proto$/,
+    );
+    await completion(
+      proto,
+      { line: 4, character: "message Consumer { ".length },
+      /Smoke$/,
+    );
+    const syntaxResponse = await request("get_extension_syntax", {
+      path: path.join(workspace, proto),
+    });
+    assert.equal(syntaxResponse.method, "get_extension_syntax");
+    const syntax = syntaxResponse.params.syntax;
+    assert.equal(syntax.language_name, "Proto");
+    assert(syntax.captures.some((capture) => capture.scope === "type"
+      && protoSource.slice(capture.start, capture.end) === "Smoke"),
+    "the installed Zed Proto grammar and highlights query must capture the message type");
+    console.log(`PASS live Zed gallery install, Proto import/symbol completion, highlights and Buf startup (${zedProtoExtension.version})`);
+  }
+  if (zedSwiftExtension) {
+    await request("install_language_extension", {
+      url: zedSwiftExtension.url,
+      extension_id: "swift",
+      version: zedSwiftExtension.version,
+      expected_sha256: zedSwiftExtension.expectedSha256,
+    });
+    notify("restart_language_servers", {});
+    await mkdir(path.join(workspace, "Sources", "Smoke"), { recursive: true });
+    await writeFile(path.join(workspace, "Package.swift"), [
+      "// swift-tools-version: 6.0",
+      "import PackageDescription",
+      "let package = Package(name: \"AHEADSwiftSmoke\", targets: [",
+      "    .executableTarget(name: \"AHEADSwiftSmoke\"),",
+      "]) ",
+      "",
+    ].join("\n"));
+    const swift = "Sources/Smoke/main.swift";
+    const swiftSource =
+      "struct Calculation { let input: Int; let doubled: Int }\nlet result: Cal\n";
+    await writeFile(path.join(workspace, swift), swiftSource);
+    const swiftStart = messages.length;
+    await snapshot(swift, swiftSource);
+    await waitForLanguageServer("sourcekit-lsp", "live Zed Swift extension", swiftStart);
+    await completion(
+      swift,
+      { line: 1, character: "let result: Cal".length },
+      "Calculation",
+    );
+    const syntaxResponse = await request("get_extension_syntax", {
+      path: path.join(workspace, swift),
+    });
+    assert.equal(syntaxResponse.method, "get_extension_syntax");
+    const syntax = syntaxResponse.params.syntax;
+    assert.equal(syntax.language_name, "Swift");
+    assert(syntax.captures.length > 0,
+      "the installed Zed Swift grammar and highlights query should produce captures");
+    console.log(`PASS live Zed gallery install, Swift completion and highlights (${zedSwiftExtension.version})`);
   }
   const ts = "typescript/src/main.ts";
   const originalTs = await readFile(path.join(workspace, ts), "utf8");
@@ -647,6 +883,42 @@ try {
   let tsCompletion;
   let candidate;
   if (selectedLanguages.has("typescript")) {
+    const extendsFile = "typescript/src/extends.ts";
+    const extendsSource =
+      "interface Calculation { input: number; doubled: number; }\ninterface ExtendedCalculation extends Cal\n";
+    const typescriptStart = messages.length;
+    await snapshot(extendsFile, extendsSource);
+    await waitForLanguageServer("vtsls", "TypeScript server readiness", typescriptStart);
+    const extendsCompletion = await completion(
+      extendsFile,
+      { line: 1, character: "interface ExtendedCalculation extends Cal".length },
+      "Calculation",
+    );
+    assert.equal(
+      extendsCompletion.completion_item.label,
+      "Calculation",
+      "Vtsls should suggest the local interface while completing `extends Cal`",
+    );
+    const repeatedExtendsCompletion = await completion(
+      extendsFile,
+      { line: 1, character: "interface ExtendedCalculation extends Cal".length },
+      "Calculation",
+    );
+    assert.equal(repeatedExtendsCompletion.completion_item.label, "Calculation");
+    const settledExtendsCompletion = await completion(
+      extendsFile,
+      { line: 1, character: "interface ExtendedCalculation extends Cal".length },
+      "Calculation",
+    );
+    assert.equal(settledExtendsCompletion.completion_item.label, "Calculation");
+    console.log(
+      `PASS TypeScript: local interface completion after \`extends\` `
+      + `(first ${extendsCompletion.elapsed_ms.toFixed(1)} ms, `
+      + `repeat ${repeatedExtendsCompletion.elapsed_ms.toFixed(1)} ms, `
+      + `settled ${settledExtendsCompletion.elapsed_ms.toFixed(1)} ms)`,
+    );
+    await closeBuffer(extendsFile);
+
     await snapshot(ts, originalTs.replace("calculate(21)", 'calculate("21")'), (items) => items.some((item) => item.code === 2345));
     await snapshot(ts, originalTs, (items) => items.length === 0);
     await snapshot(ts, tsPrefix, (items) => items.some((item) => item.message.includes("Property 'dou'")));
@@ -781,6 +1053,24 @@ try {
   let rustPosition;
   let rustCompletion;
   if (selectedLanguages.has("rust")) {
+    const rustStart = messages.length;
+    const onTypeRust = "fn formatting_probe() {\n    unknown()\n    .\n}\n";
+    await snapshot(rust, onTypeRust);
+    const rustStatus = await waitForLanguageServer(
+      "rust-analyzer",
+      "Rust Analyzer readiness",
+      rustStart,
+    );
+    const onTypeTriggers = rustStatus.params.params.on_type_formatting_triggers ?? [];
+    assert(onTypeTriggers.includes("."), "Rust Analyzer must advertise the member-access trigger");
+    const onTypeEdits = await formatOnType(rust, { line: 2, character: 5 }, ".");
+    assert(onTypeEdits.length > 0, "Rust Analyzer should indent a typed method-chain dot");
+    const onTypeFormatted = applyTextEdits(onTypeRust, onTypeEdits);
+    assert.match(onTypeFormatted, /^ {8}\.\n/m,
+      "on-type formatting should align the method-chain dot under the expression");
+    await snapshot(rust, onTypeFormatted);
+    console.log("PASS Rust: real on-type formatting routes the advertised method-chain trigger");
+
     const unformattedRust = 'fn formatting_probe(){let value=1; println!("{}",value);}\n';
     await snapshot(rust, unformattedRust, (items) => items.length === 0);
     const rustFormatting = await formatDocument(rust);
@@ -829,7 +1119,7 @@ try {
   }
   const beforeRestart = messages.length;
   notify("restart_language_servers", {});
-  for (const name of serverCommands) {
+  for (const name of expectedServerNames) {
     await waitFor((message) => message.method === "server_status"
       && message.params.params.server_name === name && message.params.params.health === "ok", `${name}: ready after restart`, beforeRestart);
   }
@@ -872,28 +1162,120 @@ try {
   }
   console.log(`PASS restart: fresh processes and selected-language recovery (${[...selectedLanguages].join(", ")})`);
   if (selectedLanguages.has("python")) await pythonServerRouting(py, pyText);
-  for (const name of serverCommands) {
+  for (const name of expectedServerNames) {
     assert(messages.some((message) => message.method === "server_status"
       && message.params.params.server_name === name && message.params.params.health === "ok"), `${name}: missing initialized status`);
     const latestStatus = messages.filter((message) => message.method === "server_status" && message.params.params.server_name === name).at(-1);
     assert.equal(latestStatus.params.params.health, "ok", `${name}: retired process replaced current status`);
   }
+  if (zedHtmlExtension) {
+    const installedExtension = path.join(dataHome, "plugins", "html");
+    await access(installedExtension);
+    await request("uninstall_language_extension", { extension_id: "html" });
+    await assert.rejects(access(installedExtension), { code: "ENOENT" });
+    console.log(`PASS live Zed gallery uninstall (${zedHtmlExtension.version})`);
+  }
+  if (zedProtoExtension) {
+    const installedExtension = path.join(dataHome, "plugins", "proto");
+    await access(installedExtension);
+    await request("uninstall_language_extension", { extension_id: "proto" });
+    await assert.rejects(access(installedExtension), { code: "ENOENT" });
+    console.log(`PASS live Zed gallery uninstall (${zedProtoExtension.version})`);
+  }
+  if (zedSwiftExtension) {
+    const installedExtension = path.join(dataHome, "plugins", "swift");
+    await access(installedExtension);
+    await request("uninstall_language_extension", { extension_id: "swift" });
+    await assert.rejects(access(installedExtension), { code: "ENOENT" });
+    console.log(`PASS live Zed gallery uninstall (${zedSwiftExtension.version})`);
+  }
+  await assert.rejects(
+    access(path.join(workspace, "ahead-data")),
+    { code: "ENOENT" },
+    "AHEAD app data must stay out of the disposable project",
+  );
   const shutdown = new Promise((resolve) => proxy.once("exit", (code, signal) => resolve({ code, signal })));
   notify("shutdown", {});
   const deadline = setTimeout(() => proxy.kill("SIGKILL"), 10000);
   const stopped = await shutdown.finally(() => clearTimeout(deadline));
   assert.equal(stopped.code, 0, `proxy shutdown failed: ${stopped.signal ?? stderr}`);
-  assert.throws(() => process.kill(-proxy.pid, 0), { code: "ESRCH" }, "language-server process group survived graceful shutdown");
+  const processGroupDeadline = Date.now() + 1000;
+  let processGroupAlive = true;
+  const processGroupMembers = () => spawnSync(
+    "ps",
+    ["-axo", "pid=,ppid=,pgid=,stat=,command="],
+    { encoding: "utf8" },
+  ).stdout.split(/\r?\n/).filter((line) => {
+    const [, , groupId] = line.trim().split(/\s+/, 3);
+    return groupId === String(proxy.pid);
+  });
+  while (processGroupAlive && Date.now() < processGroupDeadline) {
+    try {
+      process.kill(-proxy.pid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch (error) {
+      if (error.code === "ESRCH") processGroupAlive = false;
+      else if (error.code === "EPERM") {
+        processGroupAlive = processGroupMembers().some((line) => {
+          const [, , , state] = line.trim().split(/\s+/, 4);
+          return !state.startsWith("Z");
+        });
+      }
+      else throw error;
+    }
+  }
+  if (processGroupAlive) {
+    const survivors = processGroupMembers().filter((line) => {
+      const [, , , state] = line.trim().split(/\s+/, 4);
+      return !state.startsWith("Z");
+    });
+    if (survivors.length > 0) {
+    assert.fail(
+        `language-server process group survived graceful shutdown:\n${survivors.join("\n")}`,
+    );
+    }
+  }
+  const sortedCompletionLatencies = completionLatencies
+    .map(({ ms }) => ms)
+    .sort((left, right) => left - right);
+  if (sortedCompletionLatencies.length > 0) {
+    const percentile = (fraction) => {
+      const index = Math.min(
+        sortedCompletionLatencies.length - 1,
+        Math.ceil(sortedCompletionLatencies.length * fraction) - 1,
+      );
+      return sortedCompletionLatencies[index];
+    };
+    const measurements = completionLatencies
+      .map(({ file, label, ms, is_incomplete }) =>
+        `${file}:${label}=${ms.toFixed(1)} ms${is_incomplete ? " (incomplete)" : ""}`)
+      .join(", ");
+    console.log(
+      `LSP completion round trips (${sortedCompletionLatencies.length}): `
+      + `p50 ${percentile(0.50).toFixed(1)} ms, `
+      + `p95 ${percentile(0.95).toFixed(1)} ms, `
+      + `max ${sortedCompletionLatencies.at(-1).toFixed(1)} ms; `
+      + measurements,
+    );
+  }
+  passed = true;
   console.log(`PASS standard LSP readiness and graceful proxy shutdown (${[...selectedLanguages].join(", ")}). Disposable workspace retained: ${workspace}`);
+  if (keepProfile) console.log(`Disposable AHEAD profile retained: ${profile}`);
 } catch (error) {
   console.error(error);
   console.error(JSON.stringify(messages.filter((message) => /log|show_message/.test(message.method)).slice(-20), null, 2));
   console.error(`Disposable workspace retained: ${workspace}`);
+  console.error(`Disposable AHEAD profile retained: ${profile}`);
   process.exitCode = 1;
 } finally {
   lines.close();
   if (proxy.pid) {
     try { process.kill(-proxy.pid, "SIGTERM"); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
+    catch (error) {
+      if (error.code !== "ESRCH" && !(error.code === "EPERM" && proxy.exitCode !== null)) {
+        throw error;
+      }
+    }
   }
+  if (passed && !keepProfile) await rm(profile, { recursive: true, force: true });
 }

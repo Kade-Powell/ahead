@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -30,9 +30,9 @@ use lsp_types::{
     Registration, RegistrationParams, SemanticTokens, SemanticTokensLegend,
     SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentSaveRegistrationOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncSaveOptions, Unregistration,
-    UnregistrationParams, VersionedTextDocumentIdentifier,
+    TextDocumentRegistrationOptions, TextDocumentSaveRegistrationOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
+    Unregistration, UnregistrationParams, VersionedTextDocumentIdentifier,
     notification::{
         Cancel, DidChangeConfiguration, DidChangeTextDocument,
         DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
@@ -45,7 +45,7 @@ use lsp_types::{
         DocumentDiagnosticRequest, DocumentSymbolRequest, ExecuteCommand,
         FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation,
         GotoTypeDefinition, HoverRequest, Initialize, InlayHintRequest,
-        InlineCompletionRequest, PrepareRenameRequest, References,
+        InlineCompletionRequest, OnTypeFormatting, PrepareRenameRequest, References,
         RegisterCapability, Rename, Request, ResolveCompletionItem,
         SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
         UnregisterCapability, WorkDoneProgressCreate, WorkspaceSymbolRequest,
@@ -65,6 +65,7 @@ pub(super) const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 // Leave time for aggregation and IPC before the editor's five-second wait ends.
 const CODE_ACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_CANCELLED_REQUEST_TOMBSTONES: usize = 64;
 
 pub enum ResponseHandler<Resp, Error> {
     Chan(Sender<Result<Resp, Error>>),
@@ -124,6 +125,7 @@ pub enum PluginServerRpc {
         params: Value,
         language_id: Option<String>,
         path: Option<PathBuf>,
+        cancellation_id: Option<Id>,
         callback: Box<dyn ClonableCallback<Value, RpcError>>,
     },
     ServerRequest {
@@ -193,6 +195,8 @@ pub struct PluginServerRpcHandler {
 struct ServerRequests {
     stopped: bool,
     pending: HashMap<Id, PendingRequest>,
+    cancelled: HashSet<Id>,
+    cancelled_order: VecDeque<Id>,
 }
 
 struct PendingRequest {
@@ -338,6 +342,11 @@ impl PluginServerRpcHandler {
             rh.invoke(Err(Self::stopped_error()));
             return;
         }
+        if state.cancelled.remove(&id) {
+            drop(state);
+            rh.invoke(Err(Self::cancelled_error()));
+            return;
+        }
         state.pending.insert(
             id.clone(),
             PendingRequest {
@@ -398,6 +407,13 @@ impl PluginServerRpcHandler {
         }
     }
 
+    fn cancelled_error() -> RpcError {
+        RpcError {
+            code: -32800,
+            message: "Language server request cancelled".into(),
+        }
+    }
+
     fn reject_stopped(rpc: PluginServerRpc) {
         match rpc {
             PluginServerRpc::FirstCapableRequest {
@@ -406,6 +422,7 @@ impl PluginServerRpcHandler {
                 params,
                 language_id,
                 path,
+                cancellation_id,
                 callback,
             } => Self::request_first_capable(
                 remaining,
@@ -413,6 +430,7 @@ impl PluginServerRpcHandler {
                 params,
                 language_id,
                 path,
+                cancellation_id,
                 callback,
             ),
             PluginServerRpc::ServerRequest { rh, .. } => {
@@ -483,6 +501,7 @@ impl PluginServerRpcHandler {
             params,
             language_id,
             path,
+            None,
             check,
             ResponseHandler::Chan(tx),
         );
@@ -508,6 +527,28 @@ impl PluginServerRpcHandler {
             params,
             language_id,
             path,
+            None,
+            check,
+            ResponseHandler::Callback(Box::new(f)),
+        );
+    }
+
+    pub(super) fn server_request_async_with_id<P: Serialize>(
+        &self,
+        id: Id,
+        method: impl Into<Cow<'static, str>>,
+        params: P,
+        language_id: Option<String>,
+        path: Option<PathBuf>,
+        check: bool,
+        f: impl RpcCallback<Value, RpcError> + 'static,
+    ) {
+        self.server_request_common(
+            method.into(),
+            params,
+            language_id,
+            path,
+            Some(id),
             check,
             ResponseHandler::Callback(Box::new(f)),
         );
@@ -519,6 +560,7 @@ impl PluginServerRpcHandler {
         params: Value,
         language_id: Option<String>,
         path: Option<PathBuf>,
+        cancellation_id: Option<Id>,
         callback: Box<dyn ClonableCallback<Value, RpcError>>,
     ) {
         if let Some(server) = remaining.pop_front() {
@@ -528,6 +570,7 @@ impl PluginServerRpcHandler {
                 params,
                 language_id,
                 path,
+                cancellation_id,
                 callback,
             });
         } else {
@@ -549,14 +592,17 @@ impl PluginServerRpcHandler {
         params: P,
         language_id: Option<String>,
         path: Option<PathBuf>,
+        request_id: Option<Id>,
         check: bool,
         rh: ResponseHandler<Value, RpcError>,
     ) {
-        let id = self.id.fetch_add(1, Ordering::Relaxed);
+        let id = request_id.unwrap_or_else(|| {
+            Id::Num(self.id.fetch_add(1, Ordering::Relaxed) as i64)
+        });
         let params = Params::from(serde_json::to_value(params).unwrap());
         if check {
             self.handle_rpc(PluginServerRpc::ServerRequest {
-                id: Id::Num(id as i64),
+                id,
                 method,
                 params,
                 language_id,
@@ -564,7 +610,38 @@ impl PluginServerRpcHandler {
                 rh,
             });
         } else {
-            self.send_server_request(Id::Num(id as i64), &method, params, rh);
+            self.send_server_request(id, &method, params, rh);
+        }
+    }
+
+    pub(super) fn cancel_request(&self, id: Id) {
+        let pending = {
+            let mut state = self.server_requests.lock();
+            if state.stopped {
+                return;
+            }
+            if let Some(pending) = state.pending.remove(&id) {
+                Some(pending)
+            } else {
+                if state.cancelled.insert(id.clone()) {
+                    state.cancelled_order.push_back(id.clone());
+                    while state.cancelled_order.len()
+                        > MAX_CANCELLED_REQUEST_TOMBSTONES
+                    {
+                        if let Some(expired) = state.cancelled_order.pop_front() {
+                            state.cancelled.remove(&expired);
+                        }
+                    }
+                }
+                None
+            }
+        };
+        if let Some(pending) = pending {
+            self.send_server_notification(
+                Cancel::METHOD,
+                Params::from(serde_json::json!({ "id": id })),
+            );
+            pending.response.invoke(Err(Self::cancelled_error()));
         }
     }
 
@@ -705,6 +782,7 @@ impl PluginServerRpcHandler {
                     params,
                     language_id,
                     path,
+                    cancellation_id,
                     callback,
                 } => {
                     let request_params = Params::from(params.clone());
@@ -715,14 +793,27 @@ impl PluginServerRpcHandler {
                                 && handler.method_registered(Rename::METHOD)))
                     {
                         let plugin_id = self.plugin_id;
-                        self.server_request_async(
-                            method,
-                            params,
-                            language_id,
-                            path,
-                            true,
-                            move |result| callback(plugin_id, result),
-                        );
+                        let callback = move |result| callback(plugin_id, result);
+                        if let Some(cancellation_id) = cancellation_id {
+                            self.server_request_async_with_id(
+                                cancellation_id,
+                                method,
+                                params,
+                                language_id,
+                                path,
+                                true,
+                                callback,
+                            );
+                        } else {
+                            self.server_request_async(
+                                method,
+                                params,
+                                language_id,
+                                path,
+                                true,
+                                callback,
+                            );
+                        }
                     } else {
                         Self::request_first_capable(
                             remaining,
@@ -730,6 +821,7 @@ impl PluginServerRpcHandler {
                             params,
                             language_id,
                             path,
+                            cancellation_id,
                             callback,
                         );
                     }
@@ -860,7 +952,29 @@ pub fn handle_plugin_server_message(
     message: &str,
     from: &str,
 ) -> Option<JsonRpc> {
-    match JsonRpc::parse(message) {
+    let mut value: Value = match serde_json::from_str(message) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("parse error {error} message {message}");
+            return None;
+        }
+    };
+    if let Some(object) = value.as_object_mut()
+        && object.get("jsonrpc").is_some_and(Value::is_string)
+        && object.contains_key("result")
+        && !object.contains_key("method")
+        && !object.contains_key("error")
+        && let Some(id) = object.get("id").cloned()
+        && let Ok(id) = serde_json::from_value::<Id>(id)
+    {
+        // Moving a completion result avoids cloning thousands of items.
+        if let Some(result) = object.remove("result") {
+            server_rpc.handle_server_response(id, Ok(result));
+        }
+        return None;
+    }
+
+    match serde_json::from_value::<JsonRpc>(value) {
         Ok(value @ JsonRpc::Request(_)) => {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let id = value.get_id().unwrap();
@@ -929,7 +1043,8 @@ mod parameterless_message_tests {
     };
     use ahead_rpc::plugin::ServerId;
     use crossbeam_channel::unbounded;
-    use jsonrpc_lite::Params;
+    use jsonrpc_lite::{Id, Params};
+    use lsp_types::notification::{Cancel, Notification};
     use serde_json::Value;
 
     #[test]
@@ -1064,6 +1179,91 @@ mod parameterless_message_tests {
         assert_eq!(
             receiver.recv().expect("retry reply").expect("success"),
             Value::Bool(true)
+        );
+        assert!(io_rx.try_recv().is_err());
+        rpc.shutdown();
+    }
+
+    #[test]
+    fn cancelling_pending_server_request_sends_lsp_cancel_and_settles_callback() {
+        let (io_tx, io_rx) = unbounded();
+        let rpc = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".into(),
+                name: "test".into(),
+            },
+            None,
+            io_tx,
+        );
+        let request_id = Id::Str("ahead-completion-42".into());
+        let (sender, receiver) = unbounded();
+        rpc.server_request_async_with_id(
+            request_id.clone(),
+            "textDocument/completion",
+            Value::Null,
+            Some("typescript".into()),
+            None,
+            false,
+            move |result| sender.send(result).expect("completion callback"),
+        );
+
+        let request = io_rx.recv().expect("request").expect("request frame");
+        assert_eq!(request.get_id(), Some(request_id.clone()));
+        rpc.cancel_request(request_id.clone());
+
+        let cancellation =
+            io_rx.recv().expect("cancellation").expect("cancel frame");
+        assert_eq!(cancellation.get_method(), Some(Cancel::METHOD));
+        assert_eq!(
+            serde_json::to_value(cancellation.get_params()).expect("cancel params")
+                ["id"],
+            serde_json::to_value(&request_id).expect("request id")
+        );
+        assert_eq!(
+            receiver
+                .recv()
+                .expect("callback result")
+                .expect_err("cancelled request")
+                .code,
+            -32800
+        );
+        rpc.handle_server_response(request_id, Ok(Value::Null));
+        assert!(receiver.try_recv().is_err());
+        assert!(io_rx.try_recv().is_err());
+        rpc.shutdown();
+    }
+
+    #[test]
+    fn cancellation_before_server_dispatch_suppresses_request() {
+        let (io_tx, io_rx) = unbounded();
+        let rpc = PluginServerRpcHandler::new(
+            ServerId {
+                author: "ahead".into(),
+                name: "test".into(),
+            },
+            None,
+            io_tx,
+        );
+        let request_id = Id::Str("ahead-completion-43".into());
+        let (sender, receiver) = unbounded();
+        rpc.cancel_request(request_id.clone());
+        rpc.server_request_async_with_id(
+            request_id,
+            "textDocument/completion",
+            Value::Null,
+            Some("typescript".into()),
+            None,
+            false,
+            move |result| sender.send(result).expect("completion callback"),
+        );
+
+        assert_eq!(
+            receiver
+                .recv()
+                .expect("callback result")
+                .expect_err("cancelled before dispatch")
+                .code,
+            -32800
         );
         assert!(io_rx.try_recv().is_err());
         rpc.shutdown();
@@ -1214,13 +1414,21 @@ mod parameterless_message_tests {
 }
 
 struct SaveRegistration {
+    id: String,
     include_text: bool,
+    filters: Option<Vec<DocumentFilter>>,
+}
+
+struct ChangeRegistration {
+    id: String,
+    sync_kind: TextDocumentSyncKind,
     filters: Option<Vec<DocumentFilter>>,
 }
 
 #[derive(Default)]
 struct ServerRegistrations {
-    save: HashMap<String, SaveRegistration>,
+    save: Vec<SaveRegistration>,
+    change: Vec<ChangeRegistration>,
     execute_command: HashMap<String, Vec<String>>,
 }
 
@@ -1284,8 +1492,25 @@ impl PluginHostHandler {
         }
         self.catalog_rpc.language_server_status(
             self.server_rpc.plugin_id,
-            ServerStatusParams::ready(self.server_display_name.clone()),
+            ServerStatusParams::ready(self.server_display_name.clone())
+                .with_on_type_formatting_triggers(
+                    self.on_type_formatting_triggers(),
+                ),
         );
+    }
+
+    fn on_type_formatting_triggers(&self) -> Vec<String> {
+        let Some(provider) = self
+            .server_capabilities
+            .document_on_type_formatting_provider
+            .as_ref()
+        else {
+            return Vec::new();
+        };
+        std::iter::once(provider.first_trigger_character.clone())
+            .chain(provider.more_trigger_character.clone().unwrap_or_default())
+            .filter(|trigger| !trigger.is_empty())
+            .collect()
     }
 
     pub(super) fn update_workspace_configuration(
@@ -1463,6 +1688,9 @@ impl PluginHostHandler {
                     OneOf::Right(_) => true,
                 })
                 .unwrap_or(false),
+            OnTypeFormatting::METHOD => {
+                !self.on_type_formatting_triggers().is_empty()
+            }
             SemanticTokensFullRequest::METHOD => {
                 self.server_capabilities.semantic_tokens_provider.is_some()
             }
@@ -1531,6 +1759,17 @@ impl PluginHostHandler {
     }
 
     pub fn request_supported(&mut self, method: &str, params: &Params) -> bool {
+        if method == OnTypeFormatting::METHOD {
+            let trigger_character = match params {
+                Params::Map(params) => params.get("ch").and_then(Value::as_str),
+                Params::Array(_) | Params::None(_) => None,
+            };
+            return trigger_character.is_some_and(|trigger_character| {
+                self.on_type_formatting_triggers()
+                    .iter()
+                    .any(|trigger| trigger == trigger_character)
+            });
+        }
         if method != ExecuteCommand::METHOD {
             return self.method_registered(method);
         }
@@ -1552,7 +1791,28 @@ impl PluginHostHandler {
     }
 
     fn check_save_capability(&self, language_id: &str, path: &Path) -> (bool, bool) {
-        let (mut should_send, mut include_text) = if self
+        let registration_applies = |filters: Option<&Vec<DocumentFilter>>| {
+            filters.map_or_else(
+                || self.document_supported(Some(language_id), Some(path)),
+                |filters| {
+                    filters.iter().any(|filter| {
+                        filter.matches_file_document(language_id, Some(path))
+                    })
+                },
+            )
+        };
+
+        if let Some(registration) = self
+            .server_registrations
+            .save
+            .iter()
+            .rev()
+            .find(|registration| registration_applies(registration.filters.as_ref()))
+        {
+            return (true, registration.include_text);
+        }
+
+        let (should_send, include_text) = if self
             .document_supported(Some(language_id), Some(path))
         {
             self.server_capabilities
@@ -1576,22 +1836,41 @@ impl PluginHostHandler {
             (false, false)
         };
 
-        for options in self.server_registrations.save.values() {
-            let applies = options.filters.as_ref().map_or_else(
-                || self.document_supported(Some(language_id), Some(path)),
+        (should_send, include_text)
+    }
+
+    fn check_change_capability(
+        &self,
+        language_id: &str,
+        path: Option<&Path>,
+    ) -> Option<TextDocumentSyncKind> {
+        let mut sync_kind = if self.document_supported(Some(language_id), path) {
+            self.server_capabilities
+                .text_document_sync
+                .as_ref()
+                .and_then(|sync| match sync {
+                    TextDocumentSyncCapability::Kind(kind) => Some(*kind),
+                    TextDocumentSyncCapability::Options(options) => options.change,
+                })
+        } else {
+            None
+        };
+
+        for registration in &self.server_registrations.change {
+            let applies = registration.filters.as_ref().map_or_else(
+                || self.document_supported(Some(language_id), path),
                 |filters| {
                     filters.iter().any(|filter| {
-                        filter.matches_file_document(language_id, Some(path))
+                        filter.matches_file_document(language_id, path)
                     })
                 },
             );
             if applies {
-                should_send = true;
-                include_text |= options.include_text;
+                sync_kind = Some(registration.sync_kind);
             }
         }
 
-        (should_send, include_text)
+        sync_kind
     }
 
     fn register_capabilities(
@@ -1652,13 +1931,48 @@ impl PluginHostHandler {
                             options.include_text.unwrap_or(false),
                         )
                     });
-                self.server_registrations.save.insert(
-                    registration.id,
-                    SaveRegistration {
-                        include_text,
+                self.server_registrations
+                    .save
+                    .retain(|existing| existing.id != registration.id);
+                self.server_registrations.save.push(SaveRegistration {
+                    id: registration.id,
+                    include_text,
+                    filters,
+                });
+            }
+            DidChangeTextDocument::METHOD => {
+                let options = registration
+                    .register_options
+                    .filter(|options| !options.is_null());
+                let filters = options
+                    .as_ref()
+                    .cloned()
+                    .map(serde_json::from_value::<TextDocumentRegistrationOptions>)
+                    .transpose()?
+                    .and_then(|options| options.document_selector)
+                    .map(|selector| {
+                        selector
+                            .iter()
+                            .map(DocumentFilter::from_lsp_filter_loose)
+                            .collect()
+                    });
+                let sync_kind = options
+                    .as_ref()
+                    .and_then(|options| options.get("syncKind"))
+                    .cloned()
+                    .map(serde_json::from_value::<TextDocumentSyncKind>)
+                    .transpose()?;
+                let registration_id = registration.id;
+                self.server_registrations
+                    .change
+                    .retain(|existing| existing.id != registration_id);
+                if let Some(sync_kind) = sync_kind {
+                    self.server_registrations.change.push(ChangeRegistration {
+                        id: registration_id,
+                        sync_kind,
                         filters,
-                    },
-                );
+                    });
+                }
             }
             ExecuteCommand::METHOD => {
                 if let Some(options) = registration.register_options {
@@ -1695,7 +2009,13 @@ impl PluginHostHandler {
                     );
                 }
             } else if unregistration.method == DidSaveTextDocument::METHOD {
-                self.server_registrations.save.remove(&unregistration.id);
+                self.server_registrations
+                    .save
+                    .retain(|registration| registration.id != unregistration.id);
+            } else if unregistration.method == DidChangeTextDocument::METHOD {
+                self.server_registrations
+                    .change
+                    .retain(|registration| registration.id != unregistration.id);
             } else if unregistration.method == ExecuteCommand::METHOD {
                 self.server_registrations
                     .execute_command
@@ -1887,7 +2207,7 @@ impl PluginHostHandler {
 
     pub fn handle_did_change_text_document(
         &mut self,
-        lanaguage_id: String,
+        language_id: String,
         document: VersionedTextDocumentIdentifier,
         delta: AheadDelta,
         text: Rope,
@@ -1899,13 +2219,14 @@ impl PluginHostHandler {
             )>,
         >,
     ) {
-        let kind = match &self.server_capabilities.text_document_sync {
-            Some(TextDocumentSyncCapability::Kind(kind)) => *kind,
-            Some(TextDocumentSyncCapability::Options(options)) => {
-                options.change.unwrap_or(TextDocumentSyncKind::NONE)
-            }
-            None => TextDocumentSyncKind::NONE,
+        let path = document.uri.to_file_path().ok();
+        let Some(kind) = self.check_change_capability(&language_id, path.as_deref())
+        else {
+            return;
         };
+        if kind == TextDocumentSyncKind::NONE {
+            return;
+        }
 
         let mut existing = change.lock();
         let change = match kind {
@@ -1936,8 +2257,6 @@ impl PluginHostHandler {
             _ => return,
         };
 
-        let path = document.uri.to_file_path().ok();
-
         let params = DidChangeTextDocumentParams {
             text_document: document,
             content_changes: vec![change],
@@ -1946,7 +2265,7 @@ impl PluginHostHandler {
         self.server_rpc.server_notification(
             DidChangeTextDocument::METHOD,
             params,
-            Some(lanaguage_id),
+            Some(language_id),
             path,
             false,
         );
@@ -1994,6 +2313,54 @@ fn workspace_configuration_response(
         })
         .collect();
     Value::Array(items)
+}
+
+#[cfg(test)]
+mod on_type_formatting_capability_tests {
+    use super::*;
+
+    #[test]
+    fn on_type_formatting_only_accepts_advertised_triggers() {
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "on-type-formatting-test".into(),
+        };
+        let server_rpc =
+            PluginServerRpcHandler::new(server_id.clone(), None, sender);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "On Type Formatting Test".into(),
+            Vec::new(),
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        host.server_capabilities
+            .document_on_type_formatting_provider =
+            Some(lsp_types::DocumentOnTypeFormattingOptions {
+                first_trigger_character: "}".into(),
+                more_trigger_character: Some(vec![";".into()]),
+            });
+        let request = |trigger: &str| {
+            Params::from(serde_json::json!({
+                "textDocument": { "uri": "file:///workspace/main.rs" },
+                "position": { "line": 0, "character": 1 },
+                "ch": trigger,
+                "options": { "tabSize": 4, "insertSpaces": true }
+            }))
+        };
+
+        assert!(host.method_registered(OnTypeFormatting::METHOD));
+        assert!(host.request_supported(OnTypeFormatting::METHOD, &request("}")));
+        assert!(host.request_supported(OnTypeFormatting::METHOD, &request(";")));
+        assert!(!host.request_supported(OnTypeFormatting::METHOD, &request("x")));
+    }
 }
 
 #[cfg(test)]
@@ -2060,6 +2427,228 @@ mod save_capability_tests {
         })
         .expect("register file save filter");
         assert_eq!(host.check_save_capability("rust", file_path), (true, true));
+
+        host.register_capability(Registration {
+            id: "file-save-no-text".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"language": "rust", "scheme": "file"}],
+                "includeText": false
+            })),
+        })
+        .expect("register later file save filter");
+        assert_eq!(host.check_save_capability("rust", file_path), (true, false));
+
+        host.register_capability(Registration {
+            id: "toml-save".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"language": "toml", "scheme": "file"}],
+                "includeText": true
+            })),
+        })
+        .expect("register a later non-matching save filter");
+        assert_eq!(host.check_save_capability("rust", file_path), (true, false));
+
+        host.unregister_capabilities(vec![Unregistration {
+            id: "file-save-no-text".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(host.check_save_capability("rust", file_path), (true, true));
+
+        host.server_capabilities.text_document_sync =
+            Some(TextDocumentSyncCapability::Options(
+                lsp_types::TextDocumentSyncOptions {
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(
+                        lsp_types::SaveOptions {
+                            include_text: Some(false),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            ));
+        host.unregister_capabilities(vec![
+            Unregistration {
+                id: "file-save".into(),
+                method: DidSaveTextDocument::METHOD.into(),
+            },
+            Unregistration {
+                id: "untitled-save".into(),
+                method: DidSaveTextDocument::METHOD.into(),
+            },
+            Unregistration {
+                id: "toml-save".into(),
+                method: DidSaveTextDocument::METHOD.into(),
+            },
+        ]);
+        assert_eq!(host.check_save_capability("rust", file_path), (true, false));
+    }
+
+    #[test]
+    fn dynamic_did_change_selectors_override_and_unregister_by_id() {
+        let core_rpc = CoreRpcHandler::new();
+        let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
+        let server_id = ServerId {
+            author: "ahead".into(),
+            name: "sync-registration".into(),
+        };
+        let (io_tx, io_rx) = crossbeam_channel::unbounded();
+        let server_rpc = PluginServerRpcHandler::new(server_id.clone(), None, io_tx);
+        let mut host = PluginHostHandler::new(
+            None,
+            None,
+            server_id,
+            "Sync Registration".into(),
+            vec![lsp_types::DocumentFilter {
+                language: Some("rust".into()),
+                scheme: Some("file".into()),
+                pattern: None,
+            }],
+            core_rpc,
+            server_rpc,
+            catalog_rpc,
+            None,
+        );
+        host.server_capabilities.text_document_sync =
+            Some(TextDocumentSyncCapability::Options(
+                lsp_types::TextDocumentSyncOptions {
+                    change: Some(TextDocumentSyncKind::INCREMENTAL),
+                    ..Default::default()
+                },
+            ));
+
+        let rust_path = Path::new("/workspace/src/main.rs");
+        let toml_path = Path::new("/workspace/Cargo.toml");
+        let notify_change = |host: &mut PluginHostHandler| {
+            use ahead_rpc::delta::DeltaOp;
+
+            host.handle_did_change_text_document(
+                "toml".into(),
+                VersionedTextDocumentIdentifier::new(
+                    lsp_types::Url::from_file_path(toml_path).expect("file URI"),
+                    1,
+                ),
+                AheadDelta::new(
+                    1,
+                    vec![DeltaOp::Retain(1), DeltaOp::Insert("b".into())],
+                ),
+                Rope::from("a"),
+                Rope::from("ab"),
+                Arc::new(Mutex::new((None, None))),
+            );
+        };
+        let read_change_range = || {
+            let notification = io_rx
+                .recv()
+                .expect("language server notification")
+                .expect("non-shutdown notification");
+            let notification =
+                serde_json::to_value(notification).expect("serialize notification");
+            assert_eq!(notification["method"], DidChangeTextDocument::METHOD);
+            notification["params"]["contentChanges"][0]["range"].clone()
+        };
+        assert_eq!(
+            host.check_change_capability("rust", Some(rust_path)),
+            Some(TextDocumentSyncKind::INCREMENTAL)
+        );
+        assert_eq!(host.check_change_capability("toml", Some(toml_path)), None);
+
+        host.register_capability(Registration {
+            id: "scoped-sync".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({"syncKind": 1})),
+        })
+        .expect("register sync without a document selector");
+        assert_eq!(
+            host.check_change_capability("rust", Some(rust_path)),
+            Some(TextDocumentSyncKind::FULL)
+        );
+        assert_eq!(host.check_change_capability("toml", Some(toml_path)), None);
+
+        host.register_capability(Registration {
+            id: "scoped-sync".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"pattern": "**/*.toml"}],
+                "syncKind": 1
+            })),
+        })
+        .expect("replace registration with the same ID");
+        assert_eq!(
+            host.check_change_capability("rust", Some(rust_path)),
+            Some(TextDocumentSyncKind::INCREMENTAL)
+        );
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::FULL)
+        );
+        notify_change(&mut host);
+        assert!(read_change_range().is_null(), "full sync has no range");
+
+        host.register_capability(Registration {
+            id: "toml-sync".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"pattern": "**/*.toml"}],
+                "syncKind": 2
+            })),
+        })
+        .expect("register dynamic TOML synchronization");
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::INCREMENTAL)
+        );
+        notify_change(&mut host);
+        assert!(
+            !read_change_range().is_null(),
+            "incremental sync carries an edit range"
+        );
+
+        host.register_capability(Registration {
+            id: "toml-disable".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "documentSelector": [{"pattern": "**/*.toml"}],
+                "syncKind": 0
+            })),
+        })
+        .expect("register later dynamic TOML synchronization");
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::NONE)
+        );
+
+        host.unregister_capabilities(vec![Unregistration {
+            id: "toml-disable".into(),
+            method: DidSaveTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::NONE)
+        );
+        host.unregister_capabilities(vec![Unregistration {
+            id: "toml-disable".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::INCREMENTAL)
+        );
+        notify_change(&mut host);
+        assert!(!read_change_range().is_null());
+        host.unregister_capabilities(vec![Unregistration {
+            id: "toml-sync".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(
+            host.check_change_capability("toml", Some(toml_path)),
+            Some(TextDocumentSyncKind::FULL)
+        );
+        host.unregister_capabilities(vec![Unregistration {
+            id: "scoped-sync".into(),
+            method: DidChangeTextDocument::METHOD.into(),
+        }]);
+        assert_eq!(host.check_change_capability("toml", Some(toml_path)), None);
     }
 
     #[test]
@@ -2379,7 +2968,7 @@ mod save_capability_tests {
     }
 
     #[test]
-    fn dynamic_save_registrations_merge_null_and_unregister_by_id() {
+    fn dynamic_save_registrations_use_latest_match_and_unregister_by_id() {
         let core_rpc = CoreRpcHandler::new();
         let catalog_rpc = PluginCatalogRpcHandler::new(core_rpc.clone());
         let server_id = ServerId {

@@ -358,7 +358,7 @@ impl LiveVoiceCall {
                                 .await;
                             }
                             config => {
-                                run_live(
+                                Box::pin(run_live(
                                     config,
                                     command_receiver,
                                     event_sender,
@@ -368,7 +368,7 @@ impl LiveVoiceCall {
                                     worker_input_muted,
                                     worker_output_interrupted,
                                     worker_output_playing,
-                                )
+                                ))
                                 .await;
                             }
                         }
@@ -2049,7 +2049,9 @@ fn resample_24k_to_16k(pcm16le: &[u8]) -> Result<Vec<u8>, String> {
         );
     }
     let samples = pcm16le
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bytes| i32::from(i16::from_le_bytes([bytes[0], bytes[1]])))
         .collect::<Vec<_>>();
     if samples.len() % 3 != 0 {
@@ -2081,7 +2083,7 @@ fn pcm16le_to_pcm_f32le(pcm16le: &[u8]) -> Result<Vec<u8>, String> {
         );
     }
     let mut output = Vec::with_capacity(pcm16le.len() * 2);
-    for bytes in pcm16le.chunks_exact(2) {
+    for bytes in pcm16le.as_chunks::<2>().0 {
         let sample = f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0;
         output.extend_from_slice(&sample.to_le_bytes());
     }
@@ -2104,7 +2106,9 @@ fn resample_pcm16le(
     }
 
     let samples = pcm16le
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
         .collect::<Vec<_>>();
     let sample_count = u128::try_from(samples.len())

@@ -6,6 +6,7 @@ mod command_palette;
 pub mod debug_bar;
 pub mod explorer_panel;
 pub mod extensions_panel;
+mod go_to_line;
 mod help_panel;
 mod lsp_snippet;
 pub mod proxy_client;

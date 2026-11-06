@@ -57,6 +57,7 @@ use lsp_types::{
     Location, Position, PrepareRenameResponse, SignatureHelp, SignatureHelpContext,
     TextDocumentItem, TextEdit, WorkspaceEdit,
 };
+use ropey::Rope;
 
 pub const CONVERSATION_PAGE_SIZE: usize = 50;
 
@@ -72,28 +73,121 @@ pub(crate) fn next_workspace_file_request_id() -> u64 {
         .wrapping_add(1)
 }
 
-fn editor_text_delta(previous: &str, current: &str) -> Option<AheadDelta> {
-    if previous == current {
+fn common_rope_prefix_len(previous: &Rope, current: &Rope) -> usize {
+    let mut previous_chunks = previous.chunks();
+    let mut current_chunks = current.chunks();
+    let mut previous_chunk = previous_chunks.next();
+    let mut current_chunk = current_chunks.next();
+    let mut prefix_len = 0;
+
+    while let (Some(old), Some(new)) = (previous_chunk, current_chunk) {
+        if old.is_empty() {
+            previous_chunk = previous_chunks.next();
+            continue;
+        }
+        if new.is_empty() {
+            current_chunk = current_chunks.next();
+            continue;
+        }
+
+        let compared_len = old.len().min(new.len());
+        if old.as_bytes()[..compared_len] != new.as_bytes()[..compared_len] {
+            for (old_char, new_char) in previous
+                .chars_at(prefix_len)
+                .zip(current.chars_at(prefix_len))
+            {
+                if old_char != new_char {
+                    break;
+                }
+                prefix_len += old_char.len_utf8();
+            }
+            return prefix_len;
+        }
+
+        // Matching UTF-8 bytes ending at either chunk boundary also end at a
+        // character boundary in the other chunk.
+        prefix_len += compared_len;
+        previous_chunk = if old.len() == compared_len {
+            previous_chunks.next()
+        } else {
+            Some(&old[compared_len..])
+        };
+        current_chunk = if new.len() == compared_len {
+            current_chunks.next()
+        } else {
+            Some(&new[compared_len..])
+        };
+    }
+
+    prefix_len
+}
+
+fn common_rope_suffix_len(
+    previous: &Rope,
+    current: &Rope,
+    prefix_len: usize,
+) -> usize {
+    let limit = (previous.len() - prefix_len).min(current.len() - prefix_len);
+    let mut previous_chunks = previous.chunks_at(previous.len()).0.reversed();
+    let mut current_chunks = current.chunks_at(current.len()).0.reversed();
+    let mut previous_chunk = previous_chunks.next();
+    let mut current_chunk = current_chunks.next();
+    let mut suffix_len = 0;
+
+    while suffix_len < limit {
+        let (Some(old), Some(new)) = (previous_chunk, current_chunk) else {
+            break;
+        };
+        if old.is_empty() {
+            previous_chunk = previous_chunks.next();
+            continue;
+        }
+        if new.is_empty() {
+            current_chunk = current_chunks.next();
+            continue;
+        }
+
+        let compared_len = old.len().min(new.len()).min(limit - suffix_len);
+        let old_start = old.len() - compared_len;
+        let new_start = new.len() - compared_len;
+        if old.as_bytes()[old_start..] != new.as_bytes()[new_start..] {
+            for (old_char, new_char) in previous
+                .chars_at(previous.len() - suffix_len)
+                .reversed()
+                .zip(current.chars_at(current.len() - suffix_len).reversed())
+            {
+                if suffix_len == limit || old_char != new_char {
+                    break;
+                }
+                suffix_len += old_char.len_utf8();
+            }
+            return suffix_len;
+        }
+
+        // A matching suffix ending at a chunk boundary starts on a UTF-8
+        // boundary in both ropes, even when their chunk sizes differ.
+        suffix_len += compared_len;
+        previous_chunk = if old_start == 0 {
+            previous_chunks.next()
+        } else {
+            Some(&old[..old_start])
+        };
+        current_chunk = if new_start == 0 {
+            current_chunks.next()
+        } else {
+            Some(&new[..new_start])
+        };
+    }
+
+    suffix_len
+}
+
+fn editor_text_delta(previous: &Rope, current: &Rope) -> Option<AheadDelta> {
+    let prefix_len = common_rope_prefix_len(previous, current);
+    if prefix_len == previous.len() && prefix_len == current.len() {
         return None;
     }
-
-    let mut prefix_len = 0;
-    for (old, new) in previous.chars().zip(current.chars()) {
-        if old != new {
-            break;
-        }
-        prefix_len += old.len_utf8();
-    }
-
-    let previous_tail = &previous[prefix_len..];
-    let current_tail = &current[prefix_len..];
-    let mut suffix_len = 0;
-    for (old, new) in previous_tail.chars().rev().zip(current_tail.chars().rev()) {
-        if old != new {
-            break;
-        }
-        suffix_len += old.len_utf8();
-    }
+    let suffix_len = common_rope_suffix_len(previous, current, prefix_len);
 
     let previous_middle_end = previous.len() - suffix_len;
     let current_middle_end = current.len() - suffix_len;
@@ -107,7 +201,7 @@ fn editor_text_delta(previous: &str, current: &str) -> Option<AheadDelta> {
     }
     if current_middle_end > prefix_len {
         operations.push(DeltaOp::Insert(
-            current[prefix_len..current_middle_end].to_string(),
+            current.slice(prefix_len..current_middle_end).to_string(),
         ));
     }
     if suffix_len > 0 {
@@ -120,6 +214,12 @@ fn editor_text_delta(previous: &str, current: &str) -> Option<AheadDelta> {
 pub struct LspCompletion {
     pub plugin_id: PluginId,
     pub item: CompletionItem,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LspCompletionBatch {
+    pub items: Vec<LspCompletion>,
+    pub is_incomplete: bool,
 }
 
 pub use ahead_rpc::proxy::LspCodeAction;
@@ -143,6 +243,7 @@ pub struct LspServerStatus {
     pub ready: bool,
     pub quiescent: bool,
     pub message: Option<String>,
+    pub on_type_formatting_triggers: Vec<String>,
 }
 
 impl LspServerStatus {
@@ -180,6 +281,7 @@ pub struct DurableSessionState {
     pub work_items: Vec<WorkItem>,
     pub conversation: Vec<ConversationMessage>,
     pub conversation_has_older: bool,
+    pub usage: Option<AgentUsage>,
     pub harness_warning: Option<String>,
 }
 
@@ -405,6 +507,7 @@ pub(crate) struct InlinePredictionContext {
 
 pub(crate) struct InlinePrediction {
     pub text: String,
+    pub range: Option<lsp_types::Range>,
     pub context: InlinePredictionContext,
 }
 
@@ -467,7 +570,7 @@ pub struct ProxyClient {
     core_response_tx: Sender<(RequestId, CoreResponse)>,
     core_response_rx: Receiver<(RequestId, CoreResponse)>,
     pending_completion: Arc<
-        Mutex<HashMap<usize, async_channel::Sender<Option<Vec<LspCompletion>>>>>,
+        Mutex<HashMap<usize, async_channel::Sender<Option<LspCompletionBatch>>>>,
     >,
     pending_signature_help:
         Arc<Mutex<HashMap<usize, async_channel::Sender<Option<SignatureHelp>>>>>,
@@ -480,11 +583,13 @@ pub struct ProxyClient {
     diag_version: Arc<Mutex<usize>>,
     diagnostic_subscribers: Mutex<Vec<async_channel::Sender<()>>>,
     diff: Arc<Mutex<ProxyDiffState>>,
-    editor_snapshots: Mutex<HashMap<PathBuf, String>>,
+    editor_snapshots: Mutex<HashMap<PathBuf, Rope>>,
     git_generation: AtomicU64,
     extension_syntax_generation: AtomicU64,
     lsp_servers: Arc<Mutex<HashMap<String, LspServerStatus>>>,
     language_extension_issues: Mutex<Vec<LanguageExtensionIssue>>,
+    language_server_schemas:
+        Arc<Mutex<HashMap<String, ahead_rpc::core::LanguageServerSchemas>>>,
     /// Uncommitted attribution anchors per file, refreshed from the ahead host.
     anchors: Arc<Mutex<HashMap<PathBuf, Vec<CodeAnchor>>>>,
     anchor_requests: Mutex<HashMap<PathBuf, usize>>,
@@ -507,6 +612,7 @@ pub struct ProxyClient {
     config_options: Arc<Mutex<HashMap<String, Vec<AgentConfigOption>>>>,
     agent_auth_methods: Arc<Mutex<HashMap<String, Vec<AgentAuthMethod>>>>,
     usage: Arc<Mutex<HashMap<String, AgentUsage>>>,
+    usage_update_subscribers: Mutex<Vec<async_channel::Sender<()>>>,
     pending_user_inputs: Arc<Mutex<HashMap<String, Vec<AgentUserInputRequest>>>>,
     pending_buffer_snapshot_requests: Arc<Mutex<Vec<BufferSnapshotRequest>>>,
     pending_editor_presentation_requests: Arc<Mutex<Vec<EditorPresentationRequest>>>,
@@ -598,6 +704,7 @@ impl ProxyClient {
             extension_syntax_generation: AtomicU64::new(0),
             lsp_servers: Arc::new(Mutex::new(HashMap::new())),
             language_extension_issues: Mutex::new(Vec::new()),
+            language_server_schemas: Arc::new(Mutex::new(HashMap::new())),
             anchors: Arc::new(Mutex::new(HashMap::new())),
             anchor_requests: Mutex::new(HashMap::new()),
             debug: Arc::new(Mutex::new(DebugState::default())),
@@ -617,6 +724,7 @@ impl ProxyClient {
             config_options: Arc::new(Mutex::new(HashMap::new())),
             agent_auth_methods: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
+            usage_update_subscribers: Mutex::new(Vec::new()),
             pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
             pending_buffer_snapshot_requests: Arc::new(Mutex::new(Vec::new())),
             pending_editor_presentation_requests: Arc::new(Mutex::new(Vec::new())),
@@ -947,8 +1055,27 @@ impl ProxyClient {
         servers
     }
 
+    pub fn supports_on_type_formatting(&self, trigger_character: &str) -> bool {
+        self.lsp_servers().iter().any(|server| {
+            server.ready
+                && server
+                    .on_type_formatting_triggers
+                    .iter()
+                    .any(|trigger| trigger == trigger_character)
+        })
+    }
+
     pub fn language_extension_issues(&self) -> Vec<LanguageExtensionIssue> {
         self.language_extension_issues
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn language_server_schemas(
+        &self,
+    ) -> HashMap<String, ahead_rpc::core::LanguageServerSchemas> {
+        self.language_server_schemas
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -1730,14 +1857,19 @@ impl ProxyClient {
                     .remove(&request_id)
                 {
                     let list = resp.map(|response| {
-                        let items = match response {
-                            CompletionResponse::Array(items) => items,
-                            CompletionResponse::List(list) => list.items,
+                        let (items, is_incomplete) = match response {
+                            CompletionResponse::Array(items) => (items, false),
+                            CompletionResponse::List(list) => {
+                                (list.items, list.is_incomplete)
+                            }
                         };
-                        items
-                            .into_iter()
-                            .map(|item| LspCompletion { plugin_id, item })
-                            .collect()
+                        LspCompletionBatch {
+                            items: items
+                                .into_iter()
+                                .map(|item| LspCompletion { plugin_id, item })
+                                .collect(),
+                            is_incomplete,
+                        }
                     });
                     if let Err(error) = tx.try_send(list) {
                         eprintln!("Delivering completion list: {error}");
@@ -1796,6 +1928,8 @@ impl ProxyClient {
                 let ready = params.is_ok();
                 let quiescent = params.is_quiescent();
                 let message = params.message.clone();
+                let on_type_formatting_triggers =
+                    params.on_type_formatting_triggers.clone();
                 let name = params
                     .server_name
                     .unwrap_or_else(|| "language-server".to_string());
@@ -1809,6 +1943,7 @@ impl ProxyClient {
                             ready,
                             quiescent,
                             message,
+                            on_type_formatting_triggers,
                         },
                     );
                 self.notify_editor_metadata();
@@ -1822,8 +1957,19 @@ impl ProxyClient {
                     .fetch_add(1, Ordering::Release);
                 self.notify_editor_metadata();
             }
+            CoreNotification::LanguageServerSchemas { server_id, schemas } => {
+                self.language_server_schemas
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(server_id, schemas);
+                self.notify_editor_metadata();
+            }
             CoreNotification::LanguageServerStatusesCleared => {
                 self.lsp_servers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear();
+                self.language_server_schemas
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .clear();
@@ -2203,6 +2349,7 @@ impl ProxyClient {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(session_id, usage);
+                self.notify_usage_updates();
             }
             AheadNotification::AgentUserInputRequested {
                 session_id,
@@ -2388,6 +2535,25 @@ impl ProxyClient {
             .unwrap_or_else(|e| e.into_inner())
             .get(session_id)
             .cloned()
+    }
+
+    pub(crate) fn subscribe_usage_updates(&self) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.usage_update_subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(sender);
+        receiver
+    }
+
+    fn notify_usage_updates(&self) {
+        self.usage_update_subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|sender| match sender.try_send(()) {
+                Ok(()) | Err(async_channel::TrySendError::Full(())) => true,
+                Err(async_channel::TrySendError::Closed(())) => false,
+            });
     }
 
     pub fn pending_user_input(
@@ -2677,6 +2843,14 @@ impl ProxyClient {
             let conversation =
                 self.conversation_page(&session_id, None, CONVERSATION_PAGE_SIZE)?;
             let runtime_state = self.agent_runtime_state(&session_id);
+            let usage = runtime_state.as_ref().and_then(|state| state.usage.clone());
+            if let Some(usage) = &usage {
+                self.usage
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entry(session_id.clone())
+                    .or_insert_with(|| usage.clone());
+            }
             active = Some(DurableSessionState {
                 view,
                 harness: summary.harness,
@@ -2684,6 +2858,7 @@ impl ProxyClient {
                 work_items: self.work_items(&session_id),
                 conversation: conversation.messages,
                 conversation_has_older: conversation.has_older,
+                usage,
                 harness_warning: self
                     .harness_warning(&session_id, runtime_state.as_ref()),
             });
@@ -3086,6 +3261,13 @@ impl ProxyClient {
             })
             .await?;
         if let Some(runtime) = &runtime {
+            if let Some(usage) = &runtime.usage {
+                self.usage
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entry(session_id.into())
+                    .or_insert_with(|| usage.clone());
+            }
             let streaming = self
                 .streaming_turns
                 .lock()
@@ -3114,13 +3296,6 @@ impl ProxyClient {
                     .unwrap_or_else(|error| error.into_inner())
                     .entry(session_id.into())
                     .or_insert_with(|| runtime.commands.clone());
-                if let Some(usage) = &runtime.usage {
-                    self.usage
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .entry(session_id.into())
-                        .or_insert_with(|| usage.clone());
-                }
             }
         }
         let backend: serde_json::Value = self
@@ -4089,7 +4264,7 @@ impl ProxyClient {
         path: PathBuf,
         position: Position,
         input: String,
-    ) -> (usize, async_channel::Receiver<Option<Vec<LspCompletion>>>) {
+    ) -> (usize, async_channel::Receiver<Option<LspCompletionBatch>>) {
         let (tx, rx) = async_channel::unbounded();
         let id = self.next_id();
         self.pending_completion
@@ -4101,10 +4276,15 @@ impl ProxyClient {
     }
 
     pub(crate) fn cancel_completion_request(&self, request_id: usize) {
-        self.pending_completion
+        let was_pending = self
+            .pending_completion
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(&request_id);
+            .remove(&request_id)
+            .is_some();
+        if was_pending {
+            self.proxy_rpc.cancel_completion(request_id);
+        }
     }
 
     pub fn request_signature_help(
@@ -4134,8 +4314,8 @@ impl ProxyClient {
     pub fn resolve_completion(
         &self,
         completion: LspCompletion,
-    ) -> Receiver<Result<CompletionItem, RpcError>> {
-        let (sender, receiver) = crossbeam_channel::bounded(1);
+    ) -> async_channel::Receiver<Result<CompletionItem, RpcError>> {
+        let (sender, receiver) = async_channel::bounded(1);
         self.proxy_rpc.completion_resolve(
             completion.plugin_id,
             completion.item,
@@ -4147,7 +4327,7 @@ impl ProxyClient {
                         message: "Unexpected completion resolve response".into(),
                     }),
                 });
-                if let Err(error) = sender.send(result) {
+                if let Err(error) = sender.try_send(result) {
                     eprintln!("Delivering resolved completion: {error}");
                 }
             },
@@ -4206,7 +4386,7 @@ impl ProxyClient {
         receiver
     }
 
-    pub fn execute_code_action_command(
+    pub fn execute_lsp_command(
         &self,
         command: lsp_types::Command,
         plugin_id: PluginId,
@@ -4233,18 +4413,23 @@ impl ProxyClient {
     }
 
     pub fn sync_editor_snapshot(&self, path: PathBuf, content: String) {
+        let rope = Rope::from(content.as_str());
         let previous = self
             .editor_snapshots
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(path.clone(), content.clone());
-        if previous.as_ref() != Some(&content) {
+            .insert(path.clone(), rope.clone());
+        if previous.as_ref() != Some(&rope) {
             self.invalidate_prediction_buffer(&path);
         }
         self.proxy_rpc.editor_snapshot(path, content);
     }
 
     pub fn update_editor_text(&self, path: PathBuf, content: String) {
+        self.update_editor_rope(path, Rope::from(content.as_str()));
+    }
+
+    pub fn update_editor_rope(&self, path: PathBuf, content: Rope) {
         let mut snapshots = self
             .editor_snapshots
             .lock()
@@ -4258,7 +4443,7 @@ impl ProxyClient {
         } else {
             self.invalidate_prediction_buffer(&path);
             self.proxy_rpc
-                .editor_snapshot(path.clone(), content.clone());
+                .editor_snapshot(path.clone(), content.to_string());
             snapshots.insert(path, content);
         }
     }
@@ -4498,6 +4683,31 @@ impl ProxyClient {
         receiver
     }
 
+    pub fn request_document_on_type_formatting(
+        self: &Arc<Self>,
+        path: PathBuf,
+        position: Position,
+        trigger_character: String,
+    ) -> Receiver<Result<Vec<TextEdit>, String>> {
+        let (sender, receiver) = unbounded();
+        self.proxy_rpc.get_document_on_type_formatting(
+            path,
+            position,
+            trigger_character,
+            move |result| {
+                let result = match result {
+                    Ok(ProxyResponse::GetDocumentOnTypeFormatting { edits }) => {
+                        Ok(edits)
+                    }
+                    Ok(_) => Err("Unexpected response to on-type formatting".into()),
+                    Err(error) => Err(error.message),
+                };
+                let _ = sender.send(result);
+            },
+        );
+        receiver
+    }
+
     pub fn request_prepare_rename(
         &self,
         path: PathBuf,
@@ -4717,7 +4927,7 @@ impl ProxyClient {
                 if !client.inline_prediction_is_current(&context) {
                     return;
                 }
-                let text = match completions {
+                let (text, range) = match completions {
                     InlineCompletionResponse::Array(items) => {
                         items.into_iter().next()
                     }
@@ -4725,11 +4935,13 @@ impl ProxyClient {
                         list.items.into_iter().next()
                     }
                 }
-                .map(|item| item.insert_text)
+                .map(|item| (item.insert_text, item.range))
                 .unwrap_or_default();
-                if let Err(error) =
-                    sender.try_send(InlinePrediction { text, context })
-                {
+                if let Err(error) = sender.try_send(InlinePrediction {
+                    text,
+                    range,
+                    context,
+                }) {
                     eprintln!("Inline prediction receiver closed: {error}");
                 }
             },
@@ -5155,13 +5367,21 @@ mod tests {
     }
 
     fn inline_reply(text: &str, paths: &[&str]) -> ProxyResponse {
+        inline_reply_with_range(text, None, paths)
+    }
+
+    fn inline_reply_with_range(
+        text: &str,
+        range: Option<lsp_types::Range>,
+        paths: &[&str],
+    ) -> ProxyResponse {
         ProxyResponse::GetInlineCompletions {
             prediction: None,
             completions: lsp_types::InlineCompletionResponse::Array(vec![
                 lsp_types::InlineCompletionItem {
                     insert_text: text.into(),
                     filter_text: None,
-                    range: None,
+                    range,
                     command: None,
                     insert_text_format: None,
                 },
@@ -5212,12 +5432,18 @@ mod tests {
             "/project/docs/other.md".into(),
             "changed unrelated".into(),
         );
+        let range = lsp_types::Range::new(Position::new(0, 0), Position::new(0, 1));
         rpc.handle_response(
             second_id,
-            Ok(inline_reply("second", &["src/helper.rs"])),
+            Ok(inline_reply_with_range(
+                "second",
+                Some(range.clone()),
+                &["src/helper.rs"],
+            )),
         );
         let prediction = second.try_recv().expect("second reply");
         assert_eq!(prediction.text, "second");
+        assert_eq!(prediction.range, Some(range));
         assert!(client.inline_prediction_is_current(&prediction.context));
         client.route_ahead(AheadNotification::PredictionContextChanged {
             session_id: Some("first-session".into()),
@@ -5359,7 +5585,10 @@ mod tests {
     fn editor_text_delta_is_utf8_safe_and_only_carries_changed_text() {
         let previous = "fn main() { let crab = \"🦀\"; let value = 1; }\n";
         let current = "fn main() { let crab = \"🦀\"; let value = 2; }\n";
-        let delta = editor_text_delta(previous, current).expect("one edit");
+        let previous_rope = ropey::Rope::from(previous);
+        let current_rope = ropey::Rope::from(current);
+        let delta =
+            editor_text_delta(&previous_rope, &current_rope).expect("one edit");
         assert_eq!(delta.base_len(), previous.len());
         assert_eq!(
             delta.apply(&ropey::Rope::from(previous)).to_string(),
@@ -5383,11 +5612,12 @@ mod tests {
             .sum::<usize>();
         assert_eq!(deleted_bytes, 1);
         assert_eq!(inserted_bytes, 1);
-        assert!(editor_text_delta(current, current).is_none());
+        assert!(editor_text_delta(&current_rope, &current_rope).is_none());
 
         let appended = "fn main() { let crab = \"🦀✨\"; let value = 2; }\n";
         let unicode_delta =
-            editor_text_delta(current, appended).expect("Unicode insertion");
+            editor_text_delta(&current_rope, &ropey::Rope::from(appended))
+                .expect("Unicode insertion");
         assert_eq!(
             unicode_delta.apply(&ropey::Rope::from(current)).to_string(),
             appended
@@ -5395,6 +5625,56 @@ mod tests {
         assert!(unicode_delta.ops().iter().any(
             |operation| matches!(operation, DeltaOp::Insert(text) if text == "✨")
         ));
+    }
+
+    #[test]
+    fn editor_text_delta_handles_long_multichunk_unicode_prefix() {
+        let prefix = "🦀 café\r\n".repeat(2_000);
+        let previous = format!("{prefix}let value = 1;\n");
+        let current = format!("{prefix}let value = 2;\n");
+        let previous_rope = ropey::Rope::from(previous.as_str());
+        let current_rope = ropey::Rope::from(current.as_str());
+
+        assert_eq!(
+            editor_text_delta(&previous_rope, &current_rope)
+                .expect("one edit")
+                .apply(&previous_rope)
+                .to_string(),
+            current
+        );
+        assert!(editor_text_delta(&previous_rope, &previous_rope).is_none());
+
+        let inserted = format!("✨{previous}");
+        let inserted_rope = ropey::Rope::from(inserted.as_str());
+        assert_eq!(
+            editor_text_delta(&previous_rope, &inserted_rope)
+                .expect("leading Unicode insertion")
+                .apply(&previous_rope)
+                .to_string(),
+            inserted
+        );
+
+        let mut resegmented_rope = previous_rope.clone();
+        resegmented_rope.insert(0, "x");
+        resegmented_rope.remove(0..1);
+        assert!(editor_text_delta(&previous_rope, &resegmented_rope).is_none());
+
+        let old = ropey::Rope::from(format!("é{prefix}"));
+        let new = ropey::Rope::from(format!("©{prefix}"));
+        assert_eq!(
+            editor_text_delta(&old, &new)
+                .expect("changed leading Unicode character")
+                .apply(&old),
+            new
+        );
+        let old = ropey::Rope::from("é");
+        let new = ropey::Rope::from("©");
+        assert_eq!(
+            editor_text_delta(&old, &new)
+                .expect("shared trailing UTF-8 byte is not a character")
+                .apply(&old),
+            new
+        );
     }
 
     #[test]
@@ -5414,7 +5694,7 @@ mod tests {
             })) if snapshot_path == path && content == initial
         ));
 
-        client.update_editor_text(path.clone(), edited.into());
+        client.update_editor_rope(path.clone(), ropey::Rope::from(edited));
         assert!(matches!(
             receiver.try_recv(),
             Ok(ProxyRpc::Notification(ProxyNotification::EditorEdit {
@@ -5633,6 +5913,7 @@ mod tests {
                     rev: 1,
                     path: path.clone(),
                     len: 4,
+                    language_name: Some("HTML".into()),
                     captures: vec![ahead_rpc::style::SyntaxCapture {
                         start: 0,
                         end: 4,
@@ -5648,6 +5929,7 @@ mod tests {
             .expect("extension syntax");
         assert_eq!(syntax.path, path);
         assert_eq!(syntax.len, 4);
+        assert_eq!(syntax.language_name.as_deref(), Some("HTML"));
         assert_eq!(syntax.captures[0].scope, "tag");
     }
 
@@ -6191,6 +6473,7 @@ mod tests {
             .try_recv()
             .expect("completion response")
             .expect("non-null completion response")
+            .items
             .remove(0);
         assert_eq!(completion.plugin_id, plugin_id);
         assert_eq!(completion.item, item);
@@ -6260,8 +6543,41 @@ mod tests {
             empty_receiver
                 .try_recv()
                 .expect("empty response")
-                .is_some_and(|items| items.is_empty())
+                .is_some_and(|batch| batch.items.is_empty() && !batch.is_incomplete)
         );
+    }
+
+    #[test]
+    fn completion_list_preserves_the_server_incomplete_flag() {
+        let client = test_client();
+        let (sender, receiver) = async_channel::bounded(1);
+        client
+            .pending_completion
+            .lock()
+            .expect("completion map")
+            .insert(53, sender);
+        client.route_core(CoreNotification::CompletionResponse {
+            request_id: 53,
+            input: "Calcul".into(),
+            resp: Some(lsp_types::CompletionResponse::List(
+                lsp_types::CompletionList {
+                    is_incomplete: true,
+                    items: vec![lsp_types::CompletionItem {
+                        label: "Calculation".into(),
+                        ..Default::default()
+                    }],
+                },
+            )),
+            plugin_id: ahead_rpc::plugin::PluginId(17),
+        });
+
+        let batch = receiver
+            .try_recv()
+            .expect("completion reply")
+            .expect("completion list");
+        assert!(batch.is_incomplete);
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(batch.items[0].plugin_id, ahead_rpc::plugin::PluginId(17));
     }
 
     #[test]
@@ -6912,7 +7228,8 @@ mod tests {
         installing.message = Some("Installing from npm".into());
         for params in [
             installing,
-            ahead_rpc::core::ServerStatusParams::ready("vtsls".into()),
+            ahead_rpc::core::ServerStatusParams::ready("vtsls".into())
+                .with_on_type_formatting_triggers(vec!["}".into()]),
             ahead_rpc::core::ServerStatusParams::failed(
                 "vtsls".into(),
                 "process exited".into(),
@@ -6925,6 +7242,8 @@ mod tests {
             assert_eq!(client.lsp_servers().len(), 1);
             assert_eq!(client.lsp_servers()[0].is_ready(), ready);
             assert_eq!(client.lsp_servers()[0].is_error(), error);
+            assert_eq!(client.supports_on_type_formatting("}"), ready);
+            assert!(!client.supports_on_type_formatting(";"));
         }
         client.restart_language_servers();
         assert!(matches!(
@@ -6981,6 +7300,37 @@ mod tests {
         });
         assert_eq!(updates.try_recv(), Ok(()));
         assert!(client.language_extension_issues().is_empty());
+    }
+
+    #[test]
+    fn language_server_schemas_are_cached_and_cleared_with_server_statuses() {
+        let client = test_client();
+        let updates = client.subscribe_diagnostics();
+        let schemas = ahead_rpc::core::LanguageServerSchemas {
+            initialization_options: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "enabled": { "type": "boolean" } }
+            })),
+            settings: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "mode": { "enum": ["safe", "strict"] } }
+            })),
+        };
+
+        client.route_core(CoreNotification::LanguageServerSchemas {
+            server_id: "example-lsp".into(),
+            schemas: schemas.clone(),
+        });
+
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert_eq!(
+            client.language_server_schemas().get("example-lsp"),
+            Some(&schemas)
+        );
+
+        client.route_core(CoreNotification::LanguageServerStatusesCleared);
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert!(client.language_server_schemas().is_empty());
     }
 
     #[test]
@@ -7178,6 +7528,12 @@ mod tests {
 
         client.route_ahead(AheadNotification::AgentTurnState {
             session_id: "session".into(),
+            turn_id: "turn-1".into(),
+            message_id: "message-1".into(),
+            state: "completed".into(),
+        });
+        client.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
             turn_id: "turn-2".into(),
             message_id: "message-2".into(),
             state: "streaming".into(),
@@ -7229,6 +7585,7 @@ mod tests {
     #[test]
     fn ignores_stale_turn_events_after_a_new_turn_starts() {
         let client = test_client();
+        let usage_updates = client.subscribe_usage_updates();
         client
             .streaming_turns
             .lock()
@@ -7278,7 +7635,7 @@ mod tests {
             session_id: "session".into(),
             turn_id: "stale".into(),
             usage: AgentUsage {
-                total_tokens: 42,
+                used_tokens: 42,
                 context_window: Some(100),
             },
         });
@@ -7298,7 +7655,38 @@ mod tests {
         assert!(client.plan("session").is_empty());
         assert!(client.tool_calls("session").is_empty());
         assert!(client.usage("session").is_none());
+        assert!(usage_updates.try_recv().is_err());
         assert!(client.pending_user_input("session").is_none());
+    }
+
+    #[test]
+    fn accepted_agent_usage_updates_the_cache_and_notifies_subscribers() {
+        let client = test_client();
+        let usage_updates = client.subscribe_usage_updates();
+        client.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "message".into(),
+            state: "streaming".into(),
+        });
+
+        client.route_ahead(AheadNotification::AgentUsage {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            usage: AgentUsage {
+                used_tokens: 81_000,
+                context_window: Some(1_050_000),
+            },
+        });
+
+        assert_eq!(usage_updates.try_recv(), Ok(()));
+        assert_eq!(
+            client.usage("session"),
+            Some(AgentUsage {
+                used_tokens: 81_000,
+                context_window: Some(1_050_000),
+            })
+        );
     }
 
     #[test]
@@ -7464,10 +7852,11 @@ cwd = "."
 
         let configs = client.stored_configs();
         assert_eq!(configs.len(), 1);
-        assert_eq!(
-            configs[0].cwd.as_deref(),
-            Some(workspace.path().to_string_lossy().as_ref())
-        );
+        let cwd = configs[0]
+            .cwd
+            .as_deref()
+            .expect("resolved working directory");
+        assert_eq!(std::path::Path::new(cwd), workspace.path());
         assert!(client.debug_config_error().is_none());
     }
 }

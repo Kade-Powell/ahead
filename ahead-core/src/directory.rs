@@ -26,13 +26,7 @@ impl Directory {
         if let Some(path) = std::env::var_os("AHEAD_DATA_HOME") {
             return Self::project_dirs_from_data_home(PathBuf::from(path));
         }
-        #[cfg(not(feature = "portable"))]
-        return ProjectDirs::from("io", "ahead", NAME);
-        #[cfg(feature = "portable")]
-        return std::env::current_exe()
-            .ok()?
-            .parent()
-            .and_then(|parent| ProjectDirs::from_path(parent.join("ahead-data")));
+        ProjectDirs::from("io", "ahead", NAME)
     }
 
     fn project_dirs_from_data_home(path: PathBuf) -> Option<ProjectDirs> {

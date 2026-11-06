@@ -6,7 +6,9 @@ Use **Cmd** on macOS for shortcuts shown with Cmd; use **Ctrl** on other platfor
 | --- | --- | --- |
 | Command Palette | Cmd+Shift+P or F1 | Ctrl+Shift+P or F1 |
 | Quick Open | Cmd+P | Ctrl+P |
+| Go to Line | Ctrl+G | Ctrl+G |
 | Save file | Cmd+S | Ctrl+S |
+| Close focused editor or terminal tab | Cmd+W | Ctrl+W in editor; Ctrl+F4 in terminal |
 | Search workspace | Cmd+Shift+F | Ctrl+Shift+F |
 | Explorer | Cmd+Shift+E | Ctrl+Shift+E |
 | Source Control | Ctrl+Shift+G | Ctrl+Shift+G |
@@ -29,5 +31,7 @@ Use **Cmd** on macOS for shortcuts shown with Cmd; use **Ctrl** on other platfor
 | Preview or edit Markdown | Cmd+Shift+V | Ctrl+Shift+V |
 
 The Command Palette also lists discovered `just` recipes as **Run just _recipe_** actions. **Commit Staged Changes** appears when Source Control is connected, at least one change is staged, and a commit message is ready.
+
+Other searchable actions include **Open File**, **Open Folder**, **Close Editor**, **Close Other Editors**, **Close Editors to the Left**, **Close Editors to the Right**, **Close All Editors**, **Move Editor to Other Group**, **Go Back**, **Go Forward**, **Rename Symbol**, **Format Document**, **Show Signature Help**, **Show Code Actions**, **Stage All Changes**, **Extensions**, **AHEAD Guide**, **New Terminal**, **Tasks**, **Language Servers**, **New AHEAD Session**, **Start External Agent**, **Toggle Threads**, and **Zoom Agent Chat**. Debugging actions are available while the debugger is connected; LSP actions appear when the active language server supports them.
 
 Some keys are handled by the focused editor or terminal. If a shortcut does not act on the intended view, click that view and try again. A command that depends on a language server or debugger adapter also needs that service running.

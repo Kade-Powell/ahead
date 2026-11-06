@@ -1,4 +1,4 @@
-# AHEAD runtime config loader
+# Embedded AHEAD runtime config loader
 
 This module loads the runtime's configuration layers and administrator
 requirements, then produces:
@@ -9,16 +9,14 @@ requirements, then produces:
 
 ## Public surface
 
-Exported from `codex_config::loader`:
+Exported from the retained runtime's `codex_config::loader` module:
 
-- `load_config_layers_state(fs, codex_home, cwd_opt, cli_overrides, options) -> ConfigLayerStack`
+- `load_config_layers_state(fs, runtime_home, cwd, cli_overrides, overrides) -> ConfigLayerStack`
 - `ConfigLayerStack`
   - `effective_config() -> toml::Value`
   - `origins() -> HashMap<String, ConfigLayerMetadata>`
   - `layers_high_to_low() -> impl Iterator<Item = &ConfigLayerEntry>`
-  - `with_user_config(config_path, user_config) -> ConfigLayerStack`
 - `ConfigLayerEntry` (one layer’s `{name, config, version, disabled_reason}`; `name` carries source metadata)
-- `ConfigLoadOptions` (user-facing load behavior such as strict config validation)
 - `LoaderOverrides` (host paths and test overrides)
 - `merge_toml_values(base, overlay)` (public helper used elsewhere)
 
@@ -32,21 +30,23 @@ Precedence is **top overrides bottom**:
 
 `ConfigLayerStack` stores layers in the opposite order internally: lowest
 precedence first, highest precedence last, so later layers override earlier
-layers when folded. Administrator requirements are separate from ordinary
-configuration: Unix reads `/etc/ahead/requirements.toml`, Windows reads
-`%ProgramData%\AHEAD\requirements.toml`, and macOS reads the
-`com.ahead.editor` managed-preferences key `requirements_toml_base64`.
+layers when folded. The retained API still names its runtime-root argument
+`codex_home`; AHEAD passes its isolated runtime home there. The name is
+inherited from the runtime source and does not identify a separate Codex
+installation or account.
 
-The executor does not expose a config-read RPC or reopen host configuration;
-AHEAD supplies the runtime inputs it needs directly. There is no system or
-project config-file layer. The AHEAD native agent receives provider settings
-from the host in memory and does not load user config files. Workspace settings
-live under `.ahead`; repository instructions and skills use the standard
-`AGENTS.md` and `.agents/skills/` paths.
+The managed AHEAD client builds this stack from embedded defaults and
+host-derived runtime overrides. It sets `ignore_user_config` and
+`ignore_managed_requirements`, so it does not read a runtime `config.toml`,
+project config file, system requirements file, or macOS managed-preferences
+requirements. Provider settings arrive from AHEAD in memory. Workspace
+settings live under `.ahead`; repository instructions and skills use the
+standard `AGENTS.md` and `.agents/skills/` paths. Host policy is enforced at
+the AHEAD boundary rather than delegated to this retained loader.
 
 The obsolete `managed_config.toml` file and MDM config-layer formats are not
-supported. System and MDM administrator requirements remain separate from
-ordinary configuration layers.
+supported. Generic administrator-requirement loading remains in this library,
+but the managed AHEAD runtime explicitly opts out of those inputs.
 The copied thread-config injection path, gRPC transport and generated protocol
 have been removed; AHEAD has no remote config-service boundary.
 
@@ -66,10 +66,11 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use toml::Value as TomlValue;
 
 let cli_overrides: Vec<(String, TomlValue)> = Vec::new();
+let runtime_home = AbsolutePathBuf::current_dir()?;
 let cwd = AbsolutePathBuf::current_dir()?;
 let layers = load_config_layers_state(
     LOCAL_FS.as_ref(),
-    &codex_home,
+    runtime_home.as_path(),
     Some(cwd),
     &cli_overrides,
     LoaderOverrides::default(),

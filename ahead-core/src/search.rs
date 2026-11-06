@@ -153,7 +153,7 @@ impl<'a, R: Read> Utf8ValidatingReader<'a, R> {
             }
             self.prefix.extend_from_slice(&buffer[..bytes_read]);
         }
-        match classify_search_bytes(&self.prefix) {
+        match classify_search_bytes(self.prefix) {
             SearchByteClass::Utf8 => self.initialized = true,
             SearchByteClass::Encoded => {
                 return Err(io::Error::new(
@@ -439,6 +439,11 @@ struct SearchWorkspace<'a> {
     directory: File,
 }
 
+#[cfg(unix)]
+type SearchDirectoryCache = HashMap<PathBuf, File>;
+#[cfg(not(unix))]
+type SearchDirectoryCache = ();
+
 impl<'a> SearchWorkspace<'a> {
     fn open(requested: &'a Path) -> io::Result<Self> {
         let canonical = requested.canonicalize()?;
@@ -477,16 +482,45 @@ impl<'a> SearchWorkspace<'a> {
 
     fn open_file(&self, path: &Path) -> io::Result<File> {
         let relative = self.relative_path(path)?;
-        self.open_relative_file(relative)
+        let mut directory_cache = SearchDirectoryCache::default();
+        self.open_relative_file(relative, &mut directory_cache)
     }
 
-    fn open_relative_file(&self, relative: &Path) -> io::Result<File> {
+    fn open_relative_file(
+        &self,
+        relative: &Path,
+        directory_cache: &mut SearchDirectoryCache,
+    ) -> io::Result<File> {
         #[cfg(unix)]
         {
-            crate::secure_fs::open_relative_regular_file(&self.directory, relative)
+            let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+            let Some(file_name) = relative.file_name() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected a workspace-relative file path",
+                ));
+            };
+            if parent.as_os_str().is_empty() {
+                return crate::secure_fs::open_relative_regular_file(
+                    &self.directory,
+                    relative,
+                );
+            }
+            if !directory_cache.contains_key(parent) {
+                let directory = crate::secure_fs::open_relative_directory_path(
+                    &self.directory,
+                    parent,
+                )?;
+                directory_cache.insert(parent.to_path_buf(), directory);
+            }
+            let directory = directory_cache.get(parent).ok_or_else(|| {
+                io::Error::other("cached search directory disappeared")
+            })?;
+            crate::secure_fs::open_regular_file_in_directory(directory, file_name)
         }
         #[cfg(not(unix))]
         {
+            let _ = directory_cache;
             let canonical_file = self.canonical.join(relative).canonicalize()?;
             if !canonical_file.starts_with(&self.canonical) {
                 return Err(io::Error::new(
@@ -633,11 +667,16 @@ where
     })
 }
 
+struct SearchPathSource<'a, 'b> {
+    path: &'a Path,
+    relative_path: Option<&'a Path>,
+    workspace: Option<&'a SearchWorkspace<'b>>,
+    directory_cache: &'a mut SearchDirectoryCache,
+    overrides: &'a HashMap<PathBuf, String>,
+}
+
 fn search_one_path<M>(
-    path: &Path,
-    relative_path: Option<&Path>,
-    workspace: Option<&SearchWorkspace<'_>>,
-    overrides: &HashMap<PathBuf, String>,
+    source: SearchPathSource<'_, '_>,
     matcher: &M,
     searcher: &mut Searcher,
     prefix_scratch: &mut Vec<u8>,
@@ -647,6 +686,13 @@ fn search_one_path<M>(
 where
     M: Matcher<Error = NoError>,
 {
+    let SearchPathSource {
+        path,
+        relative_path,
+        workspace,
+        directory_cache,
+        overrides,
+    } = source;
     if !overrides.contains_key(path) && workspace.is_none() {
         return Ok(Vec::new());
     }
@@ -678,7 +724,9 @@ where
         let Some(relative_path) = relative_path else {
             return Ok(Vec::new());
         };
-        let mut file = match workspace.open_relative_file(relative_path) {
+        let mut file = match workspace
+            .open_relative_file(relative_path, directory_cache)
+        {
             Ok(file) => file,
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
@@ -751,10 +799,7 @@ where
 /// Look-around can span lines, so regex searches decode each file before
 /// matching; literal searches keep the streaming grep path.
 fn search_regex_one_path<F>(
-    path: &Path,
-    relative_path: Option<&Path>,
-    workspace: Option<&SearchWorkspace<'_>>,
-    overrides: &HashMap<PathBuf, String>,
+    source: SearchPathSource<'_, '_>,
     matcher: &FancyRegex,
     options: &FileSearchOptions,
     should_continue: &F,
@@ -762,6 +807,13 @@ fn search_regex_one_path<F>(
 where
     F: Fn() -> bool,
 {
+    let SearchPathSource {
+        path,
+        relative_path,
+        workspace,
+        directory_cache,
+        overrides,
+    } = source;
     if !should_continue() {
         return Err(FileSearchError::Cancelled);
     }
@@ -777,7 +829,9 @@ where
         let Some(relative_path) = relative_path else {
             return Ok(Vec::new());
         };
-        let mut file = match workspace.open_relative_file(relative_path) {
+        let mut file = match workspace
+            .open_relative_file(relative_path, directory_cache)
+        {
             Ok(file) => file,
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "skipping unreadable search path");
@@ -2061,7 +2115,8 @@ where
                 .case_insensitive(!options.case_sensitive)
                 .multi_line(true)
                 .crlf(true)
-                .word(options.whole_word);
+                .word(options.whole_word)
+                .fixed_strings(true);
             // Only single-line literals can use grep-regex's candidate-line prefilter.
             if options.pattern.contains('\r') || options.pattern.contains('\n') {
                 matcher_builder.line_terminator(None);
@@ -2144,6 +2199,7 @@ where
                 let keep_running = keep_running.clone();
                 // Batch misses to avoid task/channel overhead, but flush hits promptly.
                 scope.spawn(move |_| {
+                    let mut directory_cache = SearchDirectoryCache::default();
                     let mut results = Vec::with_capacity(batch.len());
                     let batch_len = batch.len();
                     let mut batch_complete = false;
@@ -2161,6 +2217,13 @@ where
                             }
                             continuing
                         };
+                        let source = SearchPathSource {
+                            path: &path,
+                            relative_path: relative_path.as_deref(),
+                            workspace,
+                            directory_cache: &mut directory_cache,
+                            overrides,
+                        };
                         let result = match matcher {
                             SearchMatcher::Literal(matcher) => {
                                 SEARCH_STATE.with(|state| {
@@ -2170,10 +2233,7 @@ where
                                         utf8_prefix,
                                     } = &mut *state;
                                     search_one_path(
-                                        &path,
-                                        relative_path.as_deref(),
-                                        workspace,
-                                        overrides,
+                                        source,
                                         matcher,
                                         searcher,
                                         utf8_prefix,
@@ -2183,10 +2243,7 @@ where
                                 })
                             }
                             SearchMatcher::Regex(matcher) => search_regex_one_path(
-                                &path,
-                                relative_path.as_deref(),
-                                workspace,
-                                overrides,
+                                source,
                                 matcher,
                                 options,
                                 &worker_should_continue,
@@ -2214,13 +2271,11 @@ where
                             }
                         }
                     }
-                    if !batch_complete {
-                        if let Err(error) = sender.send((results, true)) {
-                            tracing::debug!(
-                                result_count = error.0.0.len(),
-                                "search result receiver closed before worker batch completed"
-                            );
-                        }
+                    if !batch_complete && let Err(error) = sender.send((results, true)) {
+                        tracing::debug!(
+                            result_count = error.0.0.len(),
+                            "search result receiver closed before worker batch completed"
+                        );
                     }
                 });
                 in_flight += 1;
@@ -2487,6 +2542,36 @@ mod tests {
         assert!(results[0].0.ends_with("src/lib.rs"));
         assert_eq!(results[0].1[0].line, 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn literal_search_treats_regex_metacharacters_as_text_case_insensitively() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file_path = workspace.path().join("main.js");
+        fs::write(
+            &file_path,
+            "console.log(42)\nConsole.Log(21)\nconsoleXlog(3)\n",
+        )
+        .expect("write source");
+        let options = FileSearchOptions {
+            pattern: "console.log(".into(),
+            case_sensitive: false,
+            whole_word: false,
+            is_regex: false,
+            max_results: 10,
+        };
+
+        let results = search_paths(
+            SearchScope::Workspace(workspace.path()),
+            workspace_files(workspace.path()),
+            &options,
+            || true,
+        )
+        .expect("literal punctuation must not be parsed as a regex");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.len(), 2);
+        assert!(results[0].0.ends_with("main.js"));
     }
 
     #[test]

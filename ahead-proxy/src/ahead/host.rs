@@ -43,6 +43,11 @@ use super::{
 use ahead_agent::{HarnessController, path_is_allowed};
 use ahead_core::search::WorkspaceFileIndex;
 
+const MAX_PREDICTION_DISCUSSION_MESSAGES: usize = 6;
+const MAX_PREDICTION_DISCUSSION_MESSAGE_BYTES: usize = 2 * 1024;
+const MAX_PREDICTION_DISCUSSION_BYTES: usize = 8 * 1024;
+const PREDICTION_DISCUSSION_TRUNCATION_MARKER: &str = " … [truncated]";
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TeamManifest {
@@ -75,6 +80,94 @@ pub struct AheadSessionHost {
         Mutex<VecDeque<(Id, PredictionSessionVersion, bool, String)>>,
     /// Streams conversations through the built-in runtime or an external ACP agent.
     harness: HarnessController,
+}
+
+fn recent_prediction_discussion(
+    store: &SessionStore,
+    session_id: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    const HEADER: &str = "Recent session discussion:\n";
+    if max_bytes <= HEADER.len() {
+        return Ok(String::new());
+    }
+
+    let messages = store
+        .list_messages_page(session_id, None, 24)?
+        .messages
+        .into_iter()
+        .filter(|message| {
+            message.status == "complete"
+                && matches!(message.role.as_str(), "human" | "agent")
+                && !message.content.trim().is_empty()
+        })
+        .rev()
+        .take(MAX_PREDICTION_DISCUSSION_MESSAGES)
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return Ok(String::new());
+    }
+
+    let budget = max_bytes.min(MAX_PREDICTION_DISCUSSION_BYTES);
+    let mut remaining = budget.saturating_sub(HEADER.len());
+    let mut lines = Vec::new();
+    for message in messages {
+        let label = if message.role == "human" {
+            "Human"
+        } else {
+            "Agent"
+        };
+        let prefix = format!("- {label}: ");
+        let body_budget = remaining.saturating_sub(prefix.len() + 1);
+        if body_budget == 0 {
+            break;
+        }
+
+        let body = message
+            .content
+            .trim()
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "\n  ");
+        let body_limit = body_budget.min(MAX_PREDICTION_DISCUSSION_MESSAGE_BYTES);
+        let truncated = body.len() > body_limit;
+        let marker = if truncated
+            && body_limit > PREDICTION_DISCUSSION_TRUNCATION_MARKER.len()
+        {
+            PREDICTION_DISCUSSION_TRUNCATION_MARKER
+        } else {
+            ""
+        };
+        let excerpt = utf8_prefix(&body, body_limit.saturating_sub(marker.len()));
+        if excerpt.is_empty() {
+            continue;
+        }
+        let line = format!("{prefix}{excerpt}{marker}\n");
+        remaining = remaining.saturating_sub(line.len());
+        lines.push(line);
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    lines.reverse();
+    let mut discussion = String::with_capacity(budget.saturating_sub(remaining));
+    discussion.push_str(HEADER);
+    for line in lines {
+        discussion.push_str(&line);
+    }
+    Ok(discussion)
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 impl AheadSessionHost {
@@ -2664,6 +2757,7 @@ impl AheadSessionHost {
                     caret: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
                     selection: None,
                     file_content: String::new(),
+                    selected_excerpt: None,
                     visible_end: None,
                     attached_anchor_ids: Vec::new(),
                     attached_files: Vec::new(),
@@ -2851,6 +2945,14 @@ impl AheadSessionHost {
                         context.len() <= max_bytes,
                         "Prediction durable work exceeds its context budget; no required context was dropped"
                     );
+                    if let Some(artifact_id) = event.artifact_id {
+                        let reference =
+                            format!("    Related artifact ID: {artifact_id}\n");
+                        if context.len().saturating_add(reference.len()) <= max_bytes
+                        {
+                            context.push_str(&reference);
+                        }
+                    }
                 }
                 anyhow::ensure!(
                     context.len() <= max_bytes,
@@ -2929,6 +3031,14 @@ impl AheadSessionHost {
                 }
             }
         }
+        let discussion_budget = max_bytes
+            .saturating_sub(context.len())
+            .min(MAX_PREDICTION_DISCUSSION_BYTES);
+        context.push_str(&recent_prediction_discussion(
+            store,
+            session_id,
+            discussion_budget,
+        )?);
         let summaries = if include_summaries {
             store.prediction_summaries(
                 session_id,
@@ -2979,6 +3089,12 @@ impl AheadSessionHost {
             context.push_str(&format!(
                 "Issue: {}/{}#{} — {}\n",
                 issue.owner, issue.repo, issue.issue_number, issue.title
+            ));
+        }
+        if !view.workflow.current_artifact_ids.is_empty() {
+            context.push_str(&format!(
+                "Current artifact IDs: {}\n",
+                view.workflow.current_artifact_ids.join(", ")
             ));
         }
         context.push_str(&format!(
@@ -4989,6 +5105,119 @@ mod tests {
     }
 
     #[test]
+    fn prepared_fim_context_includes_instructions_discussion_and_artifact_refs()
+    -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        std::fs::create_dir_all(workspace.path().join(".ahead"))?;
+        std::fs::create_dir_all(workspace.path().join("src"))?;
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "Root instruction: preserve retry semantics.\n",
+        )?;
+        std::fs::write(
+            workspace.path().join("src/AGENTS.md"),
+            "Source instruction: keep the public signature.\n",
+        )?;
+        std::fs::write(
+            workspace.path().join(".ahead/settings.toml"),
+            "[ai]\nactive_connection = 'FIM test'\n\n[[ai.connections]]\nname = 'FIM test'\nprovider_id = 'fim-test'\nbase_url = 'http://127.0.0.1:1234/v1'\nmodel = 'qwen2.5-coder'\n",
+        )?;
+
+        let host = AheadSessionHost::in_memory()?;
+        host.set_workspace(workspace.path().to_path_buf());
+        let view = host.start_work(
+            Some(WorkKind::ProductChange),
+            "Retry implementation".into(),
+            "Keep the committed-response boundary unchanged".into(),
+            None,
+        )?;
+        let item = host.store.read().create_work_item(
+            &view.session.id,
+            "Preserve retry contract",
+            "human",
+        )?;
+        host.store.read().insert_work_item_event_row(
+            &ahead_rpc::ahead::WorkItemEvent {
+                id: Uuid::new_v4().to_string(),
+                item_id: item.id,
+                session_id: view.session.id.clone(),
+                kind: "decision".into(),
+                body_markdown: "Do not retry after a committed response.".into(),
+                actor_id: "human".into(),
+                anchor_id: None,
+                artifact_id: Some("artifact-retry-contract".into()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )?;
+
+        {
+            let store = host.store.read();
+            for (role, content) in [
+                ("human", "Keep the idempotency key on retries."),
+                ("human_to:reviewer", "PRIVATE_REVIEW_SENTINEL"),
+                ("agent", "I will preserve the commit boundary."),
+                ("agent", "Incomplete streaming text must stay out."),
+            ] {
+                let sequence = store.next_message_sequence(&view.session.id)?;
+                store.upsert_message(&ConversationMessage {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: view.session.id.clone(),
+                    turn_id: Uuid::new_v4().to_string(),
+                    sequence,
+                    role: role.into(),
+                    actor_id: "human".into(),
+                    content: content.into(),
+                    status: if content.starts_with("Incomplete") {
+                        "streaming".into()
+                    } else {
+                        "complete".into()
+                    },
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    voice_timing: None,
+                })?;
+            }
+            store.save_conversation_summary(
+                &view.session.id,
+                "implementation",
+                "PRIVATE_SUMMARY_SENTINEL",
+                "recent messages",
+            )?;
+        }
+
+        let snapshot = host.prepare_prediction(
+            PredictionRequest {
+                request_id: "fim-session-context".into(),
+                session_id: Some(view.session.id.clone()),
+                path: "src/main.rs".into(),
+                cursor: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
+                prefix: "pub fn retry".into(),
+                suffix: " {\n}".into(),
+                work_context: "Editor context: preserve the selected call site."
+                    .into(),
+            },
+            &[],
+        )?;
+        let context = &snapshot.request.work_context;
+        assert!(context.contains("Retry implementation"));
+        assert!(context.contains("Keep the committed-response boundary unchanged"));
+        assert!(context.contains("Preserve retry contract"));
+        assert!(context.contains("Do not retry after a committed response."));
+        assert!(context.contains("artifact-retry-contract"));
+        assert!(context.contains("Keep the idempotency key on retries."));
+        assert!(context.contains("I will preserve the commit boundary."));
+        assert!(context.contains("Root instruction: preserve retry semantics."));
+        assert!(context.contains("Source instruction: keep the public signature."));
+        assert!(
+            context.contains("Editor context: preserve the selected call site.")
+        );
+        assert!(!context.contains("PRIVATE_REVIEW_SENTINEL"));
+        assert!(!context.contains("PRIVATE_SUMMARY_SENTINEL"));
+        assert!(!context.contains("Incomplete streaming text"));
+        assert!(snapshot.session_context_version.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn oversized_prediction_plan_keeps_goal_constraints_active_step_and_progress()
     -> Result<()> {
         let host = AheadSessionHost::in_memory()?;
@@ -5331,7 +5560,28 @@ mod tests {
 
     #[test]
     fn prediction_session_cache_reuses_large_durable_work() -> Result<()> {
-        let host = AheadSessionHost::in_memory()?;
+        let temporary = tempfile::tempdir()?;
+        let ahead_directory = temporary.path().join(".ahead");
+        std::fs::create_dir_all(&ahead_directory)?;
+        std::fs::create_dir_all(temporary.path().join("src"))?;
+        let database_path = ahead_directory.join("session.db");
+        std::fs::write(
+            ahead_directory.join("settings.toml"),
+            r#"
+                [ai]
+                active_connection = "FIM timing"
+
+                [[ai.connections]]
+                name = "FIM timing"
+                provider_id = "fim-timing"
+                provider = "openai-compatible"
+                base_url = "http://127.0.0.1:9/v1"
+                model = "fim-timing-model"
+            "#,
+        )?;
+        std::fs::write(temporary.path().join("src/main.rs"), "fn main() {}\n")?;
+        let host = AheadSessionHost::new(SessionStore::open(&database_path)?);
+        host.set_workspace(temporary.path().to_path_buf());
         let session = host.start_work(
             Some(WorkKind::ProductChange),
             "Context timing".into(),
@@ -5352,27 +5602,75 @@ mod tests {
                 "human",
             )?;
         }
+        let session_id = session.session.id;
+        drop(host);
+        let host = AheadSessionHost::new(SessionStore::open(&database_path)?);
         let started = std::time::Instant::now();
-        let (version, expected) =
-            host.cached_prediction_context(&session.session.id)?;
+        let (version, expected) = host.cached_prediction_context(&session_id)?;
         let cold = started.elapsed();
         let mut warm = Vec::new();
         for _ in 0..100 {
             let started = std::time::Instant::now();
-            let (current, context) =
-                host.cached_prediction_context(&session.session.id)?;
+            let (current, context) = host.cached_prediction_context(&session_id)?;
             warm.push(started.elapsed());
             assert!(current == version);
             assert_eq!(context, expected);
         }
         warm.sort();
         eprintln!(
-            "100-work-item FIM context ({} bytes): cold {cold:?}, warm median {:?}, p95 {:?}",
+            "100-work-item file-backed Turso FIM context after host reopen ({} bytes): cold {cold:?}, warm median {:?}, p95 {:?}",
             expected.len(),
             warm[50],
             warm[94]
         );
         assert_eq!(host.prediction_contexts.lock().len(), 1);
+
+        drop(host);
+        let host = AheadSessionHost::new(SessionStore::open(&database_path)?);
+        host.set_workspace(temporary.path().to_path_buf());
+        let request = PredictionRequest {
+            request_id: "fim-timing".into(),
+            session_id: Some(session_id),
+            path: "src/main.rs".into(),
+            cursor: ahead_rpc::ahead::DisplayPosition { line: 0, col: 11 },
+            prefix: "p".repeat(8 * 1024),
+            suffix: "s".repeat(4 * 1024),
+            work_context: String::new(),
+        };
+        let model_context = PredictionModelContext {
+            provider_id: "fim-timing".into(),
+            model_id: "fim-timing-model".into(),
+            context_window: Some(65_536),
+        };
+        let open_buffers = (0..4)
+            .map(|index| OpenBufferContext {
+                path: format!("src/related-{index}.rs"),
+                relevant_excerpt: "c".repeat(4 * 1024),
+            })
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let cold_snapshot = host.prepare_prediction_with_model_context(
+            request.clone(),
+            &open_buffers,
+            Some(&model_context),
+        )?;
+        let cold_prepare = started.elapsed();
+        let mut warm_prepare = Vec::new();
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            let current = host.prepare_prediction_with_model_context(
+                request.clone(),
+                &open_buffers,
+                Some(&model_context),
+            )?;
+            warm_prepare.push(started.elapsed());
+            assert!(current == cold_snapshot);
+        }
+        warm_prepare.sort();
+        eprintln!(
+            "full FIM context prep (100 work items, 12 KiB active-file excerpt, four 4 KiB related excerpts): cold after host reopen {cold_prepare:?}, warm median {:?}, p95 {:?}",
+            warm_prepare[50], warm_prepare[94]
+        );
         Ok(())
     }
 
@@ -5397,6 +5695,7 @@ mod tests {
                 caret: ahead_rpc::ahead::DisplayPosition { line: 10, col: 0 },
                 selection: None,
                 file_content: "pub fn retry() {}".to_string(),
+                selected_excerpt: None,
                 visible_end: None,
                 attached_anchor_ids: Vec::new(),
                 attached_files: Vec::new(),
@@ -5655,7 +5954,7 @@ mod tests {
                 kind: "search".to_string(),
             }],
             usage: Some(AgentUsage {
-                total_tokens: 128,
+                used_tokens: 128,
                 context_window: Some(4096),
             }),
             commands: vec![AgentCommand {

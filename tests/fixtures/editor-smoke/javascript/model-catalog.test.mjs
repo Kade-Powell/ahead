@@ -38,7 +38,7 @@ async function startCatalog(mode) {
 }
 
 async function fetchCatalog(port) {
-  const response = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  const response = await fetch(`http://127.0.0.1:${port}/v1/models?client_version=0.0.0`);
   assert.equal(response.status, 200);
   return response.json();
 }
@@ -90,6 +90,8 @@ test("provider catalogs keep reasoning metadata scoped to their endpoint", async
 
   for (const mode of ["catalog-a", "catalog-b"]) {
     const trace = await readFile(servers.get(mode).traceFile, "utf8");
-    assert.equal(JSON.parse(trace.trim()).type, "model_catalog_request");
+    const request = JSON.parse(trace.trim());
+    assert.equal(request.type, "model_catalog_request");
+    assert.equal(request.url, "/v1/models?client_version=0.0.0");
   }
 });

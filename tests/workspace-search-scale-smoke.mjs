@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -95,7 +95,7 @@ try {
     for (let fileIndex = 0; fileIndex < filesPerDirectory; fileIndex++) {
       const globalIndex = directoryIndex * filesPerDirectory + fileIndex;
       const content = globalIndex === 0
-        ? "ordinary text AHEAD_SEARCH_HOT\nAHEAD_SEARCH_MULTILINE\nNEXT_LINE\n"
+        ? "ordinary text AHEAD_SEARCH_HOT\nAHEAD_SEARCH_MULTILINE\nNEXT_LINE\nconsole.log(42)\nconsoleXlog(3)\n"
         : "ordinary text AHEAD_SEARCH_HOT\n";
       writes.push(writeFile(
         path.join(directory, `file-${globalIndex.toString().padStart(5, "0")}.txt`),
@@ -170,6 +170,8 @@ try {
   const indexBuildMs = performance.now() - indexStarted;
   assert.equal(indexResult.method, "workspace_files_response");
   assert.equal(indexResult.params.files.length, fileCount);
+  assert.equal(await search("console.log("), 1,
+    "Text-mode search must treat regex punctuation literally");
 
   const noHitSamples = { ahead: [], ripgrep: [] };
   const measureAheadNoHit = async () => {
@@ -195,8 +197,10 @@ try {
     }
   }
 
-  const resultLimitStarted = performance.now();
+  const multilineStarted = performance.now();
   assert.equal(await search("AHEAD_SEARCH_MULTILINE\nNEXT_LINE"), 1);
+  const multilineMs = performance.now() - multilineStarted;
+  const resultLimitStarted = performance.now();
   assert.equal(await search("AHEAD_SEARCH_HOT"), 5_000);
   const resultLimitMs = performance.now() - resultLimitStarted;
   const ripgrepAllMatches = compareRipgrep
@@ -217,6 +221,20 @@ try {
   await symlink(outsideSearchFile, indexedFile);
   assert.equal(await search("AHEAD_SEARCH_OUTSIDE_SECRET"), 0,
     "workspace search must not follow an indexed file replaced with an outside symlink");
+  if (!flatDirectories) {
+    const indexedDirectory = path.dirname(indexedFile);
+    const displacedDirectory = `${indexedDirectory}-original`;
+    const outsideDirectory = path.join(profile, "outside-search-directory");
+    await mkdir(outsideDirectory);
+    await writeFile(
+      path.join(outsideDirectory, path.basename(indexedFile)),
+      "AHEAD_SEARCH_OUTSIDE_DIRECTORY\n",
+    );
+    await rename(indexedDirectory, displacedDirectory);
+    await symlink(outsideDirectory, indexedDirectory, "dir");
+    assert.equal(await search("AHEAD_SEARCH_OUTSIDE_DIRECTORY"), 0,
+      "workspace search must not follow an indexed directory replaced with an outside symlink");
+  }
 
   child.stdin.write(JSON.stringify({ method: "shutdown", params: {} }) + "\n");
   const shutdownDeadline = performance.now() + 15_000;
@@ -232,7 +250,7 @@ try {
     ? `${medianNoHitSummary}; ripgrep counted ${ripgrepAllMatches.count} hot matches in ${ripgrepAllMatches.elapsedMs.toFixed(0)}ms`
     : medianNoHitSummary;
   console.log(
-    `PASS workspace search: ${fileCount} files across ${directoryCount} ${flatDirectories ? "flat " : "nested "}directories (${filesPerDirectory} per directory); index build ${indexBuildMs.toFixed(0)}ms; ${resultLimitMs.toFixed(0)}ms to return 5,000 capped matches; stale-index symlink escape rejected${ripgrepSummary}`,
+    `PASS workspace search: ${fileCount} files across ${directoryCount} ${flatDirectories ? "flat " : "nested "}directories (${filesPerDirectory} per directory); index build ${indexBuildMs.toFixed(0)}ms; multiline ${multilineMs.toFixed(0)}ms; ${resultLimitMs.toFixed(0)}ms to return 5,000 capped matches; stale-index symlink escape rejected${ripgrepSummary}`,
   );
 } finally {
   if (!exited && child?.pid) {

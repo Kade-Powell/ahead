@@ -33,7 +33,7 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::progress::ProgressCircle;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::searchable_list::{
-    SearchableGroup, SearchableListItem as SelectItem, SearchableVec,
+    SearchableGroup, SearchableListDelegate, SearchableListItem as SelectItem,
 };
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::spinner::Spinner;
@@ -54,6 +54,37 @@ use std::{
 // ponytail: keep optional LSP scope lookup off the critical search path beyond this deadline.
 const AGENT_BUFFER_SYMBOL_COLLECTION_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(300);
+const CHAT_FILE_FALLBACK_EXCERPT_BYTES: usize = 1024;
+const CHAT_FILE_OUTLINE_MAX_BYTES: usize = 8 * 1024;
+const CONTEXT_USAGE_LABEL_MIN_WIDTH: f32 = 800.0;
+
+fn chat_inline_file_limit(model_context_window: Option<u32>) -> usize {
+    let zed_threshold = ahead_rpc::ahead::CHAT_FILE_OUTLINE_THRESHOLD_BYTES;
+    model_context_window
+        .map(|window| (window as usize / 4).min(zed_threshold))
+        .unwrap_or(zed_threshold)
+        .max(CHAT_FILE_FALLBACK_EXCERPT_BYTES)
+}
+
+fn show_context_usage_label(
+    composer_width: Option<f32>,
+    context_window: Option<u64>,
+) -> bool {
+    context_window.is_some()
+        && composer_width.is_some_and(|width| width >= CONTEXT_USAGE_LABEL_MIN_WIDTH)
+}
+
+fn context_usage_window(
+    harness_kind: ahead_rpc::ahead::HarnessKind,
+    runtime_window: Option<u64>,
+    model_window: Option<u32>,
+) -> Option<u64> {
+    if harness_kind == ahead_rpc::ahead::HarnessKind::Ahead {
+        // Runtime usage has no model identity, so it may describe the previous selection.
+        return model_window.map(u64::from);
+    }
+    runtime_window
+}
 
 fn can_submit_user_input(
     request: &ahead_rpc::ahead::AgentUserInputRequest,
@@ -112,6 +143,104 @@ async fn collect_open_buffer_symbols(
         }
     })
     .await
+}
+
+fn summarize_large_chat_file(
+    file: &mut ahead_rpc::ahead::TurnContextFile,
+    symbols: &[ahead_rpc::ahead::AgentBufferSymbol],
+    inline_limit: usize,
+) {
+    use ahead_rpc::ahead::TurnContextFileKind;
+    if file.content.len() <= inline_limit {
+        return;
+    }
+
+    let lines = file.content.lines().collect::<Vec<_>>();
+    let mut outline = String::new();
+    for symbol in symbols {
+        let start_line = symbol.start_line as usize;
+        let Some(nearby_lines) =
+            lines.get(start_line..start_line.saturating_add(3).min(lines.len()))
+        else {
+            continue;
+        };
+        let name = symbol.name.trim();
+        if name.is_empty()
+            || name.contains('\n')
+            || name.contains('\r')
+            || !nearby_lines.iter().any(|line| line.contains(name))
+        {
+            continue;
+        }
+        let entry = format!(
+            "{}line {}: {}\n",
+            "  ".repeat(usize::from(symbol.depth).min(8)),
+            symbol.start_line + 1,
+            name,
+        );
+        if outline.len() + entry.len() > CHAT_FILE_OUTLINE_MAX_BYTES {
+            outline
+                .push_str("… more symbols omitted; inspect the file for the rest\n");
+            break;
+        }
+        outline.push_str(&entry);
+    }
+    if !outline.is_empty() {
+        file.content = outline;
+        file.kind = TurnContextFileKind::Outline;
+        return;
+    }
+
+    let mut end = CHAT_FILE_FALLBACK_EXCERPT_BYTES;
+    while !file.content.is_char_boundary(end) {
+        end -= 1;
+    }
+    file.content.truncate(end);
+    file.kind = TurnContextFileKind::Excerpt;
+}
+
+async fn prepare_chat_file_context(
+    request: &mut ahead_rpc::ahead::AgentTurnRequestDto,
+    proxy: &std::sync::Arc<crate::proxy_client::ProxyClient>,
+    workspace: &Path,
+    executor: &gpui_kit::BackgroundExecutor,
+) {
+    let inline_limit = chat_inline_file_limit(request.model_context_window);
+
+    let current = request.context.attached_files.iter().position(|file| {
+        file.path == request.context.active_path
+            && file.content == request.context.file_content
+            && file.content.len() > inline_limit
+    });
+    let symbols = if let Some(index) = current {
+        let path = workspace.join(&request.context.active_path);
+        if path.starts_with(workspace) {
+            collect_open_buffer_symbols(
+                vec![(index, proxy.document_symbols(path))],
+                executor,
+            )
+            .await
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+    for (index, file) in request.context.attached_files.iter_mut().enumerate() {
+        // A memory review proposes a complete replacement; an excerpt would
+        // hide notes that the replacement could then delete.
+        if is_memory_review_document(&file.path) {
+            continue;
+        }
+        summarize_large_chat_file(
+            file,
+            symbols.get(&index).map(Vec::as_slice).unwrap_or(&[]),
+            inline_limit,
+        );
+    }
+    request.context.selected_excerpt =
+        request.context.selected_text().map(str::to_owned);
+    request.context.file_content.clear();
 }
 
 fn current_symbol_document_indices(
@@ -252,15 +381,13 @@ fn config_option_update_is_current(
         && active_generation == request_generation
 }
 
-/// A selectable inference backend, including its context budget so the
-/// composer can show how full the window is.
+/// A selectable inference backend and its known context budget.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelSpec {
     pub name: String,
     pub provider_name: Option<String>,
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
-    pub context_window: u32,
     pub model_context_window: Option<u32>,
     pub supports_tool_calls: Option<bool>,
 }
@@ -385,7 +512,6 @@ impl Default for ModelSpec {
             provider_name: None,
             provider_id: None,
             model_id: None,
-            context_window: 32_768,
             model_context_window: None,
             supports_tool_calls: None,
         }
@@ -408,6 +534,15 @@ impl SelectItem for ModelSpec {
         }
     }
 
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.title().to_lowercase().contains(&query)
+            || self
+                .model_id
+                .as_ref()
+                .is_some_and(|model_id| model_id.to_lowercase().contains(&query))
+    }
+
     fn display_title(&self) -> Option<AnyElement> {
         Some(
             div()
@@ -419,6 +554,11 @@ impl SelectItem for ModelSpec {
     }
 
     fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let option_id = format!(
+            "agent-chat-model-option-{}-{}",
+            self.provider_id.as_deref().unwrap_or("default"),
+            self.model_id.as_deref().unwrap_or(&self.name),
+        );
         let tool_support_label = self.tool_support_label();
         let tool_support_color = if self.supports_tool_calls == Some(false) {
             cx.theme().warning
@@ -426,14 +566,7 @@ impl SelectItem for ModelSpec {
             cx.theme().muted_foreground
         };
         h_flex()
-            .debug_selector(|| {
-                format!(
-                    "agent-chat-model-option-{}-{}",
-                    self.provider_id.as_deref().unwrap_or("default"),
-                    self.model_id.as_deref().unwrap_or(&self.name),
-                )
-                .into()
-            })
+            .debug_selector(move || option_id.clone().into())
             .items_center()
             .gap_2()
             .min_w_0()
@@ -455,7 +588,171 @@ impl SelectItem for ModelSpec {
     }
 }
 
-type GroupedModels = SearchableVec<SearchableGroup<ModelSpec>>;
+#[derive(Clone)]
+struct GroupedModels {
+    groups: std::sync::Arc<Vec<SearchableGroup<ModelSpec>>>,
+    matched_items: std::sync::Arc<parking_lot::Mutex<Vec<(usize, Vec<usize>)>>>,
+}
+
+impl GroupedModels {
+    fn new(groups: Vec<SearchableGroup<ModelSpec>>) -> Self {
+        let matched_items = groups
+            .iter()
+            .enumerate()
+            .map(|(group_index, group)| {
+                (group_index, (0..group.items.len()).collect())
+            })
+            .collect();
+        Self {
+            groups: std::sync::Arc::new(groups),
+            matched_items: std::sync::Arc::new(parking_lot::Mutex::new(
+                matched_items,
+            )),
+        }
+    }
+}
+
+impl SearchableListDelegate for GroupedModels {
+    type Item = ModelSpec;
+
+    fn sections_count(&self, _: &App) -> usize {
+        self.matched_items.lock().len()
+    }
+
+    fn items_count(&self, section: usize) -> usize {
+        self.matched_items
+            .lock()
+            .get(section)
+            .map_or(0, |(_, items)| items.len())
+    }
+
+    fn section(&self, section: usize) -> Option<AnyElement> {
+        self.matched_items
+            .lock()
+            .get(section)
+            .and_then(|(group_index, _)| self.groups.get(*group_index))
+            .map(|group| group.title.clone().into_any_element())
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        let (group_index, item_index) = {
+            let matches = self.matched_items.lock();
+            let (group_index, items) = matches.get(ix.section)?;
+            (*group_index, *items.get(ix.row)?)
+        };
+        self.groups.get(group_index)?.items.get(item_index)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SelectItem<Value = V>,
+        V: PartialEq,
+    {
+        let matches = self.matched_items.lock();
+        matches
+            .iter()
+            .enumerate()
+            .find_map(|(section, (group_index, items))| {
+                items
+                    .iter()
+                    .position(|item_index| {
+                        self.groups[*group_index].items[*item_index].value() == value
+                    })
+                    .map(|row| IndexPath::default().section(section).row(row))
+            })
+    }
+
+    fn perform_search(
+        &mut self,
+        query: &str,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<()> {
+        if query.trim().is_empty() {
+            *self.matched_items.lock() = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    (group_index, (0..group.items.len()).collect())
+                })
+                .collect();
+            return Task::ready(());
+        }
+
+        let groups = self.groups.clone();
+        let matched_items = self.matched_items.clone();
+        let query = query.to_owned();
+        cx.background_executor().spawn(async move {
+            *matched_items.lock() = search_model_groups(&groups, &query);
+        })
+    }
+}
+
+fn search_model_groups(
+    groups: &[SearchableGroup<ModelSpec>],
+    query: &str,
+) -> Vec<(usize, Vec<usize>)> {
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let mut matcher = FuzzyMatcher::new(FuzzyConfig::DEFAULT);
+    let mut candidate_chars = Vec::new();
+    let mut matches = Vec::new();
+
+    for (group_index, group) in groups.iter().enumerate() {
+        for (item_index, model) in group.items.iter().enumerate() {
+            let name_score = pattern.score(
+                Utf32Str::new(&model.name, &mut candidate_chars),
+                &mut matcher,
+            );
+            if let Some(score) = name_score {
+                matches.push((0_u8, score, group_index, item_index));
+            } else if let Some(score) = [
+                model.provider_name.as_deref(),
+                model.model_id.as_deref(),
+                Some(group.title.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|candidate| {
+                pattern.score(
+                    Utf32Str::new(candidate, &mut candidate_chars),
+                    &mut matcher,
+                )
+            })
+            .max()
+            {
+                matches.push((1_u8, score, group_index, item_index));
+            }
+        }
+    }
+
+    matches.sort_by_key(|(category, score, group_index, item_index)| {
+        (
+            *category,
+            std::cmp::Reverse(*score),
+            *group_index,
+            *item_index,
+        )
+    });
+
+    let mut ranked_groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (_, _, group_index, item_index) in matches {
+        if let Some((_, items)) = ranked_groups
+            .iter_mut()
+            .find(|(existing_group, _)| *existing_group == group_index)
+        {
+            items.push(item_index);
+        } else {
+            ranked_groups.push((group_index, vec![item_index]));
+        }
+    }
+    ranked_groups
+}
 
 fn is_model_option(option: &ahead_rpc::ahead::AgentConfigOption) -> bool {
     option.id.eq_ignore_ascii_case("model")
@@ -543,7 +840,22 @@ fn grouped_models(models: &[ModelSpec]) -> GroupedModels {
                 .push(SearchableGroup::new(provider.to_owned()).item(model.clone()));
         }
     }
-    SearchableVec::new(groups)
+    GroupedModels::new(groups)
+}
+
+fn replace_model_select_items(
+    select: &Entity<ComboboxState<GroupedModels>>,
+    models: &[ModelSpec],
+    window: &mut Window,
+    cx: &mut Context<SessionPanel>,
+) {
+    select.update(cx, |select, cx| {
+        let query = select.query(cx).to_string();
+        select.set_items(grouped_models(models), window, cx);
+        if !query.is_empty() {
+            select.set_query(query, window, cx);
+        }
+    });
 }
 
 fn external_model_specs(
@@ -727,6 +1039,50 @@ fn skill_slash_label(
     }
 }
 
+fn acp_command_input_hint(input: Option<&str>) -> Option<String> {
+    input
+        .as_deref()
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+        .and_then(|input| {
+            input
+                .get("hint")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|hint| hint.trim().to_string())
+        .filter(|hint| !hint.is_empty())
+}
+
+fn acp_command_description(command: &ahead_rpc::ahead::AgentCommand) -> String {
+    let input_hint = acp_command_input_hint(command.input.as_deref());
+    let description = command.description.trim();
+    let description = match (description.is_empty(), input_hint) {
+        (true, Some(hint)) => format!("Input: {hint}"),
+        (false, Some(hint)) => format!("{description} · Input: {hint}"),
+        (false, None) => description.to_string(),
+        (true, None) => String::new(),
+    };
+    compact_description(&description)
+}
+
+fn active_acp_command_hint(
+    prompt: &str,
+    commands: &[ahead_rpc::ahead::AgentCommand],
+) -> Option<String> {
+    let command_text = prompt.trim_start().strip_prefix('/')?;
+    let name_end = command_text
+        .find(char::is_whitespace)
+        .unwrap_or(command_text.len());
+    let name = command_text.get(..name_end)?;
+    let arguments = command_text.get(name_end..).unwrap_or_default();
+    if name.is_empty() || !arguments.trim().is_empty() {
+        return None;
+    }
+
+    let command = commands.iter().find(|command| command.name == name)?;
+    acp_command_input_hint(command.input.as_deref())
+}
+
 fn code_comment_context(
     harness_kind: ahead_rpc::ahead::HarnessKind,
     session_id: Option<&str>,
@@ -761,7 +1117,7 @@ pub struct SessionPanel {
     comments_expanded: bool,
     resolving_comment_id: Option<String>,
     comment_error: Option<String>,
-    pub model_select: Entity<ComboboxState<GroupedModels>>,
+    model_select: Entity<ComboboxState<GroupedModels>>,
     reasoning_slider: Entity<SliderState>,
     pub selected_model: usize,
     selected_reasoning_effort: Option<String>,
@@ -777,9 +1133,11 @@ pub struct SessionPanel {
     external_model_selects: Vec<(
         ahead_rpc::ahead::AgentConfigOption,
         Entity<ComboboxState<GroupedModels>>,
+        gpui_kit::Subscription,
     )>,
     external_reasoning_slider_config: Option<ahead_rpc::ahead::AgentConfigOption>,
     model_config_warning: Option<String>,
+    model_discovery_warning: Option<String>,
     model_config_modified: [Option<std::time::SystemTime>; 4],
     model_config_loaded: bool,
     model_config_load_in_flight: bool,
@@ -788,6 +1146,7 @@ pub struct SessionPanel {
     _model_config_watch: Option<Task<()>>,
     /// Real tokens reported by the harness `usage_update`; 0 until measured.
     pub context_used: u32,
+    composer_footer_width: Option<f32>,
     pub session: ahead_viewmodel::SessionSnapshot,
     pub voice: ahead_viewmodel::VoiceIntent,
     voice_output_interrupt_slot:
@@ -832,6 +1191,7 @@ pub struct SessionPanel {
     pub session_id: Option<String>,
     session_generation: u64,
     conversation_refresh_task: Option<Task<()>>,
+    usage_update_task: Option<Task<()>>,
     share_offer: Option<ahead_rpc::ahead::SharedSessionOffer>,
     team_members: Vec<ahead_rpc::ahead::SessionParticipantRecord>,
     share_starting: bool,
@@ -1084,18 +1444,15 @@ fn merge_discovered_models(
             {
                 existing.name = display_name;
             }
-            if existing.model_context_window.is_none() {
-                if let Some(context_window) = discovered.context_window {
-                    existing.context_window = context_window;
-                    existing.model_context_window = Some(context_window);
-                }
+            if let Some(context_window) = discovered.context_window {
+                // Settings resolves manual model limits before catalog data.
+                existing.model_context_window = Some(context_window);
             }
             if discovered.supports_tool_calls.is_some() {
                 existing.supports_tool_calls = discovered.supports_tool_calls;
             }
             continue;
         }
-        let context_window = discovered.context_window.unwrap_or(32_768);
         let name = discovered
             .display_name
             .unwrap_or_else(|| discovered.model_id.clone());
@@ -1104,7 +1461,6 @@ fn merge_discovered_models(
             provider_name: Some(discovered.provider_name),
             provider_id: Some(discovered.provider_id),
             model_id: Some(discovered.model_id),
-            context_window,
             model_context_window: discovered.context_window,
             supports_tool_calls: discovered.supports_tool_calls,
         });
@@ -1130,6 +1486,23 @@ fn refresh_discovered_model_cache(
     });
     cache.extend(discovery.models);
     discovery.warnings
+}
+
+fn model_discovery_warning(warnings: &[String]) -> Option<String> {
+    (!warnings.is_empty())
+        .then(|| format!("Model discovery incomplete: {}", warnings.join("; ")))
+}
+
+fn combined_model_warning(
+    config_warning: Option<&str>,
+    discovery_warning: Option<&str>,
+) -> Option<String> {
+    match (config_warning, discovery_warning) {
+        (Some(config), Some(discovery)) => Some(format!("{config}; {discovery}")),
+        (Some(config), None) => Some(config.to_string()),
+        (None, Some(discovery)) => Some(discovery.to_string()),
+        (None, None) => None,
+    }
 }
 
 fn models_with_discovered(
@@ -1173,13 +1546,63 @@ fn mentions_terminal_output(message: &str) -> bool {
     })
 }
 
+fn editor_context_attachment(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+    selection: Option<ahead_rpc::ahead::DisplayRange>,
+    explicit_current_file: bool,
+) -> (String, String) {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let display_path = path
+        .strip_prefix(workspace)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            path.file_name().map(std::path::Path::new).unwrap_or(path)
+        })
+        .to_string_lossy();
+    let description = selection.map_or_else(
+        || format!("{display_path} · @currentFile"),
+        |selection| {
+            let first_line = selection.start.line.saturating_add(1);
+            let last_line = if selection.end.line > selection.start.line
+                && selection.end.col == 0
+            {
+                selection.end.line
+            } else {
+                selection.end.line.saturating_add(1).max(first_line)
+            };
+            let line_label = if first_line == last_line {
+                format!("line {first_line}")
+            } else {
+                format!("lines {first_line}–{last_line}")
+            };
+            format!(
+                "{display_path} · {line_label} · selected code{}",
+                if explicit_current_file {
+                    " + @currentFile"
+                } else {
+                    ""
+                },
+            )
+        },
+    );
+    (name, description)
+}
+
 fn context_for_message(
+    workspace: &std::path::Path,
     context: ahead_rpc::ahead::TurnEditorContext,
     message: &str,
     attached_files: Vec<ahead_rpc::ahead::TurnContextFile>,
     attached_memories: Vec<ahead_rpc::ahead::MemoryExcerpt>,
 ) -> ahead_rpc::ahead::TurnEditorContext {
     context_for_message_with_focus(
+        workspace,
         context,
         message,
         attached_files,
@@ -1189,6 +1612,7 @@ fn context_for_message(
 }
 
 fn context_for_voice_message(
+    workspace: &std::path::Path,
     mut context: ahead_rpc::ahead::TurnEditorContext,
     message: &str,
     attached_files: Vec<ahead_rpc::ahead::TurnContextFile>,
@@ -1204,6 +1628,7 @@ fn context_for_voice_message(
         context.attached_anchor_ids.clear();
     }
     context_for_message_with_focus(
+        workspace,
         context,
         message,
         attached_files,
@@ -1275,6 +1700,7 @@ fn voice_editor_context_summary(
 }
 
 fn context_for_message_with_focus(
+    workspace: &std::path::Path,
     mut context: ahead_rpc::ahead::TurnEditorContext,
     message: &str,
     attached_files: Vec<ahead_rpc::ahead::TurnContextFile>,
@@ -1285,11 +1711,18 @@ fn context_for_message_with_focus(
     context.attached_memories = attached_memories;
     let include_current_file = mentions_current_file(message);
     if include_current_file && !context.active_path.is_empty() {
+        let active_path = std::path::Path::new(&context.active_path);
+        let absolute_path = workspace.join(active_path);
+        context.attached_files.retain(|file| {
+            let attached_path = std::path::Path::new(&file.path);
+            attached_path != active_path && attached_path != absolute_path
+        });
         context
             .attached_files
             .push(ahead_rpc::ahead::TurnContextFile {
                 path: context.active_path.clone(),
                 content: context.file_content.clone(),
+                kind: ahead_rpc::ahead::TurnContextFileKind::Full,
             });
     }
     context.discard_stale_selection();
@@ -1338,6 +1771,11 @@ fn memory_source_label(scope: ahead_rpc::ahead::MemoryScope) -> &'static str {
         ahead_rpc::ahead::MemoryScope::Project => ".ahead/memories/MEMORY.md",
         ahead_rpc::ahead::MemoryScope::User => "~/.ahead/memories/MEMORY.md",
     }
+}
+
+fn is_memory_review_document(path: &str) -> bool {
+    path == memory_source_label(ahead_rpc::ahead::MemoryScope::Project)
+        || path == memory_source_label(ahead_rpc::ahead::MemoryScope::User)
 }
 
 fn memory_review_prompt(scope: ahead_rpc::ahead::MemoryScope) -> String {
@@ -1408,12 +1846,24 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
             if last_profile_by_provider.get(&provider_id) != Some(&index) {
                 continue;
             }
-            let model_context_window = table
+            let provider_context_window = table
                 .get("context_window")
                 .and_then(toml::Value::as_integer)
                 .and_then(|value| u32::try_from(value).ok())
                 .filter(|value| *value > 0);
-            let context_window = model_context_window.unwrap_or(32_768);
+            let model_context_windows = table
+                .get("model_context_windows")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flat_map(|limits| limits.iter())
+                .filter_map(|(model, value)| {
+                    let tokens = value
+                        .as_integer()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0)?;
+                    Some((model.as_str(), tokens))
+                })
+                .collect::<HashMap<_, _>>();
             let configured_models = table
                 .get("models")
                 .and_then(toml::Value::as_array)
@@ -1423,13 +1873,20 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
                 .chain(table.get("model").and_then(toml::Value::as_str))
                 .map(str::trim)
                 .filter(|model| !model.is_empty());
+            let mut seen_models = HashSet::new();
             for model in configured_models {
+                if !seen_models.insert(model) {
+                    continue;
+                }
+                let model_context_window = model_context_windows
+                    .get(model)
+                    .copied()
+                    .or(provider_context_window);
                 models.push(ModelSpec {
                     name: model.to_string(),
                     provider_name: Some(connection_name.to_string()),
                     provider_id: Some(provider_id.clone()),
                     model_id: Some(model.to_string()),
-                    context_window,
                     model_context_window,
                     supports_tool_calls: None,
                 });
@@ -1451,7 +1908,6 @@ fn models_from_ai_config(value: &toml::Value) -> Vec<ModelSpec> {
                     provider,
                 )),
                 model_id: Some(model.to_string()),
-                context_window: 32_768,
                 model_context_window: None,
                 supports_tool_calls: None,
             });
@@ -1731,7 +2187,11 @@ impl SessionPanel {
                     && let Some(model) = this.models.get(this.selected_model)
                 {
                     state.update(cx, |state, cx| {
-                        state.set_selected_values(&[model.clone()], _window, cx)
+                        state.set_selected_values(
+                            std::slice::from_ref(model),
+                            _window,
+                            cx,
+                        )
                     });
                 }
                 if let ComboboxEvent::Confirm(models) = event
@@ -1742,6 +2202,7 @@ impl SessionPanel {
                     {
                         if this.selected_model != idx {
                             this.invalidate_reasoning_options();
+                            this.harness_context_window = None;
                             if this.harness_kind
                                 == ahead_rpc::ahead::HarnessKind::Ahead
                                 && let Some(code) = this.code.as_ref()
@@ -1885,6 +2346,7 @@ impl SessionPanel {
             external_model_selects: Vec::new(),
             external_reasoning_slider_config: None,
             model_config_warning: None,
+            model_discovery_warning: None,
             model_config_modified: [None; 4],
             model_config_loaded: false,
             model_config_load_in_flight: false,
@@ -1892,6 +2354,7 @@ impl SessionPanel {
             model_discovery_generation: 0,
             _model_config_watch: None,
             context_used: 0,
+            composer_footer_width: None,
             session: ahead_viewmodel::SessionSnapshot::default(),
             voice: ahead_viewmodel::VoiceIntent::new(),
             voice_output_interrupt_slot: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1935,6 +2398,7 @@ impl SessionPanel {
             session_id: None,
             session_generation: 0,
             conversation_refresh_task: None,
+            usage_update_task: None,
             share_offer: None,
             team_members: Vec::new(),
             share_starting: false,
@@ -2072,6 +2536,40 @@ impl SessionPanel {
         let Some(proxy) = self.proxy.as_ref() else {
             return;
         };
+        if self.usage_update_task.is_none() {
+            let usage_updates = proxy.subscribe_usage_updates();
+            let usage_proxy = proxy.clone();
+            self.usage_update_task =
+                Some(cx.spawn_in(window, async move |this, cx| {
+                    while usage_updates.recv().await.is_ok() {
+                        let result = this.update_in(cx, |panel, _, cx| {
+                            let Some(session_id) = panel.session_id.as_deref()
+                            else {
+                                return;
+                            };
+                            let Some(usage) = usage_proxy.usage(session_id) else {
+                                return;
+                            };
+                            let context_used =
+                                u32::try_from(usage.used_tokens).unwrap_or(u32::MAX);
+                            if panel.context_used != context_used
+                                || panel.harness_context_window
+                                    != usage.context_window
+                            {
+                                panel.context_used = context_used;
+                                panel.harness_context_window = usage.context_window;
+                                cx.notify();
+                            }
+                        });
+                        if let Err(error) = result {
+                            eprintln!(
+                                "Could not update the agent context meter: {error}"
+                            );
+                            break;
+                        }
+                    }
+                }));
+        }
         let receiver = proxy.subscribe_workspace_file_changes();
         let workspace = self.workspace.clone();
         self._model_config_watch =
@@ -2223,8 +2721,8 @@ impl SessionPanel {
                     });
                 let selected_model = matched_model.unwrap_or(0);
                 panel.invalidate_reasoning_options();
+                replace_model_select_items(&panel.model_select, &models, window, cx);
                 panel.model_select.update(cx, |select, cx| {
-                    select.set_items(grouped_models(&models), window, cx);
                     if panel.model_select_popup_open {
                         select.clear_selection(cx);
                     } else if let Some(model) = models.get(selected_model) {
@@ -2235,6 +2733,7 @@ impl SessionPanel {
                 panel.models = models;
                 panel.selected_model = selected_model;
                 panel.model_config_warning = warning;
+                panel.model_discovery_warning = None;
                 panel.model_config_modified = modified;
                 panel.model_config_loaded = true;
                 if panel.status.as_ref()
@@ -2265,7 +2764,6 @@ impl SessionPanel {
             self.model_discovery_generation.wrapping_add(1);
         let generation = self.model_discovery_generation;
         let workspace = self.workspace.clone();
-        let base_warning = self.model_config_warning.clone();
         cx.spawn_in(window, async move |this, cx| {
             let discovery_workspace = workspace.clone();
             let discovery = cx
@@ -2303,8 +2801,8 @@ impl SessionPanel {
                 if matched_model.is_none() {
                     panel.invalidate_reasoning_options();
                 }
+                replace_model_select_items(&panel.model_select, &models, window, cx);
                 panel.model_select.update(cx, |select, cx| {
-                    select.set_items(grouped_models(&models), window, cx);
                     if panel.model_select_popup_open {
                         select.clear_selection(cx);
                     } else if let Some(model) = models.get(selected_model) {
@@ -2312,18 +2810,7 @@ impl SessionPanel {
                     }
                 });
                 panel.models = models;
-                panel.model_config_warning = if warnings.is_empty() {
-                    base_warning
-                } else {
-                    let discovery_warning = format!(
-                        "Model discovery incomplete: {}",
-                        warnings.join("; ")
-                    );
-                    Some(match base_warning {
-                        Some(existing) => format!("{existing}; {discovery_warning}"),
-                        None => discovery_warning,
-                    })
-                };
+                panel.model_discovery_warning = model_discovery_warning(&warnings);
                 panel.invalidate_skill_catalog();
                 if panel.show_commands {
                     panel.load_skill_catalog(cx);
@@ -2343,7 +2830,7 @@ impl SessionPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let status = match self.thread_launcher.clone() {
+        let (status, opened) = match self.thread_launcher.clone() {
             Some(threads)
                 if threads
                     .update(cx, |threads, cx| {
@@ -2351,17 +2838,30 @@ impl SessionPanel {
                     })
                     .is_ok() =>
             {
-                match harness_kind {
-                    ahead_rpc::ahead::HarnessKind::Ahead => {
-                        "AHEAD session setup opened in Threads"
-                    }
-                    ahead_rpc::ahead::HarnessKind::ExternalAcp => {
-                        "External agent setup opened in Threads"
-                    }
-                }
+                (
+                    match harness_kind {
+                        ahead_rpc::ahead::HarnessKind::Ahead => {
+                            "AHEAD session setup opened in Threads"
+                        }
+                        ahead_rpc::ahead::HarnessKind::ExternalAcp => {
+                            "External agent setup opened in Threads"
+                        }
+                    },
+                    true,
+                )
             }
-            Some(_) | None => "Threads panel is unavailable",
+            Some(_) | None => ("Threads panel is unavailable", false),
         };
+        let status = status.to_owned();
+        if opened && let Some(shell) = self.shell.clone() {
+            window.defer(cx, move |window, cx| {
+                if let Err(error) = shell.update(cx, |shell, cx| {
+                    shell.set_threads_visible(true, window, cx);
+                }) {
+                    eprintln!("Could not show Threads panel: {error}");
+                }
+            });
+        }
         self.status = status.into();
         cx.notify();
     }
@@ -2412,6 +2912,11 @@ impl SessionPanel {
         self.shared_polling = false;
         self.shared_connection_lost = false;
         let session_id = state.view.session.id.clone();
+        let usage = self
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.usage(&session_id))
+            .or(state.usage);
         ahead_viewmodel::adopt_session(&mut self.session, state.view.clone());
         if self.session_id.as_deref() != Some(session_id.as_str()) {
             self.invalidate_reasoning_options();
@@ -2445,8 +2950,10 @@ impl SessionPanel {
         self.config_options.clear();
         self.pending_user_input = None;
         self.user_input_answers.clear();
-        self.context_used = 0;
-        self.harness_context_window = None;
+        self.context_used = usage.as_ref().map_or(0, |usage| {
+            u32::try_from(usage.used_tokens).unwrap_or(u32::MAX)
+        });
+        self.harness_context_window = usage.and_then(|usage| usage.context_window);
         self.harness_warning = state.harness_warning;
         self.agent_auth_methods = self
             .proxy
@@ -3751,12 +4258,20 @@ impl SessionPanel {
         let editor_context = self
             .code
             .as_ref()
-            .and_then(|code| code.read(cx).turn_context(cx))
+            .and_then(|code| {
+                let code = code.read(cx);
+                (voice_call
+                    || mentions_current_file(&text)
+                    || code.selected_context_range(cx).is_some())
+                .then(|| code.turn_context(cx))
+                .flatten()
+            })
             .unwrap_or(ahead_rpc::ahead::TurnEditorContext {
                 active_path: String::new(),
                 caret: ahead_rpc::ahead::DisplayPosition { line: 0, col: 0 },
                 selection: None,
                 file_content: String::new(),
+                selected_excerpt: None,
                 visible_end: None,
                 attached_anchor_ids: Vec::new(),
                 attached_files: Vec::new(),
@@ -3764,6 +4279,7 @@ impl SessionPanel {
             });
         let context = if voice_call {
             context_for_voice_message(
+                &self.workspace,
                 editor_context,
                 &text,
                 self.attached_files.clone(),
@@ -3771,6 +4287,7 @@ impl SessionPanel {
             )
         } else {
             context_for_message(
+                &self.workspace,
                 editor_context,
                 &text,
                 self.attached_files.clone(),
@@ -3840,7 +4357,45 @@ impl SessionPanel {
         self.turn_cancel_requested = false;
         self.turn_cancel_task = None;
         let session_generation = self.session_generation;
+        let workspace = self.workspace.clone();
+        let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
+            let mut request = request;
+            prepare_chat_file_context(
+                &mut request,
+                &proxy,
+                &workspace,
+                &executor,
+            )
+            .await;
+            let should_start = match this.update_in(cx, |panel, window, cx| {
+                if panel.session_generation != session_generation
+                    || panel.session_id.as_deref() != Some(session_id.as_str())
+                {
+                    return false;
+                }
+                if panel.turn_cancel_requested {
+                    panel.turn_cancel_requested = false;
+                    panel.turn_starting = false;
+                    if panel.memory_review.as_ref().is_some_and(|review| review.turn_id.is_none()) {
+                        panel.memory_review = None;
+                    } else if panel.chat_input.read(cx).value().is_empty() {
+                        panel.chat_input.update(cx, |input, cx| {
+                            input.set_value(draft.clone(), window, cx);
+                        });
+                    }
+                    panel.status = "Turn cancelled before starting".into();
+                    cx.notify();
+                    return false;
+                }
+                true
+            }) {
+                Ok(should_start) => should_start,
+                Err(_) => return,
+            };
+            if !should_start {
+                return;
+            }
             let result = proxy.agent_turn(request).await;
             this.update_in(cx, |panel, window, cx| {
                 if panel.session_generation != session_generation
@@ -3959,6 +4514,7 @@ impl SessionPanel {
                 ahead_rpc::ahead::TERMINAL_CONTEXT_PATH_PREFIX
             ),
             content,
+            kind: ahead_rpc::ahead::TurnContextFileKind::Full,
         });
         let source = if selected {
             "Selected output"
@@ -4547,8 +5103,7 @@ impl SessionPanel {
         self.agent_auth_methods = proxy.agent_auth_methods(session_id);
         self.refresh_user_input(proxy, session_id);
         if let Some(usage) = proxy.usage(session_id) {
-            self.context_used =
-                u32::try_from(usage.total_tokens).unwrap_or(u32::MAX);
+            self.context_used = u32::try_from(usage.used_tokens).unwrap_or(u32::MAX);
             self.harness_context_window = usage.context_window;
         }
         if was_streaming && !self.streaming {
@@ -5560,6 +6115,8 @@ impl SessionPanel {
     }
 
     fn attach_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        const MAX_CHAT_FILE_ATTACHMENTS: usize = 16;
+        const MAX_CHAT_FILE_SOURCE_BYTES: usize = 512 * 1024;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -5572,23 +6129,41 @@ impl SessionPanel {
             let files = match selected {
                 Ok(Ok(Some(paths))) => {
                     cx.background_spawn(async move {
-                        paths
-                            .into_iter()
-                            .filter_map(|path| {
-                                let content = std::fs::read_to_string(&path).ok()?;
-                                if content.len() > 512 * 1024 {
-                                    return None;
-                                }
-                                Some(ahead_rpc::ahead::TurnContextFile {
-                                    path: path.to_string_lossy().to_string(),
-                                    content,
-                                })
-                            })
-                            .collect::<Vec<_>>()
+                        if paths.len() > MAX_CHAT_FILE_ATTACHMENTS {
+                            return Err(format!(
+                                "Select at most {MAX_CHAT_FILE_ATTACHMENTS} files at once"
+                            ));
+                        }
+                        let mut files = Vec::with_capacity(paths.len());
+                        for path in paths {
+                            let size = std::fs::metadata(&path)
+                                .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
+                                .len();
+                            if size > MAX_CHAT_FILE_SOURCE_BYTES as u64 {
+                                return Err(format!(
+                                    "{} is larger than the 512 KiB attachment limit",
+                                    path.display()
+                                ));
+                            }
+                            let content = std::fs::read_to_string(&path)
+                                .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+                            if content.len() > MAX_CHAT_FILE_SOURCE_BYTES {
+                                return Err(format!(
+                                    "{} changed while attaching and is now larger than 512 KiB",
+                                    path.display()
+                                ));
+                            }
+                            files.push(ahead_rpc::ahead::TurnContextFile {
+                                path: path.to_string_lossy().to_string(),
+                                content,
+                                kind: ahead_rpc::ahead::TurnContextFileKind::Full,
+                            });
+                        }
+                        Ok(files)
                     })
                     .await
                 }
-                Ok(Ok(None)) => Vec::new(),
+                Ok(Ok(None)) => Ok(Vec::new()),
                 Ok(Err(error)) => {
                     panel.update(cx, |panel, cx| {
                         panel.status = format!("Attachment failed: {error}").into();
@@ -5599,13 +6174,22 @@ impl SessionPanel {
                 Err(_) => return,
             };
             panel.update(cx, |panel, cx| {
-                if !files.is_empty() {
-                    panel.attached_files.extend(files);
-                    panel.status = format!(
-                        "{} file(s) attached as context",
-                        panel.attached_files.len()
-                    )
-                    .into();
+                match files {
+                    Ok(files) if panel.attached_files.len().saturating_add(files.len()) > MAX_CHAT_FILE_ATTACHMENTS => {
+                        panel.status = format!(
+                            "Attach at most {MAX_CHAT_FILE_ATTACHMENTS} files per message"
+                        ).into();
+                    }
+                    Ok(files) if !files.is_empty() => {
+                        panel.attached_files.extend(files);
+                        panel.status = format!(
+                            "{} file(s) attached as context",
+                            panel.attached_files.len()
+                        )
+                        .into();
+                    }
+                    Ok(_) => {}
+                    Err(error) => panel.status = format!("Attachment failed: {error}").into(),
                 }
                 cx.notify();
             });
@@ -5668,6 +6252,7 @@ impl SessionPanel {
                             ahead_rpc::ahead::TurnContextFile {
                                 path: document.source.clone(),
                                 content: document.content,
+                                kind: ahead_rpc::ahead::TurnContextFileKind::Full,
                             },
                         );
                         panel.memory_review = Some(MemoryReview {
@@ -7245,15 +7830,16 @@ impl SessionPanel {
             cx.notify();
             return;
         }
-        if self.proxy.is_none() || self.session_id.is_none() {
-            self.status = "Agent unavailable — message was not sent".into();
-            cx.notify();
-            return;
-        }
         if self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
+            && self.session_id.is_some()
             && !self.model_config_loaded
         {
             self.status = "Wait for workspace model settings to load".into();
+            cx.notify();
+            return;
+        }
+        if self.proxy.is_none() || self.session_id.is_none() {
+            self.status = "Agent unavailable — message was not sent".into();
             cx.notify();
             return;
         }
@@ -7526,7 +8112,7 @@ impl SessionPanel {
         cx: &mut Context<Self>,
     ) {
         self.external_model_selects
-            .retain(|(cached, _)| self.config_options.contains(cached));
+            .retain(|(cached, _, _)| self.config_options.contains(cached));
         for option in self.config_options.clone() {
             if !matches!(
                 option.current_value,
@@ -7535,7 +8121,7 @@ impl SessionPanel {
                 || self
                     .external_model_selects
                     .iter()
-                    .any(|(cached, _)| cached == &option)
+                    .any(|(cached, _, _)| cached == &option)
             {
                 continue;
             }
@@ -7545,32 +8131,36 @@ impl SessionPanel {
                     .searchable(true)
             });
             let config_id = option.id.clone();
-            cx.subscribe(&state, move |panel, state, event, cx| {
-                if matches!(event, ComboboxEvent::Confirm(_)) {
-                    state.update(cx, |state, cx| state.clear_selection(cx));
-                }
-                if let ComboboxEvent::Confirm(models) = event
-                    && let Some(model) = models.first()
-                    && let Some(value) = &model.model_id
-                    && panel.config_options.iter().any(|option| {
-                        option.id == config_id
-                            && option.current_value
-                                != ahead_rpc::ahead::AgentConfigOptionValue::Select(
-                                    value.clone(),
-                                )
-                    })
-                {
-                    panel.set_external_config_option(
-                        config_id.clone(),
-                        ahead_rpc::ahead::AgentConfigOptionValue::Select(
-                            value.clone(),
-                        ),
-                        cx,
-                    );
-                }
-            })
-            .detach();
-            self.external_model_selects.push((option, state));
+            let subscription = cx.subscribe_in(
+                &state,
+                window,
+                move |panel, state, event, _window, cx| {
+                    if matches!(event, ComboboxEvent::Confirm(_)) {
+                        state.update(cx, |state, cx| state.clear_selection(cx));
+                    }
+                    if let ComboboxEvent::Confirm(models) = event
+                        && let Some(model) = models.first()
+                        && let Some(value) = &model.model_id
+                        && panel.config_options.iter().any(|option| {
+                            option.id == config_id
+                                && option.current_value
+                                    != ahead_rpc::ahead::AgentConfigOptionValue::Select(
+                                        value.clone(),
+                                    )
+                        })
+                    {
+                        panel.set_external_config_option(
+                            config_id.clone(),
+                            ahead_rpc::ahead::AgentConfigOptionValue::Select(
+                                value.clone(),
+                            ),
+                            cx,
+                        );
+                    }
+                },
+            );
+            self.external_model_selects
+                .push((option, state, subscription));
         }
     }
 }
@@ -7608,6 +8198,11 @@ impl Render for SessionPanel {
             .get(self.selected_model)
             .cloned()
             .unwrap_or_default();
+        let chat_inline_limit = chat_inline_file_limit(
+            (self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead)
+                .then_some(model.model_context_window)
+                .flatten(),
+        );
         let muted = cx.theme().muted_foreground;
         let explicit_current_file =
             mentions_current_file(self.chat_input.read(cx).value().as_ref());
@@ -7620,32 +8215,25 @@ impl Render for SessionPanel {
             });
         let active_editor_context = self.code.as_ref().and_then(|code| {
             let code = code.read(cx);
-            let selection = code.turn_context(cx)?.selection;
+            if !code.is_text_available() {
+                return None;
+            }
+            let selection = code.selected_context_range(cx);
             if selection.is_none() && !explicit_current_file {
                 return None;
             }
             let path = code.file_path.clone();
-            let name = std::path::Path::new(&path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let description = selection.map_or_else(
-                || format!("{path} · @currentFile"),
-                |selection| {
-                    format!(
-                        "{}:{}-{} · selected code{}",
-                        path,
-                        selection.start.line + 1,
-                        selection.end.line + 1,
-                        if explicit_current_file {
-                            " + @currentFile"
-                        } else {
-                            ""
-                        },
-                    )
-                },
+            let (name, mut description) = editor_context_attachment(
+                &self.workspace,
+                std::path::Path::new(&path),
+                selection,
+                explicit_current_file,
             );
+            if explicit_current_file
+                && code.editor.read(cx).text().len() > chat_inline_limit
+            {
+                description.push_str(" · outline or excerpt on send");
+            }
             Some((name, description))
         });
         let has_context_attachments = !self.shared_guest
@@ -7653,11 +8241,17 @@ impl Render for SessionPanel {
                 || terminal_output_requested
                 || !self.attached_files.is_empty()
                 || !self.attached_memories.is_empty());
-        let context_window = self
-            .harness_context_window
-            .unwrap_or(u64::from(model.context_window));
-        let pct = (self.context_used as f32 / context_window.max(1) as f32)
-            .clamp(0.0, 1.0);
+        let context_window = context_usage_window(
+            self.harness_kind,
+            self.harness_context_window,
+            model.model_context_window,
+        );
+        let context_used = self.context_used;
+        let pct = context_window.map_or(0.0, |context_window| {
+            (context_used as f32 / context_window.max(1) as f32).clamp(0.0, 1.0)
+        });
+        let show_context_usage_count =
+            show_context_usage_label(self.composer_footer_width, context_window);
         let chat_available = self.session_id.is_some();
         let can_share = !self.shared_guest
             && self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead
@@ -7731,6 +8325,10 @@ impl Render for SessionPanel {
         let memory_search_error = self.memory_search_error.clone();
         let memory_review = self.memory_review.clone();
         let available_commands = self.available_commands.clone();
+        let acp_command_input_hint = active_acp_command_hint(
+            self.chat_input.read(cx).value().as_ref(),
+            &available_commands,
+        );
         let available_skills = self.available_skills.clone();
         let skipped_skill_count = self.skill_catalog_skipped_count;
         let mut skill_name_counts = HashMap::new();
@@ -7896,7 +8494,7 @@ impl Render for SessionPanel {
                     .iter()
                     .map(|command| SlashPaletteEntry {
                         label: format!("/{}", command.name),
-                        description: compact_description(&command.description),
+                        description: acp_command_description(command),
                         icon: IconName::CircleDot,
                         action: SlashPaletteAction::Prompt(format!(
                             "/{} ",
@@ -8231,6 +8829,7 @@ impl Render for SessionPanel {
                 .when(!self.status.as_ref().is_empty(), |empty_state| {
                     empty_state.child(
                         div()
+                            .id("empty_session_status")
                             .debug_selector(|| "empty_session_status".into())
                             .text_size(px(11.))
                             .child(self.status.clone()),
@@ -8401,7 +9000,6 @@ impl Render for SessionPanel {
                             };
                         Message::new()
                             .alignment(MessageAlignment::Start)
-                            .avatar(IconName::Bot)
                             .header(
                                 MessageHeader::new().child(
                                     div()
@@ -8737,7 +9335,12 @@ impl Render for SessionPanel {
                         )
                     })
                     .when(self.harness_kind == ahead_rpc::ahead::HarnessKind::Ahead, |bar| {
-                        bar.when_some(self.model_config_warning.clone(), |bar, warning| {
+                        bar.when_some(
+                            combined_model_warning(
+                                self.model_config_warning.as_deref(),
+                                self.model_discovery_warning.as_deref(),
+                            ),
+                            |bar, warning| {
                             bar.child(
                                 div()
                                     .w_full()
@@ -8747,7 +9350,8 @@ impl Render for SessionPanel {
                                     .text_color(cx.theme().warning)
                                     .child(warning),
                             )
-                        })
+                            },
+                        )
                     }))
             )
             .when(can_share && self.share_offer.as_ref().is_some_and(|offer| {
@@ -9627,7 +10231,16 @@ impl Render for SessionPanel {
                                                 |title| format!("{title} output"),
                                             );
                                             let description = terminal_title.map_or_else(
-                                                || format!("{} · attached context", file.path),
+                                                || if self.memory_review.as_ref().is_some_and(|review| {
+                                                    review.turn_id.is_none()
+                                                        && file.path == memory_source_label(review.scope)
+                                                }) {
+                                                    format!("{} · complete memory snapshot for review", file.path)
+                                                } else if file.content.len() > chat_inline_limit {
+                                                    format!("{} · large file, outline or excerpt on send", file.path)
+                                                } else {
+                                                    format!("{} · attached context", file.path)
+                                                },
                                                 |_| "Recent terminal output · bounded excerpt".to_string(),
                                             );
                                             Attachment::new()
@@ -9793,7 +10406,7 @@ impl Render for SessionPanel {
                         },
                     )
                     .child(
-                        div()
+                        v_flex()
                             .w_full()
                             .child(
                                 Textarea::new(&self.chat_input)
@@ -9806,14 +10419,48 @@ impl Render for SessionPanel {
                                     .w_full()
                                     .max_h(px(160.)),
                             )
+                            .when_some(acp_command_input_hint, |composer, hint| {
+                                composer.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "acp-command-input-hint".into()
+                                        })
+                                        .w_full()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.))
+                                        .text_color(muted)
+                                        .child(format!("Input: {hint}")),
+                                )
+                            })
                     )
                     .child(
                         h_flex()
+                            .relative()
                             .w_full()
                             .flex_wrap()
                             .min_w_0()
                             .items_center()
                             .justify_between()
+                            .child({
+                                let panel = session_panel.clone();
+                                canvas(
+                                    |bounds, _, _| bounds.size.width,
+                                    move |_, width, _, cx| {
+                                        let width = width.as_f32();
+                                        panel.update(cx, |panel, cx| {
+                                            if panel.composer_footer_width.is_none_or(
+                                                |current| (current - width).abs() >= 1.0,
+                                            ) {
+                                                panel.composer_footer_width = Some(width);
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                )
+                                .absolute()
+                                .inset_0()
+                            })
                             .child(
                                 h_flex()
                                     .flex_1()
@@ -9828,7 +10475,7 @@ impl Render for SessionPanel {
                                                 .min_w_0()
                                                 .gap_1()
                                                 .child(
-                                                    v_flex().w(px(160.)).flex_shrink_0().gap_1()
+                                                    v_flex().w(px(160.)).min_w_0().gap_1()
                                                         .child(
                                                     {
                                                         let reasoning_options = self.reasoning_options.clone();
@@ -9885,6 +10532,8 @@ impl Render for SessionPanel {
                                                             })
                                                             .child(
                                                                 Combobox::new(&model_select)
+                                                                    .h(px(34.))
+                                                                    .when(selected_effort_label.is_some(), |picker| picker.h(px(44.)).py(px(2.)))
                                                                     .render_trigger({
                                                                         let selected_model_name = selected_model_name.clone();
                                                                         let selected_provider_name = selected_provider_name.clone();
@@ -9892,9 +10541,10 @@ impl Render for SessionPanel {
                                                                         let model_accessibility_label = model_accessibility_label.clone();
                                                                         move |_, _, cx| h_flex()
                                                                             .id("agent-chat-model-select-trigger")
+                                                                            .debug_selector(|| "agent-chat-model-select-trigger".into())
                                                                             .w_full()
                                                                             .min_w_0()
-                                                                            .h(px(38.))
+                                                                            .when(selected_effort_label.is_some(), |trigger| trigger.h(px(38.)))
                                                                             .items_center()
                                                                             .justify_between()
                                                                             .gap_1()
@@ -9980,7 +10630,8 @@ impl Render for SessionPanel {
                                                         column.child(
                                                             div()
                                                                 .debug_selector(|| "selected-model-chat-only".into())
-                                                                .w(px(160.))
+                                                                .w_full()
+                                                                .min_w_0()
                                                                 .truncate()
                                                                 .text_size(px(10.))
                                                                 .text_color(cx.theme().warning)
@@ -10019,8 +10670,8 @@ impl Render for SessionPanel {
                                                 {
                                                     if is_model_option(&option) {
                                                         let state = self.external_model_selects.iter()
-                                                            .find(|(cached, _)| cached.id == option.id)
-                                                            .map(|(_, state)| state)?;
+                                                            .find(|(cached, _, _)| cached.id == option.id)
+                                                            .map(|(_, state, _)| state)?;
                                                         let selected_model = external_model_specs(&option)
                                                             .into_iter()
                                                             .find(|model| model.model_id.as_deref() == Some(&current))
@@ -10063,6 +10714,7 @@ impl Render for SessionPanel {
                                                                 .child(Combobox::new(state)
                                                                 .w_full()
                                                                 .min_w_0()
+                                                                .h(px(34.))
                                                                 .menu_width(px(320.))
                                                                 .menu_max_h(px(320.))
                                                                 .search_placeholder("Search models or providers…")
@@ -10072,11 +10724,16 @@ impl Render for SessionPanel {
                                                                     move |_, _, cx| h_flex()
                                                                         .w_full()
                                                                         .min_w_0()
-                                                                        .overflow_hidden()
-                                                                        .gap_2()
-                                                                        .child(div().flex_1().min_w_0().truncate().child(model.clone()))
+                                                                        .items_center()
+                                                                        .gap_1()
+                                                                        .child(div()
+                                                                            .debug_selector(|| "acp-selected-model-name".into())
+                                                                            .flex_1().min_w_0().truncate().child(model.clone())
+                                                                        )
                                                                         .when_some(effort.clone(), |row, effort| row.child(
-                                                                            div().flex_shrink_0().whitespace_nowrap().text_color(cx.theme().accent).child(effort)
+                                                                            div().debug_selector(|| "acp-selected-model-effort".into())
+                                                                                .flex_shrink_0().text_size(px(10.))
+                                                                                .text_color(cx.theme().muted_foreground).child(effort)
                                                                         ))
                                                                 })
                                                                 .when_some(effort_footer, |picker, (effort, options, first_label, last_label)| {
@@ -10182,8 +10839,11 @@ impl Render for SessionPanel {
                                             })),
                                     ))
                                     // Context window budget
-                                    .when(!self.shared_guest, |bar| bar.child(
+                                    .when(
+                                        !self.shared_guest && context_window.is_some(),
+                                        |bar| bar.child(
                                         h_flex()
+                                            .debug_selector(|| "context-budget".into())
                                             .gap_1()
                                             .items_center()
                                             .child(
@@ -10194,22 +10854,31 @@ impl Render for SessionPanel {
                                                     } else {
                                                         cx.theme().magenta
                                                     })
-                                                    .accessibility_label(format!(
-                                                        "Context window {:.1}k of {:.0}k",
-                                                        self.context_used as f32 / 1000.0,
-                                                        context_window as f32 / 1000.0,
+                                                    .accessibility_label(context_window.map_or_else(
+                                                        || "Context usage unavailable".to_string(),
+                                                        |context_window| format!(
+                                                            "Context window {:.1}k of {:.0}k",
+                                                            context_used as f32 / 1000.0,
+                                                            context_window as f32 / 1000.0,
+                                                        ),
                                                     )),
                                             )
-                                            .child(
-                                                div()
-                                                    .whitespace_nowrap()
-                                                    .text_size(px(10.))
-                                                    .text_color(muted)
-                                                    .child(format!(
-                                                        "{:.1}k / {:.0}k",
-                                                        self.context_used as f32 / 1000.0,
-                                                        context_window as f32 / 1000.0,
-                                                    )),
+                                            .when_some(
+                                                context_window
+                                                    .filter(|_| show_context_usage_count),
+                                                |usage, context_window| {
+                                                    usage.child(
+                                                        div()
+                                                            .whitespace_nowrap()
+                                                            .text_size(px(10.))
+                                                            .text_color(muted)
+                                                            .child(format!(
+                                                                "{:.1}k / {:.0}k",
+                                                                context_used as f32 / 1000.0,
+                                                                context_window as f32 / 1000.0,
+                                                            )),
+                                                    )
+                                                },
                                             ),
                                     ))
                                     .child(
@@ -10306,6 +10975,7 @@ impl Render for SessionPanel {
                                     })
                                     .child(
                                         Button::new("send_btn")
+                                            .debug_selector(|| "send_btn".into())
                                             .primary()
                                             .disabled(managed_ahead && !self.model_config_loaded && self.pending_user_input.is_none() && human_recipients.is_empty())
                                             .icon(IconName::Send)
@@ -10339,19 +11009,22 @@ impl Render for SessionPanel {
 mod tests {
     use super::{
         ModelSpec, SessionPanel, SlashPaletteAction, SlashPaletteEntry,
-        SlashPaletteGroup, VOICE_AGENT_SESSION_CONTEXT, agent_display_name,
-        append_voice_transcript, can_submit_user_input, code_comment_context,
-        collect_open_buffer_symbols, config_option_update_is_current,
+        SlashPaletteGroup, VOICE_AGENT_SESSION_CONTEXT, acp_command_description,
+        active_acp_command_hint, agent_display_name, append_voice_transcript,
+        can_submit_user_input, code_comment_context, collect_open_buffer_symbols,
+        combined_model_warning, config_option_update_is_current,
         configured_models_with_user_home, context_for_message,
-        context_for_voice_message, current_symbol_document_indices,
+        context_for_voice_message, context_usage_window,
+        current_symbol_document_indices, editor_context_attachment,
         external_model_specs, external_reasoning_options,
         format_model_selection_accessibility_label, grouped_models,
         memory_replacement, memory_search_query, mentions_terminal_output,
-        merge_discovered_models, models_from_ai_config, models_with_discovered,
-        parse_toml_value, rank_slash_groups, reasoning_effort_at_slider_position,
-        reasoning_effort_slider_position, recent_voice_text,
-        refresh_discovered_model_cache, remember_voice_delegation,
-        safe_external_url, skill_catalog_key, skill_slash_label,
+        merge_discovered_models, model_discovery_warning, models_from_ai_config,
+        models_with_discovered, parse_toml_value, rank_slash_groups,
+        reasoning_effort_at_slider_position, reasoning_effort_slider_position,
+        recent_voice_text, refresh_discovered_model_cache,
+        remember_voice_delegation, safe_external_url, search_model_groups,
+        show_context_usage_label, skill_catalog_key, skill_slash_label,
         slash_command_query, truncate_voice_result, voice_editor_context_summary,
         voice_turn_queue_has_capacity,
     };
@@ -10595,6 +11268,74 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_fuzzy_search_ranks_names_before_provider_metadata() {
+        let models = vec![
+            ModelSpec {
+                name: "GPT-5.5 Codex".into(),
+                provider_name: Some("OpenAI".into()),
+                provider_id: Some("openai".into()),
+                model_id: Some("gpt-5.5-codex".into()),
+                ..ModelSpec::default()
+            },
+            ModelSpec {
+                name: "Reasoner".into(),
+                provider_name: Some("High Cloud".into()),
+                provider_id: Some("high-cloud".into()),
+                model_id: Some("high/reasoner".into()),
+                ..ModelSpec::default()
+            },
+        ];
+        let groups = grouped_models(&models);
+
+        let fuzzy_matches = search_model_groups(&groups.groups, "gpt55");
+        assert_eq!(fuzzy_matches.len(), 1);
+        assert_eq!(
+            groups.groups[fuzzy_matches[0].0].items[fuzzy_matches[0].1[0]].name,
+            "GPT-5.5 Codex"
+        );
+
+        let metadata_matches = search_model_groups(&groups.groups, "high");
+        let names = metadata_matches
+            .iter()
+            .flat_map(|(group_index, item_indices)| {
+                item_indices.iter().map(|item_index| {
+                    groups.groups[*group_index].items[*item_index].name.as_str()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Reasoner"]);
+    }
+
+    #[test]
+    fn model_picker_provider_search_returns_models_from_that_provider() {
+        let models = vec![
+            ModelSpec {
+                name: "Qwen 3".into(),
+                provider_name: Some("OpenRouter".into()),
+                provider_id: Some("openrouter".into()),
+                model_id: Some("qwen/qwen3".into()),
+                ..ModelSpec::default()
+            },
+            ModelSpec {
+                name: "Claude Sonnet".into(),
+                provider_name: Some("Anthropic".into()),
+                provider_id: Some("anthropic".into()),
+                model_id: Some("claude-sonnet".into()),
+                ..ModelSpec::default()
+            },
+        ];
+        let groups = grouped_models(&models);
+
+        let matches = search_model_groups(&groups.groups, "openrouter");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            groups.groups[matches[0].0].items[matches[0].1[0]].name,
+            "Qwen 3"
+        );
+    }
+
+    #[test]
     fn model_picker_accessible_name_includes_available_selection_details() {
         assert_eq!(
             format_model_selection_accessibility_label(
@@ -10611,6 +11352,98 @@ mod tests {
                 None
             ),
             "Model: Loading models…"
+        );
+    }
+
+    #[test]
+    fn context_usage_count_only_appears_when_known_and_wide_enough() {
+        assert!(!show_context_usage_label(Some(900.0), None));
+        assert!(!show_context_usage_label(None, Some(272_000)));
+        assert!(!show_context_usage_label(Some(799.0), Some(272_000)));
+        assert!(show_context_usage_label(Some(800.0), Some(272_000)));
+    }
+
+    #[gpui_kit::test]
+    fn session_panel_refreshes_context_usage_from_proxy_events(
+        cx: &mut TestAppContext,
+    ) {
+        use ahead_rpc::ahead::{AgentUsage, AheadNotification};
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_path_buf(),
+        );
+        let (panel, cx) = cx.add_window_view({
+            let workspace = workspace.path().to_path_buf();
+            let proxy = proxy.clone();
+            move |window, cx| {
+                SessionPanel::new(workspace, window, cx).with_proxy_client(proxy)
+            }
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.session_id = Some("session".into());
+            panel.watch_config_changes(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        proxy.route_ahead(AheadNotification::AgentTurnState {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            message_id: "message".into(),
+            state: "streaming".into(),
+        });
+        proxy.route_ahead(AheadNotification::AgentUsage {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            usage: AgentUsage {
+                used_tokens: 81_000,
+                context_window: Some(1_050_000),
+            },
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.context_used, 81_000);
+            assert_eq!(panel.harness_context_window, Some(1_050_000));
+        });
+    }
+
+    #[test]
+    fn context_usage_prefers_selected_model_window_for_managed_sessions() {
+        use ahead_rpc::ahead::HarnessKind;
+
+        assert_eq!(context_usage_window(HarnessKind::Ahead, None, None), None);
+        assert_eq!(
+            context_usage_window(HarnessKind::Ahead, Some(32_768), None),
+            None,
+            "managed usage can be stale when the selected model has no known limit"
+        );
+        assert_eq!(
+            context_usage_window(HarnessKind::Ahead, None, Some(272_000)),
+            Some(272_000)
+        );
+        assert_eq!(
+            context_usage_window(HarnessKind::Ahead, Some(258_400), Some(272_000),),
+            Some(272_000)
+        );
+        assert_eq!(
+            context_usage_window(HarnessKind::Ahead, Some(32_768), Some(258_400)),
+            Some(258_400),
+            "the selected model controls the next managed turn's context budget"
+        );
+        assert_eq!(
+            context_usage_window(HarnessKind::ExternalAcp, None, Some(272_000)),
+            None
+        );
+        assert_eq!(
+            context_usage_window(
+                HarnessKind::ExternalAcp,
+                Some(258_400),
+                Some(32_768),
+            ),
+            Some(258_400),
+            "external agents report their own active context window"
         );
     }
 
@@ -10714,27 +11547,84 @@ mod tests {
     }
 
     #[test]
+    fn large_chat_file_context_is_labeled_and_bounded() {
+        use ahead_rpc::ahead::{
+            AgentBufferSymbol, CHAT_FILE_OUTLINE_THRESHOLD_BYTES, TurnContextFile,
+            TurnContextFileKind,
+        };
+
+        assert_eq!(super::chat_inline_file_limit(None), 16 * 1024);
+        assert_eq!(super::chat_inline_file_limit(Some(33_000)), 8_250);
+        assert!(super::is_memory_review_document(
+            ".ahead/memories/MEMORY.md"
+        ));
+        let mut file = TurnContextFile {
+            path: "src/large.rs".into(),
+            content: format!("fn calculate() {{}}\n{}", "x".repeat(17 * 1024)),
+            kind: TurnContextFileKind::Full,
+        };
+        super::summarize_large_chat_file(
+            &mut file,
+            &[AgentBufferSymbol {
+                name: "calculate".into(),
+                start_line: 0,
+                end_line: 1,
+                depth: 0,
+            }],
+            CHAT_FILE_OUTLINE_THRESHOLD_BYTES,
+        );
+        assert_eq!(file.kind, TurnContextFileKind::Outline);
+        assert_eq!(file.content, "line 1: calculate\n");
+
+        let mut stale = TurnContextFile {
+            path: "src/large.rs".into(),
+            content: format!("{}é{}", "x".repeat(1023), "x".repeat(17 * 1024)),
+            kind: TurnContextFileKind::Full,
+        };
+        super::summarize_large_chat_file(
+            &mut stale,
+            &[AgentBufferSymbol {
+                name: "missing".into(),
+                start_line: 0,
+                end_line: 1,
+                depth: 0,
+            }],
+            CHAT_FILE_OUTLINE_THRESHOLD_BYTES,
+        );
+        assert_eq!(stale.kind, TurnContextFileKind::Excerpt);
+        assert_eq!(stale.content, "x".repeat(1023));
+    }
+
+    #[test]
     fn chat_context_requires_selection_or_current_file_mention() {
         use ahead_rpc::ahead::{DisplayPosition, DisplayRange, TurnEditorContext};
 
+        let workspace = std::path::Path::new("/workspace");
         let editor = TurnEditorContext {
             active_path: "src/main.rs".into(),
             caret: DisplayPosition { line: 0, col: 0 },
             selection: None,
             file_content: "unsaved buffer".into(),
+            selected_excerpt: None,
             visible_end: None,
             attached_anchor_ids: vec!["anchor".into()],
             attached_files: Vec::new(),
             attached_memories: Vec::new(),
         };
-        let plain =
-            context_for_message(editor.clone(), "What next?", vec![], vec![]);
+        let plain = context_for_message(
+            workspace,
+            editor.clone(),
+            "What next?",
+            vec![],
+            vec![],
+        );
         assert!(plain.active_path.is_empty());
         assert!(plain.file_content.is_empty());
         assert!(plain.attached_anchor_ids.is_empty());
         assert!(plain.attached_files.is_empty());
 
         let voice = context_for_voice_message(
+            workspace,
             editor.clone(),
             "Explain this code",
             vec![],
@@ -10746,6 +11636,7 @@ mod tests {
         assert!(voice.attached_anchor_ids.is_empty());
 
         let explicit = context_for_message(
+            workspace,
             editor.clone(),
             "Review (@currentFile), please",
             vec![],
@@ -10754,11 +11645,39 @@ mod tests {
         assert_eq!(explicit.attached_files[0].path, "src/main.rs");
         assert_eq!(explicit.attached_files[0].content, "unsaved buffer");
 
+        let refreshed = context_for_message(
+            workspace,
+            editor.clone(),
+            "Review @currentFile",
+            vec![
+                ahead_rpc::ahead::TurnContextFile {
+                    path: "src/main.rs".into(),
+                    content: "stale relative content".into(),
+                    kind: ahead_rpc::ahead::TurnContextFileKind::Full,
+                },
+                ahead_rpc::ahead::TurnContextFile {
+                    path: "/workspace/src/main.rs".into(),
+                    content: "stale absolute content".into(),
+                    kind: ahead_rpc::ahead::TurnContextFileKind::Full,
+                },
+                ahead_rpc::ahead::TurnContextFile {
+                    path: "/another-project/src/main.rs".into(),
+                    content: "unrelated file".into(),
+                    kind: ahead_rpc::ahead::TurnContextFileKind::Full,
+                },
+            ],
+            vec![],
+        );
+        assert_eq!(refreshed.attached_files.len(), 2);
+        assert_eq!(refreshed.attached_files[0].content, "unrelated file");
+        assert_eq!(refreshed.attached_files[1].content, "unsaved buffer");
+
         assert!(mentions_terminal_output("Explain this @terminal, please"));
         assert!(!mentions_terminal_output("Explain @terminalize"));
         assert!(!mentions_terminal_output("user@example.com"));
 
         let selected = context_for_message(
+            workspace,
             TurnEditorContext {
                 selection: Some(DisplayRange {
                     start: DisplayPosition { line: 0, col: 0 },
@@ -10775,6 +11694,7 @@ mod tests {
         assert!(selected.attached_files.is_empty());
 
         let selected_voice = context_for_voice_message(
+            workspace,
             TurnEditorContext {
                 selection: Some(DisplayRange {
                     start: DisplayPosition { line: 0, col: 0 },
@@ -10798,6 +11718,7 @@ mod tests {
             ..editor.clone()
         };
         let stale = context_for_message(
+            workspace,
             stale_editor.clone(),
             "Explain this selection",
             vec![],
@@ -10807,13 +11728,19 @@ mod tests {
         assert!(stale.file_content.is_empty());
         assert!(stale.selection.is_none());
 
-        let stale_explicit =
-            context_for_message(stale_editor, "Review @currentFile", vec![], vec![]);
+        let stale_explicit = context_for_message(
+            workspace,
+            stale_editor,
+            "Review @currentFile",
+            vec![],
+            vec![],
+        );
         assert_eq!(stale_explicit.active_path, "src/main.rs");
         assert_eq!(stale_explicit.attached_files[0].path, "src/main.rs");
         assert_eq!(stale_explicit.attached_files[0].content, "unsaved buffer");
 
         let stale_voice = context_for_voice_message(
+            workspace,
             TurnEditorContext {
                 selection: Some(DisplayRange {
                     start: DisplayPosition { line: 99, col: 0 },
@@ -10827,6 +11754,40 @@ mod tests {
         );
         assert!(stale_voice.active_path.is_empty());
         assert!(stale_voice.selection.is_none());
+    }
+
+    #[test]
+    fn editor_context_attachment_shows_relative_path_and_selected_lines() {
+        use ahead_rpc::ahead::{DisplayPosition, DisplayRange};
+
+        let workspace = std::path::Path::new("/workspace");
+        let file = std::path::Path::new("/workspace/python/main.py");
+        let (name, description) = editor_context_attachment(
+            workspace,
+            file,
+            Some(DisplayRange {
+                start: DisplayPosition { line: 2, col: 0 },
+                end: DisplayPosition { line: 2, col: 31 },
+            }),
+            false,
+        );
+        assert_eq!(name, "main.py");
+        assert_eq!(description, "python/main.py · line 3 · selected code");
+
+        let (_, description) = editor_context_attachment(
+            workspace,
+            file,
+            Some(DisplayRange {
+                start: DisplayPosition { line: 2, col: 0 },
+                end: DisplayPosition { line: 4, col: 0 },
+            }),
+            false,
+        );
+        assert_eq!(description, "python/main.py · lines 3–4 · selected code");
+
+        let (_, description) =
+            editor_context_attachment(workspace, file, None, true);
+        assert_eq!(description, "python/main.py · @currentFile");
     }
 
     #[test]
@@ -10963,7 +11924,6 @@ mod tests {
             provider_name: None,
             provider_id: Some("provider-a".into()),
             model_id: Some("model-a".into()),
-            context_window: 8_192,
             model_context_window: None,
             supports_tool_calls: None,
         };
@@ -10972,7 +11932,6 @@ mod tests {
             provider_name: None,
             provider_id: Some("provider-a".into()),
             model_id: Some("model-b".into()),
-            context_window: 8_192,
             model_context_window: None,
             supports_tool_calls: None,
         };
@@ -10981,7 +11940,6 @@ mod tests {
             provider_name: None,
             provider_id: Some("provider-b".into()),
             model_id: Some("model-a".into()),
-            context_window: 8_192,
             model_context_window: None,
             supports_tool_calls: None,
         };
@@ -11025,6 +11983,45 @@ mod tests {
         assert_eq!(skill_slash_label(&user_skill, true), "/user:review");
         assert_eq!(skill_slash_label(&project_skill, true), "/project:review");
         assert_eq!(skill_slash_label(&project_skill, false), "/review");
+    }
+
+    #[test]
+    fn acp_slash_command_description_includes_optional_input_hint() {
+        let command = ahead_rpc::ahead::AgentCommand {
+            name: "deploy".into(),
+            description: "Deploy the current project".into(),
+            input: Some(r#"{"hint":"environment name"}"#.into()),
+        };
+        assert_eq!(
+            acp_command_description(&command),
+            "Deploy the current project · Input: environment name"
+        );
+        assert_eq!(
+            active_acp_command_hint("/deploy", std::slice::from_ref(&command))
+                .as_deref(),
+            Some("environment name")
+        );
+        assert_eq!(
+            active_acp_command_hint("/deploy ", std::slice::from_ref(&command))
+                .as_deref(),
+            Some("environment name")
+        );
+        assert_eq!(
+            active_acp_command_hint(
+                "/deploy production",
+                std::slice::from_ref(&command),
+            ),
+            None
+        );
+
+        let command_without_hint = ahead_rpc::ahead::AgentCommand {
+            input: Some("not JSON".into()),
+            ..command
+        };
+        assert_eq!(
+            acp_command_description(&command_without_hint),
+            "Deploy the current project"
+        );
     }
 
     #[test]
@@ -11128,6 +12125,7 @@ mod tests {
             caret: ahead_rpc::ahead::DisplayPosition { line: 1, col: 2 },
             selection: None,
             file_content: "fn main() {\n    let answer = 42;\n}".into(),
+            selected_excerpt: None,
             visible_end: None,
             attached_anchor_ids: Vec::new(),
             attached_files: Vec::new(),
@@ -11144,6 +12142,7 @@ mod tests {
         let private = ahead_rpc::ahead::TurnEditorContext {
             active_path: ".env".into(),
             file_content: "API_KEY=do-not-send".into(),
+            selected_excerpt: None,
             ..context
         };
         let summary = voice_editor_context_summary(Some(&private));
@@ -11153,6 +12152,7 @@ mod tests {
         assert!(!summary.contains("do-not-send"));
 
         let private_voice_context = context_for_voice_message(
+            std::path::Path::new("/workspace"),
             private,
             "Explain @currentFile",
             Vec::new(),
@@ -11187,8 +12187,8 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("empty_new_ahead").is_some());
             assert!(window.try_find("empty_new_external").is_some());
-            assert!(window.try_find("empty_session_status").is_none());
         });
+        assert!(cx.debug_bounds("empty_session_status").is_none());
         for (button, expected_status) in [
             ("empty_new_ahead", "Threads panel is unavailable"),
             ("empty_new_external", "Threads panel is unavailable"),
@@ -11206,8 +12206,8 @@ mod tests {
             });
             cx.update(|window, cx| {
                 window.render_frame(cx);
-                assert!(window.try_find("empty_session_status").is_some());
             });
+            assert!(cx.debug_bounds("empty_session_status").is_some());
         }
 
         panel.update(cx, |panel, _| panel.share_starting = true);
@@ -11339,7 +12339,7 @@ mod tests {
             panel.available_commands = vec![ahead_rpc::ahead::AgentCommand {
                 name: "deploy".into(),
                 description: "Deploy the current project".into(),
-                input: None,
+                input: Some(r#"{"hint":"environment name"}"#.into()),
             }];
         });
         let chat_input = panel.update(cx, |panel, _| panel.chat_input.clone());
@@ -11478,6 +12478,7 @@ mod tests {
                 .find(|entry| entry.label == "/deploy")
                 .expect("active ACP command is available in the slash palette");
             assert!(command.description.contains("Deploy"));
+            assert!(command.description.contains("Input: environment name"));
         });
 
         cx.simulate_keystrokes("enter");
@@ -11485,6 +12486,13 @@ mod tests {
             assert!(!panel.show_commands);
             assert_eq!(panel.chat_input.read(cx).value().as_ref(), "/deploy ");
         });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("acp-command-input-hint").is_some());
+        chat_input.update_in(cx, |input, window, cx| {
+            input.replace_all("/deploy production".to_string(), window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("acp-command-input-hint").is_none());
     }
 
     #[gpui_kit::test]
@@ -11918,6 +12926,7 @@ mod tests {
                 panel.attached_files.push(TurnContextFile {
                     path: ".ahead/memories/MEMORY.md".into(),
                     content: format!("reviewed snapshot for {turn_id}"),
+                    kind: ahead_rpc::ahead::TurnContextFileKind::Full,
                 });
                 panel.apply_memory_replacement(review.clone(), proposal.into(), cx);
             });
@@ -12394,6 +13403,165 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn cancelling_during_large_file_outline_lookup_does_not_start_a_turn(
+        cx: &mut TestAppContext,
+    ) {
+        use ahead_rpc::ahead::AheadRequest;
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        use gpui_kit::AppContext;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("large.rs");
+        std::fs::write(
+            &path,
+            format!("fn example() {{}}\n{}", "x".repeat(17 * 1024)),
+        )
+        .expect("large source file");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_path_buf(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let code = cx.new(|cx| {
+                crate::code_panel::CodePanel::new(
+                    path.to_str().expect("source path"),
+                    window,
+                    cx,
+                )
+            });
+            SessionPanel::new(workspace.path().to_path_buf(), window, cx)
+                .with_code(code)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.session_id = Some("outline-session".into());
+            panel.start_agent_turn("Explain @currentFile".into(), window, cx);
+        });
+
+        let mut symbol_request = None;
+        for _ in 0..32 {
+            if let Ok(message) = rpc.rx().try_recv() {
+                match message {
+                    ProxyRpc::Request(
+                        id,
+                        ProxyRequest::GetDocumentSymbols {
+                            path: requested_path,
+                        },
+                    ) => {
+                        assert_eq!(requested_path, path);
+                        symbol_request = Some(id);
+                        break;
+                    }
+                    ProxyRpc::Request(
+                        _,
+                        ProxyRequest::AheadRequest {
+                            request: AheadRequest::AgentTurnStart { .. },
+                        },
+                    ) => panic!("turn started before the outline lookup finished"),
+                    _ => {}
+                }
+            }
+            assert!(
+                cx.background_executor.tick(),
+                "outline request was not scheduled"
+            );
+        }
+        let symbol_request = symbol_request.expect("pending outline request");
+        panel.update(cx, |panel, cx| panel.cancel_turn(cx));
+        rpc.handle_response(
+            symbol_request,
+            Ok(ProxyResponse::GetDocumentSymbols {
+                resp: lsp_types::DocumentSymbolResponse::Nested(Vec::new()),
+            }),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            !rpc.rx().try_iter().any(|message| matches!(
+                message,
+                ProxyRpc::Request(
+                    _,
+                    ProxyRequest::AheadRequest {
+                        request: AheadRequest::AgentTurnStart { .. },
+                    },
+                )
+            )),
+            "a cancelled outline lookup must not start a model turn"
+        );
+        panel.read_with(cx, |panel, cx| {
+            assert!(!panel.turn_starting);
+            assert!(!panel.turn_cancel_requested);
+            assert_eq!(panel.status.as_ref(), "Turn cancelled before starting");
+            assert_eq!(
+                panel.chat_input.read(cx).value().to_string(),
+                "Explain @currentFile"
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_agent_turn("Explain @currentFile".into(), window, cx);
+        });
+        let mut symbol_request = None;
+        for _ in 0..32 {
+            if let Ok(message) = rpc.rx().try_recv() {
+                match message {
+                    ProxyRpc::Request(
+                        id,
+                        ProxyRequest::GetDocumentSymbols { .. },
+                    ) => {
+                        symbol_request = Some(id);
+                        break;
+                    }
+                    ProxyRpc::Request(
+                        _,
+                        ProxyRequest::AheadRequest {
+                            request: AheadRequest::AgentTurnStart { .. },
+                        },
+                    ) => panic!(
+                        "second turn started before the outline lookup finished"
+                    ),
+                    _ => {}
+                }
+            }
+            assert!(
+                cx.background_executor.tick(),
+                "second outline request was not scheduled"
+            );
+        }
+        panel.update(cx, |panel, cx| {
+            panel.invalidate_chat_requests();
+            panel.session_id = Some("replacement-session".into());
+            panel.status = "Replacement session".into();
+            cx.notify();
+        });
+        rpc.handle_response(
+            symbol_request.expect("second pending outline request"),
+            Ok(ProxyResponse::GetDocumentSymbols {
+                resp: lsp_types::DocumentSymbolResponse::Nested(Vec::new()),
+            }),
+        );
+        cx.run_until_parked();
+        assert!(
+            !rpc.rx().try_iter().any(|message| matches!(
+                message,
+                ProxyRpc::Request(
+                    _,
+                    ProxyRequest::AheadRequest {
+                        request: AheadRequest::AgentTurnStart { .. },
+                    },
+                )
+            )),
+            "a previous session's outline lookup must not start a model turn"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.session_id.as_deref(), Some("replacement-session"));
+            assert_eq!(panel.status.as_ref(), "Replacement session");
+            assert!(!panel.turn_starting);
+        });
+    }
+
+    #[gpui_kit::test]
     fn completed_chat_before_acceptance_does_not_leave_stop_visible(
         cx: &mut TestAppContext,
     ) {
@@ -12593,6 +13761,8 @@ mod tests {
             AheadRequest, HarnessKind,
         };
         use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        use gpui_kit::AppContext;
+        use gpui_kit::component::combobox::ComboboxEvent;
         use gpui_kit::test::TestWindowExt;
 
         cx.update(gpui_kit::component::init);
@@ -12600,8 +13770,16 @@ mod tests {
         let proxy =
             crate::proxy_client::ProxyClient::new_for_test(workspace.clone());
         let rpc = proxy.rpc_for_test();
-        let (panel, cx) = cx
-            .add_window_view(|window, cx| SessionPanel::new(workspace, window, cx));
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let panel = cx.new(|cx| SessionPanel::new(workspace, window, cx));
+            gpui_kit::component::Root::new(panel, window, cx)
+        });
+        let panel = root.update(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<SessionPanel>()
+                .expect("session panel")
+        });
         panel.update(cx, |panel, cx| {
             panel.proxy = Some(proxy.clone());
             panel.session_id = Some("external-session".into());
@@ -12671,7 +13849,9 @@ mod tests {
                     ProxyRequest::AheadRequest { request },
                 ) = outgoing
                     .recv_timeout(std::time::Duration::from_secs(2))
-                    .expect("ACP config option update request")
+                    .unwrap_or_else(|_| {
+                        panic!("ACP config option update request for {expected_id}")
+                    })
                 else {
                     panic!("expected ACP config option update");
                 };
@@ -12696,6 +13876,11 @@ mod tests {
         });
 
         cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("acp-selected-model-effort").is_some(),
+            "the selected reasoning effort is visible in the collapsed ACP model selector"
+        );
         let picker = cx
             .debug_bounds("acp-config-model")
             .expect("ACP model picker");
@@ -12713,11 +13898,55 @@ mod tests {
             cx.debug_bounds("agent-chat-model-option-provider-provider/two")
                 .is_some()
         );
-        let option = cx
-            .debug_bounds("agent-chat-model-option-provider-provider/two")
-            .expect("second ACP model");
-        cx.simulate_click(option.center(), Default::default());
+        let (
+            model_select,
+            selected_model,
+            model_confirm_seen,
+            _model_confirm_subscription,
+        ) = panel.update(cx, |panel, cx| {
+            assert!(
+                panel
+                    .config_options
+                    .iter()
+                    .any(|option| option.id == "model"),
+                "the ACP model option remains current before confirmation"
+            );
+            let (option, state, _) = panel
+                .external_model_selects
+                .first()
+                .expect("external model selector state");
+            let selected_model = external_model_specs(option)
+                .into_iter()
+                .find(|model| model.model_id.as_deref() == Some("provider/two"))
+                .expect("second ACP model option");
+            let model_confirm_seen = std::rc::Rc::new(std::cell::Cell::new(false));
+            let model_confirm_seen_callback = model_confirm_seen.clone();
+            let subscription = cx.subscribe(
+                state,
+                move |_, _, event: &ComboboxEvent<super::GroupedModels>, _| {
+                    if matches!(event, ComboboxEvent::Confirm(_)) {
+                        model_confirm_seen_callback.set(true);
+                    }
+                },
+            );
+            (
+                state.clone(),
+                selected_model,
+                model_confirm_seen,
+                subscription,
+            )
+        });
+        cx.update(|window, cx| {
+            model_select.update(cx, |_, cx| {
+                cx.emit(ComboboxEvent::Confirm(vec![selected_model]));
+            });
+            window.render_frame(cx);
+        });
         cx.run_until_parked();
+        assert!(
+            model_confirm_seen.get(),
+            "ACP selector emits Confirm events"
+        );
 
         let picker = cx
             .debug_bounds("acp-config-model")
@@ -12732,11 +13961,24 @@ mod tests {
             Default::default(),
         );
         cx.run_until_parked();
+        assert_eq!(
+            panel.update(cx, |panel, _| panel
+                .config_option_update_session_id
+                .clone()),
+            None,
+            "the previous ACP option update completes before the next toggle"
+        );
 
         cx.update(|window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("acp-config-reasoning").is_some());
-            window.click("acp-config-reasoning", cx);
+        });
+        panel.update(cx, |panel, cx| {
+            panel.set_external_config_option(
+                "reasoning".into(),
+                AgentConfigOptionValue::Boolean(true),
+                cx,
+            );
         });
         cx.run_until_parked();
         responder.join().expect("ACP response");
@@ -13074,7 +14316,7 @@ mod tests {
         std::fs::create_dir(&ahead).expect("settings directory");
         std::fs::write(
             ahead.join("settings.toml"),
-            "[ai]\nactive_connection = 'First'\n[[ai.connections]]\nname = 'Other'\nprovider_id = 'other'\nbase_url = 'http://other/v1'\nmodels = ['other-model']\n[[ai.connections]]\nname = 'First'\nprovider_id = 'shared'\nbase_url = 'http://first/v1'\nmodels = ['first-model']\nhidden_models = ['first-model']\n[[ai.connections]]\nname = 'Second'\nprovider_id = 'shared'\nbase_url = 'http://second/v1'\nmodels = ['second-model', 'hidden-model']\nhidden_models = ['hidden-model']\n",
+            "[ai]\nactive_connection = 'First'\n[[ai.connections]]\nname = 'Other'\nprovider_id = 'other'\nbase_url = 'http://other/v1'\nmodels = ['other-model']\n[[ai.connections]]\nname = 'First'\nprovider_id = 'shared'\nbase_url = 'http://first/v1'\nmodels = ['first-model']\nhidden_models = ['first-model']\n[[ai.connections]]\nname = 'Second'\nprovider_id = 'shared'\nbase_url = 'http://second/v1'\ncontext_window = 262144\nmodel_context_windows = { 'second-model' = 1048576 }\nmodels = ['second-model', 'third-model', 'hidden-model']\nhidden_models = ['hidden-model']\n",
         )
         .expect("settings");
 
@@ -13082,11 +14324,13 @@ mod tests {
             configured_models_with_user_home(workspace.path(), None);
 
         assert!(warning.is_none());
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].name, "second-model");
         assert_eq!(models[0].provider_name.as_deref(), Some("Second"));
         assert_eq!(models[0].provider_id.as_deref(), Some("shared"));
-        assert_eq!(models[1].name, "other-model");
+        assert_eq!(models[0].model_context_window, Some(1_048_576));
+        assert_eq!(models[1].name, "third-model");
+        assert_eq!(models[2].name, "other-model");
     }
 
     #[test]
@@ -13096,8 +14340,7 @@ mod tests {
             provider_name: Some("Local".into()),
             provider_id: Some("local".into()),
             model_id: Some("qwen".into()),
-            context_window: 32_768,
-            model_context_window: None,
+            model_context_window: Some(32_768),
             supports_tool_calls: None,
         }];
         merge_discovered_models(
@@ -13127,22 +14370,30 @@ mod tests {
                     context_window: None,
                     supports_tool_calls: None,
                 },
+                crate::settings_panel::DiscoveredModel {
+                    provider_id: "openrouter".into(),
+                    provider_name: "OpenRouter".into(),
+                    model_id: "openai/gpt-6-luna".into(),
+                    display_name: Some("GPT-6 Luna".into()),
+                    context_window: Some(1_050_000),
+                    supports_tool_calls: Some(true),
+                },
             ],
         );
 
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[1].provider_id.as_deref(), Some("local"));
         assert_eq!(models[1].model_id.as_deref(), Some("llama"));
         assert_eq!(models[2].provider_id.as_deref(), Some("remote"));
         assert_eq!(models[2].model_id.as_deref(), Some("qwen"));
-        assert_eq!(models[0].context_window, 131_072);
         assert_eq!(models[0].model_context_window, Some(131_072));
         assert_eq!(models[0].name, "Qwen 3");
-        assert_eq!(models[1].context_window, 65_536);
         assert_eq!(models[1].model_context_window, Some(65_536));
         assert_eq!(models[1].name, "Llama 4");
-        assert_eq!(models[2].context_window, 32_768);
         assert_eq!(models[2].model_context_window, None);
+        assert_eq!(models[3].model_id.as_deref(), Some("openai/gpt-6-luna"));
+        assert_eq!(models[3].model_context_window, Some(1_050_000));
+        assert_eq!(models[3].name, "GPT-6 Luna");
         assert_eq!(models[0].supports_tool_calls, Some(true));
         assert_eq!(models[1].supports_tool_calls, Some(false));
         assert_eq!(models[2].supports_tool_calls, None);
@@ -13189,7 +14440,6 @@ mod tests {
             provider_name: Some("OpenRouter".into()),
             provider_id: Some("openrouter".into()),
             model_id: Some("pinned-model".into()),
-            context_window: 32_768,
             model_context_window: None,
             supports_tool_calls: None,
         }];
@@ -13297,6 +14547,28 @@ mod tests {
         assert_eq!(cache[0].model_id, "last-known-model");
     }
 
+    #[test]
+    fn repeated_model_discovery_warnings_do_not_accumulate() {
+        let config_warning = ".ahead/config.toml: invalid TOML";
+        let discovery_warnings =
+            vec!["OpenAI-compatible server: endpoint unavailable".to_string()];
+
+        for _ in 0..3 {
+            let discovery_warning = model_discovery_warning(&discovery_warnings);
+            assert_eq!(
+                combined_model_warning(
+                    Some(config_warning),
+                    discovery_warning.as_deref(),
+                )
+                .as_deref(),
+                Some(
+                    ".ahead/config.toml: invalid TOML; Model discovery incomplete: \
+                     OpenAI-compatible server: endpoint unavailable"
+                )
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn model_picker_reports_rejected_settings_and_recovers_after_repair() {
@@ -13365,16 +14637,12 @@ mod tests {
         let config = ahead.join("config.toml");
         std::fs::write(&config, "[ai]\nmodel = 'before-load'\n")
             .expect("initial config");
-        let proxy = crate::proxy_client::ProxyClient::new_for_test(
-            workspace.path().to_path_buf(),
-        );
         // add_window_view pumps background work before returning, which would
         // skip the loading state this test needs to exercise.
         let cx = cx.add_empty_window();
         let panel = cx.update(|window, cx| {
             window.replace_root(cx, |window, cx| {
                 SessionPanel::new(workspace.path().to_path_buf(), window, cx)
-                    .with_proxy_client(proxy)
             })
         });
         panel.update_in(cx, |panel, window, cx| {
@@ -13428,10 +14696,10 @@ mod tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let provider_label = cx
-            .debug_bounds("selected-model-provider")
+            .debug_bounds("selected-model-provider-trigger")
             .expect("selected model provider label");
-        assert!(provider_label.size.width <= gpui_kit::px(150.));
-        assert!(provider_label.size.width > gpui_kit::px(80.));
+        assert!(provider_label.size.width <= gpui_kit::px(70.));
+        assert!(provider_label.size.width > gpui_kit::px(0.));
         panel.update(cx, |panel, cx| {
             if let Some(model) = panel.models.get_mut(panel.selected_model) {
                 model.supports_tool_calls = Some(false);
@@ -13442,7 +14710,7 @@ mod tests {
         let chat_only_label = cx
             .debug_bounds("selected-model-chat-only")
             .expect("selected chat-only model label");
-        assert!(chat_only_label.size.width <= gpui_kit::px(150.));
+        assert!(chat_only_label.size.width <= gpui_kit::px(160.));
     }
 
     #[gpui_kit::test]
@@ -13494,6 +14762,7 @@ mod tests {
             panel.update_in(cx, |panel, window, cx| {
                 assert!(panel.model_config_loaded);
                 assert_eq!(panel.selected_model, 0);
+                panel.harness_context_window = Some(32_768);
                 panel.reload_configured_models(window, cx);
                 (panel.model_select.clone(), panel.models[1].clone())
             });
@@ -13504,6 +14773,7 @@ mod tests {
         });
         panel.update(cx, |panel, _| {
             assert_eq!(panel.selected_model, 1);
+            assert_eq!(panel.harness_context_window, None);
             panel.session_id = Some("new-external-session".into());
             panel.harness_kind = ahead_rpc::ahead::HarnessKind::ExternalAcp;
             panel.external_agent_id = Some("pi-acp".into());
@@ -13523,7 +14793,7 @@ mod tests {
             assert_eq!(selected.model_id.as_deref(), Some("shared"));
             assert_eq!(selected.name, "shared");
             assert_eq!(selected.provider_name.as_deref(), Some("Renamed second"));
-            assert_eq!(selected.context_window, 64000);
+            assert_eq!(selected.model_context_window, Some(64000));
             assert_eq!(panel.selected_model, 0);
             assert_eq!(
                 panel
@@ -13555,6 +14825,94 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn narrow_composer_keeps_model_and_send_controls_inside_panel(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::AppContext;
+        use std::ops::Deref;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(280.), gpui_kit::px(640.)),
+            move |window, cx| {
+                let panel =
+                    cx.new(|cx| SessionPanel::new(workspace_path, window, cx));
+                gpui_kit::component::Root::new(panel, window, cx)
+            },
+        );
+        let root = window.root(cx).expect("root view");
+        let panel = root.update(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<SessionPanel>()
+                .expect("session panel")
+        });
+        let mut cx = gpui_kit::VisualTestContext::from_window(*window.deref(), cx);
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.session_id = Some("narrow-composer-session".into());
+            panel.harness_kind = ahead_rpc::ahead::HarnessKind::Ahead;
+            panel.model_config_loaded = true;
+            panel.models = vec![ModelSpec {
+                name: "A model with a deliberately long display name".into(),
+                provider_name: Some("OpenRouter".into()),
+                provider_id: Some("openrouter".into()),
+                model_id: Some("long-model".into()),
+                model_context_window: Some(1_000_000),
+                supports_tool_calls: Some(false),
+            }];
+            panel.selected_model = 0;
+            panel.reasoning_options = ahead_rpc::ahead::AgentReasoningOptions {
+                default_effort: Some("high".into()),
+                supported_efforts: vec![ahead_rpc::ahead::AgentReasoningEffort {
+                    value: "high".into(),
+                    description: String::new(),
+                }],
+            };
+            panel.selected_reasoning_effort = Some("high".into());
+            panel.sync_reasoning_slider(window, cx);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let controls = ["agent-chat-model-select", "context-budget", "send_btn"]
+            .map(|selector| {
+                let bounds = cx.debug_bounds(selector).unwrap_or_else(|| {
+                    panic!("missing composer control {selector}")
+                });
+                (selector, bounds)
+            });
+        for (selector, bounds) in &controls {
+            assert!(
+                bounds.left() >= gpui_kit::px(0.)
+                    && bounds.right() <= gpui_kit::px(280.),
+                "{selector} must stay inside a 280px panel: {bounds:?}"
+            );
+        }
+        for (index, (selector, bounds)) in controls.iter().enumerate() {
+            for (other_selector, other_bounds) in &controls[index + 1..] {
+                assert!(
+                    !bounds.intersects(other_bounds),
+                    "{selector} {bounds:?} and {other_selector} {other_bounds:?} must not overlap"
+                );
+            }
+        }
+        assert!(
+            cx.debug_bounds("selected-model-effort").is_some(),
+            "reasoning effort remains in the combined model selector"
+        );
+        let chat_only = cx
+            .debug_bounds("selected-model-chat-only")
+            .expect("chat-only model warning");
+        assert!(
+            chat_only.right() <= controls[0].1.right(),
+            "the warning must truncate with the model selector"
+        );
+    }
+
+    #[gpui_kit::test]
     async fn chat_model_select_filters_by_provider_name(cx: &mut TestAppContext) {
         use gpui_kit::AppContext;
         use gpui_kit::component::WindowExt;
@@ -13581,9 +14939,30 @@ mod tests {
                 .downcast::<SessionPanel>()
                 .expect("session panel")
         });
-        panel.update_in(cx, |panel, _window, cx| {
+        panel.update_in(cx, |panel, window, cx| {
             assert!(panel.model_config_loaded);
-            assert_eq!(panel.models.len(), 2);
+            assert!(panel.models.iter().any(|model| {
+                model.provider_id.as_deref() == Some("openrouter")
+                    && model.model_id.as_deref() == Some("qwen-3")
+            }));
+            assert!(panel.models.iter().any(|model| {
+                model.provider_id.as_deref() == Some("anthropic")
+                    && model.model_id.as_deref() == Some("claude-sonnet")
+            }));
+            let discovered_model = ModelSpec {
+                name: "Nemotron 3 Ultra".into(),
+                provider_name: Some("OpenRouter".into()),
+                provider_id: Some("openrouter".into()),
+                model_id: Some("nvidia/nemotron-3-ultra-550b-a55b:free".into()),
+                model_context_window: Some(1_000_000),
+                supports_tool_calls: Some(true),
+            };
+            panel.configured_model_specs.push(discovered_model.clone());
+            panel.models.push(discovered_model);
+            let models = panel.models.clone();
+            panel.model_select.update(cx, |select, cx| {
+                select.set_items(grouped_models(&models), window, cx);
+            });
             panel.session_id = Some("model-search-test-session".into());
             panel.harness_kind = ahead_rpc::ahead::HarnessKind::Ahead;
             cx.notify();
@@ -13609,12 +14988,57 @@ mod tests {
         );
         assert!(cx.debug_bounds("agent-effort-value").is_none());
         assert!(cx.debug_bounds("agent-model-reasoning-slider").is_none());
-        cx.simulate_keystrokes("escape");
+        cx.simulate_input("550b-a55b");
         cx.run_until_parked();
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(150))
+            .await;
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let model_id_option = cx
+            .debug_bounds(
+                "agent-chat-model-option-openrouter-nvidia/nemotron-3-ultra-550b-a55b:free",
+            )
+            .expect("provider model IDs remain searchable when the display name differs");
         assert!(
-            !panel.update(cx, |panel, _| panel.model_select_popup_open),
-            "Escape closes the model selector"
+            cx.debug_bounds("agent-chat-model-option-openrouter-qwen-3")
+                .is_none(),
+            "an ID-only query filters out models that do not match"
         );
+        let models = panel.update(cx, |panel, _| panel.models.clone());
+        panel.update_in(cx, |panel, window, cx| {
+            super::replace_model_select_items(
+                &panel.model_select,
+                &models,
+                window,
+                cx,
+            );
+        });
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(150))
+            .await;
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            cx.debug_bounds(
+                "agent-chat-model-option-openrouter-nvidia/nemotron-3-ultra-550b-a55b:free"
+            )
+            .is_some(),
+            "replacing the discovered model catalog reapplies the active query"
+        );
+        assert!(
+            cx.debug_bounds("agent-chat-model-option-openrouter-qwen-3")
+                .is_none(),
+            "a catalog refresh must not reset the picker to unfiltered models"
+        );
+        cx.simulate_click(model_id_option.center(), Default::default());
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.models[panel.selected_model].model_id.as_deref(),
+                Some("nvidia/nemotron-3-ultra-550b-a55b:free")
+            );
+        });
 
         panel.update_in(cx, |panel, window, cx| {
             panel.reasoning_options = ahead_rpc::ahead::AgentReasoningOptions {
@@ -13652,6 +15076,18 @@ mod tests {
         let trigger_provider = cx
             .debug_bounds("selected-model-provider-trigger")
             .expect("muted provider in the combined selector trigger");
+        let trigger_frame = cx
+            .debug_bounds("agent-chat-model-select")
+            .expect("combined selector frame");
+        let trigger_body = cx
+            .debug_bounds("agent-chat-model-select-trigger")
+            .expect("combined selector trigger body");
+        assert!(
+            trigger_frame.size.height >= gpui_kit::px(44.)
+                && trigger_body.top() >= trigger_frame.top()
+                && trigger_body.bottom() <= trigger_frame.bottom(),
+            "the gpui-kit trigger frame must fit the two-line model and effort label"
+        );
         assert!(
             trigger_effort.bottom() <= trigger_model.top(),
             "effort sits above the selected model, like the compact Codex selector"
@@ -13786,6 +15222,10 @@ mod tests {
         );
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
+        assert!(
+            !panel.update(cx, |panel, _| panel.model_select_popup_open),
+            "Escape closes the searchable model selector"
+        );
     }
 
     #[gpui_kit::test(iterations = 20)]

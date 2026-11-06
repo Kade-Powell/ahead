@@ -402,7 +402,6 @@ fn test_invocation(
     ToolInvocation {
         session,
         step_context,
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(tokio::sync::Mutex::new(
             crate::turn_diff_tracker::TurnDiffTracker::new(),

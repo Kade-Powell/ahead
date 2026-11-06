@@ -342,8 +342,8 @@ impl ToolRegistry {
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.turn.session_telemetry.clone();
-        let permission_profile = invocation.turn.permission_profile();
+        let otel = invocation.step_context.turn.session_telemetry.clone();
+        let permission_profile = invocation.step_context.turn.permission_profile();
         // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
         // instead of reporting the thread-wide backend for environment-scoped tools.
         let base_tool_result_tags = [
@@ -351,7 +351,7 @@ impl ToolRegistry {
                 "sandbox",
                 permission_profile_sandbox_tag(
                     &permission_profile,
-                    invocation.turn.windows_sandbox_level,
+                    invocation.step_context.turn.windows_sandbox_level,
                 ),
             ),
             (
@@ -359,7 +359,7 @@ impl ToolRegistry {
                 permission_profile_policy_tag(
                     &permission_profile,
                     #[allow(deprecated)]
-                    invocation.turn.cwd.as_path(),
+                    invocation.step_context.turn.cwd.as_path(),
                 ),
             ),
         ];

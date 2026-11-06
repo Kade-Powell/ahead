@@ -2,9 +2,9 @@
 
 ## Use the terminal
 
-Open the bottom panel with **Cmd+J** / **Ctrl+J** or **Ctrl+`**. The terminal is a live PTY: type commands directly, use shell history and completion, and press **Ctrl+C** to interrupt a running command. The plus control or **New Terminal** in the Command Palette opens another terminal. A task launched from AHEAD opens in a terminal, so you can see its real output and exit status.
+Open the bottom panel with **Cmd+J** / **Ctrl+J** or **Ctrl+`**. The terminal is a live PTY: type commands directly, use shell history and completion, and press **Ctrl+C** to interrupt a running command. The plus control or **New Terminal** in the Command Palette opens another terminal. **Cmd+W** closes the focused terminal tab on macOS; **Ctrl+F4** does so on Linux and Windows, where **Ctrl+W** stays available to the shell. A task launched from AHEAD opens in a terminal, so you can see its real output and exit status.
 
-Drag to select text; double-click selects a word and triple-click selects a line. The **Edit** menu and terminal right-click menu both provide **Copy**, **Paste**, and **Select All**; right-click also provides **Paste Text**. **Select All** includes scrollback; use **Cmd+A** on macOS or **Ctrl+Shift+A** elsewhere so plain **Ctrl+A** remains available to the shell. **Paste** follows the clipboard type (text, shell-quoted file paths, or image paste); **Paste Text** always inserts clipboard text.
+Drag to select text; double-click selects a word and triple-click selects a line. The **Edit** menu and terminal right-click menu both provide **Copy**, **Paste**, and **Select All**; right-click also provides **Paste Text**, **Clear**, and **Close Terminal Tab**. **Clear** removes scrollback while keeping the current command line. The tab's right-click menu offers New, Rename, Close, Close Others, Close Left/Right, Close Clean and Close All. **Select All** includes scrollback; use **Cmd+A** on macOS or **Ctrl+Shift+A** elsewhere so plain **Ctrl+A** remains available to the shell. **Paste** follows the clipboard type (text, shell-quoted file paths, or image paste); **Paste Text** always inserts clipboard text.
 
 Mouse input is forwarded to terminal apps that enable mouse tracking, including clicks, drags, movement, and wheel scrolling. Hold **Shift** to select terminal text or scroll the terminal history instead.
 

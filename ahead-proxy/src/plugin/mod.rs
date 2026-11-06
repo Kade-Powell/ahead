@@ -28,6 +28,7 @@ use ahead_rpc::{
 use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender};
 use dyn_clone::DynClone;
+use jsonrpc_lite::Id;
 use lsp_types::{
     CallHierarchyClientCapabilities, CallHierarchyIncomingCall,
     CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyPrepareParams,
@@ -38,6 +39,7 @@ use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemCapability,
     CompletionItemCapabilityResolveSupport, CompletionParams, CompletionResponse,
     CompletionTriggerKind, Diagnostic, DocumentFormattingParams,
+    DocumentOnTypeFormattingClientCapabilities, DocumentOnTypeFormattingParams,
     DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
     ExecuteCommandParams, FoldingRange, FoldingRangeClientCapabilities,
     FoldingRangeParams, FormattingOptions, GotoCapability, GotoDefinitionParams,
@@ -63,7 +65,7 @@ use lsp_types::{
         DocumentSymbolRequest, ExecuteCommand, FoldingRangeRequest, Formatting,
         GotoDefinition, GotoImplementation, GotoImplementationResponse,
         GotoTypeDefinition, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
-        HoverRequest, InlayHintRequest, InlineCompletionRequest,
+        HoverRequest, InlayHintRequest, InlineCompletionRequest, OnTypeFormatting,
         PrepareRenameRequest, References, Rename, Request, ResolveCompletionItem,
         SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
         WorkspaceSymbolRequest,
@@ -102,12 +104,16 @@ pub enum PluginCatalogRpc {
     ServerRequest {
         plugin_id: Option<PluginId>,
         request_sent: Option<Arc<AtomicUsize>>,
+        cancellation_id: Option<Id>,
         method: Cow<'static, str>,
         params: Value,
         language_id: Option<String>,
         path: Option<PathBuf>,
         check: bool,
         f: Box<dyn ClonableCallback<Value, RpcError>>,
+    },
+    CancelCompletion {
+        request_id: Id,
     },
     ServerNotification {
         plugin_id: Option<PluginId>,
@@ -310,6 +316,7 @@ impl PluginCatalogRpcHandler {
                 PluginCatalogRpc::ServerRequest {
                     plugin_id,
                     request_sent,
+                    cancellation_id,
                     method,
                     params,
                     language_id,
@@ -320,6 +327,7 @@ impl PluginCatalogRpcHandler {
                     plugin.handle_server_request(
                         plugin_id,
                         request_sent,
+                        cancellation_id,
                         method,
                         params,
                         language_id,
@@ -327,6 +335,9 @@ impl PluginCatalogRpcHandler {
                         check,
                         f,
                     );
+                }
+                PluginCatalogRpc::CancelCompletion { request_id } => {
+                    plugin.cancel_completion(request_id);
                 }
                 PluginCatalogRpc::ServerNotification {
                     plugin_id,
@@ -503,9 +514,32 @@ impl PluginCatalogRpcHandler {
         P: Serialize,
         Resp: DeserializeOwned,
     {
-        self.send_request(
+        self.send_request_to_first_capable_plugin_with_id(
+            method,
+            params,
+            language_id,
+            path,
+            None,
+            cb,
+        );
+    }
+
+    fn send_request_to_first_capable_plugin_with_id<P, Resp>(
+        &self,
+        method: &'static str,
+        params: P,
+        language_id: Option<String>,
+        path: Option<PathBuf>,
+        cancellation_id: Option<Id>,
+        cb: impl FnOnce(PluginId, Result<Resp, RpcError>) + Clone + Send + 'static,
+    ) where
+        P: Serialize,
+        Resp: DeserializeOwned,
+    {
+        self.send_request_with_cancellation_id(
             None,
             None,
+            cancellation_id,
             method,
             params,
             language_id,
@@ -541,10 +575,37 @@ impl PluginCatalogRpcHandler {
         check: bool,
         f: impl FnOnce(PluginId, Result<Value, RpcError>) + Send + DynClone + 'static,
     ) {
+        self.send_request_with_cancellation_id(
+            plugin_id,
+            request_sent,
+            None,
+            method,
+            params,
+            language_id,
+            path,
+            check,
+            f,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_request_with_cancellation_id<P: Serialize>(
+        &self,
+        plugin_id: Option<PluginId>,
+        request_sent: Option<Arc<AtomicUsize>>,
+        cancellation_id: Option<Id>,
+        method: impl Into<Cow<'static, str>>,
+        params: P,
+        language_id: Option<String>,
+        path: Option<PathBuf>,
+        check: bool,
+        f: impl FnOnce(PluginId, Result<Value, RpcError>) + Send + DynClone + 'static,
+    ) {
         let params = serde_json::to_value(params).unwrap();
         let rpc = PluginCatalogRpc::ServerRequest {
             plugin_id,
             request_sent,
+            cancellation_id,
             method: method.into(),
             params,
             language_id,
@@ -1118,6 +1179,42 @@ impl PluginCatalogRpcHandler {
         );
     }
 
+    pub fn get_document_on_type_formatting(
+        &self,
+        path: &Path,
+        position: Position,
+        trigger_character: String,
+        cb: impl FnOnce(PluginId, Result<Vec<TextEdit>, RpcError>)
+        + Clone
+        + Send
+        + 'static,
+    ) {
+        let uri = Url::from_file_path(path).unwrap();
+        let method = OnTypeFormatting::METHOD;
+        let params = DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            ch: trigger_character,
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: true,
+                ..Default::default()
+            },
+        };
+        let language_id = Some(language_id_from_path(path).unwrap_or_default());
+        self.send_request_to_first_capable_plugin(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            move |plugin_id, result: Result<Option<Vec<TextEdit>>, RpcError>| {
+                cb(plugin_id, result.map(Option::unwrap_or_default));
+            },
+        );
+    }
+
     pub fn prepare_rename(
         &self,
         path: &Path,
@@ -1276,11 +1373,15 @@ impl PluginCatalogRpcHandler {
         let core_rpc = self.core_rpc.clone();
         let language_id = Some(language_id_from_path(path).unwrap_or_default());
 
-        self.send_request_to_first_capable_plugin(
+        self.send_request_with_cancellation_id(
+            None,
+            None,
+            Some(Id::Str(format!("ahead-completion-{request_id}"))),
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
+            true,
             move |plugin_id, result: Result<Value, RpcError>| {
                 let response = result
                     .and_then(|value| {
@@ -1302,6 +1403,14 @@ impl PluginCatalogRpcHandler {
                 core_rpc.completion_response(request_id, input, response, plugin_id);
             },
         );
+    }
+
+    pub fn cancel_completion(&self, request_id: usize) {
+        if let Err(error) = self.plugin_tx.send(PluginCatalogRpc::CancelCompletion {
+            request_id: Id::Str(format!("ahead-completion-{request_id}")),
+        }) {
+            tracing::error!(?error, "cancelling language-server completion");
+        }
     }
 
     pub fn completion_resolve(
@@ -1622,7 +1731,10 @@ fn client_capabilities() -> ClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
                     snippet_support: Some(true),
                     resolve_support: Some(CompletionItemCapabilityResolveSupport {
-                        properties: vec!["additionalTextEdits".to_string()],
+                        properties: vec![
+                            "additionalTextEdits".to_string(),
+                            "command".to_string(),
+                        ],
                     }),
                     ..Default::default()
                 }),
@@ -1641,6 +1753,9 @@ fn client_capabilities() -> ClientCapabilities {
                     active_parameter_support: Some(true),
                 }),
                 ..Default::default()
+            }),
+            on_type_formatting: Some(DocumentOnTypeFormattingClientCapabilities {
+                dynamic_registration: Some(false),
             }),
             hover: Some(HoverClientCapabilities {
                 content_format: Some(vec![
@@ -2010,6 +2125,45 @@ mod capability_tests {
     }
 
     #[test]
+    fn on_type_formatting_uses_lsp_trigger_and_post_edit_position() {
+        use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
+        use ahead_rpc::plugin::PluginId;
+        use lsp_types::Position;
+
+        let rpc =
+            PluginCatalogRpcHandler::new(ahead_rpc::core::CoreRpcHandler::new());
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let path = std::env::temp_dir().join("on-type-format.rs");
+        let position = Position::new(3, 4);
+        rpc.get_document_on_type_formatting(
+            &path,
+            position,
+            "\n".into(),
+            move |plugin_id, result| {
+                sender
+                    .send((plugin_id, result))
+                    .expect("formatting response");
+            },
+        );
+        let PluginCatalogRpc::ServerRequest {
+            method, params, f, ..
+        } = rpc.test_receiver().recv().expect("request")
+        else {
+            panic!("server request expected");
+        };
+        assert_eq!(method, "textDocument/onTypeFormatting");
+        assert_eq!(params["position"]["line"], 3);
+        assert_eq!(params["position"]["character"], 4);
+        assert_eq!(params["ch"], "\n");
+        f(PluginId(7), Ok(serde_json::json!([])));
+        let (plugin_id, edits) = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("formatting result");
+        assert_eq!(plugin_id, PluginId(7));
+        assert!(edits.expect("valid result").is_empty());
+    }
+
+    #[test]
     fn first_capable_requests_preserve_null_and_report_invalid_responses() {
         use super::{PluginCatalogRpc, PluginCatalogRpcHandler};
         for (reply, succeeds) in [
@@ -2054,11 +2208,18 @@ mod capability_tests {
             .text_document
             .and_then(|text_document| text_document.completion)
             .and_then(|completion| completion.completion_item);
-        assert_eq!(
-            completion_item
-                .and_then(|completion_item| completion_item.snippet_support),
-            Some(true)
+        let completion_item = completion_item.expect("completion-item capability");
+        assert_eq!(completion_item.snippet_support, Some(true));
+        let resolve_properties = completion_item
+            .resolve_support
+            .expect("completion resolve capability")
+            .properties;
+        assert!(
+            resolve_properties
+                .iter()
+                .any(|name| name == "additionalTextEdits")
         );
+        assert!(resolve_properties.iter().any(|name| name == "command"));
     }
 
     #[test]

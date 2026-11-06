@@ -2,7 +2,6 @@ use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::ShellEnvironmentPolicyFilter;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -10,8 +9,7 @@ use std::collections::HashMap;
 use toml::Value as TomlValue;
 
 /// Policy for building the `env` when spawning a process via shell-like tools.
-#[derive(Serialize, Debug, Clone, PartialEq, Default, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Debug, Clone, PartialEq, Default)]
 pub struct ShellEnvironmentPolicyToml {
     pub inherit: Option<ShellEnvironmentPolicyInherit>,
 

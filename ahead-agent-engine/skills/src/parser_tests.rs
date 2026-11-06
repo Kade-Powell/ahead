@@ -6,9 +6,9 @@ use super::ParsedSkillFrontmatter;
 use super::parse_skill_frontmatter_metadata;
 
 #[test]
-fn parses_repairs_and_sanitizes_frontmatter() {
+fn parses_and_sanitizes_frontmatter() {
     let parsed = parse_skill_frontmatter_metadata(
-        "---\nname: deploy-service\ndescription: Build for AWS: ECS\ndisable-model-invocation: true\nmetadata:\n  short-description:  Deploy   safely\n---\n",
+        "---\nname: deploy-service\ndescription: 'Build for AWS: ECS'\ndisable-model-invocation: true\nmetadata:\n  short-description:  Deploy   safely\n---\n",
         "deploy-service",
     )
     .expect("valid frontmatter");
@@ -22,6 +22,17 @@ fn parses_repairs_and_sanitizes_frontmatter() {
             disable_model_invocation: true,
         }
     );
+}
+
+#[test]
+fn accepts_standard_optional_fields_and_string_metadata() {
+    let parsed = parse_skill_frontmatter_metadata(
+        "---\nname: deploy-service\ndescription: Deploy the service\nlicense: MIT\ncompatibility: Requires git\nallowed-tools: Bash(git:*) Read\nmetadata:\n  author: example-org\n  version: \"1.0\"\n  short-description: Deploy safely\n---\n",
+        "deploy-service",
+    )
+    .expect("standard optional fields should be accepted");
+
+    assert_eq!(parsed.short_description.as_deref(), Some("Deploy safely"));
 }
 
 #[test]
@@ -86,6 +97,48 @@ fn validates_name_characters_and_parent_directory() {
 }
 
 #[test]
+fn rejects_non_string_standard_fields_and_metadata_values() {
+    for frontmatter in [
+        "license: 1",
+        "license: null",
+        "compatibility: [git]",
+        "compatibility: null",
+        "allowed-tools: [Read]",
+        "allowed-tools: null",
+        "metadata:\n  version: 1",
+        "metadata: null",
+    ] {
+        let contents = format!("---\nname: demo\ndescription: Demo skill\n{frontmatter}\n---\n");
+        assert!(matches!(
+            parse_skill_frontmatter_metadata(&contents, "demo"),
+            Err(super::SkillParseError::InvalidYaml(_))
+        ));
+    }
+
+    let long_compatibility = format!(
+        "---\nname: demo\ndescription: Demo skill\ncompatibility: {}\n---\n",
+        "x".repeat(501)
+    );
+    assert!(matches!(
+        parse_skill_frontmatter_metadata(&long_compatibility, "demo"),
+        Err(super::SkillParseError::InvalidField {
+            field: "compatibility",
+            ..
+        })
+    ));
+
+    let empty_compatibility =
+        "---\nname: demo\ndescription: Demo skill\ncompatibility: '  '\n---\n";
+    assert!(matches!(
+        parse_skill_frontmatter_metadata(empty_compatibility, "demo"),
+        Err(super::SkillParseError::InvalidField {
+            field: "compatibility",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn accepts_unicode_lowercase_letters_and_digits_in_names() {
     for name in ["démø", "παράδειγμα", "skill-٢"] {
         let contents = format!("---\nname: {name}\ndescription: Demo skill\n---\n");
@@ -116,12 +169,12 @@ fn rejects_names_and_descriptions_over_the_spec_limits() {
 }
 
 #[test]
-fn repairs_short_descriptions_containing_colons_and_apostrophes() {
+fn parses_quoted_short_descriptions_containing_colons_and_apostrophes() {
     let parsed = parse_skill_frontmatter_metadata(
-        "---\nname: short\ndescription: Short skill\nmetadata:\n  short-description: What's included: builds and tests\n---\n",
+        "---\nname: short\ndescription: Short skill\nmetadata:\n  short-description: \"What's included: builds and tests\"\n---\n",
         "short",
     )
-    .expect("frontmatter with an unquoted short description should be repaired");
+    .expect("quoted YAML scalar should parse");
 
     assert_eq!(
         parsed,
@@ -135,31 +188,31 @@ fn repairs_short_descriptions_containing_colons_and_apostrophes() {
 }
 
 #[test]
-fn repairs_unrecognized_frontmatter_fields_that_need_quotes() {
-    let parsed = parse_skill_frontmatter_metadata(
-        "---\nname: unknown\ndescription: Unknown fields\nargument-hint: <duration: e.g. 7d, 2w>\ntags: [next,@supabase/ssr]\n---\n",
-        "unknown",
-    )
-    .expect("frontmatter with unrecognized fields should be repaired");
-
-    assert_eq!(
-        parsed,
-        ParsedSkillFrontmatter {
-            name: "unknown".to_string(),
-            description: "Unknown fields".to_string(),
-            short_description: None,
-            disable_model_invocation: false,
-        }
-    );
+fn rejects_invalid_yaml_in_known_and_unknown_fields() {
+    for field in [
+        "description: Build for AWS: ECS",
+        "argument-hint: <duration: e.g. 7d, 2w>",
+        "tags: [next,@supabase/ssr]",
+    ] {
+        let contents = if field.starts_with("description:") {
+            format!("---\nname: unknown\n{field}\n---\n")
+        } else {
+            format!("---\nname: unknown\ndescription: Unknown fields\n{field}\n---\n")
+        };
+        assert!(matches!(
+            parse_skill_frontmatter_metadata(&contents, "unknown"),
+            Err(super::SkillParseError::InvalidYaml(_))
+        ));
+    }
 }
 
 #[test]
-fn preserves_block_scalar_bodies_while_repairing_other_fields() {
+fn parses_block_scalar_bodies_with_valid_unknown_fields() {
     let parsed = parse_skill_frontmatter_metadata(
-        "---\nname: block\ndescription: |-\n  Build for AWS: ECS\nargument-hint: <duration: e.g. 7d>\n---\n",
+        "---\nname: block\ndescription: |-\n  Build for AWS: ECS\nargument-hint: '<duration: e.g. 7d>'\n---\n",
         "block",
     )
-    .expect("frontmatter repair should preserve block scalar bodies");
+    .expect("valid block scalar should parse");
 
     assert_eq!(
         parsed,

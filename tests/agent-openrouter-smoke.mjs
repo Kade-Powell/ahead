@@ -28,6 +28,7 @@ const editedSource = "value = 8\n";
 const expectedPrefix = "AHEAD_OPENROUTER_SMOKE_TOKEN";
 const expectedToken = randomBytes(18).toString("hex");
 const markerPath = path.join(workspace, "smoke-data.txt");
+const workspaceInstructions = path.join(workspace, "AGENTS.md");
 const sourcePath = path.join(workspace, "src", "main.py");
 const prompt = `This is a synthetic integration test. Use managed Code Mode tools to call file_search for the exact text ${expectedPrefix} and read the matching line. Then use the nested apply_patch tool to change only src/main.py from "value = 7" to "value = 8". Do not use a shell, exec_command, or another tool to edit files. Do not modify any other file. Reply with only the random token found by file_search.`;
 
@@ -78,6 +79,25 @@ function rpc(method, params, transport = "ahead") {
       : { id, method: "ahead_request", params: { request: { method, params } } };
     child.stdin.write(JSON.stringify(request) + "\n");
   });
+}
+
+async function waitForTurnMessage(sessionId, turnId, predicate, description) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const page = await rpc("conversation_messages_page", {
+      session_id: sessionId,
+      before: null,
+      limit: 12,
+    });
+    const message = page.messages.find((item) =>
+      item.turn_id === turnId && item.role === "agent");
+    if (message && predicate(message)) return message;
+    if (message && ["complete", "failed", "cancelled"].includes(message.status)) {
+      throw new Error(`${description}: turn ended as ${message.status} before the expected state`);
+    }
+    await delay(100);
+  }
+  throw new Error(`${description}: timed out waiting for provider output`);
 }
 
 try {
@@ -147,6 +167,7 @@ try {
       const call = notification.params?.call;
       observedNotifications.push({
         method: notification.method,
+        turnId: notification.params?.turn_id,
         call: call ? { title: call.title, kind: call.kind, status: call.status } : undefined,
         questions: Array.isArray(requestQuestions)
           ? requestQuestions.map((question) => ({
@@ -160,10 +181,12 @@ try {
     }
     if (message.method === "ahead_notification"
       && notification?.method === "agent_buffer_snapshots_requested") {
-      notificationReplies.push(rpc("agent_buffer_snapshots_response", {
-        ...notification.params,
-        buffers: [{ path: "src/main.py", content: originalSource, symbols: [] }],
-      }).catch((error) => notificationReplyErrors.push(sanitize(error))));
+      notificationReplies.push(readFile(sourcePath, "utf8")
+        .then((content) => rpc("agent_buffer_snapshots_response", {
+          ...notification.params,
+          buffers: [{ path: "src/main.py", content, symbols: [] }],
+        }))
+        .catch((error) => notificationReplyErrors.push(sanitize(error))));
       return;
     }
     const waiter = pending.get(message.id);
@@ -301,12 +324,80 @@ try {
   assert.equal((await rpc("list_anchors_for_paths", { paths: ["src/main.py"] })).length, 0,
     "Committed CodeAnchor was not cleared");
 
+  await writeFile(
+    workspaceInstructions,
+    `Updated project instructions.\n${"context ".repeat(6_000)}`,
+    { mode: 0o600 },
+  );
+  const compactionTurn = await rpc("agent_turn_start", {
+    request: {
+      ...turnRequest,
+      model_context_window: 10_000,
+      user_message: "Reply exactly AHEAD_OPENROUTER_COMPACTION_OK.",
+    },
+  });
+  const compactedMessage = await waitForTurnMessage(
+    sessionId,
+    compactionTurn.turn_id,
+    (message) => message.status === "complete",
+    "Authenticated automatic compaction turn",
+  );
+  assert(compactedMessage.content.includes("AHEAD_OPENROUTER_COMPACTION_OK"),
+    "Authenticated turn did not complete after compaction");
+  assert(observedNotifications.some((notification) =>
+    notification.method === "agent_context_compacted"
+      && notification.turnId === compactionTurn.turn_id),
+  "Authenticated turn did not emit its automatic compaction event");
+
+  const cancellationRequest = {
+    ...turnRequest,
+    user_message: "For this cancellation smoke, write a very long numbered plain-text list. Do not call any tools. Begin immediately and keep generating as many entries as you can.",
+    context: { ...turnRequest.context, file_content: editedSource },
+  };
+  const { turn_id: cancelledTurnId } = await rpc("agent_turn_start", {
+    request: cancellationRequest,
+  });
+  await waitForTurnMessage(
+    sessionId,
+    cancelledTurnId,
+    (message) => message.status === "streaming" && message.content.length > 0,
+    "Authenticated cancellation turn",
+  );
+  assert.equal((await rpc("agent_turn_cancel", { session_id: sessionId })).cancelled, true);
+  const cancelledMessage = await waitForTurnMessage(
+    sessionId,
+    cancelledTurnId,
+    (message) => message.status === "cancelled",
+    "Authenticated cancellation",
+  );
+  assert.equal(cancelledMessage.status, "cancelled");
+
+  const { turn_id: retriedTurnId } = await rpc("agent_turn_retry", {
+    session_id: sessionId,
+    turn_id: cancelledTurnId,
+  });
+  assert.notEqual(retriedTurnId, cancelledTurnId);
+  await waitForTurnMessage(
+    sessionId,
+    retriedTurnId,
+    (message) => message.status === "streaming" && message.content.length > 0,
+    "Authenticated retried turn",
+  );
+  assert.equal((await rpc("agent_turn_cancel", { session_id: sessionId })).cancelled, true);
+  const retriedMessage = await waitForTurnMessage(
+    sessionId,
+    retriedTurnId,
+    (message) => message.status === "cancelled",
+    "Authenticated retried cancellation",
+  );
+  assert.equal(retriedMessage.status, "cancelled");
+
   child.stdin.write(JSON.stringify({ method: "shutdown", params: {} }) + "\n");
   const shutdownDeadline = Date.now() + 10_000;
   while (!exited && Date.now() < shutdownDeadline) await delay(20);
   assert(exited, "Proxy did not shut down cleanly");
   assert.deepEqual(exitResult, { code: 0, signal: null }, stderr);
-  console.log("PASS authenticated OpenRouter edit -> Turso CodeAnchor -> staged GitCommit; streamed file_search; AHEAD author and human committer");
+  console.log("PASS authenticated OpenRouter managed edit, Turso CodeAnchor and GitCommit; compaction, streaming, cancellation and retry");
 } catch (error) {
   process.exitCode = 1;
   console.error(sanitize(error?.stack ?? error));

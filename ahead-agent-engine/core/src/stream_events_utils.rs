@@ -18,7 +18,6 @@ use crate::tools::router::tool_log_payload;
 use ahead_memory::citations::parse_memory_citation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
-use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
@@ -107,23 +106,6 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
             .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &turn_context.sub_id)
             .await;
     }
-    let has_memory_citation = finalized_facts
-        .and_then(|facts| facts.memory_citation.as_ref())
-        .is_some()
-        || detect_memory_citation(item);
-    if has_memory_citation {
-        sess.record_memory_citation_for_turn(&turn_context.sub_id)
-            .await;
-    }
-}
-
-fn detect_memory_citation(item: &ResponseItem) -> bool {
-    let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
-        return false;
-    };
-
-    let (_, citations) = strip_citations(&raw_text);
-    parse_memory_citation(citations).is_some()
 }
 
 /// Handle a completed output item from the model stream, recording it and
@@ -153,7 +135,6 @@ pub(crate) struct FinalizedTurnItem {
 
 #[derive(Clone, Default)]
 pub(crate) struct FinalizedTurnItemFacts {
-    pub(crate) memory_citation: Option<MemoryCitation>,
     pub(crate) last_agent_message: Option<String>,
     pub(crate) defers_mailbox_delivery_to_next_turn: bool,
 }
@@ -163,36 +144,30 @@ pub(crate) fn finalize_non_tool_response_item(
     plan_mode: bool,
 ) -> Option<FinalizedTurnItem> {
     let turn_item = handle_non_tool_response_item(item, plan_mode)?;
-    let (memory_citation, last_agent_message, defers_mailbox_delivery_to_next_turn) =
-        match &turn_item {
-            TurnItem::AgentMessage(agent_message) => {
-                let combined = agent_message
-                    .content
-                    .iter()
-                    .map(|entry| match entry {
-                        codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
-                    })
-                    .collect::<String>();
-                let last_agent_message = if combined.trim().is_empty() {
-                    None
-                } else {
-                    Some(combined)
-                };
-                let defers_mailbox_delivery_to_next_turn =
-                    !matches!(agent_message.phase, Some(MessagePhase::Commentary))
-                        && last_agent_message.is_some();
-                (
-                    agent_message.memory_citation.clone(),
-                    last_agent_message,
-                    defers_mailbox_delivery_to_next_turn,
-                )
-            }
-            _ => (None, None, false),
-        };
+    let (last_agent_message, defers_mailbox_delivery_to_next_turn) = match &turn_item {
+        TurnItem::AgentMessage(agent_message) => {
+            let combined = agent_message
+                .content
+                .iter()
+                .map(|entry| match entry {
+                    codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
+                })
+                .collect::<String>();
+            let last_agent_message = if combined.trim().is_empty() {
+                None
+            } else {
+                Some(combined)
+            };
+            let defers_mailbox_delivery_to_next_turn =
+                !matches!(agent_message.phase, Some(MessagePhase::Commentary))
+                    && last_agent_message.is_some();
+            (last_agent_message, defers_mailbox_delivery_to_next_turn)
+        }
+        _ => (None, false),
+    };
     Some(FinalizedTurnItem {
         turn_item,
         facts: FinalizedTurnItemFacts {
-            memory_citation,
             last_agent_message,
             defers_mailbox_delivery_to_next_turn,
         },

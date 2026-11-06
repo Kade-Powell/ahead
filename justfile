@@ -38,9 +38,11 @@ dev $workspace='.':
         -w ahead-agent-engine -w ahead-agent-graph-store -w ahead-agent-skills
         -w ahead-model-auth -w ahead-runtime-api
         -w ahead-code-mode-host -w ahead-code-mode-runtime
-        -i '**/tests/**' -i '**/*_tests.rs' -i '**/AGENTS.md' -i '**/README.md'
+        -w third_party/gpui-pre
+        -i '**/tests/**' -i '**/tests.rs' -i '**/*_tests.rs'
+        -i '**/AGENTS.md' -i '**/README.md'
         -i 'TODO.md' -i 'docs/development/**' -i 'docs/building-from-source.md'
-        -r -- just _run-dev "$workspace"
+        -r -- bash scripts/run-dev-watcher.sh just _run-dev "$workspace"
     )
     if [[ "$(uname -s)" == Darwin ]]; then
         # Native macOS watching missed atomically replaced Rust source files in this checkout.
@@ -56,7 +58,7 @@ dev $workspace='.':
         printf '%s\n' 'Reuse its existing dev terminal; do not start another Cargo loop.' >&2
     }
     if command -v lockf >/dev/null 2>&1; then
-        if lockf -t 0 -k "$lock_path" watchexec "${watch_args[@]}"; then
+        if lockf -t 0 -k "$lock_path" bash scripts/run-dev-watcher.sh watchexec "${watch_args[@]}"; then
             exit 0
         else
             status=$?
@@ -66,7 +68,7 @@ dev $workspace='.':
             exit "$status"
         fi
     elif command -v flock >/dev/null 2>&1; then
-        if flock -n -E 75 "$lock_path" watchexec "${watch_args[@]}"; then
+        if flock -n -E 75 "$lock_path" bash scripts/run-dev-watcher.sh watchexec "${watch_args[@]}"; then
             exit 0
         else
             status=$?
@@ -83,6 +85,10 @@ dev $workspace='.':
 # Verify that a second development loop is refused before Cargo starts.
 dev-lock-smoke:
     bash tests/just-dev-lock-smoke.sh
+
+# Verify that stopping the dev watcher reaps its managed command.
+dev-shutdown-smoke:
+    bash tests/just-dev-shutdown-smoke.sh
 
 # Keep a distinct, stable macOS dev identity across watcher rebuilds.
 [private]
@@ -104,6 +110,27 @@ _run-dev $workspace:
         export AHEAD_USER_HOME="${AHEAD_USER_HOME:-$profile_root/user-home}"
         export AHEAD_HOME="${AHEAD_HOME:-$profile_root/runtime-home}"
     fi
+    app_pid=""
+    stop_dev_app() {
+        if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then
+            kill -TERM "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+        fi
+    }
+    run_dev_app() {
+        "$@" "$workspace" &
+        app_pid=$!
+        local status=0
+        wait "$app_pid" || status=$?
+        if kill -0 "$app_pid" 2>/dev/null; then
+            stop_dev_app
+        fi
+        app_pid=""
+        return "$status"
+    }
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap stop_dev_app EXIT
     if [[ "$(uname -s)" == Darwin ]]; then
         source scripts/ensure-code-mode-v8.sh
         cargo build -p ahead -p ahead-code-mode-host --bins
@@ -116,11 +143,11 @@ _run-dev $workspace:
         cp extra/macos/Ahead.app/Contents/Resources/ahead.icns "$dev_bundle/Contents/Resources/ahead.icns"
         /bin/cp -c target/debug/ahead "$dev_bundle/Contents/MacOS/ahead"
         /bin/cp -c target/debug/ahead-code-mode-host "$dev_bundle/Contents/MacOS/ahead-code-mode-host"
-        exec "$dev_bundle/Contents/MacOS/ahead" "$workspace"
+        run_dev_app "$dev_bundle/Contents/MacOS/ahead"
     else
         source scripts/ensure-code-mode-v8.sh
         cargo build -p ahead -p ahead-code-mode-host --bins
-        exec target/debug/ahead "$workspace"
+        run_dev_app target/debug/ahead
     fi
 
 # Run bacon's default check loop.

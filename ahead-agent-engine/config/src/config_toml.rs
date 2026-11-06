@@ -3,8 +3,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use crate::browser_use::BrowserUseConfigToml;
-use crate::computer_use::ComputerUseConfigToml;
 use crate::permissions_toml::PermissionsToml;
 use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
@@ -33,7 +31,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -62,22 +59,19 @@ const fn default_true() -> bool {
 }
 
 /// Orchestrator-owned feature settings.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrchestratorToml {
     pub skills: Option<OrchestratorFeatureToml>,
 }
 
 /// Settings for a feature owned by the orchestrator.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrchestratorFeatureToml {
     pub enabled: Option<bool>,
 }
 
 /// Configuration shape consumed by AHEAD's managed agent runtime.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigToml {
     /// Optional override of model selection.
     pub model: Option<String>,
@@ -95,12 +89,7 @@ pub struct ConfigToml {
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
 
     /// Default approval policy for executing commands.
-    #[schemars(with = "Option<crate::schema::ConfigAskForApproval>")]
     pub approval_policy: Option<AskForApproval>,
-
-    pub browser_use: Option<BrowserUseConfigToml>,
-
-    pub computer_use: Option<ComputerUseConfigToml>,
 
     #[serde(default)]
     pub shell_environment_policy: ShellEnvironmentPolicyToml,
@@ -158,7 +147,6 @@ pub struct ConfigToml {
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     #[serde(default)]
     // Uses the raw MCP input shape (custom deserialization) rather than `McpServerConfig`.
-    #[schemars(schema_with = "crate::schema::mcp_servers_schema")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
     /// Milliseconds to wait for optional MCP servers while building the initial tool catalog.
@@ -258,11 +246,9 @@ pub struct ConfigToml {
 
     /// Removed. Retained only to fail fast rather than silently ignore a
     /// configured remote thread-store endpoint.
-    #[schemars(skip)]
     pub experimental_thread_store_endpoint: Option<String>,
 
     /// Removed. Managed sessions always use the application-injected Turso store.
-    #[schemars(skip)]
     pub experimental_thread_store: Option<JsonValue>,
 
     /// Controls the web search tool mode: disabled, cached, indexed, or live.
@@ -280,7 +266,6 @@ pub struct ConfigToml {
     /// Centralized feature flags (new). Prefer this over individual toggles.
     #[serde(default)]
     // Injects known feature keys into the schema and forbids unknown keys.
-    #[schemars(schema_with = "crate::schema::features_schema")]
     pub features: Option<FeaturesToml>,
 
     /// Suppress warnings about unstable (under development) features.
@@ -307,7 +292,7 @@ pub struct RealtimeAudioConfig {
     pub speaker: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RealtimeWsMode {
     #[default]
@@ -315,7 +300,7 @@ pub enum RealtimeWsMode {
     Transcription,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RealtimeTransport {
     #[default]
@@ -327,8 +312,7 @@ pub enum RealtimeTransport {
 pub use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 pub use codex_protocol::protocol::RealtimeVoice;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RealtimeConfig {
     pub version: RealtimeWsVersion,
     #[serde(rename = "type")]
@@ -337,8 +321,7 @@ pub struct RealtimeConfig {
     pub voice: Option<RealtimeVoice>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RealtimeToml {
     pub version: Option<RealtimeWsVersion>,
     #[serde(rename = "type")]
@@ -347,15 +330,13 @@ pub struct RealtimeToml {
     pub voice: Option<RealtimeVoice>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RealtimeAudioToml {
     pub microphone: Option<String>,
     pub speaker: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ToolsToml {
     #[serde(
         default,
@@ -366,15 +347,13 @@ pub struct ToolsToml {
     pub update_plan: Option<UpdatePlanToolConfig>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ExperimentalRequestUserInput {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePlanToolConfig {
     #[serde(default)]
     pub enabled: bool,

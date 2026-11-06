@@ -38,7 +38,6 @@ fn user_layer(config_folder: &AbsolutePathBuf) -> ConfigLayerEntry {
     ConfigLayerEntry::new(
         ConfigLayerSource::User {
             file: config_folder.join("config.toml"),
-            profile: None,
         },
         empty_config(),
     )

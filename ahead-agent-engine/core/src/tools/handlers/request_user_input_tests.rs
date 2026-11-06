@@ -38,7 +38,6 @@ async fn multi_agent_v2_request_user_input_rejects_subagent_threads() {
     .handle(ToolInvocation {
         session: Arc::new(session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn,
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
@@ -92,7 +91,6 @@ async fn run_non_blocking_request_user_input_case(answer: Option<(&str, String)>
             .handle(ToolInvocation {
                 session,
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
                 call_id: "call-1".to_string(),
@@ -204,7 +202,6 @@ async fn request_user_input_sets_blocking_from_turn_mode() {
             .handle(ToolInvocation {
                 session,
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
                 call_id: "call-1".to_string(),

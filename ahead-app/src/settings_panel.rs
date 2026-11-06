@@ -40,6 +40,8 @@ struct AiConnection {
     base_url: String,
     api_key: String,
     model: String,
+    context_window: Option<u32>,
+    model_context_windows: HashMap<String, u32>,
     models: Vec<String>,
     hidden_models: Vec<String>,
 }
@@ -74,6 +76,7 @@ struct ModelCatalogEntry {
 struct ModelVisibilityModel {
     model_id: String,
     visible: bool,
+    context_window_override: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +85,7 @@ struct ModelVisibilityProvider {
     provider_id: String,
     name: String,
     models: Vec<ModelVisibilityModel>,
+    discovery_error: Option<String>,
     expanded: bool,
 }
 
@@ -361,21 +365,10 @@ pub(crate) fn discover_configured_models(workspace: &Path) -> ModelDiscovery {
         match result {
             Ok(model_catalog) => {
                 refreshed_provider_ids.insert(connection.provider_id.clone());
-                models.extend(
-                    model_catalog
-                        .into_iter()
-                        .filter(|model| {
-                            !connection.hidden_models.contains(&model.model_id)
-                        })
-                        .map(|model| DiscoveredModel {
-                            provider_id: connection.provider_id.clone(),
-                            provider_name: connection.name.clone(),
-                            model_id: model.model_id,
-                            display_name: model.display_name,
-                            context_window: model.context_window,
-                            supports_tool_calls: model.supports_tool_calls,
-                        }),
-                );
+                models.extend(discovered_models_for_connection(
+                    &connection,
+                    model_catalog,
+                ));
             }
             Err(error) => {
                 let reason = if error.starts_with("Model endpoint responded")
@@ -411,6 +404,29 @@ fn model_endpoint_status(status: reqwest::StatusCode) -> String {
     }
 }
 
+fn model_discovery_error_label(error: &str) -> String {
+    let normalized_error = error.to_ascii_lowercase();
+    if let Some(reason) = error.strip_prefix("Model endpoint reachable · ")
+        && reason.starts_with("credentials rejected")
+    {
+        return reason.to_string();
+    }
+    if error.starts_with("Model endpoint responded with HTTP ")
+        || error == "Invalid model list response"
+        || error == "No model ids returned"
+        || error == "Model discovery task failed"
+    {
+        error.to_string()
+    } else if normalized_error.contains("timeout")
+        || normalized_error.contains("timed out")
+    {
+        "Model request timed out".into()
+    } else {
+        // Request errors can include the configured URL, so keep the UI message credential-safe.
+        "Could not reach model endpoint".into()
+    }
+}
+
 fn discovered_model_catalog(value: serde_json::Value) -> Vec<ModelCatalogEntry> {
     let entries = value
         .get("data")
@@ -431,6 +447,14 @@ fn discovered_model_catalog(value: serde_json::Value) -> Vec<ModelCatalogEntry> 
             .find_map(|field| {
                 entry
                     .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|tokens| u32::try_from(tokens).ok())
+                    .filter(|tokens| *tokens > 0)
+            })
+            .or_else(|| {
+                entry
+                    .get("top_provider")
+                    .and_then(|provider| provider.get("context_length"))
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|tokens| u32::try_from(tokens).ok())
                     .filter(|tokens| *tokens > 0)
@@ -482,6 +506,47 @@ fn discovered_model_catalog(value: serde_json::Value) -> Vec<ModelCatalogEntry> 
     models
 }
 
+fn discovered_models_for_connection(
+    connection: &AiConnection,
+    models: Vec<ModelCatalogEntry>,
+) -> Vec<DiscoveredModel> {
+    let mut discovered = models
+        .into_iter()
+        .filter(|model| !connection.hidden_models.contains(&model.model_id))
+        .map(|model| {
+            let context_window = connection
+                .model_context_windows
+                .get(&model.model_id)
+                .copied()
+                .or(model.context_window)
+                .or(connection.context_window);
+            DiscoveredModel {
+                provider_id: connection.provider_id.clone(),
+                provider_name: connection.name.clone(),
+                model_id: model.model_id,
+                display_name: model.display_name,
+                context_window,
+                supports_tool_calls: model.supports_tool_calls,
+            }
+        })
+        .collect::<Vec<_>>();
+    for (model_id, context_window) in &connection.model_context_windows {
+        if !connection.hidden_models.contains(model_id)
+            && !discovered.iter().any(|model| &model.model_id == model_id)
+        {
+            discovered.push(DiscoveredModel {
+                provider_id: connection.provider_id.clone(),
+                provider_name: connection.name.clone(),
+                model_id: model_id.clone(),
+                display_name: None,
+                context_window: Some(*context_window),
+                supports_tool_calls: None,
+            });
+        }
+    }
+    discovered
+}
+
 fn model_discovery_outcome<T>(
     active_generation: u64,
     request_generation: u64,
@@ -493,6 +558,7 @@ fn model_discovery_outcome<T>(
 fn model_visibility_providers(
     connections: &[AiConnection],
     discovered_models: &[Vec<String>],
+    discovery_errors: &[Option<String>],
     expanded_providers: &HashSet<String>,
 ) -> Vec<ModelVisibilityProvider> {
     connections
@@ -500,6 +566,11 @@ fn model_visibility_providers(
         .enumerate()
         .map(|(connection_index, connection)| {
             let mut models = connection.models.clone();
+            for model in connection.model_context_windows.keys() {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
             if let Some(discovered) = discovered_models.get(connection_index) {
                 for model in discovered {
                     if !models.contains(model) {
@@ -515,9 +586,17 @@ fn model_visibility_providers(
                     .into_iter()
                     .map(|model_id| ModelVisibilityModel {
                         visible: !connection.hidden_models.contains(&model_id),
+                        context_window_override: connection
+                            .model_context_windows
+                            .get(&model_id)
+                            .copied(),
                         model_id,
                     })
                     .collect(),
+                discovery_error: discovery_errors
+                    .get(connection_index)
+                    .cloned()
+                    .flatten(),
                 expanded: expanded_providers.contains(&connection.provider_id),
             }
         })
@@ -525,6 +604,91 @@ fn model_visibility_providers(
 }
 
 const MODEL_VISIBILITY_ROW_HEIGHT: f32 = 36.0;
+const MODEL_VISIBILITY_VIEWPORT_HEIGHT: f32 = 280.0;
+
+struct ModelListScrollMask {
+    scroll_handle: UniformListScrollHandle,
+    minimum_offset: Pixels,
+}
+
+impl IntoElement for ModelListScrollMask {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ModelListScrollMask {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.position = Position::Absolute;
+        style.inset.top = px(0.).into();
+        style.inset.left = px(0.).into();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let hitbox_id = hitbox.id;
+        let scroll_handle = self.scroll_handle.clone();
+        let minimum_offset = self.minimum_offset;
+        let current_view = window.current_view();
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture
+                || !hitbox_id.should_handle_scroll(window)
+            {
+                return;
+            }
+
+            let delta = event.delta.pixel_delta(window.line_height());
+            let mut offset = scroll_handle.0.borrow().base_handle.offset();
+            offset.y = (offset.y + delta.y).clamp(minimum_offset, px(0.));
+            scroll_handle.0.borrow().base_handle.set_offset(offset);
+            cx.notify(current_view);
+            cx.stop_propagation();
+        });
+    }
+}
 
 fn model_visibility_scroll_area(
     scroll_handle: &UniformListScrollHandle,
@@ -537,8 +701,15 @@ fn model_visibility_scroll_area(
     div()
         .relative()
         .w_full()
-        .h(px(280.))
+        .h(px(MODEL_VISIBILITY_VIEWPORT_HEIGHT))
         .overflow_hidden()
+        // Capture before GPUI's nested scroll handlers can also move Settings.
+        .child(ModelListScrollMask {
+            scroll_handle: scroll_handle.clone(),
+            minimum_offset: (px(MODEL_VISIBILITY_VIEWPORT_HEIGHT)
+                - px(model_count as f32 * MODEL_VISIBILITY_ROW_HEIGHT))
+            .min(px(0.)),
+        })
         .child(model_list)
         // Paint above virtual rows, which otherwise cover the scrollbar thumb.
         .child(
@@ -675,6 +846,29 @@ fn serialize_ai_config(
                         "model".into(),
                         toml::Value::String(connection.model.clone()),
                     );
+                    if let Some(context_window) = connection.context_window {
+                        table.insert(
+                            "context_window".into(),
+                            toml::Value::Integer(i64::from(context_window)),
+                        );
+                    }
+                    if !connection.model_context_windows.is_empty() {
+                        table.insert(
+                            "model_context_windows".into(),
+                            toml::Value::Table(
+                                connection
+                                    .model_context_windows
+                                    .iter()
+                                    .map(|(model, tokens)| {
+                                        (
+                                            model.clone(),
+                                            toml::Value::Integer(i64::from(*tokens)),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                    }
                     table.insert(
                         "models".into(),
                         toml::Value::Array(
@@ -746,6 +940,19 @@ fn parse_connections(value: &toml::Value) -> Vec<AiConnection> {
                     }
                     hidden
                 });
+            let model_context_windows = table
+                .get("model_context_windows")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flat_map(|limits| limits.iter())
+                .filter_map(|(model, value)| {
+                    let tokens = value
+                        .as_integer()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0)?;
+                    Some((model.clone(), tokens))
+                })
+                .collect();
             if name.is_empty() || base_url.is_empty() {
                 return None;
             }
@@ -761,6 +968,12 @@ fn parse_connections(value: &toml::Value) -> Vec<AiConnection> {
                     .unwrap_or_default()
                     .to_string(),
                 model,
+                context_window: table
+                    .get("context_window")
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0),
+                model_context_windows,
                 models,
                 hidden_models,
             })
@@ -1037,11 +1250,13 @@ fn load_voice_settings(workspace: &Path) -> VoiceSettings {
 fn load_settings(
     workspace: &Path,
     previous_modified: Option<[Option<SystemTime>; 4]>,
+    initial: bool,
 ) -> Option<LoadedSettings> {
     load_settings_with_user_home(
         workspace,
         previous_modified,
         ahead_core::directory::Directory::home_dir().as_deref(),
+        initial,
     )
 }
 
@@ -1049,9 +1264,9 @@ fn load_settings_with_user_home(
     workspace: &Path,
     previous_modified: Option<[Option<SystemTime>; 4]>,
     user_home: Option<&Path>,
+    initial: bool,
 ) -> Option<LoadedSettings> {
     let path = SettingsPanel::config_path(workspace);
-    let initial = previous_modified.is_none();
     let bootstrap = if initial {
         ensure_settings_file(&path)
     } else {
@@ -1101,6 +1316,8 @@ pub struct SettingsPanel {
     pub base_url_input: Entity<InputState>,
     pub api_key_input: Entity<InputState>,
     pub model_input: Entity<InputState>,
+    model_context_window_input: Entity<InputState>,
+    editing_model_context_window: Option<(String, String)>,
     voice_endpoint_input: Entity<InputState>,
     voice_model_input: Entity<InputState>,
     voice_api_key_input: Entity<InputState>,
@@ -1118,6 +1335,7 @@ pub struct SettingsPanel {
     loaded: bool,
     load_in_flight: bool,
     reload_requested: bool,
+    reload_force_requested: bool,
     _config_watch: Option<Task<()>>,
     save_generation: u64,
     save_in_flight: bool,
@@ -1125,6 +1343,7 @@ pub struct SettingsPanel {
     save_error: Option<String>,
     settings_modified: [Option<SystemTime>; 4],
     discovered_models: Vec<Vec<String>>,
+    model_discovery_errors: Vec<Option<String>>,
     expanded_model_providers: HashSet<String>,
     model_visibility_scrolls: HashMap<String, UniformListScrollHandle>,
     model_discovery_generation: u64,
@@ -1154,6 +1373,8 @@ impl SettingsPanel {
         let base_url_input = cx.new(|cx| InputState::new(window, cx));
         let api_key_input = cx.new(|cx| InputState::new(window, cx).masked(true));
         let model_input = cx.new(|cx| InputState::new(window, cx));
+        let model_context_window_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Default"));
         let voice_endpoint_input = cx.new(|cx| InputState::new(window, cx));
         let voice_model_input = cx.new(|cx| InputState::new(window, cx));
         let voice_api_key_input =
@@ -1190,6 +1411,12 @@ impl SettingsPanel {
                                 .get_mut(this.selected_connection)
                             {
                                 models.clear();
+                            }
+                            if let Some(error) = this
+                                .model_discovery_errors
+                                .get_mut(this.selected_connection)
+                            {
+                                *error = None;
                             }
                             this.test_status =
                                 "Endpoint changed; discover models again".into();
@@ -1228,6 +1455,8 @@ impl SettingsPanel {
             base_url_input,
             api_key_input,
             model_input,
+            model_context_window_input,
+            editing_model_context_window: None,
             voice_endpoint_input,
             voice_model_input,
             voice_api_key_input,
@@ -1245,6 +1474,7 @@ impl SettingsPanel {
             loaded: false,
             load_in_flight: false,
             reload_requested: false,
+            reload_force_requested: false,
             _config_watch: None,
             save_generation: 0,
             save_in_flight: false,
@@ -1252,6 +1482,7 @@ impl SettingsPanel {
             save_error: None,
             settings_modified: [None; 4],
             discovered_models: Vec::new(),
+            model_discovery_errors: Vec::new(),
             expanded_model_providers: HashSet::new(),
             model_visibility_scrolls: HashMap::new(),
             model_discovery_generation: 0,
@@ -1399,27 +1630,33 @@ impl SettingsPanel {
         paths: &[PathBuf],
         user_home: Option<&Path>,
     ) -> bool {
-        let workspace_ahead = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.to_path_buf())
-            .join(".ahead");
-        let user_ahead = user_home.map(|home| {
-            home.canonicalize()
-                .unwrap_or_else(|_| home.to_path_buf())
-                .join(".ahead")
-        });
+        if paths.is_empty() {
+            return true;
+        }
+        let workspace_ahead = workspace.join(".ahead");
+        let user_ahead = user_home.map(|home| home.join(".ahead"));
+        let equivalent_path = |left: &Path, right: &Path| {
+            left == right
+                || matches!(
+                    (left.canonicalize(), right.canonicalize()),
+                    (Ok(left), Ok(right)) if left == right
+                )
+        };
         paths.iter().any(|path| {
-            (path.parent() == Some(workspace_ahead.as_path())
+            (path
+                .parent()
+                .is_some_and(|parent| equivalent_path(parent, &workspace_ahead))
                 && matches!(
                     path.file_name().and_then(|name| name.to_str()),
                     Some("settings.toml" | "config.toml" | "config.local.toml")
                 ))
                 || user_ahead.as_ref().is_some_and(|directory| {
-                    path == directory
-                        || (path.parent() == Some(directory.as_path())
-                            && path
-                                .file_name()
-                                .is_some_and(|name| name == "settings.toml"))
+                    equivalent_path(path, directory)
+                        || (path.parent().is_some_and(|parent| {
+                            equivalent_path(parent, directory)
+                        }) && path
+                            .file_name()
+                            .is_some_and(|name| name == "settings.toml"))
                 })
         })
     }
@@ -1567,6 +1804,15 @@ impl SettingsPanel {
                     .iter_mut()
                     .find(|existing| existing.provider_id == connection.provider_id)
                 {
+                    if connection.context_window.is_none() {
+                        connection.context_window = existing.context_window;
+                    }
+                    for (model, tokens) in &existing.model_context_windows {
+                        connection
+                            .model_context_windows
+                            .entry(model.clone())
+                            .or_insert(*tokens);
+                    }
                     if connection.api_key.is_empty()
                         && existing.base_url == connection.base_url
                     {
@@ -1602,6 +1848,8 @@ impl SettingsPanel {
                 api_key,
                 model: resolve_config_value(&configs, "model")
                     .unwrap_or_else(|| "deepseek-coder".to_string()),
+                context_window: None,
+                model_context_windows: HashMap::new(),
                 models: vec![
                     resolve_config_value(&configs, "model")
                         .unwrap_or_else(|| "deepseek-coder".to_string()),
@@ -1764,7 +2012,8 @@ impl SettingsPanel {
                 }
                 this.start_pending_save(window, cx);
                 if this.reload_requested {
-                    this.refresh_from_disk(true, window, cx);
+                    let force = this.reload_force_requested;
+                    this.refresh_from_disk(force, window, cx);
                 }
                 cx.notify();
             })
@@ -1870,7 +2119,7 @@ impl SettingsPanel {
                 }
                 if this
                     .update_in(cx, |this, window, cx| {
-                        this.refresh_from_disk(true, window, cx)
+                        this.refresh_from_disk(false, window, cx)
                     })
                     .is_err()
                 {
@@ -1892,19 +2141,23 @@ impl SettingsPanel {
             || self.pending_save.is_some()
             || self.save_error.is_some()
         {
+            self.reload_force_requested |= force;
             return;
         }
+        let force = force || self.reload_force_requested;
         self.reload_requested = false;
+        self.reload_force_requested = false;
         self.load_in_flight = true;
         let workspace = self.workspace.clone();
         let generation = self.save_generation;
+        let initial = !self.loaded;
         let modified = (self.loaded && !force).then_some(self.settings_modified);
         cx.spawn_in(window, async move |this, cx| {
             let load_workspace = workspace.clone();
             let loaded = cx
-                .background_spawn(
-                    async move { load_settings(&load_workspace, modified) },
-                )
+                .background_spawn(async move {
+                    load_settings(&load_workspace, modified, initial)
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.load_in_flight = false;
@@ -1914,6 +2167,8 @@ impl SettingsPanel {
                         this.connections = loaded.connections;
                         this.discovered_models =
                             vec![Vec::new(); this.connections.len()];
+                        this.model_discovery_errors =
+                            vec![None; this.connections.len()];
                         let provider_ids = this
                             .connections
                             .iter()
@@ -1955,7 +2210,8 @@ impl SettingsPanel {
                     }
                 }
                 if this.reload_requested {
-                    this.refresh_from_disk(true, window, cx);
+                    let force = this.reload_force_requested;
+                    this.refresh_from_disk(force, window, cx);
                 }
             })
         })
@@ -1995,10 +2251,13 @@ impl SettingsPanel {
             base_url: "http://localhost:1234/v1".into(),
             api_key: String::new(),
             model: "deepseek-coder".into(),
+            context_window: None,
+            model_context_windows: HashMap::new(),
             models: vec!["deepseek-coder".into()],
             hidden_models: Vec::new(),
         });
         self.discovered_models.push(Vec::new());
+        self.model_discovery_errors.push(None);
         self.selected_connection = self.connections.len() - 1;
         self.load_connection_into_inputs(window, cx);
         self.test_status = "New OpenAI-compatible server".into();
@@ -2019,6 +2278,9 @@ impl SettingsPanel {
         self.connections.remove(self.selected_connection);
         if self.selected_connection < self.discovered_models.len() {
             self.discovered_models.remove(self.selected_connection);
+        }
+        if self.selected_connection < self.model_discovery_errors.len() {
+            self.model_discovery_errors.remove(self.selected_connection);
         }
         let provider_ids = self
             .connections
@@ -2052,7 +2314,7 @@ impl SettingsPanel {
         }
 
         let endpoint = models_endpoint(&url);
-        self.test_status = format!("Checking {endpoint}…").into();
+        self.test_status = "Checking model endpoint…".into();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2074,7 +2336,11 @@ impl SettingsPanel {
             let _ = this.update(cx, |this: &mut Self, cx| {
                 this.test_status = match result {
                     Ok(status) => status.into(),
-                    Err(error) => format!("Endpoint unavailable · {error}").into(),
+                    Err(error) => format!(
+                        "Endpoint unavailable · {}",
+                        model_discovery_error_label(&error)
+                    )
+                    .into(),
                 };
                 cx.notify();
             });
@@ -2091,6 +2357,7 @@ impl SettingsPanel {
             self.model_discovery_generation.wrapping_add(1);
         let generation = self.model_discovery_generation;
         let connections = self.connections.clone();
+        self.model_discovery_errors = vec![None; connections.len()];
         self.test_status =
             format!("Discovering models from {} provider(s)…", connections.len())
                 .into();
@@ -2157,7 +2424,16 @@ impl SettingsPanel {
                                         *catalog = models;
                                     }
                                 }
-                                Err(_) => unavailable_count += 1,
+                                Err(error) => {
+                                    unavailable_count += 1;
+                                    if let Some(discovery_error) = this
+                                        .model_discovery_errors
+                                        .get_mut(connection_index)
+                                    {
+                                        *discovery_error =
+                                            Some(model_discovery_error_label(&error));
+                                    }
+                                }
                             }
                         }
                         this.test_status = if unavailable_count == 0 {
@@ -2173,8 +2449,16 @@ impl SettingsPanel {
                         .into();
                     }
                     Err(error) => {
+                        for discovery_error in &mut this.model_discovery_errors {
+                            *discovery_error =
+                                Some(model_discovery_error_label(&error));
+                        }
                         this.test_status =
-                            format!("Model discovery failed · {error}").into();
+                            format!(
+                                "Model discovery failed · {}",
+                                model_discovery_error_label(&error)
+                            )
+                            .into();
                     }
                 }
                 cx.notify();
@@ -2242,19 +2526,59 @@ impl SettingsPanel {
             self.save_config(window, cx);
         }
     }
+
+    fn set_model_context_window_override(
+        &mut self,
+        connection_index: usize,
+        provider_id: String,
+        model: String,
+        context_window: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.loaded {
+            return;
+        }
+        self.commit_selected_connection(cx);
+        let Some(connection) = self.connections.get_mut(connection_index) else {
+            return;
+        };
+        if connection.provider_id != provider_id {
+            return;
+        }
+        match context_window {
+            Some(tokens) => {
+                connection
+                    .model_context_windows
+                    .insert(model.clone(), tokens);
+            }
+            None => {
+                connection.model_context_windows.remove(&model);
+            }
+        }
+        self.editing_model_context_window = None;
+        self.test_status = match context_window {
+            Some(tokens) => {
+                format!("{model} context window set to {tokens} tokens").into()
+            }
+            None => format!("{model} uses its discovered or provider context limit")
+                .into(),
+        };
+        self.save_config(window, cx);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTheme, AiConnection, HashSet, McpServerDeclaration, ModelCatalogEntry,
-        ModelVisibilityModel, ModelVisibilityProvider, SettingsPanel,
-        discovered_model_catalog, ensure_settings_file, has_ai_settings,
-        lock_settings_file, model_catalog, model_discovery_outcome,
-        model_endpoint_status, model_visibility_providers,
-        model_visibility_scroll_area, models_endpoint, parse_connections,
-        parse_toml_value, resolve_config_value, serialize_ai_config,
-        write_user_config,
+        ActiveTheme, AiConnection, HashMap, HashSet, McpServerDeclaration,
+        ModelCatalogEntry, ModelVisibilityModel, ModelVisibilityProvider,
+        SettingsPanel, discovered_model_catalog, discovered_models_for_connection,
+        ensure_settings_file, has_ai_settings, lock_settings_file, model_catalog,
+        model_discovery_error_label, model_discovery_outcome, model_endpoint_status,
+        model_visibility_providers, model_visibility_scroll_area, models_endpoint,
+        parse_connections, parse_toml_value, resolve_config_value,
+        serialize_ai_config, write_user_config,
     };
     use fs4::fs_std::FileExt;
     use gpui_kit::{
@@ -2358,7 +2682,7 @@ mod tests {
         assert!(!settings.exists());
 
         let loaded =
-            super::load_settings_with_user_home(workspace.path(), None, None)
+            super::load_settings_with_user_home(workspace.path(), None, None, true)
                 .expect("initial settings load");
 
         assert!(settings.is_file());
@@ -2373,6 +2697,7 @@ mod tests {
                 workspace.path(),
                 Some(loaded.modified),
                 None,
+                false,
             )
             .is_none(),
             "an unchanged workspace should not bootstrap or reload again"
@@ -2688,6 +3013,63 @@ mod tests {
         panel.update(cx, |panel, _| {
             assert_eq!(panel.mcp_declarations[0].id, "docs");
         });
+    }
+
+    #[gpui_kit::test]
+    fn provider_controls_wrap_inside_narrow_settings_page(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let connections = (0..3)
+            .map(|index| AiConnection {
+                name: format!("OpenAI compatible provider {index}"),
+                provider_id: format!("provider-{index}"),
+                base_url: format!("https://provider-{index}.example.test/v1"),
+                api_key: "test-key".into(),
+                model: "test-model".into(),
+                context_window: None,
+                model_context_windows: HashMap::new(),
+                models: Vec::new(),
+                hidden_models: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let settings_path = SettingsPanel::config_path(workspace.path());
+        std::fs::create_dir_all(settings_path.parent().expect("settings directory"))
+            .expect("create settings directory");
+        std::fs::write(
+            &settings_path,
+            serialize_ai_config(&connections, 0).expect("serialize providers"),
+        )
+        .expect("write test settings");
+        let workspace_path = workspace.path().to_path_buf();
+        let (_panel, cx) = cx.add_window_view(move |window, cx| {
+            let mut panel = SettingsPanel::new(workspace_path.clone(), window, cx);
+            panel.setup_required = true;
+            panel.loaded = true;
+            panel.connections = connections;
+            panel
+        });
+
+        cx.simulate_resize(gpui_kit::size(gpui_kit::px(520.), gpui_kit::px(720.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let row = cx
+            .debug_bounds("ai-provider-profile-row")
+            .expect("provider profile row");
+        for selector in ["ai-provider-add", "ai-provider-remove"] {
+            let control = cx.debug_bounds(selector).expect("provider control");
+            assert!(control.origin.x >= row.origin.x);
+            assert!(control.origin.y >= row.origin.y);
+            assert!(
+                control.origin.x + control.size.width
+                    <= row.origin.x + row.size.width
+            );
+            assert!(
+                control.origin.y + control.size.height
+                    <= row.origin.y + row.size.height
+            );
+        }
     }
 
     #[gpui_kit::test]
@@ -3386,6 +3768,11 @@ mod tests {
                 base_url: "https://example.test/v1?name=\"quoted\"".into(),
                 api_key: "key-with-\n-newline".into(),
                 model: "model\"name".into(),
+                context_window: Some(131_072),
+                model_context_windows: HashMap::from([(
+                    "model\"name".into(),
+                    524_288,
+                )]),
                 models: vec!["model\"name".into(), "second".into()],
                 hidden_models: vec!["second".into()],
             }],
@@ -3407,6 +3794,15 @@ mod tests {
             Some("model\"name")
         );
         assert_eq!(
+            ai["connections"][0]["context_window"].as_integer(),
+            Some(131_072)
+        );
+        assert_eq!(
+            ai["connections"][0]["model_context_windows"]["model\"name"]
+                .as_integer(),
+            Some(524_288)
+        );
+        assert_eq!(
             ai.get("connections")
                 .and_then(toml::Value::as_array)
                 .and_then(|items| items.first())
@@ -3424,11 +3820,28 @@ mod tests {
     #[test]
     fn parses_hidden_models_per_connection() {
         let config = parse_toml_value(
-            "[ai]\n[[ai.connections]]\nname = 'OpenRouter'\nbase_url = 'https://openrouter.ai/api/v1'\nmodels = ['a', 'b']\nhidden_models = ['b', 'b']\n",
+            "[ai]\n[[ai.connections]]\nname = 'OpenRouter'\nbase_url = 'https://openrouter.ai/api/v1'\ncontext_window = 131072\nmodels = ['a', 'b']\nhidden_models = ['b', 'b']\nmodel_context_windows = { 'model-a' = 524288, 'invalid' = 0 }\n",
         )
         .expect("settings config");
         let connections = super::parse_connections(&config);
         assert_eq!(connections[0].hidden_models, vec!["b"]);
+        assert_eq!(connections[0].context_window, Some(131_072));
+        assert_eq!(
+            connections[0].model_context_windows,
+            HashMap::from([("model-a".into(), 524_288)])
+        );
+        let serialized =
+            serialize_ai_config(&connections, 0).expect("serialize profile");
+        let roundtrip = parse_toml_value(&serialized).expect("round trip settings");
+        assert_eq!(
+            roundtrip["ai"]["connections"][0]["context_window"].as_integer(),
+            Some(131_072)
+        );
+        assert_eq!(
+            roundtrip["ai"]["connections"][0]["model_context_windows"]["model-a"]
+                .as_integer(),
+            Some(524_288)
+        );
     }
 
     #[test]
@@ -3440,6 +3853,8 @@ mod tests {
                 base_url: "http://localhost:1234/v1".into(),
                 api_key: String::new(),
                 model: "deepseek-coder".into(),
+                context_window: None,
+                model_context_windows: HashMap::new(),
                 models: vec!["deepseek-coder".into()],
                 hidden_models: Vec::new(),
             }],
@@ -3517,6 +3932,8 @@ mod tests {
                 {"id": "qwen"},
                 {"id": "llama", "context_window": 65_536, "supports_tools": false},
                 {"id": "qwen", "name": "Qwen 3", "context_length": 131_072, "supported_parameters": ["tools"]},
+                {"id": "openai/gpt-6-luna", "name": "GPT-6 Luna", "context_length": 1_050_000, "top_provider": {"context_length": 262_144}},
+                {"id": "nested-limit", "top_provider": {"context_length": 524_288}},
                 {"id": "unknown", "context_length": 0}
             ]
         });
@@ -3536,6 +3953,18 @@ mod tests {
                     supports_tool_calls: Some(false),
                 },
                 ModelCatalogEntry {
+                    model_id: "openai/gpt-6-luna".into(),
+                    display_name: Some("GPT-6 Luna".into()),
+                    context_window: Some(1_050_000),
+                    supports_tool_calls: None,
+                },
+                ModelCatalogEntry {
+                    model_id: "nested-limit".into(),
+                    display_name: None,
+                    context_window: Some(524_288),
+                    supports_tool_calls: None,
+                },
+                ModelCatalogEntry {
                     model_id: "unknown".into(),
                     display_name: None,
                     context_window: None,
@@ -3551,6 +3980,54 @@ mod tests {
                 context_window: None,
                 supports_tool_calls: None,
             }]
+        );
+    }
+
+    #[test]
+    fn discovered_model_limit_overrides_provider_context_fallback() {
+        let connection = AiConnection {
+            name: "OpenRouter".into(),
+            provider_id: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: String::new(),
+            model: "known-limit".into(),
+            context_window: Some(262_144),
+            model_context_windows: HashMap::from([
+                ("known-limit".into(), 512_000),
+                ("configured-only".into(), 196_608),
+            ]),
+            models: vec!["known-limit".into(), "provider-fallback".into()],
+            hidden_models: Vec::new(),
+        };
+        let models = discovered_models_for_connection(
+            &connection,
+            vec![
+                ModelCatalogEntry {
+                    model_id: "known-limit".into(),
+                    display_name: None,
+                    context_window: Some(131_072),
+                    supports_tool_calls: None,
+                },
+                ModelCatalogEntry {
+                    model_id: "provider-fallback".into(),
+                    display_name: None,
+                    context_window: None,
+                    supports_tool_calls: None,
+                },
+            ],
+        );
+
+        assert_eq!(models[0].context_window, Some(512_000));
+        assert_eq!(models[1].context_window, Some(262_144));
+        assert_eq!(models[2].model_id, "configured-only");
+        assert_eq!(models[2].context_window, Some(196_608));
+        let offline_models =
+            discovered_models_for_connection(&connection, Vec::new());
+        assert_eq!(offline_models.len(), 2);
+        assert!(
+            offline_models
+                .iter()
+                .all(|model| model.context_window.is_some())
         );
     }
 
@@ -3575,6 +4052,26 @@ mod tests {
         assert!(
             model_endpoint_status(reqwest::StatusCode::OK)
                 .starts_with("Model endpoint reachable")
+        );
+    }
+
+    #[test]
+    fn model_discovery_errors_are_actionable_without_exposing_endpoint_urls() {
+        assert_eq!(
+            model_discovery_error_label(&model_endpoint_status(
+                reqwest::StatusCode::UNAUTHORIZED,
+            )),
+            "credentials rejected (HTTP 401 Unauthorized)"
+        );
+        assert_eq!(
+            model_discovery_error_label("request timed out"),
+            "Model request timed out"
+        );
+        assert_eq!(
+            model_discovery_error_label(
+                "error sending request for url (https://user:secret@example.test/?token=secret)",
+            ),
+            "Could not reach model endpoint"
         );
     }
 
@@ -3607,6 +4104,11 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".into(),
                 api_key: String::new(),
                 model: "shared".into(),
+                context_window: None,
+                model_context_windows: HashMap::from([
+                    ("shared".into(), 512_000),
+                    ("configured-only".into(), 196_608),
+                ]),
                 models: vec!["shared".into(), "fallback".into()],
                 hidden_models: vec!["new-model".into()],
             },
@@ -3616,6 +4118,8 @@ mod tests {
                 base_url: "http://localhost:1234/v1".into(),
                 api_key: String::new(),
                 model: "shared".into(),
+                context_window: None,
+                model_context_windows: HashMap::new(),
                 models: vec!["shared".into()],
                 hidden_models: Vec::new(),
             },
@@ -3624,9 +4128,18 @@ mod tests {
             vec!["shared".into(), "new-model".into()],
             vec!["local-model".into()],
         ];
+        let discovery_errors = vec![
+            Some("credentials rejected (HTTP 401 Unauthorized)".into()),
+            None,
+        ];
 
         assert_eq!(
-            model_visibility_providers(&connections, &discovered, &HashSet::new()),
+            model_visibility_providers(
+                &connections,
+                &discovered,
+                &discovery_errors,
+                &HashSet::new(),
+            ),
             vec![
                 ModelVisibilityProvider {
                     connection_index: 0,
@@ -3636,16 +4149,27 @@ mod tests {
                         ModelVisibilityModel {
                             model_id: "shared".into(),
                             visible: true,
+                            context_window_override: Some(512_000),
                         },
                         ModelVisibilityModel {
                             model_id: "fallback".into(),
                             visible: true,
+                            context_window_override: None,
+                        },
+                        ModelVisibilityModel {
+                            model_id: "configured-only".into(),
+                            visible: true,
+                            context_window_override: Some(196_608),
                         },
                         ModelVisibilityModel {
                             model_id: "new-model".into(),
                             visible: false,
+                            context_window_override: None,
                         },
                     ],
+                    discovery_error: Some(
+                        "credentials rejected (HTTP 401 Unauthorized)".into(),
+                    ),
                     expanded: false,
                 },
                 ModelVisibilityProvider {
@@ -3656,12 +4180,15 @@ mod tests {
                         ModelVisibilityModel {
                             model_id: "shared".into(),
                             visible: true,
+                            context_window_override: None,
                         },
                         ModelVisibilityModel {
                             model_id: "local-model".into(),
                             visible: true,
+                            context_window_override: None,
                         },
                     ],
+                    discovery_error: None,
                     expanded: false,
                 },
             ]
@@ -3670,17 +4197,19 @@ mod tests {
         let expanded = model_visibility_providers(
             &connections,
             &discovered,
+            &discovery_errors,
             &HashSet::from(["openrouter".to_string()]),
         );
         assert!(expanded[0].expanded);
         assert!(!expanded[1].expanded);
-        assert_eq!(expanded[0].models.len(), 3);
+        assert_eq!(expanded[0].models.len(), 4);
         assert_eq!(expanded[1].models.len(), 2);
-        assert!(!expanded[0].models[2].visible);
+        assert!(!expanded[0].models[3].visible);
 
         let reordered = model_visibility_providers(
             &[connections[1].clone(), connections[0].clone()],
             &[discovered[1].clone(), discovered[0].clone()],
+            &[discovery_errors[1].clone(), discovery_errors[0].clone()],
             &HashSet::from(["openrouter".to_string()]),
         );
         assert_eq!(reordered[0].provider_id, "local");
@@ -3816,10 +4345,13 @@ impl SettingsPanel {
         let api_key_masked = self.api_key_input.read(cx).presentation().is_masked();
         let voice_api_key_masked =
             self.voice_api_key_input.read(cx).presentation().is_masked();
+        let editing_model_context_window = self.editing_model_context_window.clone();
+        let model_context_window_input = self.model_context_window_input.clone();
         let settings_panel = cx.entity();
         let model_providers = model_visibility_providers(
             &self.connections,
             &self.discovered_models,
+            &self.model_discovery_errors,
             &self.expanded_model_providers,
         );
         let model_visibility_scrolls = model_providers
@@ -4002,8 +4534,12 @@ impl SettingsPanel {
                     // Named server profiles
                     .child(
                         h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
+                            .debug_selector(|| "ai-provider-profile-row".into())
                             .children(self.connections.iter().enumerate().map(|(index, connection)| {
                                 let button = Button::new(format!("connection_{index}"))
                                     .label(connection.name.clone())
@@ -4019,6 +4555,7 @@ impl SettingsPanel {
                             }))
                             .child(
                                 Button::new("add_connection")
+                                    .debug_selector(|| "ai-provider-add".into())
                                     .disabled(!self.loaded)
                                     .icon(IconName::Plus)
                                     .tooltip("Add OpenAI-compatible server")
@@ -4029,6 +4566,7 @@ impl SettingsPanel {
                             .when(self.connections.len() > 1, |this| {
                                 this.child(
                                     Button::new("remove_connection")
+                                        .debug_selector(|| "ai-provider-remove".into())
                                         .label("Remove")
                                         .tooltip("Remove selected server")
                                         .on_click(cx.listener(|this: &mut Self, _, window, cx| {
@@ -4184,7 +4722,7 @@ impl SettingsPanel {
                             div()
                                 .text_size(px(10.))
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Models are grouped by provider. All are shown in chat by default; hide a model only for its provider."),
+                                .child("All models are shown in chat by default. Hide per provider or set a model-specific context limit."),
                         )
                         .child(
                             v_flex()
@@ -4195,12 +4733,17 @@ impl SettingsPanel {
                                     let provider_id = provider.provider_id;
                                     let expanded = provider.expanded;
                                     let model_count = provider.models.len();
+                                    let discovery_error = provider.discovery_error;
                                     let scroll_handle = model_visibility_scrolls
                                         .get(&provider_id)
                                         .cloned()
                                         .unwrap_or_else(UniformListScrollHandle::new);
                                     let row_provider_id = provider_id.clone();
                                     let models = provider.models;
+                                    let editing_model_context_window =
+                                        editing_model_context_window.clone();
+                                    let model_context_window_input =
+                                        model_context_window_input.clone();
 
                                     v_flex()
                                         .w_full()
@@ -4244,6 +4787,18 @@ impl SettingsPanel {
                                                         .child(model_count.to_string()),
                                                 ),
                                         )
+                                        .when_some(discovery_error, |provider, error| {
+                                            provider.child(
+                                                div()
+                                                    .ml_8()
+                                                    .py_1()
+                                                    .text_size(px(10.))
+                                                    .text_color(cx.theme().danger)
+                                                    .child(format!(
+                                                        "Model list unavailable · {error}"
+                                                    )),
+                                            )
+                                        })
                                         .when(expanded && model_count > 0, |provider| {
                                             provider.child(
                                                 model_visibility_scroll_area(
@@ -4264,8 +4819,14 @@ impl SettingsPanel {
                                                                         let model = models.get(model_index)?;
                                                                         let model_id = model.model_id.clone();
                                                                         let visible = model.visible;
-                                                                        Some(
-                                                                            h_flex()
+                                                                        let context_window_override = model.context_window_override;
+                                                                        let editing_this_model = editing_model_context_window.as_ref().is_some_and(
+                                                                            |(provider_id, editing_model)| {
+                                                                                provider_id == &row_provider_id
+                                                                                    && editing_model == &model_id
+                                                                            },
+                                                                        );
+                                                                        let mut row = h_flex()
                                                                                 .w_full()
                                                                                 .h(px(MODEL_VISIBILITY_ROW_HEIGHT))
                                                                                 .min_w_0()
@@ -4280,8 +4841,83 @@ impl SettingsPanel {
                                                                                         .min_w_0()
                                                                                         .truncate()
                                                                                         .child(model_id.clone()),
+                                                                                );
+                                                                        if editing_this_model {
+                                                                            row = row
+                                                                                .child(
+                                                                                    Input::new(&model_context_window_input)
+                                                                                        .w(px(104.))
+                                                                                        .aria_label(format!("Context window for {model_id} in tokens"))
+                                                                                        ,
                                                                                 )
                                                                                 .child(
+                                                                                    Button::new(format!("save-model-limit-{row_provider_id}-{model_id}"))
+                                                                                        .ghost()
+                                                                                        .icon(IconName::Check)
+                                                                                        .tooltip("Save model context window")
+                                                                                        .on_click(cx.listener({
+                                                                                            let provider_id = row_provider_id.clone();
+                                                                                            let model_id = model_id.clone();
+                                                                                            move |this, _, window, cx| {
+                                                                                                let raw = this.model_context_window_input.read(cx).value().trim().to_string();
+                                                                                                let parsed = if raw.is_empty() {
+                                                                                                    Some(None)
+                                                                                                } else {
+                                                                                                    raw.parse::<u32>().ok().filter(|tokens| *tokens > 0).map(Some)
+                                                                                                };
+                                                                                                if let Some(context_window) = parsed {
+                                                                                                    this.set_model_context_window_override(
+                                                                                                        connection_index,
+                                                                                                        provider_id.clone(),
+                                                                                                        model_id.clone(),
+                                                                                                        context_window,
+                                                                                                        window,
+                                                                                                        cx,
+                                                                                                    );
+                                                                                                } else {
+                                                                                                    this.test_status = "Enter a positive token count, or leave blank to use the discovered limit".into();
+                                                                                                    cx.notify();
+                                                                                                }
+                                                                                            }
+                                                                                        })),
+                                                                                )
+                                                                                .child(
+                                                                                    Button::new(format!("cancel-model-limit-{row_provider_id}-{model_id}"))
+                                                                                        .ghost()
+                                                                                        .icon(IconName::X)
+                                                                                        .tooltip("Cancel context window edit")
+                                                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                                                            this.editing_model_context_window = None;
+                                                                                            cx.notify();
+                                                                                        })),
+                                                                                );
+                                                                        } else {
+                                                                            row = row.child(
+                                                                                Button::new(format!("edit-model-limit-{row_provider_id}-{model_id}"))
+                                                                                    .ghost()
+                                                                                    .label(context_window_override.map(|tokens| tokens.to_string()).unwrap_or_else(|| "Limit".into()))
+                                                                                    .tooltip("Override this model's context window")
+                                                                                    .on_click(cx.listener({
+                                                                                        let provider_id = row_provider_id.clone();
+                                                                                        let model_id = model_id.clone();
+                                                                                        move |this, _, window, cx| {
+                                                                                            let value = this
+                                                                                                .connections
+                                                                                                .get(connection_index)
+                                                                                                .and_then(|connection| connection.model_context_windows.get(&model_id))
+                                                                                                .map(u32::to_string)
+                                                                                                .unwrap_or_default();
+                                                                                            this.model_context_window_input.update(cx, |input, cx| {
+                                                                                                input.set_value(&value, window, cx);
+                                                                                            });
+                                                                                            this.editing_model_context_window = Some((provider_id.clone(), model_id.clone()));
+                                                                                            cx.notify();
+                                                                                        }
+                                                                                    })),
+                                                                            );
+                                                                        }
+                                                                        Some(
+                                                                            row.child(
                                                                                     Switch::new(format!(
                                                                                         "model-visible-{row_provider_id}-{model_id}"
                                                                                     ))
@@ -4308,7 +4944,7 @@ impl SettingsPanel {
                                                                                             );
                                                                                         },
                                                                                     )),
-                                                                                ),
+                                                                            ),
                                                                         )
                                                                     })
                                                                     .collect::<Vec<_>>()

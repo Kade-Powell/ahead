@@ -92,6 +92,7 @@ impl ViewImageHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         if !invocation
+            .step_context
             .turn
             .model_info()
             .input_modalities
@@ -104,12 +105,12 @@ impl ViewImageHandler {
 
         let ToolInvocation {
             session,
-            turn,
             step_context,
             payload,
             call_id,
             ..
         } = invocation;
+        let turn = step_context.turn.clone();
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -362,7 +363,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -392,7 +392,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -434,7 +433,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),
@@ -471,7 +469,6 @@ mod tests {
             .handle(ToolInvocation {
                 session: Arc::new(session),
                 step_context: StepContext::for_test(Arc::clone(&turn)),
-                turn,
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
                 tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
                 call_id: "call-view-image".to_string(),

@@ -107,6 +107,7 @@ impl LanguageServerRouting {
         language: &str,
         available: &[String],
         defaults: &[String],
+        opt_in: &[String],
     ) -> Result<Vec<String>> {
         let configured = self.languages.get(&language_key(language));
         let Some(entries) =
@@ -125,14 +126,17 @@ impl LanguageServerRouting {
             }
             let names = if entry == "..." {
                 available
+                    .iter()
+                    .filter(|name| !opt_in.contains(name))
+                    .collect::<Vec<_>>()
             } else {
-                std::slice::from_ref(entry)
+                ensure!(
+                    available.contains(entry),
+                    "Unknown language server {entry} for {language}"
+                );
+                vec![entry]
             };
             for name in names {
-                ensure!(
-                    available.contains(name),
-                    "Unknown language server {name} for {language}"
-                );
                 if !excluded.contains(&name.as_str()) && !ordered.contains(name) {
                     ordered.push(name.clone());
                 }
@@ -164,13 +168,16 @@ mod tests {
         let mut routing = LanguageServerRouting::default();
         let available = names(&["pyright", "basedpyright-langserver", "ruff"]);
         let defaults = names(&["pyright", "ruff"]);
-        assert_eq!(routing.servers("python", &available, &defaults)?, defaults);
+        assert_eq!(
+            routing.servers("python", &available, &defaults, &[])?,
+            defaults
+        );
         routing.apply_layer(
             "[languages.Python]\nlanguage_servers = ['ruff', '!pyright', '...']\n",
             "test",
         )?;
         assert_eq!(
-            routing.servers("python", &available, &defaults)?,
+            routing.servers("python", &available, &defaults, &[])?,
             names(&["ruff", "basedpyright-langserver"])
         );
         routing.apply_layer(
@@ -178,12 +185,16 @@ mod tests {
             "test",
         )?;
         assert_eq!(
-            routing.servers("Python", &available, &defaults)?,
+            routing.servers("Python", &available, &defaults, &[])?,
             names(&["basedpyright-langserver"])
         );
         routing
             .apply_layer("[languages.Python]\nlanguage_servers = []\n", "test")?;
-        assert!(routing.servers("python", &available, &defaults)?.is_empty());
+        assert!(
+            routing
+                .servers("python", &available, &defaults, &[])?
+                .is_empty()
+        );
         routing.apply_layer(
             "[languages.TSX.requests]\n\"textDocument/hover\" = 'vtsls'\n",
             "test",
@@ -191,6 +202,31 @@ mod tests {
         assert_eq!(
             routing.request_server("typescriptreact", "textDocument/hover"),
             Some("vtsls")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_excludes_opt_in_servers_but_explicit_id_enables_them() -> Result<()>
+    {
+        let mut routing = LanguageServerRouting::default();
+        let available = names(&["html-server"]);
+        let defaults = Vec::new();
+        let opt_in = names(&["html-server"]);
+        routing
+            .apply_layer("[languages.HTML]\nlanguage_servers = ['...']\n", "test")?;
+        assert!(
+            routing
+                .servers("HTML", &available, &defaults, &opt_in)?
+                .is_empty()
+        );
+        routing.apply_layer(
+            "[languages.HTML]\nlanguage_servers = ['html-server']\n",
+            "test",
+        )?;
+        assert_eq!(
+            routing.servers("html", &available, &defaults, &opt_in)?,
+            available
         );
         Ok(())
     }
@@ -229,7 +265,8 @@ mod tests {
             routing.servers(
                 "python",
                 &names(&["basedpyright-langserver", "ruff"]),
-                &[]
+                &[],
+                &[],
             )?,
             names(&["basedpyright-langserver", "ruff"])
         );
@@ -253,7 +290,11 @@ mod tests {
             "[languages.python]\nlanguage_servers = ['missing']",
             "test",
         )?;
-        assert!(routing.servers("python", &names(&["ruff"]), &[]).is_err());
+        assert!(
+            routing
+                .servers("python", &names(&["ruff"]), &[], &[])
+                .is_err()
+        );
         Ok(())
     }
 }

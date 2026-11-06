@@ -36,10 +36,10 @@ use std::{
 };
 
 use ahead_rpc::ahead::{
-    ACP_AUTH_REQUIRED_ERROR_CODE, AgentAuthMethod, AgentAuthMethodType,
-    AgentBufferSnapshot, AgentCommand, AgentConfigChoice, AgentConfigOption,
-    AgentConfigOptionValue, AgentTerminalAuthLaunch,
-    validate_agent_buffer_snapshots,
+    ACP_AUTH_REQUIRED_ERROR_CODE, ACP_RESOURCE_NOT_FOUND_ERROR_CODE,
+    AgentAuthMethod, AgentAuthMethodType, AgentBufferSnapshot, AgentCommand,
+    AgentConfigChoice, AgentConfigOption, AgentConfigOptionValue,
+    AgentTerminalAuthLaunch, validate_agent_buffer_snapshots,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -203,6 +203,10 @@ pub fn acp_error_code(error: &anyhow::Error) -> Option<i64> {
 
 pub(crate) fn is_auth_required_error(error: &anyhow::Error) -> bool {
     acp_error_code(error) == Some(ACP_AUTH_REQUIRED_ERROR_CODE)
+}
+
+pub(crate) fn is_resource_not_found_error(error: &anyhow::Error) -> bool {
+    acp_error_code(error) == Some(ACP_RESOURCE_NOT_FOUND_ERROR_CODE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,20 +636,19 @@ impl HarnessClient {
         let id = msg.get("id").cloned();
 
         // Response to one of our requests.
-        if let Some(id_num) = id.as_ref().and_then(Value::as_u64) {
-            if method.is_none() {
-                if let Some(tx) =
-                    pending.lock().ok().and_then(|mut p| p.remove(&id_num))
-                {
-                    let outcome = if let Some(err) = msg.get("error") {
-                        Err(acp_response_error(err))
-                    } else {
-                        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
-                    };
-                    drop(tx.send(outcome));
-                }
-                return;
+        if let Some(id_num) = id.as_ref().and_then(Value::as_u64)
+            && method.is_none()
+        {
+            if let Some(tx) = pending.lock().ok().and_then(|mut p| p.remove(&id_num))
+            {
+                let outcome = if let Some(err) = msg.get("error") {
+                    Err(acp_response_error(err))
+                } else {
+                    Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+                };
+                drop(tx.send(outcome));
             }
+            return;
         }
 
         match method {
@@ -942,20 +945,17 @@ impl HarnessClient {
             Some(other) => {
                 // Unknown client method: answer method-not-found so the
                 // harness is not left waiting on a response.
-                if let Some(id) = id {
-                    if let Err(error) = write_json(
+                if let Some(id) = id
+                    && let Err(error) = write_json(
                         stdin,
                         &json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": { "code": -32601, "message": format!("method not found: {other}") },
                         }),
-                    ) {
-                        tracing::warn!(
-                            %error,
-                            "failed to answer unsupported ACP method"
-                        );
-                    }
+                    )
+                {
+                    tracing::warn!(%error, "failed to answer unsupported ACP method");
                 }
             }
             None => {}
@@ -1045,7 +1045,7 @@ impl HarnessClient {
                 });
             }
             "usage_update" => {
-                let total_tokens = update
+                let used_tokens = update
                     .get("used")
                     .or_else(|| update.get("totalTokens"))
                     .and_then(Value::as_u64)
@@ -1056,7 +1056,7 @@ impl HarnessClient {
                     .and_then(Value::as_u64);
                 sink(HarnessEvent::Usage {
                     acp_session_id: session_id,
-                    total_tokens,
+                    used_tokens,
                     context_window,
                 });
             }
@@ -1605,18 +1605,16 @@ impl HarnessClient {
             .lock()
             .map_err(|error| anyhow!("cancelled sessions lock: {error}"))?
             .contains(acp_session_id)
-        {
-            if let Some(sender) = self
+            && let Some(sender) = self
                 .pending
                 .lock()
                 .map_err(|error| anyhow!("pending lock: {error}"))?
                 .remove(&request_id)
-            {
-                drop(sender.send(Err(AcpResponseError {
-                    code: -1,
-                    message: "prompt cancelled by AHEAD".to_string(),
-                })));
-            }
+        {
+            drop(sender.send(Err(AcpResponseError {
+                code: -1,
+                message: "prompt cancelled by AHEAD".to_string(),
+            })));
         }
         let result = match receiver.recv_timeout(Duration::from_secs(60 * 30)) {
             Ok(Ok(value)) => Ok(value),
@@ -1752,18 +1750,17 @@ impl HarnessClient {
             .lock()
             .map_err(|error| anyhow!("prompt request lock: {error}"))?
             .remove(acp_session_id);
-        if let Some(request_id) = request_id {
-            if let Some(sender) = self
+        if let Some(request_id) = request_id
+            && let Some(sender) = self
                 .pending
                 .lock()
                 .map_err(|error| anyhow!("pending lock: {error}"))?
                 .remove(&request_id)
-            {
-                drop(sender.send(Err(AcpResponseError {
-                    code: -1,
-                    message: "prompt cancelled by AHEAD".to_string(),
-                })));
-            }
+        {
+            drop(sender.send(Err(AcpResponseError {
+                code: -1,
+                message: "prompt cancelled by AHEAD".to_string(),
+            })));
         }
         if let Ok(mut pending) = self.pending_editor_buffer_snapshots.lock() {
             pending.retain(|(session_id, _), _| session_id != acp_session_id);
@@ -1965,17 +1962,16 @@ impl HarnessClient {
                 }
                 _ => continue,
             };
-            if value != option.current_value {
-                if let Err(error) =
+            if value != option.current_value
+                && let Err(error) =
                     self.set_config_option(acp_session_id, &option.id, &value)
-                {
-                    tracing::warn!(
-                        config_id = %option.id,
-                        %error,
-                        "failed to apply saved ACP option default"
-                    );
-                    break;
-                }
+            {
+                tracing::warn!(
+                    config_id = %option.id,
+                    %error,
+                    "failed to apply saved ACP option default"
+                );
+                break;
             }
         }
         Ok(())
@@ -2110,7 +2106,7 @@ impl HarnessClient {
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn retain_generation_lease_in_child(command: &mut Command, lease: &File) {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
@@ -3510,6 +3506,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_session_json_rpc_error_keeps_its_protocol_code() {
+        let error = anyhow::Error::new(acp_response_error(&json!({
+            "code": ACP_RESOURCE_NOT_FOUND_ERROR_CODE,
+            "message": "Resource not found"
+        })));
+
+        assert!(is_resource_not_found_error(&error));
+        assert_eq!(
+            acp_error_code(&error),
+            Some(ACP_RESOURCE_NOT_FOUND_ERROR_CODE)
+        );
+    }
+
+    #[test]
     fn editor_mcp_negotiates_a_zed_supported_legacy_protocol_version() {
         assert_eq!(
             mcp_legacy_protocol_version(Some("2024-11-05")),
@@ -3734,10 +3744,10 @@ mod tests {
         assert_eq!(response["isError"], false);
         assert_eq!(response["content"][0]["text"], "Rendered cue `cue-1`.");
 
-        let pointer_state = state.clone();
+        let pointer_state = state;
         let pointer_presentations = pending_presentations.clone();
-        let pointer_snapshots = pending_snapshots.clone();
-        let pointer_server_id = server_id.clone();
+        let pointer_snapshots = pending_snapshots;
+        let pointer_server_id = server_id;
         let pointer_sink = sink.clone();
         let pointer_call = thread::spawn(move || {
             handle_editor_tool_call_for_server(
@@ -3777,7 +3787,7 @@ mod tests {
         let responder = pending_presentations
             .lock()
             .expect("lock pending presentations")
-            .remove(&(session_id.clone(), request_id))
+            .remove(&(session_id, request_id))
             .expect("pointer responder should be registered");
         responder
             .send((true, "Moved pointer for cue `cue-1`.".to_string()))
@@ -4032,7 +4042,7 @@ mod tests {
 
     #[test]
     fn editor_mcp_bridge_worker_slots_are_released() {
-        assert!(MAX_EDITOR_MCP_BRIDGE_WORKERS > MAX_PENDING_STDIO_TOOL_CALLS);
+        const { assert!(MAX_EDITOR_MCP_BRIDGE_WORKERS > MAX_PENDING_STDIO_TOOL_CALLS) };
         let active_workers = Arc::new(AtomicUsize::new(0));
         let permits: Vec<_> = (0..MAX_EDITOR_MCP_BRIDGE_WORKERS)
             .map(|_| {
@@ -4245,7 +4255,7 @@ mod tests {
         let (event_sender, event_receiver) =
             mpsc::sync_channel(MAX_EDITOR_MCP_QUEUED_EVENTS);
         let loop_event_sender = event_sender.clone();
-        let loop_address = address.clone();
+        let loop_address = address;
         let loop_thread = thread::spawn(move || {
             let mut output = Vec::new();
             let result = run_editor_mcp_stdio_loop(
@@ -4676,7 +4686,7 @@ fi
         assert!(matches!(
             events[1],
             HarnessEvent::Usage {
-                total_tokens: 18510,
+                used_tokens: 18510,
                 ..
             }
         ));
@@ -4782,7 +4792,9 @@ esac
         let prompt_client = client.clone();
         let (finished, result) = mpsc::channel();
         let prompt = thread::spawn(move || {
-            let _ = finished.send(prompt_client.prompt(&session_id, "hello"));
+            finished
+                .send(prompt_client.prompt(&session_id, "hello"))
+                .expect("deliver prompt result");
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -36,7 +36,9 @@ const MAX_EXTENSION_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_EXTENSION_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTENSION_QUERY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CACHED_LANGUAGE_SYNTAX: usize = 32;
+const MAX_CACHED_LANGUAGE_SOURCE_ROOTS: usize = 8;
 const MAX_EXTENSION_METADATA_BYTES: u64 = 256 * 1024;
+const MAX_EXTENSION_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const EXTENSION_DOWNLOAD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
 const EXTENSION_COMMAND_TIMEOUT: std::time::Duration =
@@ -240,7 +242,13 @@ pub struct LanguageServerCommand {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub initialization_options: Option<serde_json::Value>,
+    pub initialization_options_schema: Option<serde_json::Value>,
     pub workspace_configuration: Option<serde_json::Value>,
+    pub workspace_configuration_schema: Option<serde_json::Value>,
+}
+
+fn parse_extension_json_schema(schema: Option<String>) -> Option<serde_json::Value> {
+    schema.and_then(|schema| serde_json::from_str(&schema).ok())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +264,7 @@ pub struct LanguageServerExtension {
     pub wasm_path: PathBuf,
     api_version: ExtensionApiVersion,
     languages: Vec<String>,
+    opt_in_languages: Vec<String>,
     language_ids: BTreeMap<String, String>,
     capabilities: Vec<ProcessCapability>,
 }
@@ -275,6 +284,17 @@ impl LanguageServerExtension {
                 .language_ids
                 .values()
                 .any(|protocol_id| protocol_id.eq_ignore_ascii_case(language_id))
+    }
+
+    pub fn is_opt_in_for(&self, language_id: &str) -> bool {
+        self.opt_in_languages.iter().any(|opt_in_language| {
+            opt_in_language.eq_ignore_ascii_case(language_id)
+                || self.language_ids.iter().any(|(language, protocol_id)| {
+                    opt_in_language.eq_ignore_ascii_case(language)
+                        && (language_id.eq_ignore_ascii_case(language)
+                            || language_id.eq_ignore_ascii_case(protocol_id))
+                })
+        })
     }
 
     pub fn language_ids(&self) -> Vec<String> {
@@ -345,6 +365,7 @@ pub struct LanguageComments {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionSyntax {
+    pub language_name: String,
     pub captures: Vec<super::syntax::SyntaxCapture>,
     pub comments: LanguageComments,
 }
@@ -380,8 +401,16 @@ struct CachedLanguageSyntax {
     syntax: Arc<LanguageSyntax>,
 }
 
+struct CachedLanguageSources {
+    definitions: Vec<LanguageSource>,
+    first_error: Option<String>,
+}
+
 static LANGUAGE_SYNTAX_CACHE: OnceLock<
     Mutex<HashMap<LanguageSyntaxCacheKey, CachedLanguageSyntax>>,
+> = OnceLock::new();
+static LANGUAGE_SOURCES_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, Arc<CachedLanguageSources>>>,
 > = OnceLock::new();
 
 #[derive(Clone)]
@@ -421,8 +450,6 @@ struct ExtensionManifest {
     id: String,
     #[serde(default)]
     version: Option<String>,
-    #[serde(rename = "lib")]
-    library: Option<ExtensionLibrary>,
     #[serde(default)]
     schema_version: Option<u32>,
     #[serde(default)]
@@ -435,31 +462,44 @@ struct ExtensionManifest {
     capabilities: Vec<CapabilityManifestEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExtensionLibrary {
-    version: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtensionApiVersion {
     V0_6,
     V0_8,
 }
 
-impl ExtensionManifest {
-    fn api_version(&self) -> Result<ExtensionApiVersion> {
-        match self
-            .library
-            .as_ref()
-            .and_then(|library| library.version.as_deref())
+fn extension_api_version(
+    extension_id: &str,
+    wasm_bytes: &[u8],
+) -> Result<ExtensionApiVersion> {
+    let mut version = None;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        if let wasmparser::Payload::CustomSection(section) =
+            payload.context("error parsing extension WASM")?
+            && section.name() == "zed:api-version"
         {
-            Some("0.6.0" | "0.7.0") => Ok(ExtensionApiVersion::V0_6),
-            Some("0.8.0") => Ok(ExtensionApiVersion::V0_8),
-            Some(version) => {
-                Err(anyhow!("unsupported Zed extension API version {version}"))
-            }
-            None => Err(anyhow!("Zed extension manifest is missing [lib].version")),
+            let data = section.data();
+            anyhow::ensure!(
+                data.len() == 6,
+                "extension {extension_id} has an invalid zed:api-version section"
+            );
+            version = Some((
+                u16::from_be_bytes([data[0], data[1]]),
+                u16::from_be_bytes([data[2], data[3]]),
+                u16::from_be_bytes([data[4], data[5]]),
+            ));
         }
+    }
+
+    let (major, minor, patch) = version.with_context(|| {
+        format!("extension {extension_id} has no zed:api-version section")
+    })?;
+    match (major, minor, patch) {
+        (0, 6 | 7, 0) => Ok(ExtensionApiVersion::V0_6),
+        (0, 8, 0) => Ok(ExtensionApiVersion::V0_8),
+        _ => Err(anyhow!(
+            "unsupported Zed extension API version {major}.{minor}.{patch}"
+        )),
     }
 }
 
@@ -660,6 +700,8 @@ struct LanguageServerManifestEntry {
     languages: Vec<String>,
     #[serde(default)]
     language_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    opt_in_languages: Vec<String>,
 }
 
 pub fn discover_language_server_extensions(
@@ -673,6 +715,7 @@ pub fn discover_language_server_extensions(
     discovery
         .errors
         .extend(restore_interrupted_extension_updates(extensions_root)?);
+    invalidate_language_sources_cache(extensions_root);
     for entry in std::fs::read_dir(extensions_root)? {
         let entry = entry?;
         let directory = entry.path();
@@ -713,12 +756,9 @@ pub fn discover_language_server_extensions(
             ));
             continue;
         }
-        let api_version = manifest.api_version().with_context(|| {
-            format!(
-                "checking extension API version in {}",
-                manifest_path.display()
-            )
-        });
+        let api_version = std::fs::read(&wasm_path)
+            .with_context(|| format!("reading {}", wasm_path.display()))
+            .and_then(|wasm| extension_api_version(&manifest.id, &wasm));
         let api_version = match api_version {
             Ok(api_version) => api_version,
             Err(error) => {
@@ -732,6 +772,7 @@ pub fn discover_language_server_extensions(
                 languages.push(language);
             }
             let language_ids = server.language_ids;
+            let opt_in_languages = server.opt_in_languages;
             languages.extend(language_ids.keys().cloned());
             languages.sort_unstable_by_key(|language| language.to_ascii_lowercase());
             languages.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
@@ -742,6 +783,7 @@ pub fn discover_language_server_extensions(
                 wasm_path: wasm_path.clone(),
                 api_version,
                 languages,
+                opt_in_languages,
                 language_ids,
                 capabilities: manifest
                     .capabilities
@@ -807,24 +849,29 @@ pub fn extension_syntax_for_path(
     path: &Path,
     content: &str,
 ) -> Result<Option<ExtensionSyntax>> {
-    let (sources, first_error) = language_sources_for_root(extensions_root)?;
+    let sources = language_sources_for_root(extensions_root)?;
     let Some(source) =
-        language_source_from_path_sources(&sources, path, Some(content))
+        language_source_from_path_sources(&sources.definitions, path, Some(content))
     else {
-        return match first_error {
-            Some(error) => Err(error),
+        return match &sources.first_error {
+            Some(error) => Err(anyhow!("{error}")),
             None => Ok(None),
         };
     };
+    let language_name = source.definition.name.clone();
     let comments = source.definition.comments.clone();
     let captures = match source.definition.grammar.clone() {
         Some(grammar_name) if source.grammar_names.contains(&grammar_name) => {
             let syntax = cached_language_syntax(source, grammar_name)?;
-            super::syntax::captures(&sources, &syntax, content)?
+            super::syntax::captures(&sources.definitions, &syntax, content)?
         }
         Some(_) | None => Vec::new(),
     };
-    Ok(Some(ExtensionSyntax { captures, comments }))
+    Ok(Some(ExtensionSyntax {
+        language_name,
+        captures,
+        comments,
+    }))
 }
 
 pub(crate) fn language_syntax_for_name(
@@ -969,11 +1016,12 @@ fn language_source_for_path(
     path: &Path,
     content: Option<&str>,
 ) -> Result<Option<LanguageSource>> {
-    let (definitions, first_error) = language_sources_for_root(extensions_root)?;
-    let source = language_source_from_path_sources(&definitions, path, content);
-    match (source, first_error) {
+    let sources = language_sources_for_root(extensions_root)?;
+    let source =
+        language_source_from_path_sources(&sources.definitions, path, content);
+    match (source, &sources.first_error) {
         (Some(source), _) => Ok(Some(source)),
-        (None, Some(error)) => Err(error),
+        (None, Some(error)) => Err(anyhow!("{error}")),
         (None, None) => Ok(None),
     }
 }
@@ -1011,42 +1059,71 @@ fn language_source_from_path_sources(
 
 fn language_sources_for_root(
     extensions_root: &Path,
-) -> Result<(Vec<LanguageSource>, Option<anyhow::Error>)> {
-    let mut definitions = Vec::new();
-    if !extensions_root.exists() {
-        return Ok((definitions, None));
+) -> Result<Arc<CachedLanguageSources>> {
+    let cache = LANGUAGE_SOURCES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("extension language definitions are unavailable"))?;
+    if let Some(sources) = cache.get(extensions_root) {
+        return Ok(sources.clone());
     }
+
+    let mut definitions = Vec::new();
     let mut first_error = None;
-    for entry in std::fs::read_dir(extensions_root)? {
-        let entry = entry?;
-        let directory = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                first_error.get_or_insert(error.into());
+    if extensions_root.exists() {
+        for entry in std::fs::read_dir(extensions_root)? {
+            let entry = entry?;
+            let directory = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    first_error.get_or_insert(error.into());
+                    continue;
+                }
+            };
+            if !file_type.is_dir()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| name.starts_with('.'))
+            {
                 continue;
             }
-        };
-        if !file_type.is_dir()
-            || entry
-                .file_name()
-                .to_str()
-                .is_none_or(|name| name.starts_with('.'))
-        {
-            continue;
-        }
-        let manifest_path = directory.join("extension.toml");
-        if !manifest_path.is_file() {
-            continue;
-        }
-        match language_definitions_for_extension(&directory) {
-            Ok(extension_definitions) => definitions.extend(extension_definitions),
-            Err(error) => {
-                first_error.get_or_insert(error);
+            let manifest_path = directory.join("extension.toml");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            match language_definitions_for_extension(&directory) {
+                Ok(extension_definitions) => {
+                    definitions.extend(extension_definitions)
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
     }
-    Ok((definitions, first_error))
+    let sources = Arc::new(CachedLanguageSources {
+        definitions,
+        first_error: first_error.map(|error| format!("{error:#}")),
+    });
+    if cache.len() >= MAX_CACHED_LANGUAGE_SOURCE_ROOTS
+        && let Some(evicted_root) = cache.keys().next().cloned()
+    {
+        cache.remove(&evicted_root);
+    }
+    cache.insert(extensions_root.to_path_buf(), sources.clone());
+    Ok(sources)
+}
+
+fn invalidate_language_sources_cache(extensions_root: &Path) {
+    let Some(cache) = LANGUAGE_SOURCES_CACHE.get() else {
+        return;
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(extensions_root);
 }
 
 fn language_definitions_for_extension(
@@ -1287,7 +1364,7 @@ pub fn install_extension_from_url(
     expected_version: &str,
     expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
-    let archive = download_bytes(url)?;
+    let archive = download_bytes(url, extension_id, expected_version)?;
     if let Some(expected_sha256) = expected_sha256 {
         verify_extension_archive_sha256(&archive, expected_sha256)?;
     }
@@ -1354,12 +1431,12 @@ pub fn install_extension_package(
     );
     validate_extension_grammars(&package_root, &manifest)?;
     if !manifest.language_servers.is_empty() {
-        manifest.api_version()?;
         anyhow::ensure!(
             package_root.join("extension.wasm").is_file(),
             "extension package is missing extension.wasm"
         );
         let wasm = std::fs::read(package_root.join("extension.wasm"))?;
+        extension_api_version(&manifest.id, &wasm)?;
         ExtensionHost::new()?.validate_component(&wasm)?;
     }
     if backup.exists() {
@@ -1381,6 +1458,7 @@ pub fn install_extension_package(
     if backup.exists() {
         std::fs::remove_dir_all(backup)?;
     }
+    invalidate_language_sources_cache(extensions_root);
     Ok(target)
 }
 
@@ -1423,6 +1501,7 @@ pub fn uninstall_extension_package(
                     && key.extension_directory != backup
             });
     }
+    invalidate_language_sources_cache(extensions_root);
     Ok(())
 }
 
@@ -1504,11 +1583,13 @@ fn restore_extension_backup(root: &Path, id: &str) -> Result<()> {
     );
     validate_extension_grammars(&backup, &manifest)?;
     if !manifest.language_servers.is_empty() {
-        manifest.api_version()?;
+        let wasm_path = backup.join("extension.wasm");
         anyhow::ensure!(
-            std::fs::symlink_metadata(backup.join("extension.wasm"))?.is_file(),
+            std::fs::symlink_metadata(&wasm_path)?.is_file(),
             "extension backup has no language server component"
         );
+        let wasm = std::fs::read(wasm_path)?;
+        extension_api_version(&manifest.id, &wasm)?;
     }
     std::fs::rename(&backup, &target)
         .context("restoring an interrupted extension update")?;
@@ -1575,17 +1656,27 @@ fn lock_extension_installs(root: &Path) -> Result<ExtensionInstallLock> {
     Ok(ExtensionInstallLock(file))
 }
 
-fn download_bytes(url: &str) -> Result<Vec<u8>> {
+fn download_bytes(
+    url: &str,
+    extension_id: &str,
+    expected_version: &str,
+) -> Result<Vec<u8>> {
     let url = reqwest::Url::parse(url).context("invalid extension download URL")?;
     anyhow::ensure!(
-        allowed_extension_download_url(&url),
-        "extension downloads require HTTPS without URL credentials"
+        allowed_extension_download_source_url(&url, extension_id, expected_version,),
+        "extension downloads must use an approved registry URL over HTTPS"
     );
+    let extension_id = extension_id.to_owned();
+    let expected_version = expected_version.to_owned();
     let client = reqwest::blocking::Client::builder()
         .timeout(EXTENSION_DOWNLOAD_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() < 10
-                && allowed_extension_download_url(attempt.url())
+                && allowed_extension_download_redirect_url(
+                    attempt.url(),
+                    &extension_id,
+                    &expected_version,
+                )
             {
                 attempt.follow()
             } else {
@@ -1618,20 +1709,137 @@ fn download_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn allowed_extension_download_url(url: &reqwest::Url) -> bool {
-    if !url.username().is_empty() || url.password().is_some() {
+fn allowed_extension_download_source_url(
+    url: &reqwest::Url,
+    extension_id: &str,
+    expected_version: &str,
+) -> bool {
+    if is_test_loopback_url(url) {
+        return true;
+    }
+    if !is_credential_free_https_url(url)
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return false;
     }
-    match url.scheme() {
-        "https" => true,
-        "http" if cfg!(test) => match url.host() {
+    match url.host_str() {
+        Some("api.zed.dev") => {
+            is_zed_extension_download_path(url, extension_id, expected_version)
+        }
+        Some("github.com") => {
+            is_ahead_release_download_path(url, extension_id, expected_version)
+        }
+        _ => false,
+    }
+}
+
+fn allowed_extension_download_redirect_url(
+    url: &reqwest::Url,
+    extension_id: &str,
+    expected_version: &str,
+) -> bool {
+    if is_test_loopback_url(url) {
+        return true;
+    }
+    if !is_credential_free_https_url(url) || url.fragment().is_some() {
+        return false;
+    }
+    match url.host_str() {
+        Some("api.zed.dev") => {
+            url.query().is_none()
+                && is_zed_extension_download_path(
+                    url,
+                    extension_id,
+                    expected_version,
+                )
+        }
+        Some("github.com") => {
+            url.query().is_none()
+                && is_ahead_release_download_path(
+                    url,
+                    extension_id,
+                    expected_version,
+                )
+        }
+        Some(
+            "zed-extensions.nyc3.digitaloceanspaces.com"
+            | "release-assets.githubusercontent.com"
+            | "objects.githubusercontent.com",
+        ) => true,
+        _ => false,
+    }
+}
+
+fn is_credential_free_https_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_test_loopback_url(url: &reqwest::Url) -> bool {
+    cfg!(test)
+        && url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && match url.host() {
             Some(url::Host::Ipv4(address)) => address.is_loopback(),
             Some(url::Host::Ipv6(address)) => address.is_loopback(),
             Some(url::Host::Domain("localhost")) => true,
             _ => false,
-        },
-        _ => false,
-    }
+        }
+}
+
+fn is_zed_extension_download_path(
+    url: &reqwest::Url,
+    extension_id: &str,
+    expected_version: &str,
+) -> bool {
+    let Some(segments) = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+    else {
+        return false;
+    };
+    segments.len() == 4
+        && segments[0] == "extensions"
+        && segments[1] == extension_id
+        && segments[2] == expected_version
+        && segments[3] == "download"
+        && is_safe_extension_path_segment(extension_id)
+        && is_safe_extension_path_segment(expected_version)
+}
+
+fn is_ahead_release_download_path(
+    url: &reqwest::Url,
+    extension_id: &str,
+    expected_version: &str,
+) -> bool {
+    let Some(segments) = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+    else {
+        return false;
+    };
+    segments.len() == 6
+        && segments[0] == "Kade-Powell"
+        && segments[1] == "ahead"
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && is_safe_extension_path_segment(segments[4])
+        && segments[5] == format!("{extension_id}-{expected_version}.tar.gz")
+        && is_safe_extension_path_segment(extension_id)
+        && is_safe_extension_path_segment(expected_version)
+}
+
+fn is_safe_extension_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+')
+        })
 }
 
 async fn latest_npm_package_version(url: &str) -> Result<String> {
@@ -1786,7 +1994,9 @@ pub struct ProjectContext;
 pub struct KeyValueStoreContext;
 
 #[derive(Debug, Clone)]
-pub struct HttpResponseStreamContext;
+pub struct HttpResponseStreamContext {
+    response: Arc<tokio::sync::Mutex<reqwest::Response>>,
+}
 
 struct HostState {
     table: ResourceTable,
@@ -1844,33 +2054,142 @@ impl github::Host for HostState {
 impl http_client::Host for HostState {
     async fn fetch(
         &mut self,
-        _request: http_client::HttpRequest,
+        request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<http_client::HttpResponse, String>> {
-        Ok(Err("HTTP is not supported by AHEAD's language host".into()))
+        let url = request.url.clone();
+        let result = async {
+            let client = extension_http_client(&request.redirect_policy)?;
+            let mut response = client.execute(build_extension_http_request(&client, &request)?)
+                .await
+                .map_err(|error| error.to_string())?;
+            if response.status().is_client_error() || response.status().is_server_error() {
+                return Err(format!(
+                    "failed to fetch '{url}': status code {}",
+                    response.status()
+                ));
+            }
+
+            let mut headers = Vec::new();
+            for (name, value) in response.headers() {
+                headers.push((
+                    name.to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_EXTENSION_HTTP_RESPONSE_BYTES as u64)
+            {
+                return Err(format!(
+                    "HTTP response exceeds the {MAX_EXTENSION_HTTP_RESPONSE_BYTES}-byte limit"
+                ));
+            }
+
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                if body.len().saturating_add(chunk.len()) > MAX_EXTENSION_HTTP_RESPONSE_BYTES {
+                    return Err(format!(
+                        "HTTP response exceeds the {MAX_EXTENSION_HTTP_RESPONSE_BYTES}-byte limit"
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(http_client::HttpResponse { headers, body })
+        }
+        .await;
+        Ok(result)
     }
 
     async fn fetch_stream(
         &mut self,
-        _request: http_client::HttpRequest,
+        request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<Resource<HttpResponseStreamContext>, String>> {
-        Ok(Err("HTTP is not supported by AHEAD's language host".into()))
+        let result = async {
+            let client = extension_http_client(&request.redirect_policy)?;
+            let response = client
+                .execute(build_extension_http_request(&client, &request)?)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.table
+                .push(HttpResponseStreamContext {
+                    response: Arc::new(tokio::sync::Mutex::new(response)),
+                })
+                .map_err(|error| error.to_string())
+        }
+        .await;
+        Ok(result)
     }
 }
 
 impl HostHttpResponseStream for HostState {
     async fn next_chunk(
         &mut self,
-        _stream: Resource<HttpResponseStreamContext>,
+        stream: Resource<HttpResponseStreamContext>,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, String>> {
-        Ok(Err("HTTP is not supported by AHEAD's language host".into()))
+        let response = self.table.get(&stream)?.response.clone();
+        let result = response
+            .lock()
+            .await
+            .chunk()
+            .await
+            .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
+            .map_err(|error| error.to_string());
+        Ok(result)
     }
 
     async fn drop(
         &mut self,
-        _stream: Resource<HttpResponseStreamContext>,
+        stream: Resource<HttpResponseStreamContext>,
     ) -> wasmtime::Result<()> {
+        self.table.delete(stream)?;
         Ok(())
     }
+}
+
+fn extension_http_client(
+    redirect_policy: &http_client::RedirectPolicy,
+) -> Result<reqwest::Client, String> {
+    let redirect_policy = match redirect_policy {
+        http_client::RedirectPolicy::NoFollow => reqwest::redirect::Policy::none(),
+        http_client::RedirectPolicy::FollowLimit(limit) => {
+            reqwest::redirect::Policy::limited(*limit as usize)
+        }
+        http_client::RedirectPolicy::FollowAll => {
+            reqwest::redirect::Policy::custom(|attempt| attempt.follow())
+        }
+    };
+    reqwest::Client::builder()
+        .timeout(EXTENSION_DOWNLOAD_TIMEOUT)
+        .redirect(redirect_policy)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn build_extension_http_request(
+    client: &reqwest::Client,
+    request: &http_client::HttpRequest,
+) -> Result<reqwest::Request, String> {
+    let method = match request.method {
+        http_client::HttpMethod::Get => reqwest::Method::GET,
+        http_client::HttpMethod::Head => reqwest::Method::HEAD,
+        http_client::HttpMethod::Post => reqwest::Method::POST,
+        http_client::HttpMethod::Put => reqwest::Method::PUT,
+        http_client::HttpMethod::Delete => reqwest::Method::DELETE,
+        http_client::HttpMethod::Options => reqwest::Method::OPTIONS,
+        http_client::HttpMethod::Patch => reqwest::Method::PATCH,
+    };
+    let mut builder = client.request(method, &request.url);
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(request.body.clone().unwrap_or_default())
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 impl platform::Host for HostState {
@@ -2385,6 +2704,7 @@ impl ExtensionImports for HostState {
                     for entry in archive.entries()? {
                         let mut entry = entry?;
                         let relative = entry.path()?.into_owned();
+                        let relative = Path::new(&path).join(relative);
                         let destination = checked_extension_path(
                             &self.work_dir,
                             relative.to_str().ok_or_else(|| {
@@ -2411,6 +2731,7 @@ impl ExtensionImports for HostState {
                                 anyhow!("archive path escapes extension root")
                             })?
                             .to_path_buf();
+                        let relative = Path::new(&path).join(relative);
                         let destination = checked_extension_path(
                             &self.work_dir,
                             relative.to_str().ok_or_else(|| {
@@ -2859,6 +3180,13 @@ impl ExtensionHost {
         .map(|options| serde_json::from_str(&options))
         .transpose()
         .context("parsing language server initialization options")?;
+        let initialization_options_schema = Self::initialization_options_schema(
+            store,
+            extension,
+            language_server_id,
+            worktree_root_for_command.clone(),
+        )
+        .await?;
         let workspace_configuration = Self::workspace_configuration(
             store,
             extension,
@@ -2866,12 +3194,21 @@ impl ExtensionHost {
             worktree_root_for_command.clone(),
         )
         .await?;
+        let workspace_configuration_schema = Self::workspace_configuration_schema(
+            store,
+            extension,
+            language_server_id,
+            worktree_root_for_command,
+        )
+        .await?;
         let command = LanguageServerCommand {
             command: resolve_work_dir_command(&work_dir, command),
             args,
             env,
             initialization_options,
+            initialization_options_schema,
             workspace_configuration,
+            workspace_configuration_schema,
         };
         Ok(command)
     }
@@ -3012,6 +3349,60 @@ impl ExtensionHost {
         .transpose()
         .context("parsing language server workspace configuration")?;
         Ok(workspace_configuration)
+    }
+
+    async fn initialization_options_schema(
+        store: &mut Store<HostState>,
+        extension: &GuestExtension,
+        language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let worktree = store
+            .data_mut()
+            .table
+            .push(WorktreeContext {
+                root: worktree_root,
+            })
+            .map_err(|error| anyhow!(error))?;
+        let schema = match extension {
+            GuestExtension::V0_6(_) => None,
+            GuestExtension::V0_8(guest) => guest
+                .call_language_server_initialization_options_schema(
+                    store,
+                    language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?,
+        };
+        Ok(parse_extension_json_schema(schema))
+    }
+
+    async fn workspace_configuration_schema(
+        store: &mut Store<HostState>,
+        extension: &GuestExtension,
+        language_server_id: &str,
+        worktree_root: PathBuf,
+    ) -> Result<Option<serde_json::Value>> {
+        let worktree = store
+            .data_mut()
+            .table
+            .push(WorktreeContext {
+                root: worktree_root,
+            })
+            .map_err(|error| anyhow!(error))?;
+        let schema = match extension {
+            GuestExtension::V0_6(_) => None,
+            GuestExtension::V0_8(guest) => guest
+                .call_language_server_workspace_configuration_schema(
+                    store,
+                    language_server_id,
+                    worktree,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?,
+        };
+        Ok(parse_extension_json_schema(schema))
     }
 
     async fn additional_workspace_configuration(
@@ -3452,13 +3843,30 @@ mod tests {
     use fs4::fs_std::FileExt;
     use std::fs;
 
+    #[test]
+    fn extension_language_server_schemas_accept_json_and_ignore_invalid_values() {
+        assert_eq!(
+            parse_extension_json_schema(Some(
+                r#"{"type":"object","properties":{"enabled":{"type":"boolean"}}}"#
+                    .into()
+            )),
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "enabled": { "type": "boolean" } }
+            }))
+        );
+        assert_eq!(parse_extension_json_schema(None), None);
+        assert_eq!(parse_extension_json_schema(Some("not json".into())), None);
+    }
+
     fn local_http_response(
-        body: &'static [u8],
+        body: impl AsRef<[u8]>,
     ) -> Result<(url::Url, std::thread::JoinHandle<Result<()>>)> {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
+        let body = body.as_ref().to_vec();
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -3498,13 +3906,97 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             )?;
-            stream.write_all(body)?;
+            stream.write_all(&body)?;
             Ok(())
         });
         Ok((
             url::Url::parse(&format!("http://{address}/package"))?,
             server,
         ))
+    }
+
+    #[test]
+    fn extension_http_callbacks_support_buffered_and_streamed_responses()
+    -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let mut host = HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
+            worktree_root: workspace.path().to_path_buf(),
+            work_dir: workspace.path().to_path_buf(),
+            process_capabilities: Vec::new(),
+            granted_capabilities: ExtensionCapabilityGrants::zed_defaults(),
+            node_runtime: NodeRuntime::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let (url, server) = local_http_response(b"buffered extension response")?;
+        let buffered = runtime
+            .block_on(<HostState as http_client::Host>::fetch(
+                &mut host,
+                http_client::HttpRequest {
+                    method: http_client::HttpMethod::Get,
+                    url: url.to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    redirect_policy: http_client::RedirectPolicy::NoFollow,
+                },
+            ))
+            .expect("buffered fetch should not trap")
+            .map_err(|error| anyhow!(error))?;
+        server
+            .join()
+            .map_err(|_| anyhow!("buffered HTTP fixture panicked"))??;
+        assert_eq!(buffered.body, b"buffered extension response");
+        assert!(
+            buffered
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("content-length")
+                    && value == "27")
+        );
+
+        let (url, server) = local_http_response(b"streamed extension response")?;
+        let stream = runtime
+            .block_on(<HostState as http_client::Host>::fetch_stream(
+                &mut host,
+                http_client::HttpRequest {
+                    method: http_client::HttpMethod::Get,
+                    url: url.to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    redirect_policy: http_client::RedirectPolicy::NoFollow,
+                },
+            ))
+            .expect("stream fetch should not trap")
+            .map_err(|error| anyhow!(error))?;
+        let stream_rep = stream.rep();
+        let mut streamed = Vec::new();
+        loop {
+            let chunk = runtime
+                .block_on(<HostState as HostHttpResponseStream>::next_chunk(
+                    &mut host,
+                    Resource::new_borrow(stream_rep),
+                ))
+                .expect("stream read should not trap")
+                .map_err(|error| anyhow!(error))?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            streamed.extend(chunk);
+        }
+        runtime
+            .block_on(<HostState as HostHttpResponseStream>::drop(
+                &mut host, stream,
+            ))
+            .expect("stream resource should be released");
+        server
+            .join()
+            .map_err(|_| anyhow!("streamed HTTP fixture panicked"))??;
+        assert_eq!(streamed, b"streamed extension response");
+        Ok(())
     }
 
     #[test]
@@ -3666,27 +4158,94 @@ mod tests {
     }
 
     #[test]
-    fn extension_download_rejects_insecure_and_credentialed_urls() {
+    fn extension_download_sources_are_limited_to_supported_registries() {
+        let allowed_sources = [
+            "https://api.zed.dev/extensions/html/0.3.2/download",
+            "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz",
+        ];
+        for raw_url in allowed_sources {
+            let url = reqwest::Url::parse(raw_url).expect("source URL");
+            assert!(
+                allowed_extension_download_source_url(&url, "html", "0.3.2"),
+                "{raw_url} should be an approved extension source"
+            );
+        }
+
         for url in [
             "http://example.com/extension.tar.gz",
             "file:///tmp/extension.tar.gz",
             "https://user:secret@example.com/extension.tar.gz",
+            "https://registry.ahead.dev/extension.tar.gz",
+            "https://api.zed.dev.evil.example/extensions/html/0.3.2/download",
+            "https://api.zed.dev:8443/extensions/html/0.3.2/download",
+            "https://api.zed.dev/extensions/html/0.3.3/download",
+            "https://api.zed.dev/extensions/html/0.3.2/download/other",
+            "https://api.zed.dev/extensions/html/0.3.2/download?source=unexpected",
+            "https://github.com/attacker/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz",
+            "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.3.tar.gz",
+            "http://user:secret@127.0.0.1:8080/extension.tar.gz",
         ] {
             assert!(
-                !allowed_extension_download_url(
-                    &reqwest::Url::parse(url).expect("test URL")
+                !allowed_extension_download_source_url(
+                    &reqwest::Url::parse(url).expect("test URL"),
+                    "html",
+                    "0.3.2",
                 ),
                 "{url} must not be an extension download source"
             );
-            assert!(download_bytes(url).is_err());
+            assert!(download_bytes(url, "html", "0.3.2").is_err());
         }
-        assert!(allowed_extension_download_url(
-            &reqwest::Url::parse("https://registry.ahead.dev/extension.tar.gz")
-                .expect("HTTPS URL")
-        ));
-        assert!(allowed_extension_download_url(
+        assert!(allowed_extension_download_source_url(
             &reqwest::Url::parse("http://127.0.0.1:8080/extension.tar.gz")
-                .expect("test loopback URL")
+                .expect("test loopback URL"),
+            "html",
+            "0.3.2",
+        ));
+    }
+
+    #[test]
+    fn extension_download_redirects_are_limited_to_registry_delivery_hosts() {
+        for raw_url in [
+            "https://api.zed.dev/extensions/html/0.3.2/download",
+            "https://zed-extensions.nyc3.digitaloceanspaces.com/extensions/html/0.3.2.tar.gz?X-Amz-Signature=fixture",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/fixture?token=fixture",
+            "https://objects.githubusercontent.com/github-production-release-asset/fixture?token=fixture",
+            "https://github.com/Kade-Powell/ahead/releases/download/extensions-v1/html-0.3.2.tar.gz",
+        ] {
+            assert!(
+                allowed_extension_download_redirect_url(
+                    &reqwest::Url::parse(raw_url).expect("redirect URL"),
+                    "html",
+                    "0.3.2",
+                ),
+                "{raw_url} should be an approved registry redirect"
+            );
+        }
+
+        for raw_url in [
+            "https://example.com/extension.tar.gz",
+            "https://zed-extensions.nyc3.digitaloceanspaces.com.evil.example/archive",
+            "https://api.zed.dev.evil.example/extensions/html/0.3.2/download",
+            "https://api.zed.dev/extensions/other/0.3.2/download",
+            "https://zed-extensions.nyc3.digitaloceanspaces.com:444/archive",
+            "https://user:secret@release-assets.githubusercontent.com/archive",
+            "http://example.com/archive",
+            "http://user:secret@127.0.0.1:8080/archive",
+        ] {
+            assert!(
+                !allowed_extension_download_redirect_url(
+                    &reqwest::Url::parse(raw_url).expect("redirect URL"),
+                    "html",
+                    "0.3.2",
+                ),
+                "{raw_url} must not be an extension redirect"
+            );
+        }
+        assert!(allowed_extension_download_redirect_url(
+            &reqwest::Url::parse("http://127.0.0.1:8080/extension.tar.gz")
+                .expect("test loopback URL"),
+            "html",
+            "0.3.2",
         ));
     }
     #[test]
@@ -3903,7 +4462,9 @@ mod tests {
                 "nested": { "extension": true, "shared": "extension" },
                 "array": ["extension"]
             })),
+            initialization_options_schema: None,
             workspace_configuration: None,
+            workspace_configuration_schema: None,
         };
 
         merge_zed_configuration(
@@ -4184,20 +4745,26 @@ mod tests {
         fs::create_dir_all(&extension).expect("extension directory");
         fs::write(
             extension.join("extension.toml"),
-            "id = 'rust'\n[lib]\nversion = '0.7.0'\n[language_servers.rust-analyzer]\nlanguages = ['Rust']\n[language_servers.rust-analyzer.language_ids]\nRust = 'rust-lang'\n",
+            "id = 'rust'\n[language_servers.rust-analyzer]\nlanguages = ['Rust']\nopt_in_languages = ['Rust']\n[language_servers.rust-analyzer.language_ids]\nRust = 'rust-lang'\n",
         )
         .expect("manifest");
-        fs::write(extension.join("extension.wasm"), [])
-            .expect("component placeholder");
+        fs::write(
+            extension.join("extension.wasm"),
+            extension_component("0.7.0"),
+        )
+        .expect("component placeholder");
         let unsupported = root.path().join("unsupported");
         fs::create_dir_all(&unsupported).expect("unsupported extension directory");
         fs::write(
             unsupported.join("extension.toml"),
-            "id = 'unsupported'\n[lib]\nversion = '0.9.0'\n[language_servers.unsupported]\nlanguages = ['Rust']\n",
+            "id = 'unsupported'\n[language_servers.unsupported]\nlanguages = ['Rust']\n",
         )
         .expect("unsupported manifest");
-        fs::write(unsupported.join("extension.wasm"), [])
-            .expect("unsupported component placeholder");
+        fs::write(
+            unsupported.join("extension.wasm"),
+            extension_component("0.9.0"),
+        )
+        .expect("unsupported component placeholder");
 
         let discovered = discover_language_server_extensions(root.path())
             .expect("discover extensions");
@@ -4216,6 +4783,9 @@ mod tests {
         assert!(extension.supports_language("rust-lang"));
         assert_eq!(extension.protocol_language_id("rust-lang"), "rust-lang");
         assert_eq!(extension.language_ids(), ["Rust", "rust-lang"]);
+        assert!(extension.is_opt_in_for("rust"));
+        assert!(extension.is_opt_in_for("rust-lang"));
+        assert!(!extension.is_opt_in_for("TypeScript"));
     }
 
     #[test]
@@ -4227,11 +4797,14 @@ mod tests {
                 .expect("extension language directory");
             fs::write(
                 directory.join("extension.toml"),
-                "id = 'html'\nlanguages = ['languages/html']\n[lib]\nversion = '0.7.0'\n[language_servers.html]\nlanguages = ['HTML']\n",
+                "id = 'html'\nlanguages = ['languages/html']\n[language_servers.html]\nlanguages = ['HTML']\n",
             )
             .expect("extension manifest");
-            fs::write(directory.join("extension.wasm"), [])
-                .expect("extension component placeholder");
+            fs::write(
+                directory.join("extension.wasm"),
+                extension_component("0.7.0"),
+            )
+            .expect("extension component placeholder");
             fs::write(
                 directory.join("languages/html/config.toml"),
                 "name = 'HTML'\npath_suffixes = ['html']\n",
@@ -4250,6 +4823,11 @@ mod tests {
                 .expect("language lookup"),
             Some("HTML".to_string())
         );
+        let cached_sources =
+            language_sources_for_root(root.path()).expect("language sources");
+        let reused_sources =
+            language_sources_for_root(root.path()).expect("cached language sources");
+        assert!(Arc::ptr_eq(&cached_sources, &reused_sources));
         let install_lock = lock_extension_installs(root.path())
             .expect("hold an ongoing install lock");
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4279,6 +4857,9 @@ mod tests {
             .expect("discover extensions after rename");
         assert!(discovered.extensions.is_empty());
         assert_eq!(discovered.errors.len(), 1);
+        let refreshed_sources = language_sources_for_root(root.path())
+            .expect("language sources after extension discovery");
+        assert!(!Arc::ptr_eq(&cached_sources, &refreshed_sources));
         assert!(
             language_id_for_path(root.path(), Path::new("index.html"), None)
                 .is_err()
@@ -4314,6 +4895,7 @@ mod tests {
             extension_syntax_for_path(root.path(), Path::new("src/main.gleam"), "")
                 .expect("language config lookup")
                 .expect("matching extension");
+        assert_eq!(syntax.language_name, "Gleam");
         assert_eq!(syntax.captures, Vec::new());
         assert_eq!(
             syntax.comments,
@@ -4606,6 +5188,81 @@ granted_extension_capabilities = [
     }
 
     #[test]
+    fn downloaded_archives_are_extracted_under_the_requested_path() -> Result<()> {
+        use std::io::Write as _;
+
+        let workspace = tempfile::tempdir()?;
+        let mut host = HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
+            worktree_root: workspace.path().to_path_buf(),
+            work_dir: workspace.path().to_path_buf(),
+            process_capabilities: Vec::new(),
+            granted_capabilities: ExtensionCapabilityGrants::zed_defaults(),
+            node_runtime: NodeRuntime::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(11);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "tombi-cli/bin/tombi", &b"test binary"[..])?;
+        let tar_bytes = tar.into_inner()?.finish()?;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(
+            "tombi-cli/bin/tombi",
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+        )?;
+        zip.write_all(b"test binary")?;
+        let zip_bytes = zip.finish()?.into_inner();
+
+        for (archive, file_type, requested_path) in [
+            (tar_bytes, DownloadedFileType::GzipTar, "tar-install"),
+            (zip_bytes, DownloadedFileType::Zip, "zip-install"),
+        ] {
+            let (url, server) = local_http_response(archive)?;
+            let host_name = url.host_str().context("mock URL has no host")?;
+            host.granted_capabilities =
+                ExtensionCapabilityGrants::from_user_settings(Some(&format!(
+                    "granted_extension_capabilities = [{{ kind = 'download_file', host = '{host_name}', path = ['package'] }}]"
+                )))?;
+            runtime
+                .block_on(<HostState as ExtensionImports>::download_file(
+                    &mut host,
+                    url.to_string(),
+                    requested_path.into(),
+                    file_type,
+                ))
+                .expect("archive download callback should not trap")
+                .map_err(|error| anyhow!(error))?;
+            server
+                .join()
+                .map_err(|_| anyhow!("local archive server panicked"))??;
+
+            assert_eq!(
+                fs::read(
+                    workspace
+                        .path()
+                        .join(requested_path)
+                        .join("tombi-cli/bin/tombi")
+                )?,
+                b"test binary"
+            );
+            assert!(!workspace.path().join("tombi-cli/bin/tombi").exists());
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn extension_capability_settings_load_from_the_user_ahead_directory() {
         let home = tempfile::tempdir().expect("AHEAD user home");
         let ahead = home.path().join(".ahead");
@@ -4852,10 +5509,10 @@ granted_extension_capabilities = [
         fs::create_dir(&backup).expect("previous extension");
         fs::write(
             backup.join("extension.toml"),
-            "id = 'rust'\n[lib]\nversion = '0.8.0'\n[language_servers.rust-analyzer]\nlanguages = ['Rust']\n",
+            "id = 'rust'\n[language_servers.rust-analyzer]\nlanguages = ['Rust']\n",
         )
         .expect("previous extension manifest");
-        fs::write(backup.join("extension.wasm"), [])
+        fs::write(backup.join("extension.wasm"), extension_component("0.8.0"))
             .expect("previous extension component");
         fs::write(backup.join("sentinel"), b"previous version")
             .expect("previous extension content");
@@ -4887,10 +5544,11 @@ granted_extension_capabilities = [
             .expect("healthy extension language directory");
         fs::write(
             healthy.join("extension.toml"),
-            "id = 'html'\nlanguages = ['languages/html']\n[lib]\nversion = '0.7.0'\n[language_servers.html]\nlanguages = ['HTML']\n",
+            "id = 'html'\nlanguages = ['languages/html']\n[language_servers.html]\nlanguages = ['HTML']\n",
         )
         .expect("healthy manifest");
-        fs::write(healthy.join("extension.wasm"), []).expect("healthy component");
+        fs::write(healthy.join("extension.wasm"), extension_component("0.7.0"))
+            .expect("healthy component");
         fs::write(
             healthy.join("languages/html/config.toml"),
             "name = 'HTML'\npath_suffixes = ['html']\n",
@@ -4913,8 +5571,7 @@ granted_extension_capabilities = [
     #[test]
     fn rejects_unsupported_extension_api_before_replacement() {
         let root = tempfile::tempdir().expect("extension root");
-        let archive =
-            extension_archive_with_wasm("rust", "0.9.0", b"\0asm\x0d\0\x01\0", true);
+        let archive = extension_archive_with_api_version("rust", "0.9.0", true);
         let error = install_extension_package(&archive, root.path(), "rust", None)
             .expect_err("unsupported extension API must not install");
         assert!(error.to_string().contains("unsupported Zed extension API"));
@@ -4924,12 +5581,7 @@ granted_extension_capabilities = [
     #[test]
     fn rejects_extension_without_supported_content_before_replacement() {
         let root = tempfile::tempdir().expect("extension root");
-        let archive = extension_archive_with_wasm(
-            "rust",
-            "0.8.0",
-            b"\0asm\x0d\0\x01\0",
-            false,
-        );
+        let archive = extension_archive_with_api_version("rust", "0.8.0", false);
         let error = install_extension_package(&archive, root.path(), "rust", None)
             .expect_err("extension without supported content must not install");
         assert!(
@@ -5005,13 +5657,59 @@ granted_extension_capabilities = [
     }
 
     fn extension_archive(id: &str) -> Vec<u8> {
-        extension_archive_with_wasm(id, "0.8.0", b"\0asm\x0d\0\x01\0", true)
+        extension_archive_with_api_version(id, "0.8.0", true)
     }
 
-    fn extension_archive_with_wasm(
+    fn extension_component(api_version: &str) -> Vec<u8> {
+        let mut components = api_version.split('.');
+        let version = [
+            components
+                .next()
+                .and_then(|component| component.parse::<u16>().ok())
+                .expect("API major version"),
+            components
+                .next()
+                .and_then(|component| component.parse::<u16>().ok())
+                .expect("API minor version"),
+            components
+                .next()
+                .and_then(|component| component.parse::<u16>().ok())
+                .expect("API patch version"),
+        ];
+        assert!(components.next().is_none(), "API version has three parts");
+
+        let section_name = b"zed:api-version";
+        let mut section = Vec::with_capacity(section_name.len() + 7);
+        append_unsigned_leb128(section_name.len() as u32, &mut section);
+        section.extend_from_slice(section_name);
+        for component in version {
+            section.extend_from_slice(&component.to_be_bytes());
+        }
+
+        let mut wasm = b"\0asm\x0d\0\x01\0".to_vec();
+        wasm.push(0);
+        append_unsigned_leb128(section.len() as u32, &mut wasm);
+        wasm.extend_from_slice(&section);
+        wasm
+    }
+
+    fn append_unsigned_leb128(mut value: u32, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value > 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn extension_archive_with_api_version(
         id: &str,
         version: &str,
-        wasm: &[u8],
         language_server: bool,
     ) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(
@@ -5020,7 +5718,7 @@ granted_extension_capabilities = [
         );
         let mut archive = tar::Builder::new(encoder);
         let manifest = format!(
-            "id = '{id}'\nversion = '0.1.0'\n[lib]\nversion = '{version}'\n{}",
+            "id = '{id}'\nversion = '0.1.0'\n{}",
             if language_server {
                 "[language_servers.rust-analyzer]\nlanguages = ['Rust']\n"
             } else {
@@ -5036,11 +5734,12 @@ granted_extension_capabilities = [
             .expect("manifest entry");
 
         let mut wasm_header = tar::Header::new_gnu();
+        let wasm = extension_component(version);
         wasm_header.set_size(wasm.len() as u64);
         wasm_header.set_mode(0o644);
         wasm_header.set_cksum();
         archive
-            .append_data(&mut wasm_header, "extension.wasm", wasm)
+            .append_data(&mut wasm_header, "extension.wasm", wasm.as_slice())
             .expect("wasm entry");
         let encoder = archive.into_inner().expect("finish archive");
         encoder.finish().expect("finish compression")

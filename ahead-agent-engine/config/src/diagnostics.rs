@@ -367,48 +367,6 @@ pub(crate) fn span_for_config_path(
     span_for_path(contents, path)
 }
 
-pub(crate) fn span_for_toml_key_path(
-    contents: &str,
-    path: &[String],
-) -> Option<std::ops::Range<usize>> {
-    let doc = contents.parse::<Document<String>>().ok()?;
-    let mut node = TomlNode::Item(doc.as_item());
-    for (index, segment) in path.iter().enumerate() {
-        if index + 1 == path.len() {
-            let key_span = match &node {
-                TomlNode::Item(item) => item
-                    .as_table_like()
-                    .and_then(|table| table.get_key_value(segment))
-                    .and_then(|(key, _)| key.span()),
-                TomlNode::Table(table) => {
-                    table.get_key_value(segment).and_then(|(key, _)| key.span())
-                }
-                TomlNode::Value(Value::InlineTable(table)) => {
-                    table.get_key_value(segment).and_then(|(key, _)| key.span())
-                }
-                _ => None,
-            };
-            if key_span.is_some() {
-                return key_span;
-            }
-        }
-
-        if let Some(next) = map_child(&node, segment) {
-            node = next;
-            continue;
-        }
-
-        let index = segment.parse::<usize>().ok()?;
-        node = seq_child(&node, index)?;
-    }
-
-    match node {
-        TomlNode::Item(item) => item.span(),
-        TomlNode::Table(table) => table.span(),
-        TomlNode::Value(value) => value.span(),
-    }
-}
-
 fn is_features_table_path(path: &SerdePath) -> bool {
     let mut segments = path.iter();
     matches!(segments.next(), Some(SerdeSegment::Map { key }) if key == "features")

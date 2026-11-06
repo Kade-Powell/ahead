@@ -210,12 +210,10 @@ impl TurnMetadataState {
 
     pub(crate) fn to_responses_metadata(
         &self,
-        installation_id: String,
         window_id: String,
         request_kind: CodexResponsesRequestKind,
     ) -> CodexResponsesMetadata {
         CodexResponsesMetadata {
-            installation_id,
             window_id,
             request_kind: Some(request_kind),
             ..self.responses_metadata_template()
@@ -363,7 +361,6 @@ impl TurnMetadataState {
             turn_started_at_unix_ms: self.current_turn_started_at_unix_ms(),
             extra,
             ..CodexResponsesMetadata::new(
-                String::new(),
                 self.session_id.clone(),
                 self.thread_id.clone(),
                 String::new(),
@@ -427,6 +424,7 @@ impl TurnMetadataState {
         }));
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_git_enrichment(&self) {
         let mut completion = self.git_enrichment_complete.subscribe();
         let _ = completion.wait_for(|complete| *complete).await;

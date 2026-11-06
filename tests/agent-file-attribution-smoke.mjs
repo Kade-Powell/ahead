@@ -51,8 +51,23 @@ const model = createServer((request, response) => {
           : responseCount === 5
             ? { id: "direct-function-patch", type: "function_call", call_id: "direct-function-patch", name: "apply_patch", arguments: JSON.stringify({ patch: directPatch }) }
           : { id: "anchor-answer", type: "message", role: "assistant", content: [{ type: "output_text", text: "Updated main.py." }] };
+    const streamedArguments = responseCount === 5
+      ? JSON.stringify({ patch: directPatch })
+      : null;
+    const argumentDeltas = streamedArguments === null
+      ? []
+      : Array.from(
+        { length: Math.ceil(streamedArguments.length / 11) },
+        (_, index) => ({
+          type: "response.function_call_arguments.delta",
+          item_id: item.id,
+          call_id: item.call_id,
+          delta: streamedArguments.slice(index * 11, (index + 1) * 11),
+        }),
+      );
     const events = [
-      { type: "response.output_item.added", output_index: 0, item },
+      { type: "response.output_item.added", output_index: 0, item: streamedArguments === null ? item : { ...item, arguments: "" } },
+      ...argumentDeltas,
       { type: "response.output_item.done", output_index: 0, item },
       { type: "response.completed", response: { id: `anchor-response-${responseCount}`, end_turn: responseCount === 4 || responseCount === 6 } },
     ];
@@ -320,6 +335,27 @@ try {
   assert.equal(directPatchTool?.parameters?.properties?.patch?.type, "string",
     `the patch function should accept its complete patch as a string: ${JSON.stringify(directPatchTool?.parameters)}`);
   assert.equal(await readFile(path.join(workspace, "src", "direct.py"), "utf8"), "print('AHEAD_FUNCTION_PATCH')\n");
+  const directPatchPreviews = notifications
+    .filter(({ method, params }) => method === "ahead_notification"
+      && params?.notification?.method === "agent_patch_progress")
+    .map(({ params }) => params.notification.params)
+    .filter(({ session_id: previewSessionId, turn_id: previewTurnId }) =>
+      previewSessionId === session_id && previewTurnId === directTurnId);
+  assert(directPatchPreviews.some(({ preview }) =>
+    preview.call_id === "direct-function-patch"
+      && preview.files.some(({ path: filePath, diff }) =>
+        filePath.endsWith("src/direct.py") && diff.includes("+print('AHEAD_FUNCTION_PATCH')"))),
+  `streamed function arguments did not reach the patch-preview notification: ${JSON.stringify(directPatchPreviews)}`);
+  const previewIndex = notifications.findIndex(({ params }) =>
+    params?.notification?.method === "agent_patch_progress"
+      && params.notification.params.turn_id === directTurnId);
+  const completedPatchIndex = notifications.findIndex(({ params }) =>
+    params?.notification?.method === "agent_tool_call"
+      && params.notification.params.turn_id === directTurnId
+      && params.notification.params.call.kind === "fileChange"
+      && params.notification.params.call.status === "completed");
+  assert(previewIndex >= 0 && completedPatchIndex > previewIndex,
+    `patch preview must precede completed file change: preview=${previewIndex}, completed=${completedPatchIndex}`);
   runtimeState = await rpc("agent_runtime_state", { session_id });
   assert((runtimeState?.tool_calls ?? []).some(({ kind, status }) => kind === "fileChange" && status === "completed"),
     `the direct patch should emit a completed fileChange: ${JSON.stringify(runtimeState?.tool_calls ?? [])}`);
@@ -349,7 +385,7 @@ try {
   const commandExecutionNotifications = notifications.filter((notification) =>
     JSON.stringify(notification).includes('"commandExecution"')).length;
   const notificationMethods = [...new Set(notifications.map(({ method }) => method))];
-  console.log(`PASS shell-write denial/generated output, Code Mode edit, and standard function-schema apply_patch -> Turso CodeAnchor -> staged GitCommit; commandExecution notifications: ${commandExecutionNotifications}; notifications: ${notificationMethods.join(", ")}; ahead author, human committer, session trailer, and anchor cleanup verified (tools: ${toolNames.join(", ")})`);
+  console.log(`PASS shell-write denial/generated output, Code Mode edit, streamed function-schema apply_patch preview -> Turso CodeAnchor -> staged GitCommit; commandExecution notifications: ${commandExecutionNotifications}; notifications: ${notificationMethods.join(", ")}; ahead author, human committer, session trailer, and anchor cleanup verified (tools: ${toolNames.join(", ")})`);
 } finally {
   if (!exited && child?.pid) process.kill(-child.pid, "SIGKILL");
   lines?.close();

@@ -56,7 +56,7 @@ Non-normative implementation references (not compatibility requirements):
 - [Pinned Zed HTTP transport](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/context_server/src/transport/http.rs) and [MCP OAuth implementation](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/context_server/src/oauth.rs)
 - [Pinned Zed agent command/tool registration](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/agent.rs) and [in-process context-server registry](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/tools/context_server_registry.rs)
 - [Pinned Zed thread store](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/thread_store.rs) and [thread database model](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/agent/src/db.rs)
-- [Pinned Zed project search](https://github.com/zed-industries/zed/blob/418f89714891f9d8105a3e92e60b9a7a5084d232/crates/project/src/search.rs)
+- [Zed project search at the current review baseline](https://github.com/zed-industries/zed/blob/37faef81f74fc1bb08be9939c4cffc8ede6ced2f/crates/project/src/search.rs)
 
 ## Retained runtime configuration
 
@@ -76,6 +76,13 @@ The editor's project search and replace, proxy search routes, and managed
 agent `file_search` use its traversal, path filters, unsaved-buffer overrides,
 and match engine; callers add only their UI/session scope and pagination. Keep
 that boundary shared instead of adding a second editor or harness search engine.
+Zed's `SearchQuery` keeps literal `Text` and `Regex` as distinct variants;
+`SearchQuery::text` builds a literal matcher, and only the Regex variant parses
+user input as a pattern. AHEAD follows the same explicit mode boundary while
+retaining its streaming, secure-open workspace scanner. Text mode enables
+fixed-string matching in its regex-backed line matcher, so punctuation such as
+`(` remains literal. Keep a regression for this behavior when changing query
+construction or mode controls.
 
 The retained Codex `tool_search` is different: it searches deferred tool
 metadata (including MCP tools) so the model can discover capabilities. It does
@@ -111,8 +118,11 @@ partial diffs are not written into Turso session history. Successful final
 follows Zed's separation of tool-call identity from diff content, where
 `ToolCallContent::Diff` is rendered by the conversation view's diff editor;
 AHEAD's current card is a compact text preview, not Zed's full editable diff
-surface. The decoder, native forwarding path, and rendered card still require
-source-current test execution before acceptance.
+surface. Focused agent/app tests cover bounded previews, per-call cache
+replacement and the GPUI card; the disposable file-attribution smoke sends
+chunked function arguments through the managed loop and observes the preview
+notification before the attributed edit and commit. The rendered native chat
+card still needs visual acceptance.
 
 ## Protocols
 
@@ -191,7 +201,8 @@ source-current test execution before acceptance.
   OpenCode's `mimo-v2.5-free` model, and “active OpenCode Go subscription
   required” for the catalog-listed `opencode-go/mimo-v2.5`; local `pi auth check`
   nevertheless reported both providers `ready`. Earlier Bedrock validation
-  also returned an expired bearer token. No live Pi ACP model turn is verified.
+  also returned an expired bearer token; those failed attempts were superseded
+  by the authenticated Pi runs below.
   On 2026-10-12, the current isolated `ahead-agent` test installed `pi-acp`
   into a temporary cache, seeded the temporary Pi agent directory with two
   synthetic models and an unreachable localhost endpoint, and passed
@@ -199,9 +210,13 @@ source-current test execution before acceptance.
   A separate test installed and initialized all three curated ACP packages
   (Pi, Codex and Claude Code) with empty per-agent homes. No provider request
   or model turn was sent; real authenticated streaming/cancellation remains
-  unverified.
-  The user reconfirmed on 2026-09-28 and again on 2026-10-03 that provider
-  access is not ready and asked us to continue offline.
+  unverified at that point. On 2026-10-30, the integrated
+  `tests/agent-acp-install-smoke.mjs` path installed Pi ACP 0.0.34 into a
+  temporary profile, selected the configured OpenRouter model through ACP,
+  and completed a no-tools Pi turn through AHEAD's proxy. The credential was
+  supplied through the test environment and the temporary profile was removed.
+  This verifies one current authenticated external turn; cancellation/resume,
+  native chat rendering, and authenticated Codex/Claude Code remain open.
   An earlier offline check verified Pi CLI v0.87.1 can print help with
   `PI_OFFLINE=1` and `PI_CODING_AGENT_DIR` redirected; this did not validate
   ACP. On 2026-10-04, the CLI also printed help with an isolated `HOME`. The
@@ -210,10 +225,8 @@ source-current test execution before acceptance.
   cached tarball then failed with `EPERM` creating a temporary file in the
   existing root-owned cache. No package was installed and no ACP session was
   attempted.
-  Continue offline and do not retry a live turn until access is restored. Treat
-  auth-readiness as advisory; select a currently available model for an active
-  provider, then require both a successful direct request and ACP turn with that
-  same model.
+  Treat auth-readiness as advisory; for each provider/model pair, verify both a
+  successful direct request and an ACP turn with that same model.
 - **MCP** is the external-tool boundary. The protocol standardizes client/server
   messages, not a universal host configuration path. AHEAD's owned settings
   and managed launch path are wired: workspace declarations in tracked
@@ -600,7 +613,14 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    Explicit files attached from chat use AHEAD's `TurnContextFile` in
    `TurnEditorContext`; their in-workspace ancestor instructions are loaded
    for the managed native turn. The attached file's captured text remains
-   labeled as fallible reference context, not instructions. Do not reinterpret
+   labeled as fallible reference context, not instructions. The `kind` field
+   distinguishes full text, an LSP symbol outline, and a first-1 KiB fallback
+   excerpt. Chat captures the exact selected excerpt separately from the full
+   unsaved buffer, then clears that buffer before RPC persistence. The managed
+   turn checks individual items and the combined prompt against a hard cap and
+   the selected model's known context window before saving the request in
+   Turso. The app/agent build and native large-file turn are pending verification
+   in `TODO.md`. Do not reinterpret
    retained `UserInput::Mention` as a file reference: it identifies explicit
    resource targets, including `mcp://` servers and legacy connector records.
    External ACP agents
@@ -647,7 +667,11 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    user projects. They are installed as system-scope content at
    `<runtime-home>/skills/.system/` (default
    `.ahead/runtime/skills/.system/`, overridden by `AHEAD_HOME`); this cache is
-   not another project or user skill root.
+   not another project or user skill root. `SKILL.md` frontmatter must be valid
+   YAML as required by the [Agent Skills specification](https://agentskills.io/specification);
+   prose containing a colon followed by a space must be quoted or written as a
+   block scalar. AHEAD reports malformed packages as discovery warnings rather
+   than silently rewriting their metadata.
    The optional [MCP Skills extension](https://skills.extensions.modelcontextprotocol.io/specification/stable/skills)
    defines server-hosted discovery (`skills/list`, `skills/get`) and resource
    reads for the same Agent Skills package format. AHEAD does not advertise
@@ -758,17 +782,18 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    cleanup uses the snapshot's own modification time, so a valid Turso-backed
    session is not treated as an orphan merely because it has no rollout file.
    Managed startup and `SessionConfiguredEvent` do not expose a local rollout
-   path; live resume identity is the Turso thread ID. AHEAD does not discover
-   or import session JSONL files. A missing Turso thread is not reconstructed
-   from a local rollout; pre-production session data may be discarded when the
-   initial schema changes.
+   path; live resume identity is the Turso thread ID. A missing Turso thread
+   never triggers a live file fallback. Only the one-time legacy import below
+   may read a rollout when the requested thread has no Turso header; after
+   import, Turso is authoritative and the source file remains untouched.
    Following Zed's native thread/storage split (`crates/agent/src/thread.rs`,
    `crates/agent/src/db.rs`), the retained rollout crate no longer owns normal
    disk persistence. The AHEAD-managed dependency retains only the history
    types, replay policy, model-context scanning and fork-boundary logic used by
    the in-process agent. Rollout-file reading/writing, compression maintenance,
-   filesystem thread discovery, JSONL import and persistence telemetry are not
-   product paths. Managed history is restored from Turso only; schema version
+   general filesystem thread discovery and persistence telemetry are not
+   product paths. The bounded one-time legacy import above is the sole rollout
+   file-read exception. Managed history is restored from Turso; schema version
    checks and migration machinery are intentionally deferred while AHEAD is
    pre-production.
    Copied rollout-path resume/fork helpers and `ThreadStore` path lookup are
@@ -829,10 +854,17 @@ editor-specific instruction formats. AHEAD uses these discovery roots:
    `LocalThreadStore`, its 52-file implementation, and the `legacy-sqlite`
    feature are removed. The rollout SQLite backfill/listing path, queue-type
    exports, `codex-state` crate and root SQLx/SQLite dependencies are removed as
-   well. `ProjectSortKey` stays because the normal-build project-list params
-   still name it. The storage-neutral `ThreadStore` and `LiveThread` contracts
-   remain for the retained core loop; AHEAD injects `TursoThreadStore` as its
-   only durable managed-session backend. If an ordered replay append or its
+   well. The retained thread-store boundary no longer exposes zero-caller
+   project/section CRUD, thread-content search, pending-metadata, or bulk
+   archive/delete methods and DTOs. This leaves ordinary thread listing,
+   metadata, replay, archive/delete and the live section-move path intact.
+   The metadata crate likewise no longer carries unused pagination/backfill
+   result shapes or its old sort/anchor helpers; extraction and thread
+   metadata types remain for the in-memory runtime store.
+   The storage-neutral `ThreadStore` and
+   `LiveThread` contracts remain for the retained core loop; AHEAD injects
+   `TursoThreadStore` as its only durable managed-session backend. If an
+   ordered replay append or its
    metadata patch fails,
    that adapter latches the first error and rejects further writes for the
    loaded thread. At the next native event, the host requests an interrupt
@@ -1175,7 +1207,9 @@ layout/caret restoration are not implemented. Schema-version checks and
 compatibility handling are deferred until the pre-production layout settles;
 nonmatching databases are not migrated automatically.
 
-Retain Codex's serialized replay shapes only at the runtime adapter boundary. Old JSONL files are not an import format. Unlike Zed's compressed
+Retain Codex's serialized replay shapes only at the runtime adapter boundary.
+The only JSONL import is the uniquely matched legacy AHEAD rollout described
+above; arbitrary rollout files are not imported. Unlike Zed's compressed
 whole-thread blob, the append-only replay rows let a turn become durable
 without rewriting the whole history. The visible session list derives its
 `updated_at` from indexed conversation-message timestamps (falling back to
@@ -1742,9 +1776,11 @@ registry and the top-level `experimental_use_unified_exec_tool` setting.
 `[features]` and managed requirements use canonical keys; strict validation
 rejects retired aliases instead of silently mapping them to active behavior.
 The copied no-op removed-stage feature entries and special-case ignore branches
-are gone too; strict config rejects their old keys. The retained Windows
-sandbox feature flags (`experimental_windows_sandbox` and
-`elevated_windows_sandbox`) still have runtime readers.
+are gone too; strict config rejects their old keys. The old Windows sandbox
+feature flags (`experimental_windows_sandbox` and
+`elevated_windows_sandbox`) are removed. The current `windows.sandbox`
+setting selects the restricted-token or elevated Windows sandbox; omitting it
+leaves that sandbox disabled unless administrator requirements set a mode.
 The copied managed
 network proxy, MITM, SOCKS, DNS, certificate and credential-broker engine is
 deleted, along with its serialized sandbox/exec-server fields and startup call

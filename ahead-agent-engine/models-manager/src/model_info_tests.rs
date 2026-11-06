@@ -294,6 +294,20 @@ fn model_context_window_override_clamps_to_max_context_window() {
 }
 
 #[test]
+fn provider_context_window_replaces_generic_unknown_model_fallback() {
+    let model = model_info_from_slug("openai/gpt-6-luna");
+    let config = ModelsManagerConfig {
+        model_context_window: Some(1_050_000),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(updated.resolved_context_window(), Some(1_050_000));
+    assert_eq!(updated.auto_compact_token_limit(), Some(945_000));
+}
+
+#[test]
 fn model_context_window_uses_model_value_without_override() {
     let mut model = model_info_from_slug("unknown-model");
     model.context_window = Some(273_000);

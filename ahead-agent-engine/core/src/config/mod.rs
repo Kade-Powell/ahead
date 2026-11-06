@@ -2,7 +2,6 @@ use crate::context::world_state::validate_managed_developer_instructions;
 use crate::path_utils::normalize_for_native_workdir;
 use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
-use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
 use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
 use codex_config::ConfigLayerSource;
@@ -117,7 +116,6 @@ mod permission_profile_selection;
 mod permissions;
 mod requirements;
 mod resolved_permission_profile;
-pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
 pub use codex_config::ConstraintError;
 pub use codex_config::ConstraintResult;
@@ -855,7 +853,6 @@ pub struct ConfigBuilder {
     cli_overrides: Option<Vec<(String, TomlValue)>>,
     harness_overrides: Option<ConfigOverrides>,
     loader_overrides: Option<LoaderOverrides>,
-    strict_config: bool,
     fallback_cwd: Option<PathBuf>,
 }
 
@@ -880,11 +877,6 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn strict_config(mut self, strict_config: bool) -> Self {
-        self.strict_config = strict_config;
-        self
-    }
-
     pub fn fallback_cwd(mut self, fallback_cwd: Option<PathBuf>) -> Self {
         self.fallback_cwd = fallback_cwd;
         self
@@ -901,7 +893,6 @@ impl ConfigBuilder {
             cli_overrides,
             harness_overrides,
             loader_overrides,
-            strict_config,
             fallback_cwd,
         } = self;
         let codex_home = match codex_home {
@@ -922,10 +913,7 @@ impl ConfigBuilder {
             &codex_home,
             Some(cwd),
             &cli_overrides,
-            ConfigLoadOptions {
-                loader_overrides,
-                strict_config,
-            },
+            loader_overrides,
         )
         .await?;
         let merged_toml = config_layer_stack.effective_config();
@@ -1823,9 +1811,6 @@ impl Config {
             windows_sandbox_mode: mut constrained_windows_sandbox_mode,
             windows_sandbox_private_desktop: _,
             web_search_mode: mut constrained_web_search_mode,
-            allow_appshots: _,
-            allow_remote_control: _,
-            computer_use: _,
             feature_requirements,
             mcp_servers,
             exec_policy: _,
@@ -1909,13 +1894,7 @@ impl Config {
         let configured_windows_sandbox_mode = resolve_windows_sandbox_mode(&cfg);
         // Keep the configured mode separate so a requirement-constrained mode
         // does not look like it was explicitly selected in config.
-        let selected_windows_sandbox_mode = configured_windows_sandbox_mode.or_else(|| {
-            match WindowsSandboxLevel::from_features(&features) {
-                WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
-                WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
-                WindowsSandboxLevel::Disabled => None,
-            }
-        });
+        let selected_windows_sandbox_mode = configured_windows_sandbox_mode;
         apply_requirement_constrained_value(
             "windows.sandbox",
             selected_windows_sandbox_mode,
@@ -2369,7 +2348,7 @@ impl Config {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "`approval_policy = \"never\"` cannot be used because requirements do not allow `sandbox_mode = \"danger-full-access\"`; Codex would fall back to read-only permissions with approvals disabled. Choose an `approval_policy` based on what you need, such as `on-request`, or choose an allowed sandbox mode.",
+                "`approval_policy = \"never\"` cannot be used because requirements do not allow `sandbox_mode = \"danger-full-access\"`; AHEAD would fall back to read-only permissions with approvals disabled. Choose an `approval_policy` based on what you need, such as `on-request`, or choose an allowed sandbox mode.",
             ));
         }
         if permission_profile_was_constrained {

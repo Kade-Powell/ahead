@@ -9,11 +9,29 @@ use crate::config::ConstraintResult;
 use crate::session::session::Session;
 use crate::session::session::SessionConfiguration;
 use crate::session::session::SessionSettingsUpdate;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 
 pub(super) fn validate_environment_selections(
     selections: &[TurnEnvironmentSelection],
 ) -> ConstraintResult<()> {
+    if selections.len() > 1 {
+        return Err(ConstraintError::InvalidValue {
+            field_name: "environments",
+            candidate: format!("{} environment selections", selections.len()),
+            allowed: "at most one local environment".to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        });
+    }
+
     for selection in selections {
+        if selection.environment_id != LOCAL_ENVIRONMENT_ID {
+            return Err(ConstraintError::InvalidValue {
+                field_name: "environments",
+                candidate: selection.environment_id.clone(),
+                allowed: format!("{LOCAL_ENVIRONMENT_ID} environment"),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            });
+        }
         match &selection.config {
             EnvironmentConfigState::FromThread
             | EnvironmentConfigState::Pending

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CONFIG_TOML_FILE, ConfigRequirementsToml};
+use crate::{CONFIG_TOML_FILE, ConfigLayerSource, ConfigRequirementsToml};
 use codex_file_system::CopyOptions;
 use codex_file_system::CreateDirectoryOptions;
 use codex_file_system::ExecutorFileSystemFuture;
@@ -18,39 +18,6 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 pub(super) struct TestFileSystem;
-
-#[tokio::test]
-async fn system_browser_import_denial_survives_user_and_session_config() {
-    let tmp = tempdir().expect("tempdir");
-    let allow = "[in_app_browser]\nallow_external_browser_settings_import = true";
-    let deny = "[in_app_browser]\nallow_external_browser_settings_import = false";
-    let requirements_path = tmp.path().join("requirements.toml");
-    std::fs::write(&requirements_path, deny).expect("write system requirements");
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), allow).expect("write user config");
-    let mut loader_overrides = LoaderOverrides::isolated_for_tests();
-    loader_overrides.system_requirements_path = Some(requirements_path);
-
-    let stack = load_config_layers_state(
-        &TestFileSystem,
-        tmp.path(),
-        /*cwd*/ None,
-        &[(
-            "in_app_browser.allow_external_browser_settings_import".to_string(),
-            TomlValue::Boolean(true),
-        )],
-        ConfigLoadOptions {
-            loader_overrides,
-            strict_config: false,
-        },
-    )
-    .await
-    .expect("load managed browser import requirement");
-
-    assert_eq!(
-        stack.requirements_toml(),
-        &toml::from_str::<ConfigRequirementsToml>(deny).expect("expected requirement"),
-    );
-}
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
@@ -388,7 +355,12 @@ async fn explicitly_selected_user_config_path_is_loaded() {
         Some("ahead-test-model")
     );
     assert_eq!(
-        stack.get_user_config_file().map(AbsolutePathBuf::as_path),
+        stack
+            .layers_low_to_high()
+            .find_map(|layer| match &layer.name {
+                ConfigLayerSource::User { file } => Some(file.as_path()),
+                _ => None,
+            }),
         Some(user_config_path.as_path())
     );
 }

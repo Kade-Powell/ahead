@@ -55,7 +55,6 @@ mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
 mod image_preparation;
-mod installation_id;
 pub(crate) mod mcp;
 mod mcp_tool_exposure;
 pub use mcp::McpManager;
@@ -111,7 +110,6 @@ pub mod util;
 
 pub use client::ModelClient;
 pub use client::ModelClientSession;
-pub use client::X_CODEX_INSTALLATION_ID_HEADER;
 pub use client::X_CODEX_TURN_METADATA_HEADER;
 pub use client_common::Prompt;
 pub use client_common::ResponseEvent;
@@ -124,5 +122,4 @@ pub use event_mapping::parse_turn_item;
 pub use exec_policy::ExecPolicyError;
 pub use exec_policy::format_exec_policy_error_with_source;
 pub use exec_policy::load_exec_policy;
-pub use installation_id::resolve_installation_id;
 pub mod compact;

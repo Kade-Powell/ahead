@@ -159,8 +159,6 @@ use crate::config::PermissionProfileState;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
-use codex_config::CONFIG_TOML_FILE;
-use codex_config::ConfigLayerSource;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
@@ -278,7 +276,6 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -334,7 +331,6 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
     pub(crate) user_instructions: LoadedUserInstructions,
-    pub(crate) installation_id: String,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: SharedModelsManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
@@ -426,7 +422,6 @@ impl Session {
             mut config,
             allow_provider_model_fallback,
             user_instructions,
-            installation_id,
             auth_manager,
             models_manager,
             environment_manager,
@@ -622,7 +617,6 @@ impl Session {
             &environment_selections,
             config.clone(),
             user_instructions,
-            installation_id,
             auth_manager.clone(),
             models_manager.clone(),
             model_info,
@@ -886,21 +880,14 @@ impl Session {
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
-    /// we precompute the comma-separated list of enabled experimental feature keys at session
-    /// creation time and thread it into the client.
+    /// we precompute the comma-separated runtime beta feature keys at session creation time.
     fn build_model_client_beta_features_header(config: &Config) -> Option<String> {
         let beta_features_header = FEATURES
             .iter()
-            .filter_map(|spec| {
-                let advertise_in_model_client_header =
-                    spec.stage.experimental_menu_description().is_some()
-                        || spec.id == Feature::RemoteCompactionV2;
-                if advertise_in_model_client_header && config.features.enabled(spec.id) {
-                    Some(spec.key)
-                } else {
-                    None
-                }
+            .filter(|spec| {
+                spec.id == Feature::RemoteCompactionV2 && config.features.enabled(spec.id)
             })
+            .map(|spec| spec.key)
             .collect::<Vec<_>>()
             .join(",");
 
@@ -1501,79 +1488,6 @@ impl Session {
         self.schedule_mcp_prewarm();
     }
 
-    pub(crate) async fn reload_user_config_layer(&self) {
-        // Refresh layer-backed runtime state for an existing session, including enabled plugin,
-        // skill, and hook state. Derived config fields such as feature gates
-        // settings remain session-static.
-        //
-        // Prefer `refresh_runtime_config()` when the host can already provide a materialized
-        // config snapshot. This file-based path exists for legacy local reload flows.
-        let config_toml_paths = {
-            let state = self.state.lock().await;
-            let config = &state.session_configuration.original_config_do_not_use;
-            let user_config_paths = config
-                .config_layer_stack
-                .all_layers_low_to_high()
-                .filter_map(|layer| match &layer.name {
-                    ConfigLayerSource::User { file, .. } => Some(file.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if user_config_paths.is_empty() {
-                vec![
-                    state
-                        .session_configuration
-                        .codex_home
-                        .join(CONFIG_TOML_FILE),
-                ]
-            } else {
-                user_config_paths
-            }
-        };
-
-        let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
-        for config_toml_path in config_toml_paths {
-            let user_config = match std::fs::read_to_string(&config_toml_path) {
-                Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                    Ok(config) => config,
-                    Err(err) => {
-                        warn!("failed to parse user config while reloading layer: {err}");
-                        return;
-                    }
-                },
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    toml::Value::Table(Default::default())
-                }
-                Err(err) => {
-                    warn!("failed to read user config while reloading layer: {err}");
-                    return;
-                }
-            };
-            reloaded_user_configs.push((config_toml_path, user_config));
-        }
-
-        let next_config = {
-            let state = self.state.lock().await;
-            let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-            for (config_toml_path, user_config) in reloaded_user_configs {
-                let config_layer_stack = match config
-                    .config_layer_stack
-                    .with_user_config(&config_toml_path, user_config)
-                {
-                    Ok(config_layer_stack) => config_layer_stack,
-                    Err(err) => {
-                        warn!("failed to validate user config while reloading layer: {err}");
-                        return;
-                    }
-                };
-                config.config_layer_stack = config_layer_stack;
-            }
-            config
-        };
-        self.services.skills_service.clear_cache();
-        self.refresh_runtime_config(next_config).await;
-    }
-
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let legacy_source = msg.clone();
@@ -2112,7 +2026,7 @@ impl Session {
         let Ok(native_environment_cwd) = environment.cwd.to_abs_path() else {
             warn!(
                 cwd = %environment.cwd,
-                "request_permissions requires a cwd native to the Codex host"
+                "request_permissions requires a cwd native to the AHEAD host"
             );
             return Some(RequestPermissionsResponse {
                 permissions: RequestPermissionProfile::default(),
@@ -2270,7 +2184,7 @@ impl Session {
                         warn!(
                             cwd = %entry.environment.cwd,
                             %err,
-                            "request_permissions requires a cwd native to the Codex host"
+                            "request_permissions requires a cwd native to the AHEAD host"
                         );
                         RequestPermissionsResponse {
                             permissions: RequestPermissionProfile::default(),
@@ -3420,17 +3334,6 @@ impl Session {
             additional_details: Some(additional_details),
         });
         self.send_event(turn_context, event).await;
-    }
-
-    pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
-        let turn_state = self
-            .input_queue
-            .turn_state_for_sub_id(&self.active_turn, sub_id)
-            .await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        turn_state.lock().await.has_memory_citation = true;
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {

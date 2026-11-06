@@ -3,7 +3,6 @@ use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
 use super::UnauthorizedRecoveryExecution;
-use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
@@ -75,8 +74,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
-const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
-
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }
@@ -114,7 +111,6 @@ fn test_responses_metadata_for_client(
 ) -> CodexResponsesMetadata {
     let thread_id = client.state.thread_id.to_string();
     test_responses_metadata(
-        TEST_INSTALLATION_ID,
         &thread_id,
         &thread_id,
         turn_id,
@@ -557,6 +553,7 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
     );
     let client_metadata =
         client.build_ws_client_metadata(&responses_metadata, /*use_responses_lite*/ false);
+    assert!(!client_metadata.contains_key("x-codex-installation-id"));
     let parent_thread_id = parent_thread_id.to_string();
     let turn_metadata: serde_json::Value = serde_json::from_str(
         client_metadata
@@ -565,11 +562,6 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
     )
     .expect("valid turn metadata");
     for (client_key, metadata_key, expected) in [
-        (
-            X_CODEX_INSTALLATION_ID_HEADER,
-            "installation_id",
-            "11111111-1111-4111-8111-111111111111",
-        ),
         ("session_id", "session_id", thread_id.as_str()),
         ("thread_id", "thread_id", thread_id.as_str()),
         ("turn_id", "turn_id", "turn-123"),

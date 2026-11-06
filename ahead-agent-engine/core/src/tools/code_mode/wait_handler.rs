@@ -66,12 +66,13 @@ impl CodeModeWaitHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
-            turn,
+            step_context,
             call_id,
             tool_name,
             payload,
             ..
         } = invocation;
+        let turn = step_context.turn.clone();
 
         let mut timing = CodeModeHostTiming::new(
             session.thread_id.to_string(),

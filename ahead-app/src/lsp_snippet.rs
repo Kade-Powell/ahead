@@ -306,6 +306,13 @@ impl Session {
         self.tabstops.get(self.active)?.ranges.first().cloned()
     }
 
+    pub(crate) fn active_ranges(&self) -> Vec<Range<usize>> {
+        self.tabstops
+            .get(self.active)
+            .map(|tabstop| tabstop.ranges.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn active_contains(&self, selection: &Range<usize>) -> bool {
         self.tabstops.get(self.active).is_some_and(|tabstop| {
             tabstop.ranges.iter().any(|range| {
@@ -330,16 +337,15 @@ impl Session {
         let Some(tabstop) = self.tabstops.get(self.active) else {
             return &[];
         };
-        if tabstop.ranges.len() != 1 {
-            return &[];
-        }
-        let Some(range) = tabstop.ranges.first() else {
-            return &[];
-        };
         let Some(choice) = tabstop.choices.get(self.active_choice) else {
             return &[];
         };
-        if self.text.get(range.clone()) == Some(choice.as_str()) {
+        if !tabstop.ranges.is_empty()
+            && tabstop
+                .ranges
+                .iter()
+                .all(|range| self.text.get(range.clone()) == Some(choice.as_str()))
+        {
             &tabstop.choices
         } else {
             &[]
@@ -353,12 +359,12 @@ impl Session {
     pub(crate) fn cycle_choice(
         &mut self,
         forward: bool,
-    ) -> Option<(Range<usize>, Range<usize>, String)> {
+    ) -> Option<(Vec<Range<usize>>, Vec<Range<usize>>, String)> {
         let tabstop = self.tabstops.get(self.active)?;
-        if tabstop.ranges.len() != 1 || tabstop.choices.len() < 2 {
+        if tabstop.ranges.is_empty() || tabstop.choices.len() < 2 {
             return None;
         }
-        let range = tabstop.ranges.first()?.clone();
+        let ranges = tabstop.ranges.clone();
         let choice_index = if forward {
             (self.active_choice + 1) % tabstop.choices.len()
         } else if self.active_choice == 0 {
@@ -367,6 +373,27 @@ impl Session {
             self.active_choice - 1
         };
         let replacement = tabstop.choices.get(choice_index)?.clone();
+        if ranges.len() > 1 {
+            let mut updated_text = self.text.clone();
+            for range in ranges.iter().rev() {
+                updated_text.replace_range(range.clone(), &replacement);
+            }
+            let mut next_ranges = Vec::with_capacity(ranges.len());
+            let mut accumulated_delta = 0_isize;
+            for range in &ranges {
+                let start = range.start.checked_add_signed(accumulated_delta)?;
+                let end = start + replacement.len();
+                next_ranges.push(start..end);
+                accumulated_delta +=
+                    replacement.len() as isize - range.len() as isize;
+            }
+            if !self.update_after_multi_edit(updated_text, next_ranges.clone()) {
+                return None;
+            }
+            self.active_choice = choice_index;
+            return Some((ranges, next_ranges, replacement));
+        }
+        let range = ranges.first()?.clone();
         let delta = replacement.len() as isize - range.len() as isize;
         let mut updated_tabstops = self.tabstops.clone();
         for stop in &mut updated_tabstops {
@@ -388,7 +415,7 @@ impl Session {
         self.tabstops = updated_tabstops;
         self.active_choice = choice_index;
         let next_range = range.start..range.start + replacement.len();
-        Some((range, next_range, replacement))
+        Some((ranges, vec![next_range], replacement))
     }
 
     pub(crate) fn move_to(&mut self, next: usize) -> Option<Range<usize>> {
@@ -407,7 +434,11 @@ impl Session {
         selection: Range<usize>,
     ) -> bool {
         let Some((old_edit, new_edit)) = text_diff(&self.text, &new_text) else {
-            return false;
+            return self.active_range().is_some_and(|range| {
+                range.start <= selection.start
+                    && selection.end <= range.end
+                    && selection.start <= selection.end
+            });
         };
         let Some(active_index) =
             self.tabstops.get(self.active).map(|tabstop| tabstop.index)
@@ -470,6 +501,144 @@ impl Session {
                 && selection.end <= range.end
                 && selection.start <= selection.end
         })
+    }
+
+    pub(crate) fn update_after_multi_edit(
+        &mut self,
+        new_text: String,
+        mut selections: Vec<Range<usize>>,
+    ) -> bool {
+        let mut old_ranges = self.active_ranges();
+        if old_ranges.len() < 2 || old_ranges.len() != selections.len() {
+            return false;
+        }
+        old_ranges.sort_by_key(|range| range.start);
+        selections.sort_by_key(|range| range.start);
+        if old_ranges
+            .windows(2)
+            .any(|pair| pair[0].end >= pair[1].start)
+        {
+            return false;
+        }
+
+        let count = old_ranges.len() as isize;
+        let total_delta = new_text.len() as isize - self.text.len() as isize;
+        if total_delta % count != 0 {
+            return false;
+        }
+        let delta = total_delta / count;
+        let mut previous_old_end = 0;
+        let mut previous_new_end = 0;
+        let mut edits = Vec::with_capacity(old_ranges.len());
+        let mut first_mirror = None;
+        for (index, (old_range, selection)) in
+            old_ranges.iter().zip(&selections).enumerate()
+        {
+            let Some(new_start) =
+                old_range.start.checked_add_signed(delta * index as isize)
+            else {
+                return false;
+            };
+            let Some(new_end) = old_range
+                .end
+                .checked_add_signed(delta * (index + 1) as isize)
+            else {
+                return false;
+            };
+            if new_start > new_end
+                || self.text.get(previous_old_end..old_range.start)
+                    != new_text.get(previous_new_end..new_start)
+                || !(new_start <= selection.start
+                    && selection.end <= new_end
+                    && selection.start <= selection.end)
+            {
+                return false;
+            }
+            let Some(old_mirror) = self.text.get(old_range.clone()) else {
+                return false;
+            };
+            let Some(new_mirror) = new_text.get(new_start..new_end) else {
+                return false;
+            };
+            if let Some(first) = first_mirror {
+                if first != new_mirror {
+                    return false;
+                }
+            } else {
+                first_mirror = Some(new_mirror);
+            }
+            if let Some((old_edit, new_edit)) = text_diff(old_mirror, new_mirror) {
+                edits.push((
+                    old_range.start + old_edit.start..old_range.start + old_edit.end,
+                    new_start + new_edit.start..new_start + new_edit.end,
+                ));
+            }
+            previous_old_end = old_range.end;
+            previous_new_end = new_end;
+        }
+        if self.text.get(previous_old_end..) != new_text.get(previous_new_end..) {
+            return false;
+        }
+
+        let Some(active_index) =
+            self.tabstops.get(self.active).map(|tabstop| tabstop.index)
+        else {
+            return false;
+        };
+        let mut updated_tabstops = self.tabstops.clone();
+        for (old_edit, new_edit) in edits.iter().rev() {
+            let edit_delta = new_edit.len() as isize - old_edit.len() as isize;
+            for tabstop in &mut updated_tabstops {
+                for range in &mut tabstop.ranges {
+                    if contains_edit(range, old_edit)
+                        && (tabstop.index == active_index
+                            || range.start < old_edit.start
+                            || old_edit.end < range.end)
+                    {
+                        let Some(end) = range.end.checked_add_signed(edit_delta)
+                        else {
+                            return false;
+                        };
+                        range.end = end;
+                    } else if range.end <= old_edit.start {
+                        continue;
+                    } else if range.start >= old_edit.end {
+                        let Some(start) = range.start.checked_add_signed(edit_delta)
+                        else {
+                            return false;
+                        };
+                        let Some(end) = range.end.checked_add_signed(edit_delta)
+                        else {
+                            return false;
+                        };
+                        *range = start..end;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        let mut updated_ranges = updated_tabstops[self.active].ranges.clone();
+        updated_ranges.sort_by_key(|range| range.start);
+        if updated_ranges
+            .iter()
+            .zip(&selections)
+            .any(|(range, selection)| {
+                range.start > selection.start || selection.end > range.end
+            })
+        {
+            return false;
+        }
+        let choice_index = updated_tabstops[self.active]
+            .choices
+            .iter()
+            .position(|choice| Some(choice.as_str()) == first_mirror);
+        self.text = new_text;
+        self.tabstops = updated_tabstops;
+        if let Some(choice_index) = choice_index {
+            self.active_choice = choice_index;
+        }
+        true
     }
 }
 
@@ -1224,6 +1393,60 @@ mod tests {
             snippet.tabstops[0].choices,
             vec!["left".to_string(), "right".to_string()]
         );
+
+        let mut session = Session::new(snippet.text, snippet.tabstops)
+            .expect("editable repeated choice");
+        assert_eq!(session.active_choices().len(), 2);
+        assert_eq!(
+            session.cycle_choice(true),
+            Some((vec![0..4, 5..9], vec![0..5, 6..11], "right".into()))
+        );
+        assert_eq!(session.active_ranges(), vec![0..5, 6..11]);
+        assert_eq!(session.active_choice_index(), 1);
+    }
+
+    #[test]
+    fn repeated_tabstops_follow_a_batch_edit_and_tab_navigation() {
+        let snippet = Snippet::parse("${1:name} + $1 = ${2:value}$0")
+            .expect("valid repeated snippet");
+        let mut session =
+            Session::new(snippet.text, snippet.tabstops).expect("editable snippet");
+        assert_eq!(session.active_ranges(), vec![0..4, 7..11]);
+
+        assert!(
+            session.update_after_multi_edit(
+                "sum + sum = value".into(),
+                vec![3..3, 9..9],
+            )
+        );
+        assert_eq!(session.active_ranges(), vec![0..3, 6..9]);
+        assert_eq!(session.move_to(1), Some(12..17));
+    }
+
+    #[test]
+    fn repeated_tabstops_track_unicode_and_subsequent_typing() {
+        let snippet =
+            Snippet::parse("${1:café}::$1:$0").expect("valid repeated snippet");
+        let mut session =
+            Session::new(snippet.text, snippet.tabstops).expect("editable snippet");
+        assert!(session.update_after_multi_edit("x::x:".into(), vec![1..1, 4..4]));
+        assert_eq!(session.active_ranges(), vec![0..1, 3..4]);
+        assert!(session.update_after_multi_edit("xy::xy:".into(), vec![2..2, 6..6]));
+        assert_eq!(session.active_ranges(), vec![0..2, 4..6]);
+        assert!(session.update_after_multi_edit("x::x:".into(), vec![1..1, 4..4]));
+        assert_eq!(session.active_ranges(), vec![0..1, 3..4]);
+    }
+
+    #[test]
+    fn repeated_tabstops_reject_edits_outside_the_mirrors() {
+        let snippet = Snippet::parse("${1:name} + $1 = ${2:value}$0")
+            .expect("valid repeated snippet");
+        let mut session =
+            Session::new(snippet.text, snippet.tabstops).expect("editable snippet");
+        assert!(!session.update_after_multi_edit(
+            "name + name = values".into(),
+            vec![0..4, 7..11],
+        ));
     }
 
     #[test]
@@ -1256,7 +1479,10 @@ mod tests {
 
         assert_eq!(session.active_choices().len(), 3);
         assert_eq!(session.active_choices()[1], "🦀");
-        assert_eq!(session.cycle_choice(true), Some((0..5, 0..4, "🦀".into())));
+        assert_eq!(
+            session.cycle_choice(true),
+            Some((vec![0..5], vec![0..4], "🦀".into()))
+        );
         assert_eq!(session.active_range(), Some(0..4));
         assert_eq!(session.move_to(1), Some(5..5));
 
@@ -1266,7 +1492,7 @@ mod tests {
             Session::new(snippet.text, snippet.tabstops).expect("editable snippet");
         assert_eq!(
             session.cycle_choice(false),
-            Some((0..5, 0..4, "last".into()))
+            Some((vec![0..5], vec![0..4], "last".into()))
         );
     }
 
@@ -1282,6 +1508,20 @@ mod tests {
         assert_eq!(session.active_choice_index(), 0);
         assert_eq!(session.active_choices().len(), 2);
         assert_eq!(session.active_choices()[0], "first");
+    }
+
+    #[test]
+    fn unchanged_placeholder_text_keeps_the_active_tabstop() {
+        let snippet = Snippet::parse("fn ${1:name}(${2|arg,argument|}) {$0}\n")
+            .expect("valid choice snippet");
+        let text = snippet.text.clone();
+        let mut session =
+            Session::new(snippet.text, snippet.tabstops).expect("editable snippet");
+        assert_eq!(session.move_to(1), Some(8..11));
+
+        assert!(session.update_after_edit(text.clone(), 11..11));
+        assert_eq!(session.active_range(), Some(8..11));
+        assert!(!session.update_after_edit(text, 0..0));
     }
 
     #[test]

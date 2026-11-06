@@ -578,7 +578,27 @@ mod tests {
             assert_eq!(syntax["emphasis.strong"]["font_weight"], 700);
             assert_eq!(syntax["link_uri"]["font_style"], "italic");
 
-            serde_json::from_value::<ThemeConfig>(value)?;
+            let config = serde_json::from_value::<ThemeConfig>(value)?;
+            let syntax = &config
+                .highlight
+                .as_ref()
+                .context("Theme highlight is missing")?
+                .syntax;
+            for scope in [
+                "property",
+                "number",
+                "string",
+                "string.special",
+                "punctuation.bracket",
+            ] {
+                let style = syntax.style(scope).with_context(|| {
+                    format!("{mode} theme has no style for {scope}")
+                })?;
+                assert!(
+                    style.color.is_some(),
+                    "{mode} theme style for {scope} has no foreground color"
+                );
+            }
         }
         Ok(())
     }

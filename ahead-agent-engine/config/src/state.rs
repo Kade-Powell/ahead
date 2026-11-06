@@ -17,22 +17,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
-/// User-facing config loading behavior that is not part of the config document.
-#[derive(Debug, Default, Clone)]
-pub struct ConfigLoadOptions {
-    pub loader_overrides: LoaderOverrides,
-    pub strict_config: bool,
-}
-
-impl From<LoaderOverrides> for ConfigLoadOptions {
-    fn from(loader_overrides: LoaderOverrides) -> Self {
-        Self {
-            loader_overrides,
-            strict_config: false,
-        }
-    }
-}
-
 /// LoaderOverrides controls optional configuration inputs and loader behavior.
 #[derive(Debug, Default, Clone)]
 pub struct LoaderOverrides {
@@ -224,86 +208,12 @@ impl ConfigLayerStack {
         self.ignore_user_exec_policy_rules
     }
 
-    /// Returns the active raw user config layer, if any.
-    ///
-    /// This does not merge other config layers or apply any requirements.
-    pub fn get_active_user_layer(&self) -> Option<&ConfigLayerEntry> {
-        self.layers
-            .iter()
-            .rev()
-            .find(|layer| matches!(layer.name, ConfigLayerSource::User { .. }))
-    }
-
-    pub fn get_user_config_file(&self) -> Option<&AbsolutePathBuf> {
-        let layer = self.get_active_user_layer()?;
-        let ConfigLayerSource::User { file, .. } = &layer.name else {
-            return None;
-        };
-        Some(file)
-    }
-
-    /// Returns the merged config from enabled user layers only.
-    pub fn effective_user_config(&self) -> Option<TomlValue> {
-        let mut user_layers = self
-            .layers_low_to_high()
-            .filter(|layer| matches!(layer.name, ConfigLayerSource::User { .. }))
-            .peekable();
-        user_layers.peek()?;
-
-        let mut merged = TomlValue::Table(toml::map::Map::new());
-        for layer in user_layers {
-            merge_toml_values(&mut merged, &layer.config);
-        }
-        Some(merged)
-    }
-
     pub fn requirements(&self) -> &ConfigRequirements {
         &self.requirements
     }
 
     pub fn requirements_toml(&self) -> &ConfigRequirementsToml {
         &self.requirements_toml
-    }
-
-    /// Creates a new [ConfigLayerStack] using the specified values to inject one
-    /// user layer into the stack. If such a layer already exists, it is replaced;
-    /// otherwise, it is inserted into the stack at the appropriate position
-    /// based on precedence rules.
-    pub fn with_user_config(
-        &self,
-        config_toml: &AbsolutePathBuf,
-        user_config: TomlValue,
-    ) -> std::io::Result<Self> {
-        let user_layer = ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: config_toml.clone(),
-            },
-            user_config,
-        );
-        validate_enabled_config_layers(std::slice::from_ref(&user_layer))?;
-
-        let mut layers = self.layers.clone();
-        if let Some(index) = layers.iter().position(|layer| {
-            matches!(
-                &layer.name,
-                ConfigLayerSource::User { file, .. } if file == config_toml
-            )
-        }) {
-            layers.remove(index);
-        }
-        match layers
-            .iter()
-            .position(|layer| layer.name.precedence() > user_layer.name.precedence())
-        {
-            Some(index) => layers.insert(index, user_layer),
-            None => layers.push(user_layer),
-        }
-        Ok(Self {
-            layers,
-            requirements: self.requirements.clone(),
-            requirements_toml: self.requirements_toml.clone(),
-            ignore_user_exec_policy_rules: self.ignore_user_exec_policy_rules,
-        })
     }
 
     /// Returns a new stack with the user layer copied from `other`, preserving

@@ -930,12 +930,11 @@ pub(crate) fn runtime_config_from_sources(
             .unwrap_or_else(|| std::slice::from_ref(ai));
         for entry in entries {
             if let Some(mut provider) = runtime_provider(entry, fallback) {
-                if provider.api_key.is_none() {
-                    if let Some(previous) = providers.get(&provider.id) {
-                        if provider.base_url == previous.base_url {
-                            provider.api_key = previous.api_key.clone();
-                        }
-                    }
+                if provider.api_key.is_none()
+                    && let Some(previous) = providers.get(&provider.id)
+                    && provider.base_url == previous.base_url
+                {
+                    provider.api_key = previous.api_key.clone();
                 }
                 providers.insert(provider.id.clone(), provider);
             }

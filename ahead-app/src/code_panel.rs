@@ -31,7 +31,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, Icon, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit_assets::IconName;
@@ -49,14 +49,17 @@ use crate::lsp_snippet::{
     self, Session as SnippetSession, Tabstop as SnippetTabstop,
 };
 use crate::proxy_client::{
-    LspCodeAction, LspCompletion, ProxyClient, WorkspaceFileEvent,
+    LspCodeAction, LspCompletion, LspCompletionBatch, ProxyClient,
+    WorkspaceFileEvent,
 };
 use ahead_rpc::source_control::{BlameHunk, DiffHunk, DiffHunkKind, GitFileState};
 use ahead_rpc::style::LineStyle;
 
 const SHARED_DRAFT_PREFIX: &str = ".ahead/shared-drafts";
 const GIT_METADATA_REFRESH_DEBOUNCE: Duration = Duration::from_millis(600);
+const MERGE_CONFLICT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(75);
 const LSP_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const LOCAL_COMPLETION_PREVIEW_DELAY: Duration = Duration::from_millis(80);
 const NULL_COMPLETION_RETRY_DELAY: Duration = Duration::from_millis(200);
 const EDITOR_GUTTER_WIDTH: f32 = 23.0;
 const GIT_GUTTER_TRACK_WIDTH: f32 = 3.0;
@@ -87,18 +90,21 @@ struct PendingMergeConflict {
     invalid: bool,
 }
 
-fn parse_merge_conflicts(text: &str) -> Vec<MergeConflict> {
-    if !text.contains("<<<<<<< ") {
-        return Vec::new();
-    }
+fn parse_merge_conflicts(text: &ropey::Rope) -> Vec<MergeConflict> {
     let mut conflicts = Vec::new();
     let mut pending: Option<PendingMergeConflict> = None;
     let mut offset = 0;
 
-    for (line_index, line_with_ending) in text.split_inclusive('\n').enumerate() {
+    for (line_index, line_slice) in text.lines(ropey::LineType::LF).enumerate() {
+        let line_len = line_slice.len();
+        if !matches!(line_slice.get_byte(0), Some(b'<' | b'|' | b'=' | b'>')) {
+            offset += line_len;
+            continue;
+        }
+        let line_with_ending = line_slice.to_string();
         let line = line_with_ending
             .strip_suffix('\n')
-            .unwrap_or(line_with_ending);
+            .unwrap_or(&line_with_ending);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.starts_with("<<<<<<< ") {
             if let Some(pending) = pending.as_mut() {
@@ -106,7 +112,7 @@ fn parse_merge_conflicts(text: &str) -> Vec<MergeConflict> {
             } else {
                 pending = Some(PendingMergeConflict {
                     start: offset,
-                    ours_start: offset + line_with_ending.len(),
+                    ours_start: offset + line_len,
                     line: line_index + 1,
                     ..PendingMergeConflict::default()
                 });
@@ -125,7 +131,7 @@ fn parse_merge_conflicts(text: &str) -> Vec<MergeConflict> {
                     pending.invalid = true;
                 } else {
                     pending.ours_end.get_or_insert(offset);
-                    pending.theirs_start = Some(offset + line_with_ending.len());
+                    pending.theirs_start = Some(offset + line_len);
                 }
             }
         } else if line.starts_with(">>>>>>> ") {
@@ -139,14 +145,14 @@ fn parse_merge_conflicts(text: &str) -> Vec<MergeConflict> {
                 && theirs_start <= offset
             {
                 conflicts.push(MergeConflict {
-                    range: pending.start..offset + line_with_ending.len(),
+                    range: pending.start..offset + line_len,
                     ours: pending.ours_start..ours_end,
                     theirs: theirs_start..offset,
                     line: pending.line,
                 });
             }
         }
-        offset += line_with_ending.len();
+        offset += line_len;
     }
 
     conflicts
@@ -209,8 +215,42 @@ struct CompletionContext {
     position: lsp_types::Position,
 }
 
+#[derive(Clone, Debug)]
+struct PendingCompletionAfterServerStart {
+    context: CompletionContext,
+    server_names: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionCache {
+    path: std::path::PathBuf,
+    line: u32,
+    start_character: u32,
+    query: String,
+    batch: Arc<LspCompletionBatch>,
+}
+
+fn completion_cache_matches(
+    cache: &CompletionCache,
+    path: &std::path::Path,
+    position: lsp_types::Position,
+    query: &str,
+) -> bool {
+    !cache.batch.is_incomplete
+        && cache.path.as_path() == path
+        && cache.line == position.line
+        && cache.start_character
+            == position
+                .character
+                .saturating_sub(query.encode_utf16().count() as u32)
+        && query.len() > cache.query.len()
+        && query.starts_with(&cache.query)
+}
+
 const SEMANTIC_TOKEN_DEBOUNCE: Duration = Duration::from_millis(100);
 const MAX_COMPLETION_SUGGESTIONS: usize = 5;
+const LOCAL_COMPLETION_SEARCH_ROWS: usize = 5_000;
+const MAX_LOCAL_COMPLETION_SEARCH_BYTES: usize = 512 * 1024;
 
 fn semantic_token_scope(token_type: &str) -> Option<&'static str> {
     match token_type {
@@ -279,10 +319,27 @@ fn extension_syntax_decorations(
             {
                 return None;
             }
-            let style = resolve_style(&capture.scope)?;
+            let style = extension_syntax_style(&capture.scope, &mut resolve_style)?;
             Some(TextDecoration::new(capture.start..capture.end, style))
         })
         .collect()
+}
+
+fn extension_syntax_style(
+    scope: &str,
+    mut resolve_style: impl FnMut(&str) -> Option<HighlightStyle>,
+) -> Option<HighlightStyle> {
+    let mut candidate = scope;
+    loop {
+        if let Some(style) = resolve_style(candidate) {
+            return Some(style);
+        }
+        candidate = candidate.rsplit_once('.')?.0;
+    }
+}
+
+fn extension_syntax_trace_enabled() -> bool {
+    std::env::var("AHEAD_EXTENSION_SYNTAX_TRACE").is_ok_and(|value| value == "1")
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +347,43 @@ pub struct DiagnosticItem {
     pub line: u32,
     pub message: String,
     pub is_error: bool,
+}
+
+fn editor_diagnostic(
+    diagnostic: &lsp_types::Diagnostic,
+) -> gpui_base::input::Diagnostic {
+    use gpui_base::input::{Diagnostic, DiagnosticSeverity};
+    use gpui_kit::component::input::Position;
+
+    let severity = match diagnostic.severity {
+        Some(lsp_types::DiagnosticSeverity::ERROR) => DiagnosticSeverity::Error,
+        Some(lsp_types::DiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Info,
+        Some(lsp_types::DiagnosticSeverity::HINT) | None => DiagnosticSeverity::Hint,
+        Some(_) => DiagnosticSeverity::Info,
+    };
+    let mut editor_diagnostic = Diagnostic::new(
+        Position::new(
+            diagnostic.range.start.line,
+            diagnostic.range.start.character,
+        )
+            ..Position::new(
+                diagnostic.range.end.line,
+                diagnostic.range.end.character,
+            ),
+        diagnostic.message.clone(),
+    )
+    .with_severity(severity);
+    if let Some(code) = &diagnostic.code {
+        editor_diagnostic = editor_diagnostic.with_code(match code {
+            lsp_types::NumberOrString::Number(code) => code.to_string(),
+            lsp_types::NumberOrString::String(code) => code.clone(),
+        });
+    }
+    if let Some(source) = &diagnostic.source {
+        editor_diagnostic = editor_diagnostic.with_source(source.clone());
+    }
+    editor_diagnostic
 }
 
 #[derive(Clone, Debug)]
@@ -472,7 +566,11 @@ fn read_editor_file(path: &str) -> Result<String, FileOpenError> {
         return Ok(String::new());
     }
     let bytes = std::fs::read(path).map_err(FileOpenError::Read)?;
-    let decoded = ahead_core::encoding::decode_text(&bytes)
+    decode_editor_file(&bytes)
+}
+
+fn decode_editor_file(bytes: &[u8]) -> Result<String, FileOpenError> {
+    let decoded = ahead_core::encoding::decode_text(bytes)
         .ok_or(FileOpenError::UnsupportedText)?;
     if decoded.text.contains('\0')
         || (decoded.encoding == ahead_core::encoding::TextEncoding::Utf8
@@ -497,28 +595,51 @@ fn renamed_path_for_open_file(
         .map(|relative| new_path.join(relative))
 }
 
+fn session_record_path(workspace: &str, file_path: &str) -> Option<String> {
+    let path = std::path::Path::new(file_path);
+    // Session records use workspace-relative paths. An empty workspace is not
+    // a prefix to strip: `strip_prefix("")` would return the absolute path and
+    // leak machine-specific paths into the durable session record.
+    let relative = if workspace.is_empty() {
+        path.file_name().map(std::path::PathBuf::from)?
+    } else {
+        path.strip_prefix(workspace).ok()?.to_path_buf()
+    };
+    Some(relative.to_string_lossy().into_owned())
+}
+
 fn read_renamed_workspace_file(
     workspace: &str,
     new_path: &std::path::Path,
 ) -> Result<(std::path::PathBuf, String), String> {
-    let workspace = std::fs::canonicalize(workspace)
+    // Canonicalize only for the containment check. Adopting the canonical path
+    // as the panel path would rewrite `/var/...` to `/private/var/...` on macOS
+    // and break the path identity shared with tabs and watcher notifications.
+    let canonical_workspace = std::fs::canonicalize(workspace)
         .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
-    let new_path = std::fs::canonicalize(new_path)
+    let canonical_new_path = std::fs::canonicalize(new_path)
         .map_err(|error| format!("Could not resolve renamed file: {error}"))?;
-    if !new_path.starts_with(&workspace) {
+    if !canonical_new_path.starts_with(&canonical_workspace) {
         return Err("The renamed file is outside this workspace".into());
     }
-    if !std::fs::metadata(&new_path)
-        .map_err(|error| format!("Could not inspect renamed file: {error}"))?
-        .is_file()
-    {
-        return Err("The renamed path is not a regular file".into());
-    }
-    let path = new_path
-        .to_str()
-        .ok_or_else(|| "The renamed file path is not valid UTF-8".to_string())?;
-    let text = read_editor_file(path).map_err(|error| error.to_string())?;
-    Ok((new_path, text))
+    let relative_path = canonical_new_path
+        .strip_prefix(&canonical_workspace)
+        .map_err(|_| "The renamed file is outside this workspace".to_string())?;
+    let workspace_directory =
+        ahead_core::secure_fs::open_canonical_directory(&canonical_workspace)
+            .map_err(|error| {
+                format!("Could not securely open workspace root: {error}")
+            })?;
+    let mut file = ahead_core::secure_fs::open_relative_regular_file(
+        &workspace_directory,
+        relative_path,
+    )
+    .map_err(|error| format!("Could not securely open renamed file: {error}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .map_err(|error| format!("Could not read renamed file: {error}"))?;
+    let text = decode_editor_file(&bytes).map_err(|error| error.to_string())?;
+    Ok((new_path.to_path_buf(), text))
 }
 
 fn rebase_selection(
@@ -631,26 +752,35 @@ pub struct CodePanel {
     pub status: SharedString,
     pub active_line: u32,
     pub completions: Vec<LspCompletion>,
+    completion_cache: Option<CompletionCache>,
     completion_context: Option<CompletionContext>,
+    pending_completion_after_server_start: Option<PendingCompletionAfterServerStart>,
     completion_details_requested: HashSet<usize>,
     snippet_session: Option<SnippetSession>,
     extension_comment_variables: Option<lsp_snippet::CommentVariables>,
+    extension_language_name: Option<SharedString>,
     pub selected_completion: usize,
     pub show_completions: bool,
     completion_caret_top: Option<Pixels>,
     completion_caret_left: Option<Pixels>,
     completion_available_width: Option<Pixels>,
+    completion_editor_height: Option<Pixels>,
+    pending_on_type_format_trigger: Option<(String, async_channel::Sender<bool>)>,
+    on_type_format_request_id: u64,
     pub ghost_text: Option<String>,
+    ghost_replacement: Option<(std::ops::Range<usize>, String)>,
     ghost_context: Option<crate::proxy_client::InlinePredictionContext>,
     /// Byte offset in the editor text where the current ghost was
     /// requested. Lets edits narrow the ghost (Zed-style interpolation)
     /// instead of always dismissing it.
     pub ghost_offset: Option<usize>,
     pub diagnostics: Vec<DiagnosticItem>,
+    applied_lsp_diagnostics: Option<Vec<lsp_types::Diagnostic>>,
     pub proxy: Option<Arc<ProxyClient>>,
     diagnostic_task: Option<Task<()>>,
     prediction_context_task: Option<Task<()>>,
     inline_prediction_task: Option<Task<()>>,
+    inline_request_generation: u64,
     ghost_accepting: bool,
     pending_inline: Option<(
         std::ops::Range<usize>,
@@ -686,9 +816,12 @@ pub struct CodePanel {
     git_state: GitFileState,
     git_gutter_markers: GutterDiffMarkers,
     merge_conflicts: Vec<MergeConflict>,
+    merge_conflict_generation: u64,
+    merge_conflict_task: Option<Task<()>>,
     git_key: Option<GitStateKey>,
     git_task_key: Option<GitStateKey>,
     git_task: Option<Task<()>>,
+    pending_git_hunk_reveal: Option<u32>,
     hovered_breakpoint_line: Option<u32>,
     expanded_hunk_start: Option<u32>,
     git_diff_preview: Option<GitDiffPreview>,
@@ -696,6 +829,7 @@ pub struct CodePanel {
     /// Invalidates asynchronous completion/FIM results after edits or file switches.
     pub request_generation: u64,
     completion_request_id: u64,
+    pending_proxy_completion_request: Option<usize>,
     format_request_id: u64,
     suppress_completion_for_next_edit: bool,
     preserve_code_action_request_for_next_edit: bool,
@@ -778,16 +912,17 @@ impl CodePanel {
                         cursor_position,
                     ) != Some(offset)
             }) {
-                this.ghost_text = None;
-                this.ghost_offset = None;
-                this.ghost_context = None;
+                this.clear_ghost_prediction();
             }
             if this
                 .signature_help_position
                 .is_some_and(|position| cursor_position != position)
             {
-                let text = this.editor.read(cx).value().to_string();
-                if has_unclosed_parenthesis_before_cursor(&text, cursor_position) {
+                let inside_call = has_unclosed_parenthesis_before_cursor(
+                    this.editor.read(cx).text(),
+                    cursor_position,
+                );
+                if inside_call {
                     this.signature_help_position = Some(cursor_position);
                 } else {
                     this.signature_help = None;
@@ -809,7 +944,16 @@ impl CodePanel {
         cx.subscribe(
             &editor,
             |this: &mut Self, _state, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.cancel_pending_on_type_formatting();
+                }
                 if matches!(event, InputEvent::Change) && this.is_text_available() {
+                    if let Some((_, sender)) =
+                        this.pending_on_type_format_trigger.take()
+                        && let Err(error) = sender.try_send(true)
+                    {
+                        gpui_util::log_err(&error);
+                    }
                     this.pending_rename = None;
                     this.rename_in_progress = false;
                     this.rename_request_id = this.rename_request_id.wrapping_add(1);
@@ -821,11 +965,16 @@ impl CodePanel {
                     if !suppress_completion
                         && let Some(mut snippet) = this.snippet_session.take()
                     {
-                        let (text, selection) = {
+                        let (text, selections) = {
                             let editor = this.editor.read(cx);
-                            (editor.value().to_string(), editor.selected_range())
+                            (editor.value().to_string(), editor.selected_ranges())
                         };
-                        if snippet.update_after_edit(text, selection) {
+                        let keep_snippet = if selections.len() > 1 {
+                            snippet.update_after_multi_edit(text, selections)
+                        } else {
+                            snippet.update_after_edit(text, selections[0].clone())
+                        };
+                        if keep_snippet {
                             this.snippet_session = Some(snippet);
                         }
                     }
@@ -841,20 +990,45 @@ impl CodePanel {
                         }
                     }
                     this.dirty_rev += 1;
-                    this.merge_conflicts = parse_merge_conflicts(
-                        &this.editor.read(cx).value().to_string(),
-                    );
+                    let text = this.editor.read(cx).text().clone();
+                    this.refresh_merge_conflicts(text.clone(), cx);
                     this.update_git_gutter_line_count(cx);
                     if !this.loading {
                         this.refresh_git_metadata(cx);
                     }
                     // ponytail: same-length edits scan the rope; use edit-history dirtiness if large-file typing slows.
-                    this.dirty = this.editor.read(cx).text() != &this.saved_text;
+                    this.dirty = text != this.saved_text;
                     if !this.loading {
                         this.is_preview = false;
                     }
+                    let position = this.cursor_position(cx);
+                    let mut line = text.slice_line(position.line as usize).to_string();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                    let query = completion_prefix_range(
+                        &line,
+                        lsp_types::Position::new(0, position.character),
+                    )
+                        .and_then(|range| line.get(range))
+                        .unwrap_or_default();
+                    let reuse_completion_cache = !suppress_completion
+                        && this.completion_cache.as_ref().is_some_and(|cache| {
+                        completion_cache_matches(
+                            cache,
+                            &this.proxy_path(),
+                            position,
+                            query,
+                        )
+                    });
+                    if !reuse_completion_cache {
+                        this.completion_cache = None;
+                    }
                     this.invalidate_editor_requests();
-                    this.show_completions = false;
+                    if !reuse_completion_cache {
+                        this.show_completions = false;
+                        this.completion_context = None;
+                    }
                     this.signature_request_id =
                         this.signature_request_id.wrapping_add(1);
                     if !preserve_code_action_request {
@@ -872,37 +1046,21 @@ impl CodePanel {
                             && this.shared_conflict.is_none()
                             && this.shared_session_id.is_none()
                         {
-                            let text = this.editor.read(cx).value().to_string();
-                            proxy
-                                .update_editor_text(this.proxy_path(), text.clone());
                             let position = this.cursor_position(cx);
                             let should_request_signature_help =
                                 has_unclosed_parenthesis_before_cursor(
-                                    &text, position,
+                                    this.editor.read(cx).text(), position,
                                 );
-                            let should_complete = caret_byte_offset(&text, position)
-                                .and_then(|offset| {
-                                    text[..offset].chars().next_back()
-                                })
+                            let should_complete = rope_caret_byte_offset(&text, position)
+                                .and_then(|offset| text.chars_at(offset).reversed().next())
                                 .is_some_and(|character| {
                                     character.is_alphanumeric()
                                         || matches!(character, '_' | ':' | '.')
                                 });
+                            proxy.update_editor_rope(this.proxy_path(), text.clone());
                             let generation = this.request_generation;
                             if should_complete && !suppress_completion {
-                                cx.spawn(async move |this, cx| {
-                                    cx.background_executor()
-                                        .timer(Duration::from_millis(180))
-                                        .await;
-                                    let _ = this.update(cx, |this, cx| {
-                                        if this.request_generation == generation {
-                                            this.request_proxy_completions(
-                                                cx, false,
-                                            );
-                                        }
-                                    });
-                                })
-                                .detach();
+                                this.request_proxy_completions(cx, false);
                             }
                             if should_request_signature_help {
                                 cx.spawn(async move |this, cx| {
@@ -910,17 +1068,12 @@ impl CodePanel {
                                         .timer(Duration::from_millis(180))
                                         .await;
                                     let _ = this.update(cx, |this, cx| {
-                                        if this.request_generation != generation {
+                                        if this.request_generation != generation
+                                            || this.cursor_position(cx) != position
+                                        {
                                             return;
                                         }
-                                        let text =
-                                            this.editor.read(cx).value().to_string();
-                                        let position = this.cursor_position(cx);
-                                        if has_unclosed_parenthesis_before_cursor(
-                                            &text, position,
-                                        ) {
-                                            this.request_signature_help_after_content_change(cx);
-                                        }
+                                        this.request_signature_help_after_content_change(cx);
                                     });
                                 })
                                 .detach();
@@ -931,25 +1084,27 @@ impl CodePanel {
                     }
                     // Zed-style interpolation: when the user types a prefix of
                     // the ghost, keep the remainder; any divergence dismisses it.
-                    let ghost = this.ghost_text.take();
-                    let start = this.ghost_offset.take();
-                    if let (Some(ghost), Some(start)) = (ghost, start) {
-                        let text = this.editor.read(cx).value().to_string();
-                        let caret =
-                            caret_byte_offset(&text, this.cursor_position(cx));
-                        let rest = caret.and_then(|caret| {
-                            if caret < start {
-                                return None;
+                    if this.ghost_replacement.is_some() {
+                        this.clear_ghost_prediction();
+                    } else {
+                        let ghost = this.ghost_text.take();
+                        let start = this.ghost_offset.take();
+                        if let (Some(ghost), Some(start)) = (ghost, start) {
+                            let caret = rope_caret_byte_offset(&text, this.cursor_position(cx));
+                            let rest = caret.and_then(|caret| {
+                                if caret < start {
+                                    return None;
+                                }
+                                text.try_slice(start..caret).ok().and_then(|typed| {
+                                    interpolate_insertion(&ghost, &typed.to_string())
+                                })
+                            });
+                            this.ghost_text = rest;
+                            if this.ghost_text.is_some() {
+                                this.ghost_offset = caret;
+                            } else {
+                                this.ghost_context = None;
                             }
-                            text.get(start..caret).and_then(|typed| {
-                                interpolate_insertion(&ghost, typed)
-                            })
-                        });
-                        this.ghost_text = rest;
-                        if this.ghost_text.is_some() {
-                            this.ghost_offset = caret;
-                        } else {
-                            this.ghost_context = None;
                         }
                     }
                     cx.notify();
@@ -968,8 +1123,7 @@ impl CodePanel {
             state.create_decorations_collection(Vec::new(), cx)
         });
         let saved_text = editor.read(cx).text().clone();
-        let merge_conflicts =
-            parse_merge_conflicts(&editor.read(cx).value().to_string());
+        let merge_conflicts = parse_merge_conflicts(editor.read(cx).text());
 
         Self {
             focus: cx.focus_handle(),
@@ -1018,23 +1172,32 @@ impl CodePanel {
             status: "".into(),
             active_line: 1,
             completions: Vec::new(),
+            completion_cache: None,
             completion_context: None,
+            pending_completion_after_server_start: None,
             completion_details_requested: HashSet::new(),
             snippet_session: None,
             extension_comment_variables: None,
+            extension_language_name: None,
             selected_completion: 0,
             show_completions: false,
             completion_caret_top: None,
             completion_caret_left: None,
             completion_available_width: None,
+            completion_editor_height: None,
+            pending_on_type_format_trigger: None,
+            on_type_format_request_id: 0,
             ghost_text: None,
+            ghost_replacement: None,
             ghost_context: None,
             ghost_offset: None,
             diagnostics: Vec::new(),
+            applied_lsp_diagnostics: None,
             proxy: None,
             diagnostic_task: None,
             prediction_context_task: None,
             inline_prediction_task: None,
+            inline_request_generation: 0,
             ghost_accepting: false,
             pending_inline: None,
             workspace_file_task: None,
@@ -1067,15 +1230,19 @@ impl CodePanel {
             git_state: GitFileState::default(),
             git_gutter_markers: GutterDiffMarkers::default(),
             merge_conflicts,
+            merge_conflict_generation: 0,
+            merge_conflict_task: None,
             git_key: None,
             git_task_key: None,
             git_task: None,
+            pending_git_hunk_reveal: None,
             hovered_breakpoint_line: None,
             expanded_hunk_start: None,
             git_diff_preview: None,
             expand_first_git_hunk_after_refresh: false,
             request_generation: 0,
             completion_request_id: 0,
+            pending_proxy_completion_request: None,
             format_request_id: 0,
             suppress_completion_for_next_edit: false,
             preserve_code_action_request_for_next_edit: false,
@@ -1109,6 +1276,7 @@ impl CodePanel {
         });
         panel.loading = false;
         panel.saved_text = panel.editor.read(cx).text().clone();
+        panel.refresh_merge_conflicts(panel.saved_text.clone(), cx);
         panel.saved_sha256 = Some(format!(
             "{:x}",
             sha2::Sha256::digest(snapshot.content.as_bytes())
@@ -1129,11 +1297,9 @@ impl CodePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let session_id = self
-            .shared_session_id
-            .as_deref()
-            .ok_or("Not a shared file")?;
-        let draft_path = shared_draft_file_path(&snapshot.path, session_id)
+        let session_id =
+            self.shared_session_id.clone().ok_or("Not a shared file")?;
+        let draft_path = shared_draft_file_path(&snapshot.path, &session_id)
             .ok_or("Invalid shared draft path")?;
         if draft_path.to_str() != Some(self.file_path.as_str()) {
             return Err("Shared draft belongs to a different file".into());
@@ -1162,10 +1328,11 @@ impl CodePanel {
             editor.set_value(content, window, cx);
         });
         self.loading = false;
+        self.refresh_merge_conflicts(self.editor.read(cx).text().clone(), cx);
         self.dirty = self.editor.read(cx).text() != &self.saved_text;
         if self.dirty {
             self.shared_conflict = Some(host_snapshot);
-            self.shared_conflict_session_id = Some(session_id.to_string());
+            self.shared_conflict_session_id = Some(session_id);
             self.status = "Recovered shared draft · choose a version".into();
         } else {
             self.status = "Shared draft already matches host".into();
@@ -1431,6 +1598,7 @@ impl CodePanel {
             self.editor.update(cx, |editor, cx| {
                 editor.set_value(snapshot.content.clone(), window, cx);
             });
+            self.refresh_merge_conflicts(self.editor.read(cx).text().clone(), cx);
         }
         self.loading = false;
         self.saved_text = self.editor.read(cx).text().clone();
@@ -1461,7 +1629,7 @@ impl CodePanel {
         {
             return;
         }
-        let Some(proxy) = self.proxy.as_ref() else {
+        let Some(proxy) = self.proxy.clone() else {
             return;
         };
         let Some((session_id, previous, snapshot)) =
@@ -1477,6 +1645,10 @@ impl CodePanel {
                 self.editor.update(cx, |editor, cx| {
                     editor.set_value(snapshot.content.clone(), window, cx);
                 });
+                self.refresh_merge_conflicts(
+                    self.editor.read(cx).text().clone(),
+                    cx,
+                );
                 self.loading = false;
             }
             self.dirty = self.editor.read(cx).text() != &self.saved_text;
@@ -1525,6 +1697,10 @@ impl CodePanel {
                 self.editor.update(cx, |editor, cx| {
                     editor.set_value(snapshot.content.clone(), window, cx);
                 });
+                self.refresh_merge_conflicts(
+                    self.editor.read(cx).text().clone(),
+                    cx,
+                );
                 self.loading = false;
                 self.dirty = false;
                 self.status = "Used latest host version".into();
@@ -1537,6 +1713,7 @@ impl CodePanel {
             self.editor.update(cx, |editor, cx| {
                 editor.set_value(snapshot.content.clone(), window, cx);
             });
+            self.refresh_merge_conflicts(self.editor.read(cx).text().clone(), cx);
             self.loading = false;
             self.dirty = self.editor.read(cx).text() != &self.saved_text;
             self.shared_conflict = None;
@@ -1633,6 +1810,7 @@ impl CodePanel {
                         if extension_syntax_changed {
                             this.schedule_extension_syntax(cx);
                         }
+                        this.retry_pending_completion_after_server_start(cx);
                         cx.notify();
                     })
                     .is_err()
@@ -1701,9 +1879,7 @@ impl CodePanel {
                         if this.ghost_text.is_some()
                             && !this.ghost_context_is_current(cx)
                         {
-                            this.ghost_text = None;
-                            this.ghost_offset = None;
-                            this.ghost_context = None;
+                            this.clear_ghost_prediction();
                             cx.notify();
                         }
                     })
@@ -1937,7 +2113,15 @@ impl CodePanel {
                 self.editor.update(cx, |editor, cx| {
                     editor.set_value(disk_text.clone(), window, cx);
                     editor.set_selected_range(selection, cx);
+                    let text = editor.text().clone();
+                    if let Some(diagnostics) = editor.diagnostics_mut() {
+                        diagnostics.reset(&text);
+                    }
                 });
+                self.refresh_merge_conflicts(
+                    self.editor.read(cx).text().clone(),
+                    cx,
+                );
                 self.loading = false;
                 self.saved_text = self.editor.read(cx).text().clone();
                 self.saved_sha256 = Some(disk_sha256);
@@ -1959,13 +2143,14 @@ impl CodePanel {
                 self.code_actions_position = None;
                 self.code_actions_visible = false;
                 self.completions.clear();
+                self.completion_cache = None;
                 self.completion_context = None;
                 self.completion_details_requested.clear();
                 self.show_completions = false;
-                self.ghost_text = None;
-                self.ghost_offset = None;
+                self.clear_ghost_prediction();
                 self.hover_text = None;
                 self.diagnostics.clear();
+                self.applied_lsp_diagnostics = None;
                 self.presentation = None;
                 self.comment_popover_line = None;
                 self.comment_draft_target = None;
@@ -2052,17 +2237,18 @@ impl CodePanel {
         self.semantic_task = None;
         self.extension_syntax_task = None;
         self.completions.clear();
+        self.completion_cache = None;
         self.completion_context = None;
         self.completion_details_requested.clear();
         self.show_completions = false;
         self.completion_caret_top = None;
         self.completion_caret_left = None;
         self.completion_available_width = None;
-        self.ghost_text = None;
-        self.ghost_context = None;
-        self.ghost_offset = None;
+        self.completion_editor_height = None;
+        self.clear_ghost_prediction();
         self.hover_text = None;
         self.diagnostics.clear();
+        self.applied_lsp_diagnostics = None;
         self.signature_help = None;
         self.signature_help_position = None;
         self.code_actions.clear();
@@ -2070,6 +2256,7 @@ impl CodePanel {
         self.code_actions_visible = false;
         self.semantic_decorations.clear(cx);
         self.extension_comment_variables = None;
+        self.extension_language_name = None;
         self.extension_syntax_decorations.clear(cx);
         self.presentation = None;
         self.comment_popover_line = None;
@@ -2078,6 +2265,10 @@ impl CodePanel {
         self.editor.update(cx, |editor, cx| {
             editor.set_disabled(false, cx);
             editor.set_highlighter(editor_language(&new_path), cx);
+            let text = editor.text().clone();
+            if let Some(diagnostics) = editor.diagnostics_mut() {
+                diagnostics.reset(&text);
+            }
         });
         if let Err(error) = self.apply_editor_language_settings(&new_path, cx) {
             self.status =
@@ -2090,6 +2281,7 @@ impl CodePanel {
         self.git_task_key = None;
         self.git_diff_preview = None;
         self.expanded_hunk_start = None;
+        self.pending_git_hunk_reveal = None;
         self.hovered_breakpoint_line = None;
 
         let proxy = self.proxy.clone();
@@ -2149,10 +2341,13 @@ impl CodePanel {
         self.git_gutter_markers = GutterDiffMarkers::default();
         self.hovered_breakpoint_line = None;
         self.expanded_hunk_start = None;
+        self.pending_git_hunk_reveal = None;
         self.git_diff_preview = None;
         self.expand_first_git_hunk_after_refresh = false;
         self.invalidate_editor_requests();
         self.show_completions = false;
+        self.completions.clear();
+        self.completion_cache = None;
         self.completion_context = None;
         self.completion_details_requested.clear();
     }
@@ -2163,6 +2358,17 @@ impl CodePanel {
 
     pub(crate) fn is_text_available(&self) -> bool {
         self.file_error.is_none()
+    }
+
+    pub(crate) fn status_language_name(&self, cx: &App) -> SharedString {
+        let language_name = self.editor.read(cx).language_name();
+        if language_name == "text" {
+            self.extension_language_name
+                .clone()
+                .unwrap_or(language_name)
+        } else {
+            language_name
+        }
     }
 
     pub(crate) fn navigation_request(
@@ -2498,8 +2704,7 @@ impl CodePanel {
         self.preserve_code_action_request_for_next_edit =
             preserve_code_action_request;
         self.snippet_session = None;
-        self.ghost_text = None;
-        self.ghost_offset = None;
+        self.clear_ghost_prediction();
         self.editor.update(cx, |editor, cx| {
             editor.set_selected_range(range, cx);
             editor.replace(replacement, window, cx);
@@ -2524,7 +2729,7 @@ impl CodePanel {
         }
 
         let text = self.editor.read(cx).value().to_string();
-        let conflict = parse_merge_conflicts(&text)
+        let conflict = parse_merge_conflicts(&ropey::Rope::from(text.as_str()))
             .into_iter()
             .find(|conflict| conflict.range == range);
         let Some(conflict) = conflict else {
@@ -2542,8 +2747,7 @@ impl CodePanel {
 
         let caret = conflict.range.start + replacement.len();
         self.snippet_session = None;
-        self.ghost_text = None;
-        self.ghost_offset = None;
+        self.clear_ghost_prediction();
         self.editor.update(cx, |editor, cx| {
             editor.set_selected_range(conflict.range, cx);
             editor.replace(replacement, window, cx);
@@ -2562,28 +2766,20 @@ impl CodePanel {
             return None;
         }
         let editor = self.editor.read(cx);
+        let selection = editor_selected_display_range(editor);
+        let caret =
+            display_position_utf16_rope(editor.text(), editor.cursor_position());
         let file_content = editor.value().to_string();
-        let position = editor.cursor_position();
-        let selected_range = editor.selected_range();
-        let selection = if selected_range.start != selected_range.end {
-            let start = editor.text().offset_to_position(selected_range.start);
-            let end = editor.text().offset_to_position(selected_range.end);
-            Some(ahead_rpc::ahead::DisplayRange {
-                start: display_position_utf16(&file_content, start),
-                end: display_position_utf16(&file_content, end),
-            })
-        } else {
-            None
-        };
         Some(ahead_rpc::ahead::TurnEditorContext {
             active_path: std::path::Path::new(&self.file_path)
                 .strip_prefix(&self.workspace)
                 .unwrap_or_else(|_| std::path::Path::new(&self.file_path))
                 .to_string_lossy()
                 .to_string(),
-            caret: display_position_utf16(&file_content, position),
+            caret,
             selection,
             file_content,
+            selected_excerpt: None,
             visible_end: None,
             attached_anchor_ids: self
                 .proxy
@@ -2599,6 +2795,15 @@ impl CodePanel {
             attached_files: Vec::new(),
             attached_memories: Vec::new(),
         })
+    }
+
+    pub(crate) fn selected_context_range(
+        &self,
+        cx: &App,
+    ) -> Option<ahead_rpc::ahead::DisplayRange> {
+        self.is_text_available()
+            .then(|| editor_selected_display_range(self.editor.read(cx)))
+            .flatten()
     }
 
     pub fn selected_code_comment(&self, cx: &App) -> Option<SelectedCodeComment> {
@@ -2647,9 +2852,7 @@ impl CodePanel {
         if session_changed {
             self.comment_generation = self.comment_generation.wrapping_add(1);
             self.invalidate_editor_requests();
-            self.ghost_text = None;
-            self.ghost_offset = None;
-            self.ghost_context = None;
+            self.clear_ghost_prediction();
             self.comment_pending = false;
             self.comment_error = None;
         }
@@ -2936,6 +3139,7 @@ impl CodePanel {
         self.comment_draft_target = None;
         self.presentation_decorations.clear(cx);
         self.extension_comment_variables = None;
+        self.extension_language_name = None;
         self.extension_syntax_decorations.clear(cx);
         self.semantic_decorations.clear(cx);
         self.loading = true;
@@ -2958,7 +3162,11 @@ impl CodePanel {
         self.show_markdown_preview = is_markdown_path(path);
         self.active_line = 1;
         self.invalidate_editor_requests();
-        self.ghost_text = None;
+        self.completions.clear();
+        self.completion_cache = None;
+        self.completion_context = None;
+        self.completion_details_requested.clear();
+        self.clear_ghost_prediction();
         self.hover_text = None;
         self.signature_request_id = self.signature_request_id.wrapping_add(1);
         self.signature_help = None;
@@ -2973,6 +3181,7 @@ impl CodePanel {
         self.git_state = GitFileState::default();
         self.refresh_git_gutter_markers(cx);
         self.expanded_hunk_start = None;
+        self.pending_git_hunk_reveal = None;
         self.git_diff_preview = None;
         self.expand_first_git_hunk_after_refresh = false;
         self.show_completions = false;
@@ -3179,46 +3388,46 @@ impl CodePanel {
 
     fn cursor_position(&self, cx: &App) -> lsp_types::Position {
         let editor = self.editor.read(cx);
-        let position = editor.cursor_position();
-        let text = editor.value().to_string();
-        lsp_types::Position {
-            line: position.line,
-            character: text
-                .split('\n')
-                .nth(position.line as usize)
-                .unwrap_or_default()
-                .chars()
-                .take(position.character as usize)
-                .map(|character| character.len_utf16() as u32)
-                .sum(),
-        }
+        lsp_cursor_position(editor.text(), editor.cursor_position())
     }
 
-    fn sync_proxy_diagnostics(&mut self, _cx: &App) {
-        if self.shared_session_id.is_some() {
-            self.diagnostics.clear();
-            return;
-        }
-        let Some(proxy) = self.proxy.clone() else {
-            return;
+    fn sync_proxy_diagnostics(&mut self, cx: &mut App) {
+        let diagnostics = if self.shared_session_id.is_some() {
+            Vec::new()
+        } else {
+            self.proxy
+                .as_ref()
+                .and_then(|proxy| proxy.diagnostics_for(&self.proxy_path()))
+                .unwrap_or_default()
         };
-        self.diagnostics = proxy
-            .diagnostics_for(&self.proxy_path())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| DiagnosticItem {
-                line: d.range.start.line + 1,
-                message: if d.message.is_empty() {
+        self.diagnostics = diagnostics
+            .iter()
+            .map(|diagnostic| DiagnosticItem {
+                line: diagnostic.range.start.line + 1,
+                message: if diagnostic.message.is_empty() {
                     "Diagnostic".to_string()
                 } else {
-                    d.message
+                    diagnostic.message.clone()
                 },
                 is_error: matches!(
-                    d.severity,
+                    diagnostic.severity,
                     Some(lsp_types::DiagnosticSeverity::ERROR)
                 ),
             })
             .collect();
+
+        if self.applied_lsp_diagnostics.as_ref() == Some(&diagnostics) {
+            return;
+        }
+        self.applied_lsp_diagnostics = Some(diagnostics.clone());
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            if let Some(editor_diagnostics) = editor.diagnostics_mut() {
+                editor_diagnostics.reset(&text);
+                editor_diagnostics.extend(diagnostics.iter().map(editor_diagnostic));
+                cx.notify();
+            }
+        });
     }
 
     pub fn refresh_attribution(&mut self) {
@@ -3248,15 +3457,22 @@ impl CodePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.git_diff_preview.as_ref().is_some_and(|preview| {
+        let same_preview = self.git_diff_preview.as_ref().is_some_and(|preview| {
             preview.hunk == *hunk && preview.source_text == source_text
-        }) {
-            return;
-        }
+        });
 
         let projection = git_hunk_projection(hunk, source_text);
-        let source_offset = self.editor.read(cx).scroll_offset();
         let line_height = self.editor.read(cx).line_height().unwrap_or(px(16.));
+        let reveal_hunk = self.pending_git_hunk_reveal == Some(hunk.start);
+        let source_offset = self.editor.read(cx).scroll_offset();
+        let source_offset = if reveal_hunk {
+            point(
+                source_offset.x,
+                -(line_height * hunk.start.saturating_sub(3) as f32),
+            )
+        } else {
+            source_offset
+        };
         let insertion_y = line_height * hunk.start.saturating_sub(1) as f32;
         let inserted_height = line_height * projection.inserted_rows as f32;
         let preview_offset = if source_offset.y < -insertion_y {
@@ -3264,6 +3480,17 @@ impl CodePanel {
         } else {
             source_offset
         };
+        if same_preview {
+            if reveal_hunk {
+                if let Some(preview) = self.git_diff_preview.as_ref() {
+                    preview.editor.update(cx, |editor, cx| {
+                        editor.set_scroll_offset(preview_offset, cx);
+                    });
+                }
+                self.pending_git_hunk_reveal = None;
+            }
+            return;
+        }
         let removed_background = cx.theme().danger.opacity(0.18);
         let added_background = cx.theme().success.opacity(0.16);
         let mut decorations = projection
@@ -3315,10 +3542,14 @@ impl CodePanel {
             editor,
             inserted_rows,
         });
+        if reveal_hunk {
+            self.pending_git_hunk_reveal = None;
+        }
     }
 
     fn close_git_diff_preview(&mut self, cx: &mut Context<Self>) {
         self.expanded_hunk_start = None;
+        self.pending_git_hunk_reveal = None;
         if let Some(preview) = self.git_diff_preview.take() {
             let projected_offset = preview.editor.read(cx).scroll_offset();
             let line_height =
@@ -3341,20 +3572,43 @@ impl CodePanel {
     pub(crate) fn reveal_first_git_hunk(&mut self, cx: &mut Context<Self>) {
         if let Some(hunk) = self.git_state.hunks.first() {
             self.expanded_hunk_start = Some(hunk.start);
+            self.pending_git_hunk_reveal = Some(hunk.start);
             self.git_diff_preview = None;
             self.expand_first_git_hunk_after_refresh = false;
-            self.scroll_to_source_line(hunk.start.saturating_sub(1) as usize, cx);
         } else if self.current_git_key().as_ref() == self.git_key.as_ref()
             && self.git_task.is_none()
             && self.git_task_key.is_none()
         {
             self.expanded_hunk_start = None;
+            self.pending_git_hunk_reveal = None;
             self.expand_first_git_hunk_after_refresh = false;
         } else {
             self.expand_first_git_hunk_after_refresh = true;
             self.refresh_git_metadata(cx);
         }
         cx.notify();
+    }
+
+    fn refresh_merge_conflicts(&mut self, text: Rope, cx: &mut Context<Self>) {
+        self.merge_conflict_generation =
+            self.merge_conflict_generation.wrapping_add(1);
+        let generation = self.merge_conflict_generation;
+        self.merge_conflict_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(MERGE_CONFLICT_REFRESH_DEBOUNCE)
+                .await;
+            let conflicts = cx
+                .background_spawn(async move { parse_merge_conflicts(&text) })
+                .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.merge_conflict_generation == generation {
+                    this.merge_conflicts = conflicts;
+                    cx.notify();
+                }
+            }) {
+                eprintln!("Merge-conflict view closed: {error}");
+            }
+        }));
     }
 
     fn refresh_git_metadata(&mut self, cx: &mut Context<Self>) {
@@ -3436,12 +3690,8 @@ impl CodePanel {
                 if self.expand_first_git_hunk_after_refresh {
                     self.expanded_hunk_start =
                         self.git_state.hunks.first().map(|hunk| hunk.start);
-                    if let Some(hunk) = self.git_state.hunks.first() {
-                        self.scroll_to_source_line(
-                            hunk.start.saturating_sub(1) as usize,
-                            cx,
-                        );
-                    }
+                    self.pending_git_hunk_reveal =
+                        self.git_state.hunks.first().map(|hunk| hunk.start);
                     self.expand_first_git_hunk_after_refresh = false;
                     changed = true;
                 }
@@ -3452,6 +3702,7 @@ impl CodePanel {
             }
             Err(error) => {
                 self.expand_first_git_hunk_after_refresh = false;
+                self.pending_git_hunk_reveal = None;
                 self.status = format!("Git metadata: {error}").into();
                 changed = true;
             }
@@ -3491,11 +3742,15 @@ impl CodePanel {
     }
 
     fn schedule_extension_syntax(&mut self, cx: &mut Context<Self>) {
-        if self.proxy.is_none() || !self.is_text_available() {
+        if self.proxy.is_none()
+            || !self.is_text_available()
+            || self.file_path.is_empty()
+        {
             self.extension_syntax_request_id =
                 self.extension_syntax_request_id.wrapping_add(1);
             self.extension_syntax_task = None;
             self.extension_comment_variables = None;
+            self.extension_language_name = None;
             self.extension_syntax_decorations.clear(cx);
             return;
         }
@@ -3508,13 +3763,21 @@ impl CodePanel {
             cx.background_executor()
                 .timer(SEMANTIC_TOKEN_DEBOUNCE)
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.extension_syntax_request_id == request_id
-                    && this.request_generation == generation
-                {
-                    this.request_extension_syntax(request_id, generation, cx);
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.extension_syntax_request_id != request_id {
+                    return;
                 }
-            });
+                if this.request_generation != generation {
+                    // The path's syntax request can outlive unrelated editor invalidation.
+                    this.schedule_extension_syntax(cx);
+                    return;
+                }
+                this.request_extension_syntax(request_id, generation, cx);
+            }) {
+                eprintln!(
+                    "Could not resume extension syntax request {request_id}: {error}"
+                );
+            }
         }));
     }
 
@@ -3529,6 +3792,7 @@ impl CodePanel {
         };
         let path = self.proxy_path();
         let text_len = self.editor.read(cx).value().len();
+        let trace = extension_syntax_trace_enabled();
         let receiver = proxy.extension_syntax(path.clone());
         cx.spawn(async move |this, cx| {
             let response = cx
@@ -3536,17 +3800,73 @@ impl CodePanel {
                 .await;
             let syntax = match response {
                 Ok(Ok(syntax)) => Some(syntax),
-                Ok(Err(_)) | Err(_) => None,
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "Could not load extension syntax for {}: {error}",
+                        path.display()
+                    );
+                    None
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Extension syntax request for {} was dropped: {error}",
+                        path.display()
+                    );
+                    None
+                }
             };
-            let _ = this.update(cx, |this, cx| {
-                if this.extension_syntax_request_id != request_id
-                    || this.request_generation != generation
-                    || this.proxy_path() != path
+            if let Err(error) = this.update(cx, |this, cx| {
+                let current_request_id = this.extension_syntax_request_id;
+                let current_generation = this.request_generation;
+                let current_path = this.proxy_path();
+                if current_request_id != request_id
+                    || current_generation != generation
+                    || current_path != path
                 {
+                    if trace {
+                        let response_language = syntax
+                            .as_ref()
+                            .and_then(|syntax| syntax.language_name.as_deref())
+                            .unwrap_or("<none>");
+                        let response_captures = syntax
+                            .as_ref()
+                            .map_or(0, |syntax| syntax.captures.len());
+                        let response_path = syntax
+                            .as_ref()
+                            .map(|syntax| syntax.path.display().to_string())
+                            .unwrap_or_else(|| "<none>".to_string());
+                        eprintln!(
+                            "Extension syntax response rejected: path={} request_id={} current_request_id={} generation={} current_generation={} current_path={} response_path={} response_language={} response_captures={}",
+                            path.display(),
+                            request_id,
+                            current_request_id,
+                            generation,
+                            current_generation,
+                            current_path.display(),
+                            response_path,
+                            response_language,
+                            response_captures,
+                        );
+                    }
                     return;
                 }
 
                 let text = this.editor.read(cx).value().to_string();
+                let matching_syntax = syntax.as_ref().filter(|syntax| {
+                    syntax.path == path
+                        && syntax.len == text_len
+                        && text.len() == text_len
+                });
+                let extension_language_name = matching_syntax
+                    .as_ref()
+                    .and_then(|syntax| syntax.language_name.as_deref())
+                    .map(SharedString::from);
+                this.extension_language_name =
+                    if this.editor.read(cx).language_name() == "text" {
+                        extension_language_name
+                    } else {
+                        None
+                    };
                 this.extension_comment_variables = syntax
                     .as_ref()
                     .filter(|syntax| syntax.path == path)
@@ -3555,24 +3875,49 @@ impl CodePanel {
                         line_comment: comments.line_comment.clone(),
                         block_comment: comments.block_comment.clone(),
                     });
-                let decorations = syntax
-                    .filter(|syntax| {
-                        syntax.path == path
-                            && syntax.len == text_len
-                            && text.len() == text_len
-                    })
+                let decorations = matching_syntax
                     .map(|syntax| {
                         let theme = cx.theme().highlight_theme.clone();
-                        extension_syntax_decorations(
-                            &syntax.captures,
-                            &text,
-                            |scope| theme.style.syntax.style(scope),
-                        )
+                        extension_syntax_decorations(&syntax.captures, &text, |scope| {
+                            theme.style.syntax.style(scope)
+                        })
                     })
                     .unwrap_or_default();
+                if trace {
+                    let response_language = syntax
+                        .as_ref()
+                        .and_then(|syntax| syntax.language_name.as_deref())
+                        .unwrap_or("<none>");
+                    let response_revision =
+                        syntax.as_ref().map(|syntax| syntax.rev);
+                    let response_captures =
+                        syntax.as_ref().map_or(0, |syntax| syntax.captures.len());
+                    let response_path = syntax
+                        .as_ref()
+                        .map(|syntax| syntax.path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    eprintln!(
+                        "Extension syntax response applied: path={} request_id={} revision={:?} language={} response_path={} response_length={} current_length={} captures={} matched_current_text={} decorations={}",
+                        path.display(),
+                        request_id,
+                        response_revision,
+                        response_language,
+                        response_path,
+                        syntax.as_ref().map_or(0, |syntax| syntax.len),
+                        text.len(),
+                        response_captures,
+                        matching_syntax.is_some(),
+                        decorations.len(),
+                    );
+                }
                 this.extension_syntax_decorations.set(decorations, cx);
                 cx.notify();
-            });
+            }) {
+                eprintln!(
+                    "Could not apply extension syntax for {}: {error}",
+                    path.display()
+                );
+            }
         })
         .detach();
     }
@@ -3636,23 +3981,129 @@ impl CodePanel {
         let Some(proxy) = self.proxy.clone() else {
             return;
         };
+        if let Some(request_id) = self.pending_proxy_completion_request.take() {
+            proxy.cancel_completion_request(request_id);
+        }
+        self.pending_completion_after_server_start = None;
+        let starting_servers_at_request = proxy
+            .lsp_servers()
+            .into_iter()
+            .filter(|server| !server.is_ready() && !server.is_error())
+            .map(|server| server.name)
+            .collect::<HashSet<_>>();
         let path = self.proxy_path();
         let pos = self.cursor_position(cx);
         let generation = self.request_generation;
         self.completion_request_id = self.completion_request_id.wrapping_add(1);
         let request_id = self.completion_request_id;
         let request_path = path.clone();
-        let text = self.editor.read(cx).value().to_string();
-        let prefix = text
-            .lines()
-            .nth(pos.line as usize)
-            .unwrap_or("")
+        let mut prefix = self
+            .editor
+            .read(cx)
+            .text()
+            .slice_line(pos.line as usize)
             .to_string();
+        if prefix.ends_with('\r') {
+            prefix.pop();
+        }
+        let query = completion_prefix_range(
+            &prefix,
+            lsp_types::Position::new(0, pos.character),
+        )
+        .and_then(|range| prefix.get(range))
+        .unwrap_or_default()
+        .to_owned();
+        let source = self.editor.read(cx).text().clone();
+        if let Some(batch) = self
+            .completion_cache
+            .as_ref()
+            .filter(|cache| completion_cache_matches(cache, &path, pos, &query))
+            .map(|cache| cache.batch.clone())
+        {
+            if self.show_completions {
+                self.completions = rank_completions(&self.completions, &query);
+                self.show_completions = !self.completions.is_empty();
+                self.completion_context = self
+                    .show_completions
+                    .then(|| self.current_completion_context(cx));
+                self.selected_completion = 0;
+                self.completion_details_requested.clear();
+                self.completion_caret_top = None;
+                self.completion_caret_left = None;
+                self.completion_available_width = None;
+                self.completion_editor_height = None;
+                cx.notify();
+            }
+            let query_for_filter = query;
+            cx.spawn(async move |this, cx| {
+                let items = cx
+                    .background_spawn(async move {
+                        rank_completions_with_local_words(
+                            &batch.items,
+                            &query_for_filter,
+                            &source,
+                            pos,
+                        )
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.request_generation != generation
+                        || this.completion_request_id != request_id
+                        || this.proxy_path() != request_path
+                        || this.cursor_position(cx) != pos
+                    {
+                        return;
+                    }
+                    this.set_completion_items(items, "Completions from cache", cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
         let (proxy_request_id, rx) = proxy.request_completions(path, pos, prefix);
-        let query = completion_prefix_range(&text, pos)
-            .and_then(|range| text.get(range))
-            .unwrap_or_default()
-            .to_owned();
+        self.pending_proxy_completion_request = Some(proxy_request_id);
+        if query.chars().count() >= 2 {
+            let local_source = source.clone();
+            let local_query = query.clone();
+            let local_path = request_path.clone();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(LOCAL_COMPLETION_PREVIEW_DELAY)
+                    .await;
+                let items = cx
+                    .background_spawn(async move {
+                        rank_completions_with_local_words(
+                            &[],
+                            &local_query,
+                            &local_source,
+                            pos,
+                        )
+                    })
+                    .await;
+                if items.is_empty() {
+                    return;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if this.request_generation != generation
+                        || this.completion_request_id != request_id
+                        || this.proxy_path() != local_path
+                        || this.cursor_position(cx) != pos
+                        || this.pending_proxy_completion_request
+                            != Some(proxy_request_id)
+                    {
+                        return;
+                    }
+                    this.set_completion_items(
+                        items,
+                        "Completions from current file",
+                        cx,
+                    );
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             let mut reply = std::pin::pin!(rx.recv());
             let mut deadline =
@@ -3673,13 +4124,18 @@ impl CodePanel {
                 Some(Err(error)) => {
                     eprintln!("Receiving LSP completions: {error}");
                     proxy.cancel_completion_request(proxy_request_id);
-                    Some(Vec::new())
+                    Some(LspCompletionBatch::default())
                 }
                 None => {
                     proxy.cancel_completion_request(proxy_request_id);
-                    Some(Vec::new())
+                    Some(LspCompletionBatch::default())
                 }
             };
+            let _ = this.update(cx, |this, _| {
+                if this.pending_proxy_completion_request == Some(proxy_request_id) {
+                    this.pending_proxy_completion_request = None;
+                }
+            });
             if response.is_none() && !retried_after_null {
                 cx.background_executor()
                     .timer(NULL_COMPLETION_RETRY_DELAY)
@@ -3695,7 +4151,19 @@ impl CodePanel {
                 });
                 return;
             }
-            let items = rank_completions(response.unwrap_or_default(), &query);
+            let batch = Arc::new(response.unwrap_or_default());
+            let cache_batch = batch.clone();
+            let query_for_filter = query.clone();
+            let items = cx
+                .background_spawn(async move {
+                    rank_completions_with_local_words(
+                        &batch.items,
+                        &query_for_filter,
+                        &source,
+                        pos,
+                    )
+                })
+                .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.request_generation != generation
                     || this.completion_request_id != request_id
@@ -3704,24 +4172,134 @@ impl CodePanel {
                 {
                     return;
                 }
-                if !items.is_empty() {
-                    this.completions = items;
-                    this.completion_context =
-                        Some(this.current_completion_context(cx));
-                    this.selected_completion = 0;
-                    this.completion_details_requested.clear();
-                    this.show_completions = true;
-                    this.request_visible_completion_details(cx);
-                    this.status = "Completions from proxy".into();
-                } else {
-                    this.completions.clear();
-                    this.completion_details_requested.clear();
-                    this.show_completions = false;
+                if cache_batch.items.is_empty() {
+                    let statuses = proxy.lsp_servers();
+                    let mut candidate_servers = starting_servers_at_request;
+                    candidate_servers.extend(
+                        statuses
+                            .iter()
+                            .filter(|server| {
+                                !server.is_ready() && !server.is_error()
+                            })
+                            .map(|server| server.name.clone()),
+                    );
+                    if candidate_servers.iter().any(|name| {
+                        statuses
+                            .iter()
+                            .any(|server| server.name == *name && server.is_ready())
+                    }) {
+                        this.request_proxy_completions(cx, false);
+                        return;
+                    }
+                    let pending_servers = candidate_servers
+                        .into_iter()
+                        .filter(|name| {
+                            statuses
+                                .iter()
+                                .find(|server| server.name == *name)
+                                .is_none_or(|server| {
+                                    !server.is_ready() && !server.is_error()
+                                })
+                        })
+                        .collect::<HashSet<_>>();
+                    if !pending_servers.is_empty() {
+                        this.pending_completion_after_server_start =
+                            Some(PendingCompletionAfterServerStart {
+                                context: CompletionContext {
+                                    generation,
+                                    request_id,
+                                    path: request_path.clone(),
+                                    position: pos,
+                                },
+                                server_names: pending_servers,
+                            });
+                        this.set_completion_items(
+                            items,
+                            "Completions from current file",
+                            cx,
+                        );
+                        cx.notify();
+                        return;
+                    }
                 }
+                this.pending_completion_after_server_start = None;
+                this.completion_cache = Some(CompletionCache {
+                    path: request_path,
+                    line: pos.line,
+                    start_character: pos
+                        .character
+                        .saturating_sub(query.encode_utf16().count() as u32),
+                    query,
+                    batch: cache_batch,
+                });
+                this.set_completion_items(items, "Completions from proxy", cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn retry_pending_completion_after_server_start(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut pending) = self.pending_completion_after_server_start.take()
+        else {
+            return;
+        };
+        if pending.context.generation != self.request_generation
+            || pending.context.request_id != self.completion_request_id
+            || pending.context.path != self.proxy_path()
+            || pending.context.position != self.cursor_position(cx)
+        {
+            return;
+        }
+        let Some(proxy) = self.proxy.as_ref() else {
+            return;
+        };
+        let statuses = proxy.lsp_servers();
+        if pending.server_names.iter().any(|name| {
+            statuses
+                .iter()
+                .any(|server| server.name == *name && server.is_ready())
+        }) {
+            self.request_proxy_completions(cx, false);
+            return;
+        }
+        pending.server_names.retain(|name| {
+            statuses
+                .iter()
+                .find(|server| server.name == *name)
+                .is_none_or(|server| !server.is_error())
+        });
+        if !pending.server_names.is_empty() {
+            self.pending_completion_after_server_start = Some(pending);
+        }
+    }
+
+    fn set_completion_items(
+        &mut self,
+        items: Vec<LspCompletion>,
+        status: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.completions = items;
+        self.completion_details_requested.clear();
+        self.completion_caret_top = None;
+        self.completion_caret_left = None;
+        self.completion_available_width = None;
+        self.completion_editor_height = None;
+        self.show_completions = !self.completions.is_empty();
+        if self.show_completions {
+            self.cancel_pending_inline();
+            self.clear_ghost_prediction();
+            self.completion_context = Some(self.current_completion_context(cx));
+            self.selected_completion = 0;
+            self.request_visible_completion_details(cx);
+            self.status = status.into();
+        } else {
+            self.completion_context = None;
+        }
     }
 
     fn request_completion_detail(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3737,6 +4315,9 @@ impl CodePanel {
         ) else {
             return;
         };
+        if completion.plugin_id == ahead_rpc::plugin::PluginId(0) {
+            return;
+        }
         if completion
             .item
             .detail
@@ -3745,17 +4326,21 @@ impl CodePanel {
         {
             return;
         }
+        let original_plugin_id = completion.plugin_id;
+        let original_item = completion.item.clone();
         self.completion_details_requested.insert(index);
         let receiver = proxy.resolve_completion(completion);
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    receiver
-                        .recv()
-                        .map_err(|error| error.to_string())?
-                        .map_err(|error| error.message)
-                })
-                .await;
+            // Await the reply on the foreground task: a blocking channel recv
+            // inside a background task deadlocks GPUI's single-threaded test
+            // scheduler as soon as more than one resolve is in flight.
+            let result = match receiver.recv().await {
+                Ok(Ok(item)) => {
+                    Ok(preserve_original_completion_fields(item, &original_item))
+                }
+                Ok(Err(error)) => Err(error.message),
+                Err(error) => Err(error.to_string()),
+            };
             if let Err(error) = this.update(cx, |this, cx| {
                 if !this.show_completions
                     || this.completion_context.as_ref() != Some(&context)
@@ -3765,8 +4350,12 @@ impl CodePanel {
                 match result {
                     Ok(item) => {
                         if let Some(completion) = this.completions.get_mut(index) {
-                            completion.item = item;
-                            cx.notify();
+                            if completion.plugin_id == original_plugin_id
+                                && completion.item == original_item
+                            {
+                                completion.item = item;
+                                cx.notify();
+                            }
                         }
                     }
                     Err(error) => {
@@ -3801,10 +4390,19 @@ impl CodePanel {
 
     fn invalidate_editor_requests(&mut self) {
         self.cancel_pending_inline();
+        self.pending_completion_after_server_start = None;
         self.request_generation = self.request_generation.wrapping_add(1);
+        if let (Some(proxy), Some(request_id)) = (
+            self.proxy.as_ref(),
+            self.pending_proxy_completion_request.take(),
+        ) {
+            proxy.cancel_completion_request(request_id);
+        }
     }
 
     fn cancel_pending_inline(&mut self) {
+        self.inline_request_generation =
+            self.inline_request_generation.wrapping_add(1);
         self.inline_prediction_task = None;
         self.pending_inline = None;
         self.ghost_accepting = false;
@@ -3815,9 +4413,7 @@ impl CodePanel {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_editor_requests();
-        self.ghost_text = None;
-        self.ghost_offset = None;
-        self.ghost_context = None;
+        self.clear_ghost_prediction();
         cx.notify();
     }
 
@@ -3829,6 +4425,7 @@ impl CodePanel {
         let pos = self.cursor_position(cx);
         self.invalidate_editor_requests();
         let generation = self.request_generation;
+        let inline_request_generation = self.inline_request_generation;
         let request_path = path.clone();
         let session_id = self.comment_session_id.clone();
         let model_context = self.session_panel.as_ref().and_then(|panel| {
@@ -3855,6 +4452,8 @@ impl CodePanel {
                     return;
                 };
                 if this.request_generation != generation
+                    || this.inline_request_generation != inline_request_generation
+                    || this.show_completions
                     || this.proxy_path() != request_path
                     || this.cursor_position(cx) != pos
                     || this.comment_session_id != session_id
@@ -3872,13 +4471,27 @@ impl CodePanel {
                 {
                     return;
                 }
-                if !prediction.text.trim().is_empty() {
-                    this.ghost_offset =
-                        caret_byte_offset(&this.editor.read(cx).value(), pos);
-                    this.ghost_text = Some(prediction.text);
-                    this.ghost_context = Some(prediction.context);
+                let text = this.editor.read(cx).value().to_string();
+                if prediction.text.trim().is_empty() {
+                    this.clear_ghost_prediction();
                     cx.notify();
+                    return;
                 }
+                let Some((preview, replacement)) = inline_completion_preview(
+                    &text,
+                    pos,
+                    prediction.range,
+                    &prediction.text,
+                ) else {
+                    this.clear_ghost_prediction();
+                    cx.notify();
+                    return;
+                };
+                this.ghost_offset = caret_byte_offset(&text, pos);
+                this.ghost_text = Some(preview);
+                this.ghost_replacement = replacement;
+                this.ghost_context = Some(prediction.context);
+                cx.notify();
             })
             .log_err();
         }));
@@ -4169,6 +4782,13 @@ impl CodePanel {
         cx.notify();
     }
 
+    fn clear_ghost_prediction(&mut self) {
+        self.ghost_text = None;
+        self.ghost_replacement = None;
+        self.ghost_offset = None;
+        self.ghost_context = None;
+    }
+
     fn ghost_context_is_current(&self, cx: &App) -> bool {
         self.ghost_context.as_ref().is_none_or(|context| {
             context.session_id == self.comment_session_id
@@ -4204,13 +4824,15 @@ impl CodePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_completions {
+            self.accept_completion(window, cx);
+            return;
+        }
         if self.ghost_accepting {
             return;
         }
         if !self.ghost_is_current_at_caret(cx) {
-            self.ghost_text = None;
-            self.ghost_offset = None;
-            self.ghost_context = None;
+            self.clear_ghost_prediction();
             cx.notify();
             return;
         }
@@ -4229,6 +4851,10 @@ impl CodePanel {
             let Some(ghost) = self.ghost_text.clone() else {
                 return;
             };
+            let replacement = self.ghost_replacement.as_ref().map_or_else(
+                || ghost.clone(),
+                |(_, replacement)| replacement.clone(),
+            );
             let content_sha256 = format!(
                 "{:x}",
                 sha2::Sha256::digest(self.editor.read(cx).value().as_bytes())
@@ -4237,7 +4863,7 @@ impl CodePanel {
                 path.clone(),
                 position,
                 content_sha256,
-                ghost.clone(),
+                replacement,
                 binding,
             );
             self.ghost_accepting = true;
@@ -4277,9 +4903,7 @@ impl CodePanel {
                                 format!("Could not validate suggestion: {error}")
                             }
                         };
-                        this.ghost_text = None;
-                        this.ghost_offset = None;
-                        this.ghost_context = None;
+                        this.clear_ghost_prediction();
                         this.status = status.into();
                         cx.notify();
                     })
@@ -4291,7 +4915,25 @@ impl CodePanel {
     }
 
     fn insert_ghost_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ghost) = self.ghost_text.take() {
+        if let Some(ghost) = self.ghost_text.clone() {
+            let replacement = self.ghost_replacement.clone();
+            let accepted_text = if let Some((_, replacement)) = &replacement {
+                replacement.clone()
+            } else {
+                let text = self.editor.read(cx).value().to_string();
+                let position = self.cursor_position(cx);
+                let Some((text, _)) =
+                    inline_completion_preview(&text, position, None, &ghost)
+                else {
+                    self.clear_ghost_prediction();
+                    cx.notify();
+                    return;
+                };
+                text
+            };
+            self.ghost_text = None;
+            self.ghost_replacement = None;
+            let replacement_range = replacement.map(|(range, _)| range);
             let prediction_context = self.ghost_context.take();
             let acceptance_context = prediction_context.and_then(|context| {
                 Some((context.session_id?, context.binding?, context.model_context))
@@ -4300,15 +4942,18 @@ impl CodePanel {
             self.ghost_offset = None;
             self.suppress_completion_for_next_edit = true;
             self.editor.update(cx, |ed, cx| {
-                ed.insert(ghost.clone(), window, cx);
+                if let Some(range) = replacement_range {
+                    ed.set_selected_range(range, cx);
+                    ed.replace(accepted_text.clone(), window, cx);
+                } else {
+                    ed.insert(accepted_text.clone(), window, cx);
+                }
             });
             let end = self.cursor_position(cx);
             if let (Some(proxy), Some((session_id, binding, model_context))) =
                 (self.proxy.as_ref(), acceptance_context)
-                && let Some(path) = std::path::Path::new(&self.file_path)
-                    .strip_prefix(&self.workspace)
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned())
+                && let Some(path) =
+                    session_record_path(&self.workspace, &self.file_path)
                 && (start.line, start.character) < (end.line, end.character)
             {
                 let record_session_id = session_id.clone();
@@ -4372,31 +5017,43 @@ impl CodePanel {
         let Some(context) = self.completion_context.take() else {
             return;
         };
+        self.cancel_pending_inline();
+        self.clear_ghost_prediction();
         self.show_completions = false;
         cx.notify();
         if context != self.current_completion_context(cx) {
             self.status = "Completion is stale; request it again".into();
             return;
         }
-        if let Some(proxy) = &self.proxy {
+        if completion.plugin_id != ahead_rpc::plugin::PluginId(0)
+            && let Some(proxy) = &self.proxy
+        {
+            let plugin_id = completion.plugin_id;
+            let original_item = completion.item.clone();
             let receiver = proxy.resolve_completion(completion);
             self.status = "Resolving completion…".into();
             cx.spawn_in(window, async move |this, cx| {
-                let result = cx
-                    .background_spawn(async move {
-                        receiver
-                            .recv()
-                            .map_err(|error| error.to_string())?
-                            .map_err(|error| error.message)
-                    })
-                    .await;
+                let result = match receiver.recv().await {
+                    Ok(Ok(item)) => Ok(item),
+                    Ok(Err(error)) => Err(error.message),
+                    Err(error) => Err(error.to_string()),
+                }
+                .map(|item| {
+                    preserve_original_completion_fields(item, &original_item)
+                });
                 this.update_in(cx, |this, window, cx| {
-                    this.finish_completion(&context, result, window, cx);
+                    this.finish_completion(&context, plugin_id, result, window, cx);
                 })
             })
             .detach_and_log_err(cx);
         } else {
-            self.finish_completion(&context, Ok(completion.item), window, cx);
+            self.finish_completion(
+                &context,
+                completion.plugin_id,
+                Ok(completion.item),
+                window,
+                cx,
+            );
         }
     }
 
@@ -4412,6 +5069,7 @@ impl CodePanel {
     fn finish_completion(
         &mut self,
         context: &CompletionContext,
+        plugin_id: ahead_rpc::plugin::PluginId,
         result: Result<lsp_types::CompletionItem, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4419,8 +5077,29 @@ impl CodePanel {
         if context != &self.current_completion_context(cx) {
             return;
         }
-        let applied = result.and_then(|item| {
+        let applied = result.and_then(|mut item| {
             let text = self.editor.read(cx).value().to_string();
+            let line = text
+                .split('\n')
+                .nth(context.position.line as usize)
+                .unwrap_or_default()
+                .trim_end_matches('\r');
+            let query = completion_prefix_range(
+                line,
+                lsp_types::Position::new(0, context.position.character),
+            )
+            .and_then(|range| line.get(range))
+            .unwrap_or_default();
+            if let Some(cache) = self.completion_cache.as_ref().filter(|cache| {
+                completion_cache_matches(
+                    cache,
+                    &context.path,
+                    context.position,
+                    query,
+                )
+            }) {
+                adapt_cached_completion_item(&mut item, cache, query);
+            }
             let cursor = caret_byte_offset(&text, context.position)
                 .ok_or("The completion position is stale")?;
             let selected_range = self.editor.read(cx).selected_range();
@@ -4461,13 +5140,21 @@ impl CodePanel {
                     &item,
                     &variables,
                 )?;
-            let selection = tabstops
+            let selections = tabstops
                 .as_ref()
                 .and_then(|tabstops| tabstops.first())
-                .and_then(|tabstop| tabstop.ranges.first())
-                .map_or(caret..caret, |range| {
-                    edit_range.start + range.start..edit_range.start + range.end
-                });
+                .map(|tabstop| {
+                    tabstop
+                        .ranges
+                        .iter()
+                        .map(|range| {
+                            edit_range.start + range.start
+                                ..edit_range.start + range.end
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|ranges| !ranges.is_empty())
+                .unwrap_or_else(|| vec![caret..caret]);
             let snippet_session = tabstops.take().and_then(|mut tabstops| {
                 for tabstop in &mut tabstops {
                     for range in &mut tabstop.ranges {
@@ -4487,17 +5174,76 @@ impl CodePanel {
             self.editor.update(cx, |editor, cx| {
                 editor.set_selected_range(edit_range, cx);
                 editor.replace(replacement, window, cx);
-                editor.set_selected_range(selection, cx);
+                editor.set_selected_ranges(selections, cx);
             });
             self.snippet_session = snippet_session;
             self.invalidate_editor_requests();
-            Ok(item.label)
+            Ok((item.label, item.command))
         });
-        self.status = match applied {
-            Ok(label) => format!("Completed {label}"),
-            Err(error) => format!("Completion failed: {error}"),
+        match applied {
+            Ok((label, Some(command))) => {
+                let Some(proxy) = self.proxy.as_ref() else {
+                    self.status = format!("Completed {label}").into();
+                    cx.notify();
+                    return;
+                };
+                let command_title = if command.title.is_empty() {
+                    command.command.clone()
+                } else {
+                    command.title.clone()
+                };
+                let running_status =
+                    format!("Running language-server command: {command_title}…");
+                let path = self.proxy_path();
+                let receiver = proxy.execute_lsp_command(command, plugin_id);
+                self.status = running_status.clone().into();
+                cx.spawn_in(window, async move |this, cx| {
+                    let mut reply = std::pin::pin!(receiver.recv());
+                    let mut deadline = std::pin::pin!(
+                        cx.background_executor().timer(Duration::from_secs(5))
+                    );
+                    let result = std::future::poll_fn(|cx| {
+                        use std::task::Poll;
+                        if let Poll::Ready(result) = reply.as_mut().poll(cx) {
+                            return Poll::Ready(match result {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(error)) => Err(error.message),
+                                Err(error) => Err(format!(
+                                    "Waiting for language-server command: {error}"
+                                )),
+                            });
+                        }
+                        if deadline.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(Err(
+                                "Waiting for language-server command: timed out".into(),
+                            ));
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    this.update_in(cx, |this, _, cx| {
+                        if this.proxy_path() != path
+                            || this.status.as_ref() != running_status
+                        {
+                            return;
+                        }
+                        this.status = match result {
+                            Ok(()) => format!("Completed {label}"),
+                            Err(error) => format!(
+                                "Completed {label}, but its language-server command failed: {error}"
+                            ),
+                        }
+                        .into();
+                        cx.notify();
+                    })
+                })
+                .detach_and_log_err(cx);
+            }
+            Ok((label, _)) => self.status = format!("Completed {label}").into(),
+            Err(error) => {
+                self.status = format!("Completion failed: {error}").into();
+            }
         }
-        .into();
         cx.notify();
     }
 
@@ -4510,7 +5256,7 @@ impl CodePanel {
             return false;
         };
         let selection = self.editor.read(cx).selected_range();
-        if !session.active_contains(&selection) {
+        if !snippet_session_contains_selection(&session, &selection) {
             self.snippet_session = Some(session);
             return false;
         }
@@ -4525,13 +5271,14 @@ impl CodePanel {
             self.snippet_session = Some(session);
             return false;
         }
-        let Some(range) = session.move_to(next) else {
+        let Some(_) = session.move_to(next) else {
             self.snippet_session = Some(session);
             return false;
         };
         let is_final = session.active_is_final();
+        let ranges = session.active_ranges();
         self.editor.update(cx, |editor, cx| {
-            editor.set_selected_range(range, cx);
+            editor.set_selected_ranges(ranges, cx);
         });
         self.snippet_session = (!is_final).then_some(session);
         cx.notify();
@@ -4548,7 +5295,8 @@ impl CodePanel {
             return false;
         };
         let selection = self.editor.read(cx).selected_range();
-        if !session.active_contains(&selection) || session.active_choices().len() < 2
+        if !snippet_session_contains_selection(&session, &selection)
+            || session.active_choices().len() < 2
         {
             self.snippet_session = Some(session);
             return false;
@@ -4559,18 +5307,19 @@ impl CodePanel {
             self.snippet_session = Some(session);
             return false;
         };
-        if self.editor.read(cx).value().get(old_range.clone())
-            == Some(replacement.as_str())
-        {
+        if old_range.iter().all(|range| {
+            self.editor.read(cx).value().get(range.clone())
+                == Some(replacement.as_str())
+        }) {
             self.snippet_session = Some(session);
             cx.notify();
             return true;
         }
         self.suppress_completion_for_next_edit = true;
         self.editor.update(cx, |editor, cx| {
-            editor.set_selected_range(old_range, cx);
+            editor.set_selected_ranges(old_range, cx);
             editor.replace(replacement, window, cx);
-            editor.set_selected_range(new_range, cx);
+            editor.set_selected_ranges(new_range, cx);
         });
         self.snippet_session = Some(session);
         cx.notify();
@@ -4683,9 +5432,7 @@ impl CodePanel {
             && (self.ghost_text.is_some() || self.pending_inline.is_some())
         {
             self.cancel_pending_inline();
-            self.ghost_text = None;
-            self.ghost_offset = None;
-            self.ghost_context = None;
+            self.clear_ghost_prediction();
             cx.notify();
         }
     }
@@ -4972,8 +5719,7 @@ impl CodePanel {
                     Ok(Some((range, replacement, selection))) => {
                         this.suppress_completion_for_next_edit = true;
                         this.snippet_session = None;
-                        this.ghost_text = None;
-                        this.ghost_offset = None;
+                        this.clear_ghost_prediction();
                         this.editor.update(cx, |editor, cx| {
                             editor.set_selected_range(range, cx);
                             editor.replace(replacement, window, cx);
@@ -4990,6 +5736,108 @@ impl CodePanel {
             .log_err();
         })
         .detach();
+    }
+
+    fn cancel_pending_on_type_formatting(&mut self) {
+        self.on_type_format_request_id =
+            self.on_type_format_request_id.wrapping_add(1);
+        if let Some((_, sender)) = self.pending_on_type_format_trigger.take()
+            && let Err(error) = sender.try_send(false)
+        {
+            gpui_util::log_err(&error);
+        }
+    }
+
+    fn schedule_on_type_formatting(
+        &mut self,
+        trigger_character: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_text_available()
+            || (self.shared_session_id.is_some() && !self.shared_editable)
+        {
+            return;
+        }
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        if !proxy.supports_on_type_formatting(&trigger_character) {
+            return;
+        }
+
+        let (sender, receiver) = async_channel::bounded(1);
+        self.pending_on_type_format_trigger =
+            Some((trigger_character.clone(), sender));
+        let request_id = self.on_type_format_request_id;
+        cx.spawn_in(window, async move |this, cx| -> anyhow::Result<()> {
+            match receiver.recv().await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+            let Some((path, position, text, selection, dirty_rev, generation)) =
+                this.update_in(cx, |this, _, cx| {
+                    if this.on_type_format_request_id != request_id {
+                        return None;
+                    }
+                    Some((
+                        this.proxy_path(),
+                        this.cursor_position(cx),
+                        this.editor.read(cx).value().to_string(),
+                        this.editor.read(cx).selected_range(),
+                        this.dirty_rev,
+                        this.request_generation,
+                    ))
+                })?
+            else {
+                return Ok::<(), anyhow::Error>(());
+            };
+
+            let receiver = proxy.request_document_on_type_formatting(
+                path.clone(),
+                position,
+                trigger_character,
+            );
+            let result = cx
+                .background_spawn(async move {
+                    receiver.recv().map_err(|error| error.to_string())?
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.on_type_format_request_id != request_id
+                    || this.dirty_rev != dirty_rev
+                    || this.request_generation != generation
+                    || this.proxy_path() != path
+                    || this.cursor_position(cx) != position
+                    || this.editor.read(cx).selected_range() != selection
+                {
+                    return;
+                }
+                match result.and_then(|edits| {
+                    formatting_edit(&text, &edits, selection.clone())
+                }) {
+                    Ok(Some((range, replacement, selection))) => {
+                        this.suppress_completion_for_next_edit = true;
+                        this.snippet_session = None;
+                        this.clear_ghost_prediction();
+                        this.editor.update(cx, |editor, cx| {
+                            editor.set_selected_range(range, cx);
+                            editor.replace(replacement, window, cx);
+                            editor.set_selected_range(selection, cx);
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        gpui_util::log_err(&error);
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn request_signature_help(&mut self, cx: &mut Context<Self>) {
@@ -5138,8 +5986,7 @@ impl CodePanel {
         self.show_completions = false;
         self.signature_help = None;
         self.signature_help_position = None;
-        self.ghost_text = None;
-        self.ghost_offset = None;
+        self.clear_ghost_prediction();
         self.hover_text = None;
         self.status = "Looking for code actions…".into();
         cx.notify();
@@ -5353,8 +6200,7 @@ impl CodePanel {
                                     this.preserve_code_action_request_for_next_edit =
                                         true;
                                     this.snippet_session = None;
-                                    this.ghost_text = None;
-                                    this.ghost_offset = None;
+                                    this.clear_ghost_prediction();
                                     this.editor.update(cx, |editor, cx| {
                                         editor.set_selected_range(range, cx);
                                         editor.replace(text, window, cx);
@@ -5474,7 +6320,7 @@ impl CodePanel {
                 return;
             };
             let receiver = command_proxy
-                .execute_code_action_command(command, plugin_id);
+                .execute_lsp_command(command, plugin_id);
             let mut reply = std::pin::pin!(receiver.recv());
             let mut deadline = std::pin::pin!(
                 cx.background_executor().timer(Duration::from_secs(5))
@@ -5621,6 +6467,19 @@ fn completion_edit_with_variables(
             item.insert_text.as_deref().unwrap_or(&item.label),
         ),
     };
+    let insertion_repeats_a_completed_label = range.is_empty()
+        && caret_byte_offset(text, position) == Some(range.start)
+        && !new_text.is_empty()
+        && new_text.len() < item.label.len()
+        && item.label.ends_with(new_text)
+        && completion_prefix_range(text, position)
+            .and_then(|prefix| text.get(prefix))
+            .is_some_and(|prefix| prefix == item.label);
+    let new_text = if insertion_repeats_a_completed_label {
+        ""
+    } else {
+        new_text
+    };
     let snippet = (item.insert_text_format
         == Some(lsp_types::InsertTextFormat::SNIPPET))
     .then(|| lsp_snippet::Snippet::parse_with_variables(new_text, variables))
@@ -5683,6 +6542,75 @@ fn completion_edit_with_variables(
     Ok((start..end, replacement, caret, snippet_tabstops))
 }
 
+fn adapt_cached_completion_item(
+    item: &mut lsp_types::CompletionItem,
+    cache: &CompletionCache,
+    query: &str,
+) {
+    let old_caret = lsp_types::Position::new(
+        cache.line,
+        cache.start_character.saturating_add(
+            u32::try_from(cache.query.encode_utf16().count()).unwrap_or(u32::MAX),
+        ),
+    );
+    let appended_text = &query[cache.query.len()..];
+    let appended_utf16 =
+        u32::try_from(appended_text.encode_utf16().count()).unwrap_or(u32::MAX);
+    let shift = |position: &mut lsp_types::Position| {
+        if position.line == old_caret.line
+            && position.character >= old_caret.character
+        {
+            position.character = position.character.saturating_add(appended_utf16);
+        }
+    };
+    let shift_range = |range: &mut lsp_types::Range| {
+        shift(&mut range.start);
+        shift(&mut range.end);
+    };
+    match item.text_edit.as_mut() {
+        Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
+            if edit.range.start == old_caret
+                && edit.range.end == old_caret
+                && edit.new_text.starts_with(appended_text)
+            {
+                edit.new_text.drain(..appended_text.len());
+            }
+            shift_range(&mut edit.range);
+        }
+        Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+            if edit.replace.start == old_caret
+                && edit.replace.end == old_caret
+                && edit.new_text.starts_with(appended_text)
+            {
+                edit.new_text.drain(..appended_text.len());
+            }
+            shift_range(&mut edit.insert);
+            shift_range(&mut edit.replace);
+        }
+        None => {}
+    }
+    if let Some(edits) = item.additional_text_edits.as_mut() {
+        for edit in edits {
+            shift_range(&mut edit.range);
+        }
+    }
+}
+
+fn lsp_cursor_position(
+    text: &Rope,
+    position: gpui_kit::component::input::Position,
+) -> lsp_types::Position {
+    lsp_types::Position {
+        line: position.line,
+        character: text
+            .slice_line(position.line as usize)
+            .chars()
+            .take(position.character as usize)
+            .map(|character| character.len_utf16() as u32)
+            .sum(),
+    }
+}
+
 fn completion_prefix_range(
     text: &str,
     position: lsp_types::Position,
@@ -5699,7 +6627,112 @@ fn completion_prefix_range(
     Some(start..end)
 }
 
-fn rank_completions(items: Vec<LspCompletion>, query: &str) -> Vec<LspCompletion> {
+fn preserve_original_completion_fields(
+    mut resolved: lsp_types::CompletionItem,
+    original: &lsp_types::CompletionItem,
+) -> lsp_types::CompletionItem {
+    resolved.label.clone_from(&original.label);
+    let resolved_new_text = resolved
+        .text_edit
+        .as_ref()
+        .map(completion_text_edit_new_text)
+        .or(resolved.insert_text.as_deref())
+        .map(str::to_owned);
+    resolved.text_edit = original.text_edit.as_ref().map(|edit| {
+        completion_text_edit_with_new_text(
+            edit,
+            resolved_new_text
+                .clone()
+                .unwrap_or_else(|| completion_text_edit_new_text(edit).to_owned()),
+        )
+    });
+    if original.text_edit.is_none() {
+        resolved.insert_text =
+            resolved_new_text.or_else(|| original.insert_text.clone());
+    }
+    if resolved.insert_text_format.is_none() {
+        resolved.insert_text_format = original.insert_text_format;
+    }
+    if resolved.command.is_none() {
+        resolved.command.clone_from(&original.command);
+    }
+    if resolved.additional_text_edits.is_none() {
+        resolved
+            .additional_text_edits
+            .clone_from(&original.additional_text_edits);
+    }
+    resolved
+}
+
+fn completion_text_edit_new_text(edit: &lsp_types::CompletionTextEdit) -> &str {
+    match edit {
+        lsp_types::CompletionTextEdit::Edit(edit) => &edit.new_text,
+        lsp_types::CompletionTextEdit::InsertAndReplace(edit) => &edit.new_text,
+    }
+}
+
+fn completion_text_edit_with_new_text(
+    edit: &lsp_types::CompletionTextEdit,
+    new_text: String,
+) -> lsp_types::CompletionTextEdit {
+    match edit {
+        lsp_types::CompletionTextEdit::Edit(edit) => {
+            lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: edit.range,
+                new_text,
+            })
+        }
+        lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
+            lsp_types::CompletionTextEdit::InsertAndReplace(
+                lsp_types::InsertReplaceEdit {
+                    insert: edit.insert,
+                    replace: edit.replace,
+                    new_text,
+                },
+            )
+        }
+    }
+}
+
+fn snippet_session_contains_selection(
+    session: &SnippetSession,
+    selection: &std::ops::Range<usize>,
+) -> bool {
+    if session.active_contains(selection) {
+        return true;
+    }
+    if !selection.is_empty() {
+        return false;
+    }
+    let caret = selection.start;
+    (caret > 0 && session.active_contains(&(caret - 1..caret)))
+        || session.active_contains(&(caret..caret.saturating_add(1)))
+}
+
+fn compare_ranked_completions<T: Ord>(
+    (left_score, left_index, left): &(T, usize, &LspCompletion),
+    (right_score, right_index, right): &(T, usize, &LspCompletion),
+) -> std::cmp::Ordering {
+    right_score
+        .cmp(left_score)
+        .then_with(|| {
+            right
+                .item
+                .preselect
+                .unwrap_or(false)
+                .cmp(&left.item.preselect.unwrap_or(false))
+        })
+        .then_with(|| {
+            left.item
+                .sort_text
+                .as_deref()
+                .unwrap_or(&left.item.label)
+                .cmp(right.item.sort_text.as_deref().unwrap_or(&right.item.label))
+        })
+        .then_with(|| left_index.cmp(right_index))
+}
+
+fn rank_completions(items: &[LspCompletion], query: &str) -> Vec<LspCompletion> {
     let pattern = Pattern::new(
         query,
         CaseMatching::Smart,
@@ -5709,55 +6742,215 @@ fn rank_completions(items: Vec<LspCompletion>, query: &str) -> Vec<LspCompletion
     let mut matcher = FuzzyMatcher::new(FuzzyConfig::DEFAULT);
     let mut candidate_chars = Vec::new();
     let mut ranked: Vec<_> = items
-        .into_iter()
-        .filter_map(|completion| {
+        .iter()
+        .enumerate()
+        .filter_map(|(index, completion)| {
             let item = &completion.item;
             let filter = item.filter_text.as_deref().unwrap_or(&item.label);
             let score = pattern
                 .score(Utf32Str::new(filter, &mut candidate_chars), &mut matcher)?;
-            Some((score, completion))
+            Some((score, index, completion))
         })
         .collect();
-    ranked.sort_by(|(left_score, left), (right_score, right)| {
-        let (left, right) = (&left.item, &right.item);
-        right_score
-            .cmp(left_score)
-            .then_with(|| {
-                right
-                    .preselect
-                    .unwrap_or(false)
-                    .cmp(&left.preselect.unwrap_or(false))
-            })
-            .then_with(|| {
-                left.sort_text
-                    .as_deref()
-                    .unwrap_or(&left.label)
-                    .cmp(right.sort_text.as_deref().unwrap_or(&right.label))
-            })
-    });
+    let visible_count = ranked.len().min(MAX_COMPLETION_SUGGESTIONS);
+    if ranked.len() > visible_count {
+        ranked.select_nth_unstable_by(visible_count - 1, compare_ranked_completions);
+        ranked.truncate(visible_count);
+    }
+    ranked.sort_unstable_by(compare_ranked_completions);
     ranked
         .into_iter()
-        .take(MAX_COMPLETION_SUGGESTIONS)
-        .map(|(_, item)| item)
+        .map(|(_, _, item)| item.clone())
         .collect()
+}
+
+fn rank_completions_with_local_words(
+    items: &[LspCompletion],
+    query: &str,
+    text: &Rope,
+    position: lsp_types::Position,
+) -> Vec<LspCompletion> {
+    let mut ranked = rank_completions(items, query);
+    let local = local_word_completions(text, query, items, position);
+    if local.is_empty() {
+        return ranked;
+    }
+    ranked.extend(local);
+    rank_completions(&ranked, query)
+}
+
+fn local_word_completions(
+    text: &Rope,
+    query: &str,
+    lsp_items: &[LspCompletion],
+    position: lsp_types::Position,
+) -> Vec<LspCompletion> {
+    if query.chars().count() < 2 {
+        return Vec::new();
+    }
+
+    let existing = lsp_items
+        .iter()
+        .map(|completion| completion.item.label.as_str())
+        .collect::<HashSet<_>>();
+    let folded_query = (!query.is_ascii()).then(|| query.to_lowercase());
+    let mut seen = HashSet::new();
+    let mut word = String::new();
+    let mut completions = Vec::new();
+    let line_count = text.len_lines(ropey::LineType::LF);
+    let Some(caret_line) = usize::try_from(position.line)
+        .ok()
+        .filter(|line| *line < line_count)
+    else {
+        return Vec::new();
+    };
+    let start_line = caret_line.saturating_sub(LOCAL_COMPLETION_SEARCH_ROWS);
+    let end_line = caret_line
+        .saturating_add(LOCAL_COMPLETION_SEARCH_ROWS)
+        .saturating_add(1)
+        .min(line_count);
+    let row_start = text.line_to_byte_idx(start_line, ropey::LineType::LF);
+    let row_end = if end_line == line_count {
+        text.len()
+    } else {
+        text.line_to_byte_idx(end_line, ropey::LineType::LF)
+    };
+    let (start, end) = if text.len() > MAX_LOCAL_COMPLETION_SEARCH_BYTES {
+        let caret = rope_caret_byte_offset(text, position).unwrap_or(row_start);
+        let byte_start = text.floor_char_boundary(
+            caret.saturating_sub(MAX_LOCAL_COMPLETION_SEARCH_BYTES / 2),
+        );
+        let byte_end = text.ceil_char_boundary(
+            caret
+                .saturating_add(MAX_LOCAL_COMPLETION_SEARCH_BYTES / 2)
+                .min(text.len()),
+        );
+        (row_start.max(byte_start), row_end.min(byte_end))
+    } else {
+        (row_start, row_end)
+    };
+    for character in text.slice(start..end).chars().chain(std::iter::once(' ')) {
+        if character.is_alphanumeric() || character == '_' {
+            word.push(character);
+            continue;
+        }
+        if word.is_empty() {
+            continue;
+        }
+        let candidate = std::mem::take(&mut word);
+        let matches = if let Some(folded_query) = folded_query.as_deref() {
+            candidate.to_lowercase().starts_with(folded_query)
+        } else {
+            candidate
+                .get(..query.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query))
+        };
+        if candidate.len() > 128
+            || candidate == query
+            || !matches
+            || existing.contains(candidate.as_str())
+            || !seen.insert(candidate.clone())
+        {
+            continue;
+        }
+        completions.push(LspCompletion {
+            plugin_id: ahead_rpc::plugin::PluginId(0),
+            item: lsp_types::CompletionItem {
+                label: candidate,
+                kind: Some(lsp_types::CompletionItemKind::TEXT),
+                detail: Some("Current file".into()),
+                ..Default::default()
+            },
+        });
+        if completions.len() == 64 {
+            break;
+        }
+    }
+    completions
+}
+
+fn completion_match_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let mut matcher = FuzzyMatcher::new(FuzzyConfig::DEFAULT);
+    let mut label_chars = Vec::new();
+    let mut indices = Vec::new();
+    if pattern
+        .indices(
+            Utf32Str::new(label, &mut label_chars),
+            &mut matcher,
+            &mut indices,
+        )
+        .is_none()
+    {
+        return Vec::new();
+    }
+
+    let mut byte_offsets = label
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    byte_offsets.push(label.len());
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for index in indices {
+        let index = index as usize;
+        let Some((&start, &end)) =
+            byte_offsets.get(index).zip(byte_offsets.get(index + 1))
+        else {
+            continue;
+        };
+        if let Some(previous) = ranges.last_mut()
+            && previous.end == start
+        {
+            previous.end = end;
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    ranges
 }
 
 fn caret_popup_position(
     caret_top: Pixels,
+    editor_height: Option<Pixels>,
     line_height: Pixels,
     preferred_max_height: Pixels,
-) -> (Pixels, Pixels) {
+) -> (Option<Pixels>, Option<Pixels>, Pixels) {
     let gap = px(8.);
-    let available_above = caret_top - gap;
+    let available_above = px((caret_top - gap).as_f32().max(0.));
     if available_above >= line_height {
-        let max_height = if available_above < preferred_max_height {
-            available_above
-        } else {
-            preferred_max_height
-        };
-        (caret_top - max_height - gap, max_height)
+        let max_height =
+            px(available_above.as_f32().min(preferred_max_height.as_f32()));
+        match editor_height {
+            Some(editor_height) => {
+                (None, Some(editor_height - caret_top + gap), max_height)
+            }
+            None => (Some(caret_top - max_height - gap), None, max_height),
+        }
     } else {
-        (caret_top + line_height + gap, preferred_max_height)
+        let top = caret_top + line_height + gap;
+        match editor_height {
+            Some(editor_height) => {
+                let available_below = px((editor_height - top).as_f32().max(0.));
+                (
+                    Some(top),
+                    None,
+                    px(available_below.as_f32().min(preferred_max_height.as_f32())),
+                )
+            }
+            None => (Some(top), None, preferred_max_height),
+        }
     }
 }
 
@@ -5776,26 +6969,28 @@ fn caret_popup_horizontal_position(
 }
 
 fn completion_item_detail(item: &lsp_types::CompletionItem) -> Option<String> {
-    let mut details = Vec::with_capacity(4);
-    for detail in [
+    let mut explicit_details = [
         item.detail.as_deref(),
-        completion_documentation_signature(item),
         item.label_details
             .as_ref()
             .and_then(|details| details.detail.as_deref()),
-        item.label_details
-            .as_ref()
-            .and_then(|details| details.description.as_deref()),
-    ] {
-        let Some(detail) = detail.map(str::trim).filter(|detail| !detail.is_empty())
-        else {
-            continue;
-        };
-        if !details.contains(&detail) {
-            details.push(detail);
-        }
-    }
-    (!details.is_empty()).then(|| details.join(" · "))
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|detail| !detail.is_empty() && *detail != item.label);
+    explicit_details
+        .clone()
+        .find(|detail| completion_detail_looks_like_signature(detail))
+        .or_else(|| completion_documentation_signature(item))
+        .or_else(|| explicit_details.next())
+        .map(|detail| detail.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn completion_detail_looks_like_signature(detail: &str) -> bool {
+    detail.contains('(')
+        && detail.contains(')')
+        && (detail.contains("->") || detail.contains(':'))
 }
 
 fn completion_documentation_signature(
@@ -5816,22 +7011,52 @@ fn completion_documentation_signature(
         })
 }
 
+fn rope_caret_byte_offset(
+    text: &ropey::Rope,
+    position: lsp_types::Position,
+) -> Option<usize> {
+    let Some(line) = text.get_line(position.line as usize, ropey::LineType::LF)
+    else {
+        return None;
+    };
+    let mut column_utf16 = 0;
+    let mut line_bytes = 0;
+    for character in line.chars() {
+        if matches!(character, '\r' | '\n') {
+            break;
+        }
+        if column_utf16 >= position.character {
+            break;
+        }
+        column_utf16 += character.len_utf16() as u32;
+        line_bytes += character.len_utf8();
+    }
+    if column_utf16 != position.character {
+        return None;
+    }
+    Some(
+        text.line_to_byte_idx(position.line as usize, ropey::LineType::LF)
+            + line_bytes,
+    )
+}
+
 fn has_unclosed_parenthesis_before_cursor(
-    text: &str,
+    text: &ropey::Rope,
     position: lsp_types::Position,
 ) -> bool {
-    let Some(offset) = caret_byte_offset(text, position) else {
+    let Some(offset) = rope_caret_byte_offset(text, position) else {
         return false;
     };
-    let mut depth = 0usize;
-    for character in text[..offset].chars() {
+    let mut closed_calls = 0usize;
+    for character in text.chars_at(offset).reversed() {
         match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
+            ')' => closed_calls += 1,
+            '(' if closed_calls == 0 => return true,
+            '(' => closed_calls -= 1,
             _ => {}
         }
     }
-    depth > 0
+    false
 }
 
 fn default_editor_tab_size() -> TabSize {
@@ -6048,6 +7273,45 @@ fn display_position_utf16(
             .map(|character| character.len_utf16() as u32)
             .sum(),
     }
+}
+
+fn display_position_utf16_rope(
+    text: &Rope,
+    position: gpui_kit::base::input::Position,
+) -> ahead_rpc::ahead::DisplayPosition {
+    ahead_rpc::ahead::DisplayPosition {
+        line: position.line,
+        col: text
+            .get_line(position.line as usize, ropey::LineType::LF)
+            .map(|line| {
+                line.chars()
+                    .take_while(|character| *character != '\n')
+                    .take(position.character as usize)
+                    .map(|character| character.len_utf16() as u32)
+                    .sum()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn editor_selected_display_range(
+    editor: &EditorState,
+) -> Option<ahead_rpc::ahead::DisplayRange> {
+    let selection = editor.selected_range();
+    if selection.start == selection.end {
+        return None;
+    }
+    let text = editor.text();
+    Some(ahead_rpc::ahead::DisplayRange {
+        start: display_position_utf16_rope(
+            text,
+            text.offset_to_position(selection.start),
+        ),
+        end: display_position_utf16_rope(
+            text,
+            text.offset_to_position(selection.end),
+        ),
+    })
 }
 
 pub(crate) fn current_comment_range(
@@ -6444,7 +7708,7 @@ impl Render for CodePanel {
         let inline_blame_panel = cx.entity();
         let presentation_overlay = self.presentation.clone().map(|presentation| {
             let line = presentation_line.unwrap_or(1) as f32;
-            let top = scroll_offset.y + line_height * line + px(4.);
+            let top = scroll_offset.y + line_height * (line + 1.) + px(4.);
             (presentation, top)
         });
         let pointer_overlay = self
@@ -6480,15 +7744,24 @@ impl Render for CodePanel {
             })
             .unwrap_or_default();
         let cursor_position = self.cursor_position(cx);
+        let completion_query = self
+            .show_completions
+            .then(|| {
+                completion_prefix_range(&editor_text, cursor_position)
+                    .and_then(|range| editor_text.get(range))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+            .to_owned();
         self.active_line = cursor_position.line + 1;
         let active_column = cursor_position.character + 1;
-        let snippet_has_active_selection = self
-            .snippet_session
-            .as_ref()
-            .is_some_and(|session| session.active_contains(&selected_range));
+        let snippet_has_active_selection =
+            self.snippet_session.as_ref().is_some_and(|session| {
+                snippet_session_contains_selection(session, &selected_range)
+            });
         let snippet_choice_options =
             self.snippet_session.as_ref().and_then(|session| {
-                if !session.active_contains(&selected_range) {
+                if !snippet_session_contains_selection(session, &selected_range) {
                     return None;
                 }
                 let choices = session.active_choices();
@@ -6508,10 +7781,26 @@ impl Render for CodePanel {
         let caret_top = scroll_offset.y + line_height * cursor_position.line as f32;
         let completion_anchor_top = self.completion_caret_top.unwrap_or(caret_top);
         let completion_top = completion_anchor_top + line_height + px(8.);
-        let (completion_menu_top, completion_menu_max_height) =
-            caret_popup_position(completion_anchor_top, line_height, px(320.));
-        let (signature_help_top, signature_help_max_height) =
-            caret_popup_position(completion_anchor_top, line_height, px(150.));
+        let completion_editor_height = self.completion_editor_height;
+        let completion_menu_position = caret_popup_position(
+            completion_anchor_top,
+            completion_editor_height,
+            line_height,
+            px(320.),
+        );
+        let signature_help_position = caret_popup_position(
+            completion_anchor_top,
+            completion_editor_height,
+            line_height,
+            px(150.),
+        );
+        let (
+            completion_menu_top,
+            completion_menu_bottom,
+            completion_menu_max_height,
+        ) = completion_menu_position;
+        let (signature_help_top, signature_help_bottom, signature_help_max_height) =
+            signature_help_position;
         // The first frame uses an estimate; the canvas replaces it with the measured glyph x.
         let fallback_completion_left =
             px(42. + cursor_position.character as f32 * 7.2);
@@ -6521,32 +7810,36 @@ impl Render for CodePanel {
         let completion_available_width = self
             .completion_available_width
             .unwrap_or_else(|| px(completion_anchor_left.as_f32() + 480.));
+        let overlay_origin_offset = px(EDITOR_GUTTER_WIDTH + 4.);
+        let overlay_anchor_left = completion_anchor_left + overlay_origin_offset;
+        let overlay_available_width =
+            completion_available_width + overlay_origin_offset;
         let (signature_help_left, signature_help_width) =
             caret_popup_horizontal_position(
-                completion_anchor_left,
-                completion_available_width,
+                overlay_anchor_left,
+                overlay_available_width,
                 px(520.),
             );
         let (code_actions_left, code_actions_width) =
             caret_popup_horizontal_position(
-                completion_anchor_left,
-                completion_available_width,
+                overlay_anchor_left,
+                overlay_available_width,
                 px(400.),
             );
         let (ghost_text_left, ghost_text_width) = caret_popup_horizontal_position(
-            completion_anchor_left,
-            completion_available_width,
+            overlay_anchor_left,
+            overlay_available_width,
             px(520.),
         );
         let (completion_left, completion_width) = caret_popup_horizontal_position(
-            completion_anchor_left,
-            completion_available_width,
+            overlay_anchor_left,
+            overlay_available_width,
             px(480.),
         );
         let (snippet_choices_left, snippet_choices_width) =
             caret_popup_horizontal_position(
-                completion_anchor_left,
-                completion_available_width,
+                overlay_anchor_left,
+                overlay_available_width,
                 px(260.),
             );
         let completion_editor = self.editor.clone();
@@ -6604,6 +7897,7 @@ impl Render for CodePanel {
             .bg(editor_bg)
             .track_focus(&self.focus)
             .capture_action(cx.listener(|this: &mut Self, action: &Enter, window, cx| {
+                this.cancel_pending_on_type_formatting();
                 if this.pending_rename.is_some() && !action.secondary && !action.shift {
                     this.confirm_symbol_rename(window, cx);
                     cx.stop_propagation();
@@ -6613,6 +7907,8 @@ impl Render for CodePanel {
                 } else if this.show_completions && !action.secondary && !action.shift {
                     this.accept_completion(window, cx);
                     cx.stop_propagation();
+                } else if !action.secondary {
+                    this.schedule_on_type_formatting("\n".into(), window, cx);
                 }
             }))
             .capture_action(cx.listener(|this: &mut Self, _: &NextSnippetTabstop, window, cx| {
@@ -6698,8 +7994,7 @@ impl Render for CodePanel {
                 {
                     this.code_actions_visible = false;
                     this.show_completions = false;
-                    this.ghost_text = None;
-                    this.ghost_offset = None;
+                    this.clear_ghost_prediction();
                     this.signature_help = None;
                     this.snippet_session = None;
                     cx.notify();
@@ -6744,7 +8039,28 @@ impl Render for CodePanel {
             }))
             .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, window, cx| {
                 this.interrupt_speech();
+                this.cancel_pending_on_type_formatting();
+                let modifiers = event.keystroke.modifiers;
+                let trigger_character = event
+                    .keystroke
+                    .key_char
+                    .as_ref()
+                    .filter(|character| {
+                        character.chars().count() == 1
+                            && !character.chars().any(char::is_control)
+                            && !modifiers.platform
+                            && !modifiers.control
+                            && !modifiers.alt
+                    })
+                    .cloned();
                 this.handle_key(event, window, cx);
+                if let Some(trigger_character) = trigger_character {
+                    this.schedule_on_type_formatting(
+                        trigger_character,
+                        window,
+                        cx,
+                    );
+                }
             }))
             // Breadcrumb path navigation bar (matching Zed / VS Code)
             .child(
@@ -6901,6 +8217,9 @@ impl Render for CodePanel {
                         )
                         .child(
                             Button::new("resolve-merge-incoming")
+                                .debug_selector(|| {
+                                    "resolve-merge-incoming".into()
+                                })
                                 .label("Use Incoming")
                                 .disabled(merge_conflict_read_only)
                                 .tooltip("Keep the incoming side and remove the conflict markers")
@@ -7257,24 +8576,29 @@ impl Render for CodePanel {
                                                     .when_some(add_comment_target, |slot, target| slot.child(
                                                         Button::new(("add-comment-marker", ln as usize))
                                                             .debug_selector(move || format!("add-comment-marker-{ln}"))
-                                                            .ghost()
-                                                            .with_size(px(GUTTER_ACTION_WIDTH))
+                                                            .custom(comment_marker_style)
+                                                            .with_size(px(16.))
                                                             .w(px(GUTTER_ACTION_WIDTH))
                                                             .h(line_height)
                                                             .p_0()
-                                                            .rounded(px(3.))
+                                                            .rounded(px(4.))
                                                             .cursor(CursorStyle::PointingHand)
                                                             .child(
                                                                 div()
-                                                                    .size(px(GUTTER_ACTION_WIDTH))
-                                                                    .rounded(px(4.))
-                                                                    .bg(comment_accent.opacity(0.9))
-                                                                    .border_1()
-                                                                    .border_color(comment_accent)
+                                                                    .debug_selector(move || format!("add-comment-marker-icon-{ln}"))
+                                                                    .w_full()
+                                                                    .h_full()
+                                                                    .flex()
                                                                     .items_center()
                                                                     .justify_center()
-                                                                    .text_color(cx.theme().sidebar_foreground)
-                                                                    .child(Icon::new(IconName::MessageSquarePlus).with_size(px(14.))),
+                                                                    .child(
+                                                                        div()
+                                                                            .debug_selector(move || format!("add-comment-marker-glyph-{ln}"))
+                                                                            .child(
+                                                                                gpui_kit::component::Icon::new(IconName::MessageSquarePlus)
+                                                                                    .with_size(px(12.)),
+                                                                            ),
+                                                                    ),
                                                             )
                                                             .accessibility_label("Add comment to selected code")
                                                             .tooltip("Add comment to selected code")
@@ -7322,6 +8646,7 @@ impl Render for CodePanel {
                     // Code Editor & Floating Overlays Container
                     .child(
                         div()
+                            .debug_selector(|| "code-presentation-layer".into())
                             .key_context(tab_action_context)
                             .flex_1()
                             .h_full()
@@ -7439,11 +8764,16 @@ impl Render for CodePanel {
                                     .when(self.git_diff_preview.is_some(), |editor| {
                                         editor.debug_selector(|| "git-diff-projection-editor".into())
                                     })
+                                    .relative()
                                     .flex_1()
                                     .h_full()
                                     .min_h_0()
                                     .child(
                                         Editor::new(&rendered_editor)
+                                            .readonly(
+                                                self.git_diff_preview.is_some()
+                                                    || merge_conflict_read_only,
+                                            )
                                             .aria_label(if self.git_diff_preview.is_some() {
                                                 "AHEAD Git diff preview"
                                             } else {
@@ -7635,10 +8965,13 @@ impl Render for CodePanel {
                                 |el, (presentation, top)| {
                                 el.child(
                                     div()
+                                        .debug_selector(|| "code-presentation-card".into())
                                         .absolute()
                                         .top(top)
-                                        .left(px(8.))
+                                        .right(px(8.))
+                                        .w_full()
                                         .max_w(px(420.))
+                                        .min_w_0()
                                         .p_2()
                                         .bg(popup_bg)
                                         .border_1()
@@ -7646,19 +8979,36 @@ impl Render for CodePanel {
                                         .shadow_lg()
                                         .child(
                                             h_flex()
+                                                .w_full()
                                                 .gap_1()
                                                 .items_center()
+                                                .min_w_0()
                                                 .child(IconName::MessageSquare)
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
                                                         .font_weight(gpui_kit::FontWeight::BOLD)
                                                         .text_size(px(11.))
                                                         .text_color(cx.theme().primary)
                                                         .child(presentation.cue.label),
+                                                )
+                                                .child(
+                                                    Button::new("close_code_presentation")
+                                                        .debug_selector(|| "close-code-presentation".into())
+                                                        .icon(IconName::X)
+                                                        .ghost()
+                                                        .tooltip("Close code presentation")
+                                                        .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                                                            this.clear_presentation(None, cx);
+                                                        })),
                                                 ),
                                         )
                                         .child(
                                             div()
+                                                .min_w_0()
+                                                .w_full()
                                                 .mt_1()
                                                 .text_size(px(11.))
                                                 .text_color(text_color)
@@ -7731,23 +9081,36 @@ impl Render for CodePanel {
                                             (caret.origin.x - bounds.origin.x).as_f32(),
                                             (caret.origin.y - bounds.origin.y).as_f32(),
                                             bounds.size.width.as_f32(),
+                                                    bounds.size.height.as_f32(),
                                         )
                                     })
                                 },
                                 move |_, caret_anchor, _, cx| {
                                     panel.update(cx, |panel, cx| {
-                                        let (caret_left, caret_top, available_width) = caret_anchor
-                                            .map(|(left, top, width)| {
-                                                (Some(px(left)), Some(px(top)), Some(px(width)))
-                                            })
-                                            .unwrap_or((None, None, None));
+                                                let (
+                                                    caret_left,
+                                                    caret_top,
+                                                    available_width,
+                                                    editor_height,
+                                                ) = caret_anchor
+                                                    .map(|(left, top, width, height)| {
+                                                        (
+                                                            Some(px(left)),
+                                                            Some(px(top)),
+                                                            Some(px(width)),
+                                                            Some(px(height)),
+                                                        )
+                                                    })
+                                                    .unwrap_or((None, None, None, None));
                                         if panel.completion_caret_left != caret_left
                                             || panel.completion_caret_top != caret_top
                                             || panel.completion_available_width != available_width
+                                                    || panel.completion_editor_height != editor_height
                                         {
                                             panel.completion_caret_left = caret_left;
                                             panel.completion_caret_top = caret_top;
                                             panel.completion_available_width = available_width;
+                                                    panel.completion_editor_height = editor_height;
                                             cx.notify();
                                         }
                                     });
@@ -7775,7 +9138,10 @@ impl Render for CodePanel {
                                 .id("signature-help")
                                 .debug_selector(|| "signature-help".into())
                                 .absolute()
-                                .top(signature_help_top)
+                                .when_some(signature_help_top, |el, top| el.top(top))
+                                .when_some(signature_help_bottom, |el, bottom| {
+                                    el.bottom(bottom)
+                                })
                                 .left(signature_help_left)
                                 .max_w(signature_help_width)
                                 .max_h(signature_help_max_height)
@@ -8008,11 +9374,19 @@ impl Render for CodePanel {
                         )
                     })
                     // Floating LSP Completion Popup
-                    .when(self.show_completions && self.git_diff_preview.is_none(), |el| {
+                    .when(
+                        self.show_completions
+                            && self.completion_caret_top.is_some()
+                            && self.completion_editor_height.is_some()
+                            && self.git_diff_preview.is_none(),
+                        |el| {
                         el.child(
                             v_flex()
                                 .absolute()
-                                .top(completion_menu_top)
+                                .when_some(completion_menu_top, |el, top| el.top(top))
+                                .when_some(completion_menu_bottom, |el, bottom| {
+                                    el.bottom(bottom)
+                                })
                                 .left(completion_left)
                                 .w(completion_width)
                                 .debug_selector(|| "lsp-completions".into())
@@ -8027,9 +9401,22 @@ impl Render for CodePanel {
                                         .gap_1()
                                         .overflow_y_scrollbar()
                                         .children(
-                                            self.completions.iter().enumerate().map(|(idx, item)| {
+                                            self.completions
+                                                .iter()
+                                                .take(MAX_COMPLETION_SUGGESTIONS)
+                                                .enumerate()
+                                                .map(|(idx, item)| {
                                                 let is_sel = idx == selected_idx;
                                                 let detail = completion_item_detail(&item.item);
+                                                let label = &item.item.label;
+                                                let highlights = completion_match_ranges(
+                                                    label,
+                                                    &completion_query,
+                                                )
+                                                .into_iter()
+                                                .map(|range| {
+                                                    (range, FontWeight::BOLD.into())
+                                                });
                                                 h_flex()
                                                     .w_full()
                                                     .min_w_0()
@@ -8046,7 +9433,10 @@ impl Render for CodePanel {
                                                             .font_weight(if is_sel { gpui_kit::FontWeight::BOLD } else { gpui_kit::FontWeight::NORMAL })
                                                             .text_size(px(12.))
                                                             .text_color(text_color)
-                                                            .child(item.item.label.clone())
+                                                            .child(
+                                                                StyledText::new(label.clone())
+                                                                    .with_highlights(highlights),
+                                                            )
                                                     )
                                                     .when_some(detail, |row, detail| {
                                                         row.child(
@@ -8054,6 +9444,7 @@ impl Render for CodePanel {
                                                                 .debug_selector(move || format!("lsp-completion-detail-{idx}"))
                                                                 .w(completion_width * 0.58)
                                                                 .min_w_0()
+                                                                .truncate()
                                                                 .text_size(px(11.))
                                                                 .font_family("Menlo")
                                                                 .text_color(cx.theme().muted_foreground)
@@ -8074,7 +9465,10 @@ impl Render for CodePanel {
                             el.child(
                                 v_flex()
                                     .absolute()
-                                    .top(completion_menu_top)
+                                    .when_some(completion_menu_top, |el, top| el.top(top))
+                                    .when_some(completion_menu_bottom, |el, bottom| {
+                                        el.bottom(bottom)
+                                    })
                                     .left(snippet_choices_left)
                                     .w(snippet_choices_width)
                                     .debug_selector(|| "lsp-snippet-choices".into())
@@ -8803,6 +10197,80 @@ fn interpolate_insertion(predicted: &str, typed: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn inline_completion_preview(
+    text: &str,
+    position: lsp_types::Position,
+    range: Option<lsp_types::Range>,
+    replacement: &str,
+) -> Option<(String, Option<(std::ops::Range<usize>, String)>)> {
+    let cursor = caret_byte_offset(text, position)?;
+    let Some(range) = range else {
+        if replacement.is_empty() {
+            return None;
+        }
+        let word = text.get(completion_prefix_range(text, position)?)?;
+        if word.ends_with(replacement) {
+            return None;
+        }
+        let insertion = replacement.strip_prefix(word).unwrap_or(replacement);
+        let following = inline_identifier_suffix(text, cursor)?;
+        let overlap = inline_completion_suffix_overlap(insertion, following);
+        let preview = insertion.get(..insertion.len().checked_sub(overlap)?)?;
+        return (!preview.is_empty()).then(|| (preview.to_owned(), None));
+    };
+    if range.start.line != position.line
+        || range.end.line != position.line
+        || range.start.character > position.character
+        || range.end.character < position.character
+    {
+        return None;
+    }
+    let start = caret_byte_offset(text, range.start)?;
+    let end = caret_byte_offset(text, range.end)?;
+    let existing_prefix = text.get(start..cursor)?;
+    let following = inline_identifier_suffix(text, end)?;
+    let overlap = inline_completion_suffix_overlap(replacement, following);
+    let replacement = replacement.get(..replacement.len().checked_sub(overlap)?)?;
+    let preview = replacement.strip_prefix(existing_prefix)?;
+    let word = text.get(completion_prefix_range(text, position)?)?;
+    if word.ends_with(preview) {
+        return None;
+    }
+    (!preview.is_empty()).then(|| {
+        (
+            preview.to_owned(),
+            Some((start..end, replacement.to_owned())),
+        )
+    })
+}
+
+fn inline_identifier_suffix(text: &str, offset: usize) -> Option<&str> {
+    let suffix = text.get(offset..)?;
+    let end = suffix
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_alphanumeric() && !matches!(character, '_' | '$'))
+                .then_some(index)
+        })
+        .unwrap_or(suffix.len());
+    suffix.get(..end)
+}
+
+fn inline_completion_suffix_overlap(replacement: &str, following: &str) -> usize {
+    following
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(following.len()))
+        .rev()
+        .find(|&length| {
+            length > 0
+                && following
+                    .get(..length)
+                    .is_some_and(|prefix| replacement.ends_with(prefix))
+        })
+        .unwrap_or(0)
+}
+
 fn agent_anchor_lines(
     anchors: &[ahead_rpc::ahead::CodeAnchor],
 ) -> std::collections::HashSet<u32> {
@@ -8824,21 +10292,28 @@ fn presentation_gutter_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        CodePanel, EDITOR_GUTTER_WIDTH, GIT_GUTTER_TRACK_WIDTH,
-        GIT_METADATA_REFRESH_DEBOUNCE, GUTTER_ACTION_WIDTH, MergeConflictChoice,
-        NULL_COMPLETION_RETRY_DELAY, SEMANTIC_TOKEN_DEBOUNCE, agent_anchor_lines,
+        CodePanel, CompletionCache, EDITOR_GUTTER_WIDTH, GIT_GUTTER_TRACK_WIDTH,
+        GIT_METADATA_REFRESH_DEBOUNCE, GUTTER_ACTION_WIDTH,
+        LOCAL_COMPLETION_PREVIEW_DELAY, LOCAL_COMPLETION_SEARCH_ROWS,
+        MAX_COMPLETION_SUGGESTIONS, MERGE_CONFLICT_REFRESH_DEBOUNCE,
+        MergeConflictChoice, NULL_COMPLETION_RETRY_DELAY, Rope,
+        SEMANTIC_TOKEN_DEBOUNCE, adapt_cached_completion_item, agent_anchor_lines,
         blame_label, caret_byte_offset, caret_popup_horizontal_position,
-        caret_popup_position, completion_edit, completion_edit_with_variables,
-        completion_item_detail, completion_prefix_range, current_comment_range,
+        caret_popup_position, completion_cache_matches, completion_edit,
+        completion_edit_with_variables, completion_item_detail,
+        completion_match_ranges, completion_prefix_range, current_comment_range,
         definition_open_request, editor_language, extension_syntax_decorations,
-        formatting_edit, git_hunk_preview_text, git_hunk_projection,
-        has_unclosed_parenthesis_before_cursor, interpolate_insertion,
-        is_markdown_path, is_shared_draft_path, line_start_offset,
-        location_byte_position, lsp_snippet, merge_conflict_choice_text,
-        monospace_probe_range, parse_merge_conflicts, presentation_gutter_line,
-        rank_completions, read_renamed_workspace_file, rename_placeholder,
-        renamed_path_for_open_file, semantic_text_decorations, semantic_token_scope,
-        shared_draft_file_path, shared_draft_path, signature_help_view,
+        extension_syntax_style, formatting_edit, git_hunk_preview_text,
+        git_hunk_projection, has_unclosed_parenthesis_before_cursor,
+        inline_completion_preview, interpolate_insertion, is_markdown_path,
+        is_shared_draft_path, line_start_offset, local_word_completions,
+        location_byte_position, lsp_cursor_position, lsp_snippet,
+        merge_conflict_choice_text, monospace_probe_range, parse_merge_conflicts,
+        presentation_gutter_line, preserve_original_completion_fields,
+        rank_completions, rank_completions_with_local_words,
+        read_renamed_workspace_file, rename_placeholder, renamed_path_for_open_file,
+        semantic_text_decorations, semantic_token_scope, shared_draft_file_path,
+        shared_draft_path, signature_help_view,
     };
     use crate::proxy_client::{LspCodeAction, LspCompletion};
     use crate::ross::{OpenColumn, OpenLocation};
@@ -8846,6 +10321,7 @@ mod tests {
     use ahead_rpc::source_control::{DiffHunk, DiffHunkKind};
     use ahead_rpc::style::{LineStyle, Style};
     use gpui_kit::component::input::Undo;
+    use gpui_kit::test::TestWindowExt;
     use gpui_kit::{Focusable, VisualContext};
     use sha2::Digest;
 
@@ -8888,10 +10364,7 @@ mod tests {
             &destination,
         )
         .expect("read renamed workspace file");
-        assert_eq!(
-            canonical_path,
-            destination.canonicalize().expect("canonical path")
-        );
+        assert_eq!(canonical_path, destination);
         assert_eq!(text, "fn main() {}\n");
 
         let outside = tempfile::tempdir().expect("outside directory");
@@ -8902,6 +10375,26 @@ mod tests {
             read_renamed_workspace_file(
                 workspace.path().to_str().expect("workspace path"),
                 &outside_file,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_workspace_file_rejects_symlink_escape() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let outside_file = outside.path().join("external.rs");
+        std::fs::write(&outside_file, "outside workspace")
+            .expect("write outside file");
+        let link = workspace.path().join("linked.rs");
+        std::os::unix::fs::symlink(&outside_file, &link).expect("link outside file");
+
+        assert!(
+            read_renamed_workspace_file(
+                workspace.path().to_str().expect("workspace path"),
+                &link,
             )
             .is_err()
         );
@@ -8919,36 +10412,44 @@ mod tests {
 
     #[test]
     fn caret_popups_prefer_space_above_and_fall_below_at_the_top() {
-        let (top, height) = caret_popup_position(
+        let (top, bottom, height) = caret_popup_position(
             gpui_kit::px(220.),
+            Some(gpui_kit::px(800.)),
             gpui_kit::px(18.),
             gpui_kit::px(320.),
         );
-        assert_eq!(top.as_f32(), 0.);
+        assert_eq!(top, None);
+        assert_eq!(bottom.expect("bottom anchored").as_f32(), 588.);
         assert_eq!(height.as_f32(), 212.);
 
-        let (top, height) = caret_popup_position(
+        let (top, bottom, height) = caret_popup_position(
             gpui_kit::px(600.),
+            Some(gpui_kit::px(800.)),
             gpui_kit::px(18.),
             gpui_kit::px(320.),
         );
-        assert_eq!(top.as_f32(), 272.);
+        assert_eq!(top, None);
+        assert_eq!(bottom.expect("bottom anchored").as_f32(), 208.);
         assert_eq!(height.as_f32(), 320.);
 
-        let (top, height) = caret_popup_position(
+        let (top, bottom, height) = caret_popup_position(
             gpui_kit::px(16.),
+            Some(gpui_kit::px(800.)),
             gpui_kit::px(18.),
             gpui_kit::px(320.),
         );
-        assert_eq!(top.as_f32(), 42.);
+        assert_eq!(top.expect("top anchored").as_f32(), 42.);
+        assert_eq!(bottom, None);
         assert_eq!(height.as_f32(), 320.);
 
-        let (top, height) = caret_popup_position(
+        let (top, bottom, height) = caret_popup_position(
             gpui_kit::px(220.),
+            Some(gpui_kit::px(800.)),
             gpui_kit::px(18.),
             gpui_kit::px(150.),
         );
-        assert_eq!(top.as_f32(), 62.);
+        assert_eq!(top, None);
+        assert_eq!(bottom.expect("bottom anchored").as_f32(), 588.);
         assert_eq!(height.as_f32(), 150.);
     }
 
@@ -8967,7 +10468,7 @@ mod tests {
             gpui_kit::px(300.),
             gpui_kit::px(480.),
         );
-        assert_eq!(left.as_f32(), 10.);
+        assert_eq!(left.as_f32(), 0.);
         assert_eq!(width.as_f32(), 300.);
 
         let (left, width) = caret_popup_horizontal_position(
@@ -8991,7 +10492,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_detail_includes_signature_and_label_context() {
+    fn completion_detail_prefers_compact_typed_signatures() {
         let item = lsp_types::CompletionItem {
             label: "_config_traces_dir".into(),
             detail: Some("def _config_traces_dir() -> Path | None".into()),
@@ -9004,9 +10505,7 @@ mod tests {
 
         assert_eq!(
             completion_item_detail(&item).as_deref(),
-            Some(
-                "def _config_traces_dir() -> Path | None · function · internal_utils.config"
-            )
+            Some("def _config_traces_dir() -> Path | None")
         );
 
         let python_completion = lsp_types::CompletionItem {
@@ -9023,6 +10522,22 @@ mod tests {
             completion_item_detail(&python_completion).as_deref(),
             Some("def double(value: int) -> int")
         );
+
+        let prose_detail = lsp_types::CompletionItem {
+            label: "cancelIdleCallback".into(),
+            detail: Some("function cancelIdleCallback(handle: number): void".into()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                description: Some(
+                    "[MDN Reference](https://example.test/docs)".into(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_item_detail(&prose_detail).as_deref(),
+            Some("function cancelIdleCallback(handle: number): void")
+        );
     }
 
     #[test]
@@ -9030,20 +10545,40 @@ mod tests {
         use lsp_types::Position;
 
         assert!(has_unclosed_parenthesis_before_cursor(
-            "run(value",
+            &ropey::Rope::from_str("run(value"),
             Position::new(0, 9)
         ));
         assert!(has_unclosed_parenthesis_before_cursor(
-            "run(first, second",
+            &ropey::Rope::from_str("run(first, second"),
             Position::new(0, 17)
         ));
         assert!(!has_unclosed_parenthesis_before_cursor(
-            "run(value)",
+            &ropey::Rope::from_str("run(value)"),
             Position::new(0, 10)
         ));
         assert!(!has_unclosed_parenthesis_before_cursor(
-            "value",
+            &ropey::Rope::from_str("value"),
             Position::new(0, 5)
+        ));
+        assert!(has_unclosed_parenthesis_before_cursor(
+            &ropey::Rope::from_str("call(\n  café"),
+            Position::new(1, 6)
+        ));
+        assert!(!has_unclosed_parenthesis_before_cursor(
+            &ropey::Rope::from_str("call(\n  🦀"),
+            Position::new(1, 3)
+        ));
+        assert!(!has_unclosed_parenthesis_before_cursor(
+            &ropey::Rope::from_str("call(\r\nnext"),
+            Position::new(0, 6)
+        ));
+        assert!(has_unclosed_parenthesis_before_cursor(
+            &ropey::Rope::from_str("outer(inner(value), next"),
+            Position::new(0, 24)
+        ));
+        assert!(!has_unclosed_parenthesis_before_cursor(
+            &ropey::Rope::from_str("outer(inner(value))"),
+            Position::new(0, 19)
         ));
     }
 
@@ -9051,6 +10586,8 @@ mod tests {
     fn lsp_completion_popup_renders_above_the_caret_when_there_is_room(
         cx: &mut gpui_kit::TestAppContext,
     ) {
+        use gpui_kit::test::TestWindowExt;
+
         cx.update(gpui_kit::component::init);
         let directory = tempfile::tempdir().expect("disposable workspace");
         let path = directory.path().join("main.rs");
@@ -9102,6 +10639,9 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
 
         let popup = cx
             .debug_bounds("lsp-completions")
@@ -9112,8 +10652,12 @@ mod tests {
         assert!(popup.size.width >= gpui_kit::px(480.));
         assert!(detail.size.width > gpui_kit::px(100.));
         assert!(
-            detail.size.height > gpui_kit::px(14.),
-            "long completion signatures should wrap instead of being truncated: {detail:?}"
+            detail.size.height <= gpui_kit::px(20.),
+            "completion signatures should stay on one row: {detail:?}"
+        );
+        assert!(
+            popup.size.height <= gpui_kit::px(180.),
+            "completion popup should stay compact with at most five rows: {popup:?}"
         );
         let caret = panel.update(cx, |panel, cx| {
             let editor = panel.editor.read(cx);
@@ -9131,18 +10675,23 @@ mod tests {
                 )
             });
         assert!(
-            popup.bottom() < caret.origin.y,
-            "completion popup {popup:?} must end above caret {caret:?}; measured top {measured_caret_top:?}"
+            (caret.origin.y - popup.bottom() - gpui_kit::px(8.))
+                .as_f32()
+                .abs()
+                < 0.5,
+            "completion popup {popup:?} should sit 8px above caret {caret:?}; measured top {measured_caret_top:?}"
         );
         assert!(
             popup.size.width <= available_width.expect("editor width measured"),
             "completion popup {popup:?} must fit the editor width"
         );
         let caret_left = measured_caret_left.expect("caret x measured");
+        let overlay_origin_offset = gpui_kit::px(EDITOR_GUTTER_WIDTH + 4.);
         let expected_popup_left = caret.origin.x - caret_left
             + caret_popup_horizontal_position(
-                caret_left,
-                available_width.expect("editor width measured"),
+                caret_left + overlay_origin_offset,
+                available_width.expect("editor width measured")
+                    + overlay_origin_offset,
                 gpui_kit::px(480.),
             )
             .0;
@@ -9230,6 +10779,7 @@ mod tests {
             _ => panic!("unexpected proxy request kind"),
         };
         let mut resolved_item = first_item;
+        resolved_item.label = "resolved completion label".into();
         resolved_item.detail = Some("def double(value: int) -> int".into());
         rpc.handle_response(
             first_request,
@@ -9238,6 +10788,10 @@ mod tests {
             }),
         );
         cx.run_until_parked();
+        assert_eq!(
+            panel.update(cx, |panel, _| panel.completions[0].item.label.clone()),
+            "double"
+        );
         assert_eq!(
             panel.update(cx, |panel, _| {
                 completion_item_detail(&panel.completions[0].item)
@@ -9248,8 +10802,6 @@ mod tests {
         panel.update(cx, |panel, cx| panel.select_completion(1, cx));
         stale_item.detail = Some("def triple(value: int) -> int".into());
         panel.update(cx, |panel, cx| {
-            panel.completion_request_id =
-                panel.completion_request_id.wrapping_add(1);
             panel.completions = vec![LspCompletion {
                 plugin_id: PluginId(1),
                 item: lsp_types::CompletionItem {
@@ -9258,7 +10810,7 @@ mod tests {
                 },
             }];
             panel.completion_details_requested.clear();
-            panel.completion_context = Some(panel.current_completion_context(cx));
+            cx.notify();
         });
         rpc.handle_response(
             stale_request,
@@ -9356,7 +10908,9 @@ mod tests {
             available_width,
             gpui_kit::px(520.),
         );
-        let expected_left = caret.origin.x - caret_left + expected_offset;
+        let expected_left = caret.origin.x - caret_left
+            + gpui_kit::px(EDITOR_GUTTER_WIDTH + 4.)
+            + expected_offset;
         assert!(
             popup.size.width <= max_width,
             "signature popup {popup:?} must fit the measured editor width {available_width:?}"
@@ -9366,8 +10920,11 @@ mod tests {
             "signature popup {popup:?} should use the measured caret anchor {caret:?}"
         );
         assert!(
-            popup.bottom() < caret.origin.y,
-            "signature popup {popup:?} must end above caret {caret:?}"
+            (caret.origin.y - popup.bottom() - gpui_kit::px(8.))
+                .as_f32()
+                .abs()
+                < 0.5,
+            "signature popup {popup:?} should sit 8px above caret {caret:?}"
         );
         assert!(parameter_documentation.size.width > gpui_kit::px(0.));
     }
@@ -9435,6 +10992,38 @@ mod tests {
     }
 
     #[test]
+    fn extension_syntax_uses_zeds_longest_theme_prefix() {
+        let mut resolved_scopes = Vec::new();
+        let style =
+            extension_syntax_style("custom.framework.attribute.extra", |scope| {
+                resolved_scopes.push(scope.to_string());
+                (scope == "custom.framework.attribute")
+                    .then_some(gpui_kit::HighlightStyle::default())
+            });
+        assert!(style.is_some());
+        assert_eq!(
+            resolved_scopes,
+            vec![
+                "custom.framework.attribute.extra".to_string(),
+                "custom.framework.attribute".to_string(),
+            ]
+        );
+
+        let mut resolved_scopes = Vec::new();
+        let style = extension_syntax_style("variable.specialized", |scope| {
+            resolved_scopes.push(scope.to_string());
+            (scope == "variable").then_some(gpui_kit::HighlightStyle::default())
+        });
+        assert!(style.is_some());
+        assert_eq!(
+            resolved_scopes,
+            vec!["variable.specialized".to_string(), "variable".to_string()]
+        );
+
+        assert!(extension_syntax_style("unknown.scope", |_| None).is_none());
+    }
+
+    #[test]
     fn extension_syntax_keeps_utf8_ranges_and_capture_scopes() {
         let text = "fn café\n";
         let captures = [
@@ -9471,6 +11060,115 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn extension_syntax_skips_pathless_panels(cx: &mut gpui_kit::TestAppContext) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let path = workspace.path().join("page.html");
+        std::fs::write(&path, "<div></div>\n").expect("source file");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let view_path = path.to_string_lossy().into_owned();
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(&view_path, window, cx).with_proxy(
+                proxy.clone(),
+                &workspace_path,
+                window,
+                cx,
+            )
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.file_path.clear();
+            panel.schedule_extension_syntax(cx);
+        });
+        cx.background_executor
+            .advance_clock(SEMANTIC_TOKEN_DEBOUNCE);
+        cx.run_until_parked();
+
+        assert!(
+            rpc.rx().try_iter().all(|message| !matches!(
+                message,
+                ProxyRpc::Request(_, ProxyRequest::GetExtensionSyntax { .. })
+            )),
+            "pathless panels must not request extension syntax"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn proxy_diagnostics_are_applied_to_editor_ranges(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::core::CoreNotification;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("main.ts");
+        std::fs::write(&path, "const value = 1;\n").expect("source file");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_owned(),
+        );
+        let view_path = path.to_string_lossy().into_owned();
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(&view_path, window, cx).with_proxy(
+                proxy.clone(),
+                &workspace_path,
+                window,
+                cx,
+            )
+        });
+
+        let mut diagnostic = lsp_types::Diagnostic::default();
+        diagnostic.range = lsp_types::Range::new(
+            lsp_types::Position::new(0, 6),
+            lsp_types::Position::new(0, 11),
+        );
+        diagnostic.severity = Some(lsp_types::DiagnosticSeverity::ERROR);
+        diagnostic.message = "type mismatch".into();
+        proxy.route_core(CoreNotification::PublishDiagnostics {
+            diagnostics: lsp_types::PublishDiagnosticsParams {
+                uri: lsp_types::Url::from_file_path(&path).expect("file URL"),
+                diagnostics: vec![diagnostic],
+                version: None,
+            },
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            let editor = panel.editor.read(cx);
+            let diagnostic = editor
+                .diagnostics()
+                .and_then(|diagnostics| diagnostics.iter().next())
+                .expect("LSP diagnostic should reach the editor");
+            assert_eq!(diagnostic.message.as_ref(), "type mismatch");
+            assert_eq!(diagnostic.range, 6..11);
+        });
+
+        proxy.route_core(CoreNotification::PublishDiagnostics {
+            diagnostics: lsp_types::PublishDiagnosticsParams {
+                uri: lsp_types::Url::from_file_path(&path).expect("file URL"),
+                diagnostics: Vec::new(),
+                version: None,
+            },
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel
+                    .editor
+                    .read(cx)
+                    .diagnostics()
+                    .is_none_or(|diagnostics| diagnostics.is_empty())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     fn extension_syntax_applies_only_the_current_proxy_response(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -9498,6 +11196,17 @@ mod tests {
         });
 
         cx.run_until_parked();
+        panel.update(cx, |panel, _| panel.invalidate_editor_requests());
+        cx.background_executor
+            .advance_clock(SEMANTIC_TOKEN_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(
+            rpc.rx().try_iter().all(|message| !matches!(
+                message,
+                ProxyRpc::Request(_, ProxyRequest::GetExtensionSyntax { .. })
+            )),
+            "a stale generation must be rescheduled before requesting syntax"
+        );
         cx.background_executor
             .advance_clock(SEMANTIC_TOKEN_DEBOUNCE);
         cx.run_until_parked();
@@ -9526,6 +11235,7 @@ mod tests {
                     rev: 1,
                     path: path.clone(),
                     len: original.len(),
+                    language_name: Some("HTML".into()),
                     captures: vec![ahead_rpc::style::SyntaxCapture {
                         start: 1,
                         end: 4,
@@ -9544,6 +11254,7 @@ mod tests {
                 panel.extension_syntax_decorations.get_ranges(cx).is_empty(),
                 "a response for pre-edit text must not decorate the new buffer"
             );
+            assert_eq!(panel.status_language_name(cx), "text");
             assert!(panel.extension_comment_variables.is_none());
         });
 
@@ -9568,6 +11279,7 @@ mod tests {
                     rev: 2,
                     path: path.clone(),
                     len: edited.len(),
+                    language_name: Some("HTML".into()),
                     captures: vec![ahead_rpc::style::SyntaxCapture {
                         start: 1,
                         end: 8,
@@ -9582,6 +11294,7 @@ mod tests {
         );
         cx.run_until_parked();
         panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.status_language_name(cx), "HTML");
             assert_eq!(
                 panel
                     .extension_syntax_decorations
@@ -9627,6 +11340,7 @@ mod tests {
                     rev: 2,
                     path: path.clone(),
                     len: edited.len(),
+                    language_name: Some("HTML".into()),
                     captures: vec![ahead_rpc::style::SyntaxCapture {
                         start: 0,
                         end: 9,
@@ -9638,6 +11352,7 @@ mod tests {
         );
         cx.run_until_parked();
         panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.status_language_name(cx), "HTML");
             assert_eq!(
                 panel
                     .extension_syntax_decorations
@@ -9650,6 +11365,543 @@ mod tests {
             );
         });
         std::fs::remove_file(path).expect("remove disposable source");
+    }
+
+    #[gpui_kit::test]
+    fn ranged_inline_completion_does_not_append_a_duplicate_suffix(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        proxy.sync_editor_snapshot(path.clone(), source.into());
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy);
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.request_proxy_inline(cx);
+        });
+        let ProxyRpc::Request(id, ProxyRequest::GetInlineCompletions { .. }) = rpc
+            .rx()
+            .try_iter()
+            .find(|message| {
+                matches!(
+                    message,
+                    ProxyRpc::Request(_, ProxyRequest::GetInlineCompletions { .. })
+                )
+            })
+            .expect("inline completion request")
+        else {
+            panic!("inline completion request")
+        };
+        let cursor =
+            lsp_types::Position::new(0, source.encode_utf16().count() as u32);
+        let start = source.rfind("extend").expect("typed prefix");
+        rpc.handle_response(
+            id,
+            Ok(ProxyResponse::GetInlineCompletions {
+                prediction: None,
+                completions: lsp_types::InlineCompletionResponse::Array(vec![
+                    lsp_types::InlineCompletionItem {
+                        insert_text: "extends".into(),
+                        filter_text: None,
+                        range: Some(lsp_types::Range::new(
+                            lsp_types::Position::new(0, start as u32),
+                            cursor,
+                        )),
+                        command: None,
+                        insert_text_format: None,
+                    },
+                ]),
+                context_paths: Vec::new(),
+            }),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.ghost_text.clone()),
+            Some("s".into())
+        );
+        panel.update_in(cx, |panel, window, cx| {
+            panel.accept_ghost_text(window, cx);
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, cx| panel
+                .editor
+                .read(cx)
+                .value()
+                .to_string()),
+            "interface Super extends"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn lsp_completion_popup_clears_inline_ghost_text(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "interface Super extends").expect("source");
+        let path = path.to_string_lossy().into_owned();
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| CodePanel::new(&path, window, cx));
+
+        panel.update(cx, |panel, cx| {
+            panel.ghost_text = Some("tends".into());
+            panel.ghost_offset = Some("interface Super extends".len());
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.show_completions);
+            assert!(panel.ghost_text.is_none());
+            assert!(panel.ghost_replacement.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn accepting_lsp_completion_does_not_append_a_late_inline_suffix(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let path = path.to_string_lossy().into_owned();
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| CodePanel::new(&path, window, cx));
+        let start = source.rfind("extend").expect("typed prefix") as u32;
+        let cursor = source.len() as u32;
+
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                            lsp_types::TextEdit {
+                                range: lsp_types::Range::new(
+                                    lsp_types::Position::new(0, start),
+                                    lsp_types::Position::new(0, cursor),
+                                ),
+                                new_text: "extends".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+            // Reproduce an in-flight inline response that arrived after the
+            // completion popup opened.
+            panel.ghost_text = Some("tends".into());
+            panel.ghost_offset = Some(source.len());
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.accept_completion(window, cx);
+        });
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editor.read(cx).value().to_string(),
+                "interface Super extends"
+            );
+            assert!(panel.ghost_text.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn ghost_acceptance_prefers_a_visible_lsp_completion(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let path = path.to_string_lossy().into_owned();
+        let (panel, cx) =
+            cx.add_window_view(|window, cx| CodePanel::new(&path, window, cx));
+        let start = source.rfind("extend").expect("typed prefix") as u32;
+        let end = source.len() as u32;
+
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.set_code_comments(Some("active-session".into()), Vec::new(), cx);
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                            lsp_types::TextEdit {
+                                range: lsp_types::Range::new(
+                                    lsp_types::Position::new(0, start),
+                                    lsp_types::Position::new(0, end),
+                                ),
+                                new_text: "extends".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+            panel.ghost_text = Some("tends".into());
+            panel.ghost_offset = Some(source.len());
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.accept_ghost_text(window, cx);
+        });
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editor.read(cx).value().to_string(),
+                "interface Super extends"
+            );
+            assert!(panel.ghost_text.is_none());
+            assert!(!panel.show_completions);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tab_does_not_append_an_inline_suffix_already_present_in_the_word(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::NextSnippetTabstop;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "tab",
+                NextSnippetTabstop,
+                Some("(AHEADCodeEditor && tab_action == true) > Input"),
+            )]);
+        });
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extends";
+        std::fs::write(&path, source).expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.ghost_text = Some("tends".into());
+            panel.ghost_offset = Some(source.len());
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+
+        cx.simulate_keystrokes("tab");
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value().to_string(), source);
+            assert!(panel.ghost_text.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tab_accepts_lsp_completion_once_when_inline_suffix_is_stale(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::NextSnippetTabstop;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "tab",
+                NextSnippetTabstop,
+                Some("(AHEADCodeEditor && tab_action == true) > Input"),
+            )]);
+        });
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let start = source.rfind("extend").expect("typed prefix") as u32;
+        let end = source.len() as u32;
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                            lsp_types::TextEdit {
+                                range: lsp_types::Range::new(
+                                    lsp_types::Position::new(0, start),
+                                    lsp_types::Position::new(0, end),
+                                ),
+                                new_text: "extends".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+            // Simulate a prediction reply racing with an already-open popup.
+            panel.ghost_text = Some("tends".into());
+            panel.ghost_offset = Some(source.len());
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+
+        cx.simulate_keystrokes("tab");
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editor.read(cx).value().to_string(),
+                "interface Super extends"
+            );
+            assert!(panel.ghost_text.is_none());
+            assert!(!panel.show_completions);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tab_does_not_append_an_lsp_suffix_when_the_label_is_already_typed(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::NextSnippetTabstop;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new(
+                "tab",
+                NextSnippetTabstop,
+                Some("(AHEADCodeEditor && tab_action == true) > Input"),
+            )]);
+        });
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extends";
+        std::fs::write(&path, source).expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let cursor = source.encode_utf16().count() as u32;
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                            lsp_types::TextEdit {
+                                range: lsp_types::Range::new(
+                                    lsp_types::Position::new(0, cursor),
+                                    lsp_types::Position::new(0, cursor),
+                                ),
+                                new_text: "tends".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+
+        cx.simulate_keystrokes("tab");
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value().to_string(), source);
+            assert!(!panel.show_completions);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inline_reply_during_lsp_resolution_cannot_restore_ghost_suffix(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy);
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx)
+            });
+            panel.request_proxy_inline(cx);
+        });
+        let inline_request = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Request(id, ProxyRequest::GetInlineCompletions { .. }) => {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("in-flight inline request");
+        // Keep the response task alive after the popup cancels it, reproducing
+        // a reply that was already queued when Tab accepted the LSP item.
+        let _in_flight_inline_task = panel.update(cx, |panel, _| {
+            panel
+                .inline_prediction_task
+                .take()
+                .expect("inline response task")
+        });
+
+        let start = source.rfind("extend").expect("typed prefix") as u32;
+        let end = source.len() as u32;
+        panel.update(cx, |panel, cx| {
+            panel.set_completion_items(
+                vec![LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: "extends".into(),
+                        detail: Some("keyword".into()),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                            lsp_types::TextEdit {
+                                range: lsp_types::Range::new(
+                                    lsp_types::Position::new(0, start),
+                                    lsp_types::Position::new(0, end),
+                                ),
+                                new_text: "extends".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                }],
+                "Completions from proxy",
+                cx,
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.accept_completion(window, cx);
+        });
+        let resolve_request = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Request(id, ProxyRequest::CompletionResolve { .. }) => {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("completion resolve while Tab acceptance is pending");
+
+        rpc.handle_response(
+            inline_request,
+            Ok(ProxyResponse::GetInlineCompletions {
+                prediction: None,
+                completions: lsp_types::InlineCompletionResponse::Array(vec![
+                    lsp_types::InlineCompletionItem {
+                        insert_text: "tends".into(),
+                        filter_text: None,
+                        range: None,
+                        command: None,
+                        insert_text_format: None,
+                    },
+                ]),
+                context_paths: Vec::new(),
+            }),
+        );
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.ghost_text.is_none()),
+            "the delayed FIM reply must not reappear while the LSP item resolves"
+        );
+
+        rpc.handle_response(
+            resolve_request,
+            Ok(ProxyResponse::CompletionResolveResponse {
+                item: Box::new(lsp_types::CompletionItem {
+                    label: "extends".into(),
+                    text_edit: Some(lsp_types::CompletionTextEdit::Edit(
+                        lsp_types::TextEdit {
+                            range: lsp_types::Range::new(
+                                lsp_types::Position::new(0, start),
+                                lsp_types::Position::new(0, end),
+                            ),
+                            new_text: "extends".into(),
+                        },
+                    )),
+                    ..Default::default()
+                }),
+            }),
+        );
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editor.read(cx).value().to_string(),
+                "interface Super extends"
+            );
+            assert!(panel.ghost_text.is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -11126,7 +13378,7 @@ mod tests {
     }
 
     #[test]
-    fn completions_fuzzy_rank_before_five_item_limit_and_honor_server_sort_keys() {
+    fn completions_fuzzy_rank_top_five_and_honor_server_sort_keys() {
         let mut items: Vec<_> = (0..30)
             .map(|index| lsp_types::CompletionItem {
                 label: format!("unrelated_{index}"),
@@ -11158,16 +13410,14 @@ mod tests {
             sort_text: Some(format!("{index:02}")),
             ..Default::default()
         }));
-        let matches = rank_completions(
-            items
-                .into_iter()
-                .map(|item| LspCompletion {
-                    plugin_id: PluginId(7),
-                    item,
-                })
-                .collect(),
-            "dou",
-        );
+        let completions = items
+            .into_iter()
+            .map(|item| LspCompletion {
+                plugin_id: PluginId(7),
+                item,
+            })
+            .collect::<Vec<_>>();
+        let matches = rank_completions(&completions, "dou");
         assert_eq!(
             matches
                 .iter()
@@ -11181,9 +13431,29 @@ mod tests {
                 "candidate_5",
             ]
         );
-        assert_eq!(matches.len(), 5);
-        assert!(!matches.iter().any(|item| item.item.label == "d_o_u"));
-        assert!(rank_completions(matches, "not_a_match").is_empty());
+        assert_eq!(matches.len(), MAX_COMPLETION_SUGGESTIONS);
+        assert!(rank_completions(&matches, "not_a_match").is_empty());
+
+        let tied = (0..8)
+            .map(|index| LspCompletion {
+                plugin_id: PluginId(7),
+                item: lsp_types::CompletionItem {
+                    label: "same".into(),
+                    filter_text: Some("same".into()),
+                    sort_text: Some("same".into()),
+                    detail: Some(index.to_string()),
+                    ..Default::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rank_completions(&tied, "same")
+                .iter()
+                .map(|item| item.item.detail.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("0"), Some("1"), Some("2"), Some("3"), Some("4")]
+        );
+
         let text = "α🙂 object.$dou";
         let position =
             lsp_types::Position::new(0, text.encode_utf16().count() as u32);
@@ -11191,6 +13461,403 @@ mod tests {
             text.get(completion_prefix_range(text, position).expect("prefix")),
             Some("$dou")
         );
+    }
+
+    #[test]
+    fn local_words_complete_a_name_missing_from_lsp_results() {
+        let source = Rope::from(
+            "export interface Calculation { input: number }\nextends Calcu\n",
+        );
+        let lsp_items = vec![LspCompletion {
+            plugin_id: PluginId(7),
+            item: lsp_types::CompletionItem {
+                label: "Calendar".into(),
+                ..Default::default()
+            },
+        }];
+        let ranked = rank_completions_with_local_words(
+            &lsp_items,
+            "Calcu",
+            &source,
+            lsp_types::Position::new(1, 13),
+        );
+        assert_eq!(ranked[0].item.label, "Calculation");
+        assert_eq!(ranked[0].plugin_id, PluginId(0));
+        assert_eq!(ranked[0].item.detail.as_deref(), Some("Current file"));
+
+        let existing = vec![LspCompletion {
+            plugin_id: PluginId(7),
+            item: lsp_types::CompletionItem {
+                label: "Calculation".into(),
+                ..Default::default()
+            },
+        }];
+        assert_eq!(
+            rank_completions_with_local_words(
+                &existing,
+                "Calcu",
+                &source,
+                lsp_types::Position::new(1, 13),
+            )
+            .iter()
+            .filter(|completion| completion.item.label == "Calculation")
+            .count(),
+            1
+        );
+
+        let large_source = Rope::from(format!(
+            "{}\nCalculation\nCalcu\n",
+            "unused ".repeat(90_000)
+        ));
+        let nearby = rank_completions_with_local_words(
+            &[],
+            "Calcu",
+            &large_source,
+            lsp_types::Position::new(2, 5),
+        );
+        assert_eq!(nearby[0].item.label, "Calculation");
+    }
+
+    #[test]
+    fn local_word_completion_search_stays_near_the_caret() {
+        let mut lines = vec![String::new(); LOCAL_COMPLETION_SEARCH_ROWS * 2 + 3];
+        lines[0] = "CandidateFar".into();
+        lines[LOCAL_COMPLETION_SEARCH_ROWS] = "CandidateNear".into();
+        lines[LOCAL_COMPLETION_SEARCH_ROWS + 1] = "Candidate".into();
+        let source = Rope::from(lines.join("\n"));
+
+        let completions = local_word_completions(
+            &source,
+            "Candidate",
+            &[],
+            lsp_types::Position::new((LOCAL_COMPLETION_SEARCH_ROWS + 1) as u32, 9),
+        );
+        let labels = completions
+            .iter()
+            .map(|completion| completion.item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"CandidateNear"));
+        assert!(!labels.contains(&"CandidateFar"));
+    }
+
+    #[gpui_kit::test]
+    fn local_word_completion_applies_without_server_resolve(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "Calcu\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proxy = Some(proxy);
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(5..5, cx);
+            });
+            panel.completions = rank_completions_with_local_words(
+                &[],
+                "Calcu",
+                &Rope::from("Calculation\nCalcu\n"),
+                lsp_types::Position::new(1, 5),
+            );
+            panel.completion_context = Some(panel.current_completion_context(cx));
+            panel.show_completions = true;
+            panel.accept_completion(window, cx);
+        });
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "Calculation\n"
+        );
+        assert!(!rpc.rx().try_iter().any(|message| matches!(
+            message,
+            ProxyRpc::Request(_, ProxyRequest::CompletionResolve { .. })
+        )));
+    }
+
+    #[gpui_kit::test]
+    fn local_word_completion_appears_while_lsp_is_pending(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::core::CoreNotification;
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "export interface Calculation {}\nextends Calcu\n";
+        let caret = source.find("Calcu").expect("word") + 5;
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(caret..caret, cx);
+            });
+            panel.request_proxy_completions(cx, false);
+            assert!(!panel.show_completions);
+        });
+        cx.background_executor
+            .advance_clock(LOCAL_COMPLETION_PREVIEW_DELAY);
+        cx.run_until_parked();
+
+        let request_id = panel.update(cx, |panel, _| {
+            assert!(panel.show_completions);
+            assert_eq!(panel.completions[0].item.label, "Calculation");
+            assert_eq!(panel.completions[0].plugin_id, PluginId(0));
+            panel
+                .pending_proxy_completion_request
+                .expect("pending LSP reply")
+        });
+        proxy.route_core(CoreNotification::CompletionResponse {
+            request_id,
+            input: "Calcu".into(),
+            resp: Some(lsp_types::CompletionResponse::Array(vec![
+                lsp_types::CompletionItem {
+                    label: "CalcuServer".into(),
+                    detail: Some("From server".into()),
+                    ..Default::default()
+                },
+            ])),
+            plugin_id: PluginId(7),
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            assert!(panel.pending_proxy_completion_request.is_none());
+            assert!(panel.completions.iter().any(|item| {
+                item.item.label == "CalcuServer" && item.plugin_id == PluginId(7)
+            }));
+            assert!(panel.completions.iter().any(|item| {
+                item.item.label == "Calculation" && item.plugin_id == PluginId(0)
+            }));
+        });
+    }
+
+    #[test]
+    fn completion_match_highlights_are_fuzzy_and_unicode_safe() {
+        assert_eq!(completion_match_ranges("Ω Calculation", "Cal"), vec![3..6]);
+        assert_eq!(
+            completion_match_ranges("Calculation", "Cl"),
+            vec![0..1, 2..3]
+        );
+        assert!(completion_match_ranges("Calculation", "∂").is_empty());
+        assert!(completion_match_ranges("Calculation", "").is_empty());
+    }
+
+    #[test]
+    fn lsp_cursor_position_counts_utf16_in_only_the_current_rope_line() {
+        let line = "🦀 interface Calculation";
+        let text = super::Rope::from(format!("unrelated line\n{line}\r\n"));
+        let position = lsp_cursor_position(
+            &text,
+            gpui_kit::component::input::Position::new(
+                1,
+                line.chars().count() as u32,
+            ),
+        );
+        assert_eq!(
+            position,
+            lsp_types::Position::new(1, line.encode_utf16().count() as u32),
+        );
+    }
+
+    #[test]
+    fn completion_cache_only_reuses_complete_extending_prefixes() {
+        let path = std::path::PathBuf::from("/workspace/src/main.ts");
+        let cache = CompletionCache {
+            path: path.clone(),
+            line: 3,
+            start_character: 12,
+            query: "Cal".into(),
+            batch: std::sync::Arc::new(crate::proxy_client::LspCompletionBatch {
+                items: Vec::new(),
+                is_incomplete: false,
+            }),
+        };
+        assert!(completion_cache_matches(
+            &cache,
+            &path,
+            lsp_types::Position::new(3, 18),
+            "Calcul",
+        ));
+        assert!(!completion_cache_matches(
+            &cache,
+            &path,
+            lsp_types::Position::new(3, 15),
+            "Calcul",
+        ));
+        assert!(!completion_cache_matches(
+            &cache,
+            std::path::Path::new("/workspace/src/other.ts"),
+            lsp_types::Position::new(3, 18),
+            "Calcul",
+        ));
+        assert!(!completion_cache_matches(
+            &cache,
+            &path,
+            lsp_types::Position::new(3, 18),
+            "Cal",
+        ));
+
+        let mut incomplete = cache;
+        std::sync::Arc::get_mut(&mut incomplete.batch)
+            .expect("single-owner test batch")
+            .is_incomplete = true;
+        assert!(!completion_cache_matches(
+            &incomplete,
+            &path,
+            lsp_types::Position::new(3, 18),
+            "Calcul",
+        ));
+    }
+
+    #[test]
+    fn cached_completion_acceptance_extends_stale_lsp_ranges() {
+        use lsp_types::{
+            CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
+        };
+
+        let cache = CompletionCache {
+            path: std::path::PathBuf::from("/workspace/main.ts"),
+            line: 0,
+            start_character: 0,
+            query: "Cal".into(),
+            batch: std::sync::Arc::new(
+                crate::proxy_client::LspCompletionBatch::default(),
+            ),
+        };
+        let caret = Position::new(0, 4);
+        let original = CompletionItem {
+            label: "Calculation".into(),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+                new_text: "Calculation".into(),
+            })),
+            ..Default::default()
+        };
+        let mut resolved =
+            preserve_original_completion_fields(original.clone(), &original);
+        adapt_cached_completion_item(&mut resolved, &cache, "Calc");
+        let (range, replacement, _, _) =
+            completion_edit("Calc", caret, &resolved).expect("adjusted replacement");
+        assert_eq!(range, 0..4);
+        assert_eq!(replacement, "Calculation");
+
+        let mut suffix = CompletionItem {
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(0, 3), Position::new(0, 3)),
+                new_text: "culation".into(),
+            })),
+            ..original
+        };
+        adapt_cached_completion_item(&mut suffix, &cache, "Calc");
+        let (range, replacement, _, _) =
+            completion_edit("Calc", caret, &suffix).expect("adjusted suffix");
+        assert_eq!(range, 4..4);
+        assert_eq!(replacement, "ulation");
+
+        let unicode_cache = CompletionCache {
+            query: "A".into(),
+            ..cache
+        };
+        let mut unicode = CompletionItem {
+            label: "A𠀀bc".into(),
+            text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                lsp_types::InsertReplaceEdit {
+                    new_text: "A𠀀bc".into(),
+                    insert: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                    replace: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                },
+            )),
+            ..Default::default()
+        };
+        adapt_cached_completion_item(&mut unicode, &unicode_cache, "A𠀀");
+        let (range, replacement, _, _) =
+            completion_edit("A𠀀", Position::new(0, 3), &unicode)
+                .expect("UTF-16 adjusted replacement");
+        assert_eq!(range, 0..5);
+        assert_eq!(replacement, "A𠀀bc");
+    }
+
+    #[gpui_kit::test]
+    fn typing_filters_cached_completions_without_hiding_the_menu(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "Cal").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, _, cx| {
+            panel.proxy = Some(proxy);
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(3..3, cx);
+            });
+            let items = ["Calculation", "Calendar"]
+                .into_iter()
+                .map(|label| LspCompletion {
+                    plugin_id: PluginId(1),
+                    item: lsp_types::CompletionItem {
+                        label: label.into(),
+                        detail: Some("type".into()),
+                        ..Default::default()
+                    },
+                })
+                .collect::<Vec<_>>();
+            panel.completion_cache = Some(CompletionCache {
+                path: path.clone(),
+                line: 0,
+                start_character: 0,
+                query: "Cal".into(),
+                batch: std::sync::Arc::new(
+                    crate::proxy_client::LspCompletionBatch {
+                        items: items.clone(),
+                        is_incomplete: false,
+                    },
+                ),
+            });
+            panel.set_completion_items(
+                rank_completions(&items, "Cal"),
+                "Completions from proxy",
+                cx,
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.insert("c", window, cx);
+            });
+        });
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value().to_string(), "Calc");
+            assert!(panel.show_completions, "the menu should not blink off");
+            assert_eq!(panel.completions.len(), 1);
+            assert_eq!(panel.completions[0].item.label, "Calculation");
+            assert_eq!(
+                panel.completion_context,
+                Some(panel.current_completion_context(cx))
+            );
+        });
     }
 
     #[test]
@@ -11298,6 +13965,32 @@ mod tests {
             "import { calculate } from './math';\ncalculate"
         );
         assert_eq!(caret, replacement.len());
+    }
+
+    #[test]
+    fn suffix_snippet_does_not_duplicate_an_already_typed_completion() {
+        use lsp_types::{
+            CompletionItem, CompletionTextEdit, InsertTextFormat, Position, Range,
+            TextEdit,
+        };
+
+        let text = "extends";
+        let position = Position::new(0, text.len() as u32);
+        let item = CompletionItem {
+            label: "extends".into(),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(position, position),
+                new_text: "tends".into(),
+            })),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        };
+
+        let (range, replacement, _, _) =
+            completion_edit(text, position, &item).expect("completion edit");
+        let mut accepted = text.to_owned();
+        accepted.replace_range(range, &replacement);
+        assert_eq!(accepted, "extends");
     }
 
     #[gpui_kit::test]
@@ -11409,6 +14102,96 @@ mod tests {
             "human edit\n"
         );
         assert!(panel.update(cx, |panel, _| panel.status.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn on_type_formatting_uses_the_autoindented_cursor_position(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::core::CoreNotification;
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        use lsp_types::{Position, Range, TextEdit};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("disposable workspace");
+        let path = directory.path().join("main.rs");
+        let source = "fn main() {\n}\n";
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        proxy.route_core(CoreNotification::ServerStatus {
+            params: ahead_rpc::core::ServerStatusParams::ready(
+                "rust-analyzer".into(),
+            )
+            .with_on_type_formatting_triggers(vec!["\n".into()]),
+        });
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update_in(cx, |panel, _, cx| {
+            panel.proxy = Some(proxy);
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(11..11, cx);
+            });
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+        let responder_rpc = rpc.clone();
+        let (observed_sender, observed_receiver) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let (request_id, request_path, position, trigger_character) = loop {
+                let ProxyRpc::Request(
+                    request_id,
+                    ProxyRequest::GetDocumentOnTypeFormatting {
+                        path,
+                        position,
+                        trigger_character,
+                    },
+                ) = responder_rpc
+                    .rx()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("on-type formatting request")
+                else {
+                    continue;
+                };
+                break (request_id, path, position, trigger_character);
+            };
+            observed_sender
+                .send((request_path, position, trigger_character))
+                .expect("test is receiving the request details");
+            responder_rpc.handle_response(
+                request_id,
+                Ok(ProxyResponse::GetDocumentOnTypeFormatting {
+                    edits: vec![TextEdit {
+                        range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+                        new_text: "\t".into(),
+                    }],
+                }),
+            );
+        });
+        cx.simulate_keystrokes("enter");
+
+        let (request_path, position, trigger_character) = observed_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("on-type formatting request details");
+        responder.join().expect("test proxy response");
+        assert_eq!(request_path, path);
+        assert_eq!(position, Position::new(1, 4));
+        assert_eq!(trigger_character, "\n");
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "fn main() {\n\t\n}\n"
+        );
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.cursor_position(cx)),
+            Position::new(1, 1)
+        );
     }
 
     #[gpui_kit::test]
@@ -11937,7 +14720,11 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|window, cx| {
             CodePanel::new(path.to_str().expect("path"), window, cx)
         });
-        let item = CompletionItem {
+        let original_item = CompletionItem {
+            label: "calculate".into(),
+            ..Default::default()
+        };
+        let resolved_item = CompletionItem {
             label: "calculate".into(),
             additional_text_edits: Some(vec![TextEdit {
                 range: Range::new(Position::new(0, 0), Position::new(0, 0)),
@@ -11945,6 +14732,10 @@ mod tests {
             }]),
             ..Default::default()
         };
+        let item = super::preserve_original_completion_fields(
+            resolved_item,
+            &original_item,
+        );
         let context = panel.update(cx, |panel, cx| {
             panel.editor.update(cx, |editor, cx| {
                 editor.set_selected_range(original.len() - 1..original.len() - 1, cx)
@@ -11952,7 +14743,13 @@ mod tests {
             panel.current_completion_context(cx)
         });
         panel.update_in(cx, |panel, window, cx| {
-            panel.finish_completion(&context, Ok(item.clone()), window, cx)
+            panel.finish_completion(
+                &context,
+                PluginId(0),
+                Ok(item.clone()),
+                window,
+                cx,
+            )
         });
         assert_eq!(
             panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
@@ -12000,7 +14797,13 @@ mod tests {
             },
         ] {
             panel.update_in(cx, |panel, window, cx| {
-                panel.finish_completion(&stale, Ok(item.clone()), window, cx)
+                panel.finish_completion(
+                    &stale,
+                    PluginId(0),
+                    Ok(item.clone()),
+                    window,
+                    cx,
+                )
             });
             assert_eq!(
                 panel.update(cx, |panel, cx| panel
@@ -12014,6 +14817,7 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| {
             panel.finish_completion(
                 &current,
+                PluginId(0),
                 Err("server stopped".into()),
                 window,
                 cx,
@@ -12025,6 +14829,124 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).expect("unchanged disk"),
             original
+        );
+    }
+
+    #[gpui_kit::test]
+    fn completion_resolve_label_mutation_keeps_original_fallback_insertion(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use lsp_types::CompletionItem;
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("disposable workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "calc\n").expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let original_item = CompletionItem {
+            label: "calculate".into(),
+            ..Default::default()
+        };
+        let mut resolved_item = original_item.clone();
+        resolved_item.label = "resolved details".into();
+        resolved_item.detail = Some("function calculate()".into());
+        let resolved_item = super::preserve_original_completion_fields(
+            resolved_item,
+            &original_item,
+        );
+        let context = panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(4..4, cx);
+            });
+            panel.current_completion_context(cx)
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.finish_completion(
+                &context,
+                PluginId(0),
+                Ok(resolved_item),
+                window,
+                cx,
+            )
+        });
+
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "calculate\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn completion_resolve_keeps_original_edit_range_when_server_returns_stale_range(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use lsp_types::{
+            CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
+        };
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("disposable workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface Super extend";
+        std::fs::write(&path, source).expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let start = source.rfind("extend").expect("typed prefix") as u32;
+        let cursor = source.len() as u32;
+        let original_range =
+            Range::new(Position::new(0, start), Position::new(0, cursor));
+        let original_item = CompletionItem {
+            label: "extends".into(),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: original_range,
+                new_text: "extends".into(),
+            })),
+            ..Default::default()
+        };
+        let resolved_item = CompletionItem {
+            label: "resolved completion".into(),
+            detail: Some("keyword".into()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(
+                    Position::new(0, cursor),
+                    Position::new(0, cursor),
+                ),
+                new_text: "extends".into(),
+            })),
+            ..Default::default()
+        };
+        let resolved_item = super::preserve_original_completion_fields(
+            resolved_item,
+            &original_item,
+        );
+        assert!(matches!(
+            &resolved_item.text_edit,
+            Some(CompletionTextEdit::Edit(edit)) if edit.range == original_range
+        ));
+        let context = panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len()..source.len(), cx);
+            });
+            panel.current_completion_context(cx)
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.finish_completion(
+                &context,
+                PluginId(0),
+                Ok(resolved_item),
+                window,
+                cx,
+            )
+        });
+
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "interface Super extends"
         );
     }
 
@@ -12170,6 +15092,146 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn typing_dispatches_uncached_lsp_completions_without_debounce(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyNotification, ProxyRpc};
+        use lsp_types::Position;
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "ca\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(2..2, cx);
+            });
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+
+        cx.simulate_keystrokes("l");
+        cx.run_until_parked();
+
+        let request = rpc.rx().try_iter().find_map(|message| match message {
+            ProxyRpc::Notification(ProxyNotification::Completion {
+                request_id,
+                input,
+                position,
+                ..
+            }) => Some((request_id, input, position)),
+            _ => None,
+        });
+        let (_request_id, input, position) = request
+            .expect("typing sends an uncached completion request immediately");
+        assert_eq!(input, "cal");
+        assert_eq!(position, Position::new(0, 3));
+    }
+
+    #[gpui_kit::test]
+    fn complete_lsp_results_filter_locally_as_the_prefix_grows(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyNotification, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        let source = "interface ExtendedCalculation extends Cal\n";
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len() - 1..source.len() - 1, cx);
+            });
+            panel.request_proxy_completions(cx, false);
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+        let request_id = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Notification(ProxyNotification::Completion {
+                    request_id,
+                    ..
+                }) => Some(request_id),
+                _ => None,
+            })
+            .expect("initial completion request");
+        proxy.route_core(ahead_rpc::core::CoreNotification::CompletionResponse {
+            request_id,
+            input: "interface ExtendedCalculation extends Cal".into(),
+            resp: Some(lsp_types::CompletionResponse::List(
+                lsp_types::CompletionList {
+                    is_incomplete: false,
+                    items: ["Calculation", "CSSLayerBlockRule"]
+                        .into_iter()
+                        .map(|label| lsp_types::CompletionItem {
+                            label: label.into(),
+                            detail: Some("interface".into()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            )),
+            plugin_id: PluginId(7),
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cul");
+        cx.run_until_parked();
+
+        let completion_requests = rpc
+            .rx()
+            .try_iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ProxyRpc::Notification(ProxyNotification::Completion { .. })
+                )
+            })
+            .count();
+        assert_eq!(
+            completion_requests, 0,
+            "a complete list is filtered locally"
+        );
+        let labels = panel.read_with(cx, |panel, _| {
+            panel
+                .completions
+                .iter()
+                .map(|completion| completion.item.label.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(labels.first().map(String::as_str), Some("Calculation"));
+    }
+
+    #[gpui_kit::test]
     fn null_lsp_completion_retries_after_indexing(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -12259,6 +15321,91 @@ mod tests {
             "completion response was not displayed: request {request_id}, generation {generation}, path {path:?}, position {position:?}, status {status:?}, labels {labels:?}"
         );
         assert_eq!(labels, ["calculate"]);
+    }
+
+    #[gpui_kit::test]
+    fn empty_completion_retries_when_language_server_becomes_ready(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyNotification, ProxyRpc};
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let path = workspace.path().join("extends.ts");
+        let source = "interface ExtendedCalculation extends Cal\n";
+        std::fs::write(&path, source).expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        proxy.route_core(ahead_rpc::core::CoreNotification::ServerStatus {
+            params: ahead_rpc::core::ServerStatusParams::starting("vtsls".into()),
+        });
+        let view_path = path.to_string_lossy().into_owned();
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(&view_path, window, cx).with_proxy(
+                proxy.clone(),
+                &workspace_path,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(source.len() - 1..source.len() - 1, cx);
+            });
+            panel.request_proxy_completions(cx, false);
+        });
+        let completion_request_id = || {
+            rpc.rx().try_iter().find_map(|message| match message {
+                ProxyRpc::Notification(ProxyNotification::Completion {
+                    request_id,
+                    ..
+                }) => Some(request_id),
+                _ => None,
+            })
+        };
+        let first_request =
+            completion_request_id().expect("initial completion request");
+        proxy.route_core(ahead_rpc::core::CoreNotification::CompletionResponse {
+            request_id: first_request,
+            input: "interface ExtendedCalculation extends Cal".into(),
+            resp: Some(lsp_types::CompletionResponse::Array(Vec::new())),
+            plugin_id: ahead_rpc::plugin::PluginId(7),
+        });
+        cx.run_until_parked();
+        assert!(!panel.update(cx, |panel, _| panel.show_completions));
+        assert!(panel.read_with(cx, |panel, _| {
+            panel.pending_completion_after_server_start.is_some()
+        }));
+
+        proxy.route_core(ahead_rpc::core::CoreNotification::ServerStatus {
+            params: ahead_rpc::core::ServerStatusParams::ready("vtsls".into()),
+        });
+        cx.run_until_parked();
+        let second_request = completion_request_id()
+            .expect("completion should retry when Vtsls is ready");
+        assert_ne!(first_request, second_request);
+        proxy.route_core(ahead_rpc::core::CoreNotification::CompletionResponse {
+            request_id: second_request,
+            input: "interface ExtendedCalculation extends Cal".into(),
+            resp: Some(lsp_types::CompletionResponse::Array(vec![
+                lsp_types::CompletionItem {
+                    label: "Calculation".into(),
+                    detail: Some("interface".into()),
+                    ..Default::default()
+                },
+            ])),
+            plugin_id: ahead_rpc::plugin::PluginId(7),
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.show_completions);
+            assert_eq!(panel.completions[0].item.label, "Calculation");
+            assert!(panel.pending_completion_after_server_start.is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -12361,6 +15508,114 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn completion_command_runs_after_resolved_text_is_inserted(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyResponse, ProxyRpc};
+        use lsp_types::{
+            Command, CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
+        };
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("disposable workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "cal\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.proxy = Some(proxy.clone());
+            panel.editor.update(cx, |editor, cx| {
+                editor.set_selected_range(3..3, cx);
+            });
+            panel.completions = vec![LspCompletion {
+                plugin_id: PluginId(7),
+                item: CompletionItem {
+                    label: "calculate".into(),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+                        new_text: "calculate".into(),
+                    })),
+                    command: Some(Command {
+                        title: "Refresh imports".into(),
+                        command: "fixture.refreshImports".into(),
+                        arguments: Some(vec![
+                            serde_json::json!({"file": "main.ts"}),
+                        ]),
+                    }),
+                    ..Default::default()
+                },
+            }];
+            panel.completion_context = Some(panel.current_completion_context(cx));
+            panel.accept_completion(window, cx);
+        });
+        let (resolve_id, original_item) = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Request(
+                    id,
+                    ProxyRequest::CompletionResolve {
+                        plugin_id,
+                        completion_item,
+                    },
+                ) if plugin_id == PluginId(7) => Some((id, completion_item)),
+                _ => None,
+            })
+            .expect("completion resolve request");
+        assert!(original_item.command.is_some());
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "cal\n"
+        );
+        rpc.handle_response(
+            resolve_id,
+            Ok(ProxyResponse::CompletionResolveResponse {
+                item: Box::new(CompletionItem {
+                    label: "calculate".into(),
+                    detail: Some("(input: number) => number".into()),
+                    ..Default::default()
+                }),
+            }),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
+            "calculate\n"
+        );
+        let (command_id, plugin_id, command, arguments) = rpc
+            .rx()
+            .try_iter()
+            .find_map(|message| match message {
+                ProxyRpc::Request(
+                    id,
+                    ProxyRequest::ExecuteLspCommand {
+                        plugin_id,
+                        command,
+                        arguments,
+                    },
+                ) => Some((id, plugin_id, command, arguments)),
+                _ => None,
+            })
+            .expect("post-completion server command");
+        assert_eq!(plugin_id, PluginId(7));
+        assert_eq!(command, "fixture.refreshImports");
+        assert_eq!(arguments, [serde_json::json!({"file": "main.ts"})]);
+        rpc.handle_response(
+            command_id,
+            Ok(ProxyResponse::ExecuteLspCommandResponse {}),
+        );
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.status, "Completed calculate");
+        });
+    }
+
+    #[gpui_kit::test]
     fn snippet_completion_navigates_and_tracks_placeholder_edits(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -12401,11 +15656,17 @@ mod tests {
             panel.current_completion_context(cx)
         });
         panel.update_in(cx, |panel, window, cx| {
-            panel.finish_completion(&context, Ok(item.clone()), window, cx)
+            panel.finish_completion(
+                &context,
+                PluginId(0),
+                Ok(item.clone()),
+                window,
+                cx,
+            )
         });
         assert_eq!(
             panel.update(cx, |panel, cx| panel.editor.read(cx).value().to_string()),
-            "fn name() {}\n"
+            "fn name(arg) {}\n"
         );
         assert_eq!(
             panel.update(cx, |panel, cx| panel.editor.read(cx).selected_range()),
@@ -12434,7 +15695,7 @@ mod tests {
             panel.current_completion_context(cx)
         });
         panel.update_in(cx, |panel, window, cx| {
-            panel.finish_completion(&context, Ok(item), window, cx)
+            panel.finish_completion(&context, PluginId(0), Ok(item), window, cx)
         });
 
         let editor_focus =
@@ -12769,6 +16030,46 @@ mod tests {
             assert!(!panel.dirty);
             assert!(!panel.external_change_conflict);
             assert!(panel.status.contains("Reloaded"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn rapid_external_disk_changes_leave_clean_buffer_at_latest_version(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::core::CoreNotification;
+
+        cx.update(gpui_kit::component::init);
+        let workspace = tempfile::tempdir().expect("disposable workspace");
+        let path = workspace.path().join("main.rs");
+        std::fs::write(&path, "initial\n").expect("write original file");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            workspace.path().to_owned(),
+        );
+        let view_path = path.to_string_lossy().into_owned();
+        let workspace_path = workspace.path().to_string_lossy().into_owned();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(&view_path, window, cx).with_proxy(
+                proxy.clone(),
+                &workspace_path,
+                window,
+                cx,
+            )
+        });
+
+        for contents in ["second\n", "third\n", "latest\n"] {
+            std::fs::write(&path, contents).expect("write external file version");
+            proxy.route_core(CoreNotification::WorkspaceFileChange {
+                generation: 0,
+                paths: vec![path.clone()],
+            });
+        }
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.editor.read(cx).value(), "latest\n");
+            assert!(!panel.dirty);
+            assert!(!panel.external_change_conflict);
         });
     }
 
@@ -13117,6 +16418,38 @@ mod tests {
                 .update(cx, |panel, _| panel.pointer_overlay_position)
                 .is_some()
         );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let card = cx
+            .debug_bounds("code-presentation-card")
+            .expect("presentation card is visible");
+        let layer = cx
+            .debug_bounds("code-presentation-layer")
+            .expect("presentation overlay has an editor boundary");
+        let close = cx
+            .debug_bounds("close-code-presentation")
+            .expect("presentation has a close control");
+        assert!(card.origin.x >= layer.origin.x);
+        assert!(
+            card.origin.x + card.size.width <= layer.origin.x + layer.size.width
+        );
+        assert!(card.origin.y >= layer.origin.y);
+        assert!(
+            card.origin.y + card.size.height <= layer.origin.y + layer.size.height
+        );
+        assert!(close.origin.x >= card.origin.x && close.origin.y >= card.origin.y);
+        assert!(
+            close.origin.x + close.size.width <= card.origin.x + card.size.width
+                && close.origin.y + close.size.height
+                    <= card.origin.y + card.size.height
+        );
+        cx.update(|window, cx| {
+            window.click("close_code_presentation", cx);
+            let _ = window.draw(cx).clear(cx);
+        });
+        assert!(
+            panel.read_with(cx, |panel, _| panel.presentation.is_none()),
+            "the close button dismisses the active presentation"
+        );
         std::fs::remove_file(path).expect("remove temporary editor source");
     }
 
@@ -13243,16 +16576,19 @@ mod tests {
         let view_path = path.to_string_lossy().into_owned();
         let (panel, cx) =
             cx.add_window_view(|window, cx| CodePanel::new(&view_path, window, cx));
-        let selection = panel.update(cx, |panel, cx| {
+        let (selection, preview) = panel.update(cx, |panel, cx| {
             panel.editor.update(cx, |editor, cx| {
                 editor.set_selected_range(1..5, cx);
             });
-            panel
+            let preview = panel.selected_context_range(cx);
+            let selection = panel
                 .turn_context(cx)
                 .expect("text context")
                 .selection
-                .expect("editor selection")
+                .expect("editor selection");
+            (selection, preview)
         });
+        assert_eq!(preview, Some(selection));
         assert_eq!(selection.start.col, 1);
         assert_eq!(selection.end.col, 3);
         std::fs::remove_file(path).expect("remove temporary editor source");
@@ -13468,7 +16804,7 @@ mod tests {
         cx.update(gpui_kit::component::init);
         let directory = tempfile::tempdir().expect("workspace");
         let path = directory.path().join("main.ts");
-        let source = (0..80)
+        let source = (0..400)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         std::fs::write(&path, &source).expect("source");
@@ -13479,37 +16815,44 @@ mod tests {
         let (panel, cx) = cx.add_window_view(|window, cx| {
             CodePanel::new(path.to_str().expect("path"), window, cx)
         });
-        panel.update(cx, |panel, cx| {
+        panel.update(cx, |panel, _cx| {
             panel.proxy = Some(proxy);
             panel.workspace = directory.path().to_string_lossy().into_owned();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        panel.update(cx, |panel, cx| {
             panel.reveal_first_git_hunk(cx);
         });
         cx.run_until_parked();
-        cx.background_executor
-            .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
-        cx.run_until_parked();
-
-        let (request_id, request_content) = rpc
-            .rx()
-            .try_iter()
-            .find_map(|message| match message {
+        let mut first_request = None;
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
+            cx.run_until_parked();
+            first_request = rpc.rx().try_iter().find_map(|message| match message {
                 ProxyRpc::Request(
                     request_id,
                     ProxyRequest::GitFileState { content, .. },
                 ) => Some((request_id, content)),
                 _ => None,
-            })
-            .expect("Git metadata request");
+            });
+            if first_request.is_some() {
+                break;
+            }
+        }
+
+        let (request_id, request_content) =
+            first_request.expect("Git metadata request after debounce");
         assert_eq!(request_content, source);
         rpc.handle_response(
             request_id,
             Ok(ProxyResponse::GitFileState {
                 state: GitFileState {
                     hunks: vec![DiffHunk {
-                        start: 40,
+                        start: 240,
                         len: 1,
                         kind: DiffHunkKind::Modified,
-                        old_start: 40,
+                        old_start: 240,
                         old_lines: vec!["old line".into()],
                     }],
                     blame: Vec::new(),
@@ -13518,12 +16861,25 @@ mod tests {
         );
         cx.run_until_parked();
 
-        panel.update(cx, |panel, cx| {
-            assert_eq!(panel.expanded_hunk_start, Some(40));
+        panel.update(cx, |panel, _cx| {
+            assert_eq!(panel.expanded_hunk_start, Some(240));
             assert!(!panel.expand_first_git_hunk_after_refresh);
-            assert!(panel.editor.read(cx).scroll_offset().y < gpui_kit::px(0.));
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (scroll_y, visible_rows) = panel.update(cx, |panel, cx| {
+            let editor = panel
+                .git_diff_preview
+                .as_ref()
+                .expect("rendered Git diff preview")
+                .editor
+                .read(cx);
+            (editor.scroll_offset().y, editor.visible_row_range())
+        });
+        assert!(
+            scroll_y < gpui_kit::px(0.),
+            "the first hunk should be revealed; scroll={scroll_y:?}, visible={visible_rows:?}"
+        );
+        assert!(visible_rows.is_some_and(|rows| rows.contains(&239)));
         assert!(cx.debug_bounds("expanded-git-hunk").is_some());
     }
 
@@ -13552,26 +16908,27 @@ mod tests {
             }
         });
         cx.run_until_parked();
-        cx.background_executor
-            .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
-        cx.run_until_parked();
-        let take_request = || {
-            rpc.rx()
-                .try_iter()
-                .find_map(|message| {
-                    if let ProxyRpc::Request(
-                        id,
-                        ProxyRequest::GitFileState { content, .. },
-                    ) = message
-                    {
-                        Some((id, content))
-                    } else {
-                        None
-                    }
-                })
-                .expect("one metadata request")
-        };
-        let (old, content) = take_request();
+        let mut first_request = None;
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
+            cx.run_until_parked();
+            first_request = rpc.rx().try_iter().find_map(|message| {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::GitFileState { content, .. },
+                ) = message
+                {
+                    Some((id, content))
+                } else {
+                    None
+                }
+            });
+            if first_request.is_some() {
+                break;
+            }
+        }
+        let (old, content) = first_request.expect("initial metadata request");
         assert_eq!(content, "original\n");
         assert!(rpc.rx().try_recv().is_err());
         let editor = panel.update(cx, |panel, _| panel.editor.clone());
@@ -13604,10 +16961,27 @@ mod tests {
                 "edited buffer rejects old reply"
             )
         });
-        cx.background_executor
-            .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
-        cx.run_until_parked();
-        let (current, content) = take_request();
+        let mut current_request = None;
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
+            cx.run_until_parked();
+            current_request = rpc.rx().try_iter().find_map(|message| {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::GitFileState { content, .. },
+                ) = message
+                {
+                    Some((id, content))
+                } else {
+                    None
+                }
+            });
+            if current_request.is_some() {
+                break;
+            }
+        }
+        let (current, content) = current_request.expect("one metadata request");
         assert_eq!(content, "unsaved\n");
         rpc.handle_response(
             current,
@@ -13686,10 +17060,28 @@ mod tests {
             )),
             "repository changes restart the debounce"
         );
-        cx.background_executor
-            .advance_clock(std::time::Duration::from_millis(1));
-        cx.run_until_parked();
-        let (external_change, content) = take_request();
+        let mut external_request = None;
+        for _ in 0..3 {
+            cx.background_executor
+                .advance_clock(GIT_METADATA_REFRESH_DEBOUNCE);
+            cx.run_until_parked();
+            external_request = rpc.rx().try_iter().find_map(|message| {
+                if let ProxyRpc::Request(
+                    id,
+                    ProxyRequest::GitFileState { content, .. },
+                ) = message
+                {
+                    Some((id, content))
+                } else {
+                    None
+                }
+            });
+            if external_request.is_some() {
+                break;
+            }
+        }
+        let (external_change, content) =
+            external_request.expect("metadata request after repository refresh");
         assert_eq!(content, "typing latest\n");
         panel.update(cx, |panel, _| panel.release_buffer());
         rpc.handle_response(
@@ -13797,7 +17189,7 @@ mod tests {
             "<<<<<<< HEAD\nours\n||||||| base\nancestor\n=======\ntheirs\n>>>>>>> topic\n",
             "after\n",
         );
-        let conflicts = parse_merge_conflicts(source);
+        let conflicts = parse_merge_conflicts(&ropey::Rope::from(source));
         assert_eq!(conflicts.len(), 2);
         assert_eq!(conflicts[0].line, 2);
         assert_eq!(&source[conflicts[0].ours.clone()], "current\n");
@@ -13829,10 +17221,113 @@ mod tests {
             "<<<<<<< nested\ninner\n=======\nother\n>>>>>>> nested\n",
             "<<<<<<< complete\nleft\n=======\nright\n>>>>>>> complete\n",
         );
-        let conflicts = parse_merge_conflicts(source);
+        let conflicts = parse_merge_conflicts(&ropey::Rope::from(source));
         assert_eq!(conflicts.len(), 1);
         assert_eq!(&source[conflicts[0].ours.clone()], "left\n");
         assert_eq!(&source[conflicts[0].theirs.clone()], "right\n");
+    }
+
+    #[test]
+    fn merge_conflict_parser_keeps_utf8_offsets_across_rope_chunks() {
+        let source = format!(
+            "{}🦀\n<<<<<<< HEAD\r\nleft\r\n=======\r\nright\r\n>>>>>>> topic\r\n",
+            "a".repeat(8192)
+        );
+        let conflicts = parse_merge_conflicts(&ropey::Rope::from(source.as_str()));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(&source[conflicts[0].ours.clone()], "left\r\n");
+        assert_eq!(&source[conflicts[0].theirs.clone()], "right\r\n");
+        assert_eq!(
+            &source[conflicts[0].range.clone()],
+            "<<<<<<< HEAD\r\nleft\r\n=======\r\nright\r\n>>>>>>> topic\r\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn merge_conflict_refresh_uses_the_latest_edit(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("conflict.rs");
+        let conflict = "<<<<<<< HEAD\ncurrent\n=======\nincoming\n>>>>>>> topic\n";
+        std::fs::write(&path, "clean\n").expect("source");
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        let editor = panel.read_with(cx, |panel, _| panel.editor.clone());
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_all(conflict, window, cx);
+                editor.replace_all("clean again\n", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(MERGE_CONFLICT_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.merge_conflicts.is_empty()));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_all(conflict, window, cx);
+            });
+        });
+        assert!(panel.read_with(cx, |panel, _| panel.merge_conflict_generation > 0));
+        assert!(panel.read_with(cx, |panel, _| panel.merge_conflicts.is_empty()));
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(MERGE_CONFLICT_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.merge_conflicts.len()),
+            1
+        );
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_all("clean again\n", window, cx);
+            });
+        });
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.merge_conflicts.len()),
+            1
+        );
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(MERGE_CONFLICT_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.merge_conflicts.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn shared_snapshot_refreshes_conflicts_after_silent_load(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        let source = "<<<<<<< HEAD\ncurrent\n=======\nincoming\n>>>>>>> topic\n";
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new_shared(
+                "session".into(),
+                ahead_rpc::ahead::SharedBufferSnapshot {
+                    path: "conflict.rs".into(),
+                    revision: 1,
+                    content: source.into(),
+                },
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(MERGE_CONFLICT_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.merge_conflicts.len()),
+            1
+        );
     }
 
     #[gpui_kit::test]
@@ -13978,6 +17473,78 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn git_change_marker_stays_stable_during_rapid_typing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use ahead_rpc::proxy::{ProxyRequest, ProxyRpc};
+        use ahead_rpc::source_control::{DiffHunk, DiffHunkKind};
+
+        cx.update(gpui_kit::component::init);
+        let directory = tempfile::tempdir().expect("workspace");
+        let path = directory.path().join("main.ts");
+        std::fs::write(&path, "const value = 1;\n").expect("source");
+        let proxy = crate::proxy_client::ProxyClient::new_for_test(
+            directory.path().to_owned(),
+        );
+        let rpc = proxy.rpc_for_test();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            CodePanel::new(path.to_str().expect("path"), window, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.proxy = Some(proxy);
+            panel.git_state.hunks = vec![DiffHunk {
+                start: 1,
+                len: 1,
+                kind: DiffHunkKind::Added,
+                old_start: 0,
+                old_lines: Vec::new(),
+            }];
+            panel.refresh_git_gutter_markers(cx);
+            panel.git_key = panel.current_git_key();
+            cx.notify();
+        });
+        let editor_focus =
+            panel.update(cx, |panel, cx| panel.editor.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&editor_focus, cx);
+        });
+        let initial_marker = cx
+            .debug_bounds("git-change-1")
+            .expect("initial Git marker row");
+
+        for character in ["x", "y", "z"] {
+            cx.simulate_keystrokes(character);
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+
+            let marker = cx
+                .debug_bounds("git-change-1")
+                .expect("Git marker row remains rendered while typing");
+            assert_eq!(marker.origin.x, initial_marker.origin.x);
+            assert_eq!(marker.origin.y, initial_marker.origin.y);
+            assert_eq!(marker.size.width, initial_marker.size.width);
+            assert_eq!(marker.size.height, initial_marker.size.height);
+            panel.read_with(cx, |panel, _| {
+                assert_eq!(
+                    panel.git_gutter_markers.hunk_lines.get(&1),
+                    Some(&(1, DiffHunkKind::Added))
+                );
+            });
+        }
+
+        assert!(
+            !rpc.rx().try_iter().any(|message| matches!(
+                message,
+                ProxyRpc::Request(_, ProxyRequest::GitFileState { .. })
+            )),
+            "same-line typing should retain the current marker until the idle debounce"
+        );
+    }
+
+    #[gpui_kit::test]
     fn code_comment_actions_require_a_session_and_fit_the_gutter(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -14027,8 +17594,26 @@ mod tests {
         let gutter_add_comment = cx
             .debug_bounds("add-comment-marker-1")
             .expect("selected code exposes an inline add-comment button");
+        let gutter_add_comment_icon = cx
+            .debug_bounds("add-comment-marker-icon-1")
+            .expect("inline add-comment icon has a centered slot");
+        let gutter_add_comment_glyph = cx
+            .debug_bounds("add-comment-marker-glyph-1")
+            .expect("inline comment glyph is centered in its slot");
+        let gutter_actions = cx
+            .debug_bounds("gutter-actions-1")
+            .expect("inline comment button has a gutter action area");
         assert!(add_comment.size.width > gpui_kit::px(60.));
         assert_eq!(gutter_add_comment.size.width, gpui_kit::px(20.));
+        assert_eq!(
+            gutter_add_comment_icon.center(),
+            gutter_add_comment.center()
+        );
+        assert_eq!(
+            gutter_add_comment_glyph.center(),
+            gutter_add_comment_icon.center()
+        );
+        assert_eq!(gutter_add_comment.center(), gutter_actions.center());
         assert!(
             gutter_add_comment.origin.x + gutter_add_comment.size.width
                 <= gutter.origin.x + gutter.size.width
@@ -14330,5 +17915,75 @@ mod tests {
         assert_eq!(interpolate_insertion("ab", "ab"), None);
         assert_eq!(interpolate_insertion("ab", "ac"), None);
         assert_eq!(interpolate_insertion("ab", ""), Some("ab".to_string()));
+    }
+
+    #[test]
+    fn inline_completion_replaces_the_server_range_instead_of_appending() {
+        let source = "interface Super extend";
+        let cursor =
+            lsp_types::Position::new(0, source.encode_utf16().count() as u32);
+        let start = source.rfind("extend").expect("typed prefix");
+        let range =
+            lsp_types::Range::new(lsp_types::Position::new(0, start as u32), cursor);
+        let (preview, Some((range, replacement))) =
+            inline_completion_preview(source, cursor, Some(range), "extends")
+                .expect("valid ranged completion")
+        else {
+            panic!("ranged completion edit")
+        };
+        assert_eq!(preview, "s");
+        let mut accepted = source.to_owned();
+        accepted.replace_range(range, &replacement);
+        assert_eq!(accepted, "interface Super extends");
+
+        let source = "interface Super extends";
+        let cursor =
+            lsp_types::Position::new(0, source.encode_utf16().count() as u32);
+        let start = source.rfind("tends").expect("typed suffix");
+        let range =
+            lsp_types::Range::new(lsp_types::Position::new(0, start as u32), cursor);
+        assert!(
+            inline_completion_preview(source, cursor, Some(range), "tends")
+                .is_none()
+        );
+        assert!(inline_completion_preview(source, cursor, None, "tends").is_none());
+    }
+
+    #[test]
+    fn inline_completion_does_not_duplicate_text_after_the_caret() {
+        let source = "interface Super ex|tends";
+        let cursor_offset = source.find('|').expect("caret");
+        let source = source.replace('|', "");
+        let cursor = lsp_types::Position::new(
+            0,
+            source[..cursor_offset].encode_utf16().count() as u32,
+        );
+        assert!(inline_completion_preview(&source, cursor, None, "tends").is_none());
+
+        let start = source.rfind("ex").expect("typed prefix");
+        let range =
+            lsp_types::Range::new(lsp_types::Position::new(0, start as u32), cursor);
+        assert!(
+            inline_completion_preview(&source, cursor, Some(range), "extends")
+                .is_none()
+        );
+
+        let source = "interface Super exnds";
+        let cursor_offset = source.rfind("ex").expect("typed prefix") + 2;
+        let cursor = lsp_types::Position::new(0, cursor_offset as u32);
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(0, (cursor_offset - 2) as u32),
+            cursor,
+        );
+        let (preview, Some((range, replacement))) =
+            inline_completion_preview(source, cursor, Some(range), "extends")
+                .expect("partial trailing suffix")
+        else {
+            panic!("ranged completion edit")
+        };
+        assert_eq!(preview, "te");
+        let mut accepted = source.to_owned();
+        accepted.replace_range(range, &replacement);
+        assert_eq!(accepted, "interface Super extends");
     }
 }

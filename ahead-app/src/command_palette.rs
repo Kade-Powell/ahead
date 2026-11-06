@@ -58,9 +58,9 @@ pub(crate) struct CommandContext {
 impl Command {
     fn available(self, context: CommandContext) -> bool {
         match self.action {
-            ShellShortcut::SaveActiveFile | ShellShortcut::DebugKey("f9", false) => {
-                context.text_editor
-            }
+            ShellShortcut::SaveActiveFile
+            | ShellShortcut::GoToLine
+            | ShellShortcut::DebugKey("f9", false) => context.text_editor,
             ShellShortcut::Editor(_) => context.language_editor,
             ShellShortcut::NavigateBack => context.can_navigate_back,
             ShellShortcut::NavigateForward => context.can_navigate_forward,
@@ -156,6 +156,12 @@ const COMMANDS: &[Command] = &[
         keywords: "navigation next location cursor history",
         shortcut: "Ctrl+_",
         action: ShellShortcut::NavigateForward,
+    },
+    Command {
+        name: "Go to Line",
+        keywords: "jump row column position",
+        shortcut: "Ctrl+G",
+        action: ShellShortcut::GoToLine,
     },
     Command {
         name: "Go to Definition",
@@ -831,6 +837,26 @@ mod tests {
             == CommandAction::Shell(ShellShortcut::NavigateBack)));
         assert!(commands.iter().any(|command| command.action
             == CommandAction::Shell(ShellShortcut::NavigateForward)));
+    }
+
+    #[test]
+    fn go_to_line_is_available_without_a_language_server() {
+        let empty = available_commands(CommandContext::default(), &[]);
+        assert!(!empty.iter().any(|command| {
+            command.action == CommandAction::Shell(ShellShortcut::GoToLine)
+        }));
+
+        let text_editor = available_commands(
+            CommandContext {
+                active_editor: true,
+                text_editor: true,
+                ..CommandContext::default()
+            },
+            &[],
+        );
+        assert!(text_editor.iter().any(|command| {
+            command.action == CommandAction::Shell(ShellShortcut::GoToLine)
+        }));
     }
 
     #[test]

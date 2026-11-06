@@ -44,7 +44,7 @@ pub enum HarnessEvent {
     },
     Usage {
         acp_session_id: String,
-        total_tokens: u64,
+        used_tokens: u64,
         context_window: Option<u64>,
     },
     UserInputRequested {

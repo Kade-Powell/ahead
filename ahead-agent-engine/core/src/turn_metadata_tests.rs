@@ -8,7 +8,6 @@ use crate::responses_metadata::CompactionReason;
 use crate::responses_metadata::CompactionTrigger;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
-use crate::responses_metadata::INSTALLATION_ID_KEY;
 use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
 use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
@@ -55,11 +54,7 @@ fn test_responses_metadata_json(
     request_kind: CodexResponsesRequestKind,
 ) -> String {
     state
-        .to_responses_metadata(
-            "installation-a".to_string(),
-            window_id.to_string(),
-            request_kind,
-        )
+        .to_responses_metadata(window_id.to_string(), request_kind)
         .turn_metadata_json()
         .expect("turn metadata json")
 }
@@ -712,7 +707,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
             },
         })
     );
-    assert!(json.get(INSTALLATION_ID_KEY).is_none());
+    assert!(json.get("installation_id").is_none());
     assert!(json.get("x-codex-installation-id").is_none());
     assert!(json.get("x-codex-parent-thread-id").is_none());
     assert!(json.get("x-openai-subagent").is_none());
@@ -754,20 +749,12 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         Some("sdk")
     );
     assert_eq!(
-        model_request_json[INSTALLATION_ID_KEY].as_str(),
-        Some("installation-a")
-    );
-    assert_eq!(
         model_request_json[WINDOW_ID_KEY].as_str(),
         Some("thread-a:1")
     );
 
     let compatibility_headers = state
-        .to_responses_metadata(
-            "installation-a".to_string(),
-            "thread-a:1".to_string(),
-            CodexResponsesRequestKind::Turn,
-        )
+        .to_responses_metadata("thread-a:1".to_string(), CodexResponsesRequestKind::Turn)
         .compatibility_headers();
     let compatibility_metadata: Value = serde_json::from_str(
         compatibility_headers

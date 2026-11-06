@@ -166,12 +166,6 @@ fn populate_merged_regular_fields_with_sources(
         default_permissions,
         remote_sandbox_config: _,
         allowed_web_search_modes,
-        allow_browser_and_computer_use,
-        allow_appshots,
-        allow_remote_control,
-        computer_use,
-        browser_use,
-        in_app_browser,
         windows,
         feature_requirements,
         mcp_servers,
@@ -193,15 +187,6 @@ fn populate_merged_regular_fields_with_sources(
     );
     set_sourced!(default_permissions, &["default_permissions"]);
     set_sourced!(allowed_web_search_modes, &["allowed_web_search_modes"]);
-    set_sourced!(
-        allow_browser_and_computer_use,
-        &["allow_browser_and_computer_use"]
-    );
-    set_sourced!(allow_appshots, &["allow_appshots"]);
-    set_sourced!(allow_remote_control, &["allow_remote_control"]);
-    set_sourced!(computer_use, &["computer_use"]);
-    set_sourced!(browser_use, &["browser_use"]);
-    set_sourced!(in_app_browser, &["in_app_browser"]);
     set_sourced!(windows, &["windows"]);
     set_sourced!(feature_requirements, &["features", "feature_requirements"]);
     set_sourced!(mcp_servers, &["mcp_servers"]);
