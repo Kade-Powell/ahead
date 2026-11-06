@@ -8344,6 +8344,18 @@ It also passed four source-matched app regressions: directory launch,
       suffix. Diagnostics/navigation/rename/formatting/recovery acceptance
       remain open. The same app change now suppresses expected closed-channel
       logs for stale completion requests; live log reduction was not verified.
+      Also on 2026-11-06, native Python completion in the same disposable
+      project offered the imported `double` symbol after typing `dou` in
+      `python/main.py`; Tab inserted exactly `double`. Undo restored the exact
+      original buffer and cleared the transient diagnostic, with no disk save.
+      This adds Python completion evidence only; navigation, rename, formatting
+      and recovery acceptance remain open.
+      Native Rust completion on the same date offered `double(...)` with
+      `fn(value: i32) -> i32` details, inserted its argument snippet and showed
+      signature help. Two undos restored `src/main.rs` exactly; no disk save.
+      F12 on a Rust usage opened its definition in `src/math.rs`; editor back
+      navigation returned to `src/main.rs`. Rename, formatting and recovery
+      acceptance remain open.
       A 2026-11-02 comparison with Zed commit `d27ad54` found AHEAD exposed
       document formatting only. AHEAD now forwards static on-type trigger
       capabilities and formatting requests, waiting for the editor change
@@ -12199,6 +12211,12 @@ It also passed four source-matched app regressions: directory launch,
       stale-index symlink escape rejection. This is one synthetic host run;
       native large-result rendering and concurrent editor/agent contention
       remain open.
+      On 2026-11-06, the running native app in the disposable multi-language
+      fixture searched `console.log(` with Text selected and rendered three
+      literal matches without a regex error. Expanding Replace showed separate
+      `Replace Match` and `Replace All` actions in the toolbar. No replacement
+      was executed; native wide-result rendering, range selection and concurrent
+      editor/agent contention remain open.
 - [ ] Add an optional watch/restart action for parsed just recipes using
       watchexec's supervisor/process-group and clear-screen support; direct
       recipe runs should remain the default. The Tasks panel now has a
@@ -15469,6 +15487,13 @@ It also passed four source-matched app regressions: directory launch,
       palette GPUI tests, including command/skill filtering and keyboard/mouse
       selection. Native ACP-command presence, narrow layout, and live project/
       user-skill refresh remain open while macOS is locked.
+      On 2026-11-06, the running native app in disposable project
+      `/private/tmp/ahead-premvp.Uu6Voo/project` showed the grouped `/` picker;
+      typing `/skill` filtered it to the two installed project skills, with
+      their descriptions visible. I cleared the draft without selecting an
+      entry or sending a turn. This confirms native skill filtering at the
+      current width; ACP-command presence, narrower layout and live skill-file
+      refresh remain open.
 
 - [ ] Finish end-to-end behavior validation for Turso-backed managed session
       persistence. Pre-production scope is the working initial schema; schema
