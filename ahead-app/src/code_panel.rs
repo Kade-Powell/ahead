@@ -4122,7 +4122,19 @@ impl CodePanel {
             let response = match response {
                 Some(Ok(response)) => response,
                 Some(Err(error)) => {
-                    eprintln!("Receiving LSP completions: {error}");
+                    let request_is_current = this
+                        .read_with(cx, |panel, cx| {
+                            panel.request_generation == generation
+                                && panel.completion_request_id == request_id
+                                && panel.proxy_path() == request_path
+                                && panel.cursor_position(cx) == pos
+                                && panel.pending_proxy_completion_request
+                                    == Some(proxy_request_id)
+                        })
+                        .unwrap_or(false);
+                    if request_is_current {
+                        eprintln!("Receiving LSP completions: {error}");
+                    }
                     proxy.cancel_completion_request(proxy_request_id);
                     Some(LspCompletionBatch::default())
                 }
@@ -8594,6 +8606,9 @@ impl Render for CodePanel {
                                                                     .child(
                                                                         div()
                                                                             .debug_selector(move || format!("add-comment-marker-glyph-{ln}"))
+                                                                            .relative()
+                                                                            .left(px(2.))
+                                                                            .top(px(2.))
                                                                             .child(
                                                                                 gpui_kit::component::Icon::new(IconName::MessageSquarePlus)
                                                                                     .with_size(px(12.)),
@@ -17611,7 +17626,10 @@ mod tests {
         );
         assert_eq!(
             gutter_add_comment_glyph.center(),
-            gutter_add_comment_icon.center()
+            gpui_kit::point(
+                gutter_add_comment_icon.center().x + gpui_kit::px(2.),
+                gutter_add_comment_icon.center().y + gpui_kit::px(2.),
+            )
         );
         assert_eq!(gutter_add_comment.center(), gutter_actions.center());
         assert!(

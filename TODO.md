@@ -6155,6 +6155,17 @@ It also passed four source-matched app regressions: directory launch,
       An external Git commit appeared immediately in the History tab. I reset
       the disposable repository to its original commit and confirmed the
       Source Control count returned to its prior two changes.
+      On 2026-11-06, the disposable `tests/fixtures/editor-smoke/` copy passed
+      `just verify` after the shared watcher was stopped: Rust 1/1 offline,
+      Node 3/3 (JavaScript, TypeScript and model-catalog tests), and Python 1/1.
+      This reconfirms the project test lanes; native LSP/editor and provider
+      acceptance remain separate.
+      The 2026-11-06 native pass also confirmed TypeScript local type/keyword
+      completion and above-caret placement, with no duplicate suffix on
+      acceptance. In a disposable managed session, the selected-code comment
+      marker's glyph rendered centered in its purple gutter button. The broader
+      Rust/JavaScript/Python native feature matrix and authenticated chat
+      controls remain open.
 - [ ] Finish AHEAD-owned Clippy warning cleanup before calling the build
       production-ready. On 2026-10-01,
       `cargo clippy --locked --offline -p ahead-agent -p ahead-app -p ahead-proxy --lib -j 1`
@@ -8326,6 +8337,13 @@ It also passed four source-matched app regressions: directory launch,
       diagnostics and gutter refresh; navigation/back, rename, formatting and
       code-action undo; stale replies after file switches; and server
       restart/recovery. Keep FIM separate from LSP completion.
+      On 2026-11-06, the disposable native TypeScript buffer offered local
+      `Calculation` after `extends Cal`; accepting it inserted the type name.
+      The completion popup appeared above the caret, and accepting `extends`
+      after typing `exte` produced exactly `extends` without a duplicated
+      suffix. Diagnostics/navigation/rename/formatting/recovery acceptance
+      remain open. The same app change now suppresses expected closed-channel
+      logs for stale completion requests; live log reduction was not verified.
       A 2026-11-02 comparison with Zed commit `d27ad54` found AHEAD exposed
       document formatting only. AHEAD now forwards static on-type trigger
       capabilities and formatting requests, waiting for the editor change
@@ -12858,6 +12876,14 @@ It also passed four source-matched app regressions: directory launch,
       The latest screenshot still showed a slight high-left offset, so this was
       increased to 3px right/down. The shared dev loop rebuilt successfully;
       native screenshot confirmation is pending because macOS is locked.
+      On 2026-11-06, another user screenshot showed the strokes still visually
+      high-left inside the purple control. The current centered 20px button
+      keeps its layout and shifts only the 12px glyph 2 logical pixels right
+      and down. The integrated `just dev` build succeeded. A fresh native
+      screenshot in the disposable TypeScript project, with an active session
+      and selected code, confirms the glyph is centered inside the purple
+      control. The focused GPUI test was not run because the shared `just dev`
+      process owns the workspace build loop.
       Follow-up to the user's latest screenshot: replaced the nested,
       manually-positioned glyph with gpui-kit's `Button::icon(MessageSquarePlus)`
       so the purple gutter control uses the component's centered icon slot.
