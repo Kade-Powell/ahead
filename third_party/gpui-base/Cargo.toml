@@ -70,7 +70,7 @@ version = "=0.3.6"
 package = "gpui-pre-macros"
 
 [dependencies.html5ever]
-version = "0.27"
+version = "0.40"
 
 [dependencies.instant]
 version = "0.1"
@@ -85,7 +85,7 @@ version = "1.0.0"
 features = ["serde"]
 
 [dependencies.markup5ever_rcdom]
-version = "0.3.0"
+version = "0.39.0"
 
 [dependencies.regex]
 version = "1"

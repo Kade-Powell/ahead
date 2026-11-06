@@ -11,13 +11,13 @@ path = "src/lib.rs"
 [dependencies]
 codex-code-mode-protocol.workspace = true
 codex-protocol.workspace = true
-deno_core_icudata = "0.77.0"
+deno_core_icudata = "0.78.0"
 futures.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
-v8 = { version = "=150.4.0", features = ["v8_enable_sandbox"] }
+v8 = { version = "=152.2.0", features = ["v8_enable_sandbox"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
